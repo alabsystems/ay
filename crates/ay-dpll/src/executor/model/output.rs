@@ -430,13 +430,11 @@ impl Executor {
                 // symbol, so every UF-bearing `sat` in those lanes published a
                 // model with NO entry for `f` while z3 printed one.
                 //
-                // Note what this is NOT: the independent gate reads the internal
-                // `Model`, not this printout, and it already returned
-                // `confirmed-sat` on these queries. So the gap was never a gate
-                // refusal — it was the narrower and quieter failure of a
-                // CONFIRMED model being published incomplete, leaving the user
-                // (and any external validator) unable to check the `sat` that
-                // AY had in fact justified internally.
+                // The independent gate reads the internal `Model`, not this
+                // printout, but it must certify the SAME total interpretation
+                // AY publishes.  Its ground-UF fallback therefore mirrors this
+                // branch and parses these rows back into canonical model values;
+                // an unreadable or conflicting table remains fail-closed.
                 //
                 // The values are not missing, only unrouted: `(get-value ((f
                 // x)))` already answers on exactly these queries, because the
@@ -1204,7 +1202,7 @@ impl Executor {
     /// application mentions. See
     /// [`Self::uf_table_from_ground_applications`] for why that makes the
     /// ground-application table unpublishable.
-    fn symbol_occurs_under_quantifier(&self, name: &str) -> bool {
+    pub(super) fn symbol_occurs_under_quantifier(&self, name: &str) -> bool {
         fn walk(
             exec: &Executor,
             term: TermId,
@@ -1252,7 +1250,7 @@ impl Executor {
             .any(|&a| walk(self, a, name, false, &mut seen))
     }
 
-    fn uf_table_from_ground_applications(
+    pub(super) fn uf_table_from_ground_applications(
         &self,
         model: &Model,
         applications: &[(TermId, Vec<TermId>)],

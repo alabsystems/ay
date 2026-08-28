@@ -405,6 +405,7 @@ impl Executor {
                 clause,
                 farkas,
                 kind,
+                lia,
                 ..
             } => {
                 if matches!(
@@ -413,6 +414,14 @@ impl Executor {
                         | ay_core::TheoryLemmaKind::BvBitBlastGate { .. }
                 ) && self.bv_constant_disequality_is_fixed_wire_evaluate(clause)
                 {
+                    return false;
+                }
+                if ay_proof::lia_divisibility_lowering_supported(
+                    &self.ctx.terms,
+                    clause,
+                    lia.as_ref(),
+                    term_overrides.as_ref(),
+                ) {
                     return false;
                 }
                 let wire = ay_proof::promoted_wire_rule(

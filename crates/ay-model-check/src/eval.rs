@@ -86,6 +86,33 @@ pub(crate) fn congruence_keys_equal(
 /// depth budget because they do not add native evaluator frames.
 const MAX_PROJECTION_EVAL_CALL_DEPTH: usize = 128;
 
+/// Maximum nesting depth accepted while validating that a model value inhabits
+/// the sort of the term it is meant to interpret.
+///
+/// The walk fails closed before adding another native frame, so a maliciously
+/// deep datatype/array/sequence value cannot overflow libtest's small worker
+/// stack. Ordinary model witnesses are far shallower than this bound.
+const MAX_TYPED_VALUE_DEPTH: usize = 256;
+
+/// Maximum number of value nodes inspected by one typed-inhabitance walk.
+///
+/// AY's concrete sequence witnesses are capped at 4096 cells and authored
+/// datatype collection roots at 1024. This larger shared envelope admits those
+/// complete witnesses while bounding work on a model-provided aggregate. An
+/// exhausted budget is evidence insufficiency (`CannotConfirm`), never an
+/// equality decision.
+const MAX_TYPED_VALUE_WORK: usize = 8192;
+
+/// Maximum typed value-pair comparisons performed by one equality decision.
+///
+/// Array equality searches ordered override lists and deduplicates semantic
+/// keys, both of which are quadratic without a trusted hash representation.
+/// Nested aggregate keys multiply that work further. Meter every recursive
+/// pair comparison under one shared budget so an authenticated 8192-node value
+/// still cannot trigger unbounded CPU. Exhaustion is unevaluable and therefore
+/// becomes `CannotConfirm`.
+const MAX_TYPED_EQUALITY_COMPARISONS: usize = 65_536;
+
 /// Restores the local lambda-binding stack on every exit, including unwinding.
 ///
 /// The evaluator is intentionally reusable across all assertions in one gate
@@ -1177,11 +1204,296 @@ impl<'a> Evaluator<'a> {
         right: &ModelValue,
         sort: &Sort,
     ) -> Result<bool, String> {
+        self.ensure_value_inhabits_sort(left, sort)?;
+        self.ensure_value_inhabits_sort(right, sort)?;
+        let mut comparison_work = 0usize;
+        self.value_eq_for_typed_values(left, right, sort, &mut comparison_work)
+    }
+
+    /// Equality after both operands have recursively passed
+    /// [`Self::ensure_value_inhabits_sort`].
+    ///
+    /// Keeping the preflight separate makes aggregate validation linear in the
+    /// number of value nodes. Recursive datatype/array comparison can reuse the
+    /// established field invariant instead of re-walking an entire subtree at
+    /// every level.
+    fn value_eq_for_typed_values(
+        &self,
+        left: &ModelValue,
+        right: &ModelValue,
+        sort: &Sort,
+        comparison_work: &mut usize,
+    ) -> Result<bool, String> {
+        *comparison_work = comparison_work
+            .checked_add(1)
+            .ok_or_else(|| "typed equality comparison counter overflow".to_string())?;
+        if *comparison_work > MAX_TYPED_EQUALITY_COMPARISONS {
+            return Err(format!(
+                "typed equality exceeds comparison limit {MAX_TYPED_EQUALITY_COMPARISONS}"
+            ));
+        }
+        if let Some(datatype) = self.dt_of_sort(sort) {
+            return self.datatype_eq_at_sort(left, right, &datatype, comparison_work);
+        }
         match (sort, left, right) {
             (Sort::Array(array_sort), ModelValue::Array(left), ModelValue::Array(right)) => {
-                self.array_eq_at_sort(left, right, array_sort)
+                self.array_eq_at_sort(left, right, array_sort, comparison_work)
+            }
+            (Sort::Seq(element_sort), ModelValue::Seq(left), ModelValue::Seq(right)) => {
+                if left.len() != right.len() {
+                    return Ok(false);
+                }
+                let mut unresolved = None;
+                for (left_element, right_element) in left.iter().zip(right) {
+                    match self.value_eq_for_typed_values(
+                        left_element,
+                        right_element,
+                        element_sort,
+                        comparison_work,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => return Ok(false),
+                        Err(reason) if unresolved.is_none() => unresolved = Some(reason),
+                        Err(_) => {}
+                    }
+                }
+                match unresolved {
+                    Some(reason) => Err(reason),
+                    None => Ok(true),
+                }
             }
             _ => value_eq(left, right),
+        }
+    }
+
+    /// Prove that `value` is a canonical inhabitant of `sort`, within fixed
+    /// depth and work budgets.
+    ///
+    /// Model values deliberately carry less type information than terms:
+    /// arrays do not store their index/element sorts, sequences do not store an
+    /// element sort, and datatype values store only a constructor name. Exact
+    /// equality therefore has to authenticate the complete nested shape against
+    /// the declared term sort before comparing payloads. Identical malformed
+    /// values are not evidence of equality at an unrelated sort.
+    fn ensure_value_inhabits_sort(&self, value: &ModelValue, sort: &Sort) -> Result<(), String> {
+        let mut work = 0usize;
+        self.ensure_value_inhabits_sort_bounded(value, sort, 0, &mut work)
+    }
+
+    fn ensure_value_inhabits_sort_bounded(
+        &self,
+        value: &ModelValue,
+        sort: &Sort,
+        depth: usize,
+        work: &mut usize,
+    ) -> Result<(), String> {
+        if depth > MAX_TYPED_VALUE_DEPTH {
+            return Err(format!(
+                "typed model value nesting exceeds depth limit {MAX_TYPED_VALUE_DEPTH}"
+            ));
+        }
+        *work = work
+            .checked_add(1)
+            .ok_or_else(|| "typed model value work counter overflow".to_string())?;
+        if *work > MAX_TYPED_VALUE_WORK {
+            return Err(format!(
+                "typed model value exceeds work limit {MAX_TYPED_VALUE_WORK}"
+            ));
+        }
+
+        // Datatypes abstracted to an uninterpreted carrier still have a schema
+        // in the model registry. Resolve that schema before the ordinary
+        // uninterpreted-sort arm: accepting an opaque token here would discard
+        // constructor identity and arity.
+        if let Some(datatype) = self.dt_of_sort(sort) {
+            let ModelValue::Datatype { ctor, args } = value else {
+                return Err("datatype sort requires a constructor-bearing value".to_string());
+            };
+            let constructor = datatype
+                .constructors
+                .iter()
+                .find(|candidate| candidate.name == *ctor)
+                .ok_or_else(|| "datatype value names a foreign constructor".to_string())?;
+            if constructor.fields.len() != args.len() {
+                return Err("datatype value has the wrong constructor arity".to_string());
+            }
+            for (argument, field) in args.iter().zip(&constructor.fields) {
+                self.ensure_value_inhabits_sort_bounded(argument, &field.sort, depth + 1, work)?;
+            }
+            return Ok(());
+        }
+
+        match (value, sort) {
+            (ModelValue::Bool(_), Sort::Bool)
+            | (ModelValue::Int(_), Sort::Int)
+            | (ModelValue::Str(_), Sort::String)
+            | (ModelValue::Uninterpreted(_), Sort::Uninterpreted(_) | Sort::TypeVar(_)) => Ok(()),
+
+            // An exact integer is also a canonical Real value; the evaluator
+            // intentionally preserves this coercion for `to_real` equality.
+            (ModelValue::Int(_) | ModelValue::Real(_) | ModelValue::Algebraic(_), Sort::Real) => {
+                Ok(())
+            }
+
+            (ModelValue::BitVec { width, value }, Sort::BitVec(bitvec))
+                if *width == bitvec.width
+                    && !value.is_negative()
+                    && value.bits() <= u64::from(bitvec.width) =>
+            {
+                Ok(())
+            }
+
+            (
+                ModelValue::FloatingPoint {
+                    exponent,
+                    significand,
+                    exponent_bits,
+                    significand_bits,
+                    ..
+                },
+                Sort::FloatingPoint(expected_exponent_bits, expected_significand_bits),
+            ) if exponent_bits == expected_exponent_bits
+                && significand_bits == expected_significand_bits
+                && (2..=64).contains(exponent_bits)
+                && (2..=65).contains(significand_bits)
+                && (*exponent_bits == 64 || *exponent < (1u64 << *exponent_bits))
+                && (*significand_bits == 65
+                    || *significand < (1u64 << (*significand_bits - 1))) =>
+            {
+                Ok(())
+            }
+
+            (ModelValue::Int(codepoint), Sort::Char)
+                if !codepoint.is_negative() && codepoint < &BigInt::from(0x3_0000u32) =>
+            {
+                Ok(())
+            }
+            (ModelValue::Int(element), Sort::FiniteDomain(_, size))
+                if !element.is_negative() && element < &BigInt::from(*size) =>
+            {
+                Ok(())
+            }
+
+            (ModelValue::Seq(elements), Sort::Seq(element_sort)) => {
+                for element in elements {
+                    self.ensure_value_inhabits_sort_bounded(
+                        element,
+                        element_sort,
+                        depth + 1,
+                        work,
+                    )?;
+                }
+                Ok(())
+            }
+            (ModelValue::Array(array), Sort::Array(array_sort)) => {
+                self.ensure_value_inhabits_sort_bounded(
+                    &array.default,
+                    &array_sort.element_sort,
+                    depth + 1,
+                    work,
+                )?;
+                for (index, element) in &array.store {
+                    self.ensure_value_inhabits_sort_bounded(
+                        index,
+                        &array_sort.index_sort,
+                        depth + 1,
+                        work,
+                    )?;
+                    self.ensure_value_inhabits_sort_bounded(
+                        element,
+                        &array_sort.element_sort,
+                        depth + 1,
+                        work,
+                    )?;
+                }
+                Ok(())
+            }
+
+            // Regular-language terms are interpreted structurally by
+            // `crate::regex`; `ModelValue` intentionally has no RegLan carrier
+            // to adopt from a solver model. Equality over a purported regex
+            // value therefore remains unsupported and fail-closed.
+            (_, Sort::RegLan) => {
+                Err("regular-language sorts have no model-value carrier".to_string())
+            }
+            _ => Err(format!(
+                "model value shape {} does not inhabit the declared sort",
+                crate::value_shape(value)
+            )),
+        }
+    }
+
+    /// Equality for a declared datatype while retaining its constructor schema.
+    ///
+    /// Constructor identity is decisive, and every constructor must have the
+    /// declared arity. Fields are compared recursively at their declared sort,
+    /// so arrays retain the index sort required by [`Self::array_eq_at_sort`]
+    /// and sequences retain their exact element shape. This is not an opaque
+    /// carrier coercion: either operand lacking a constructor, naming a foreign
+    /// constructor, carrying the wrong arity, or mismatching a nested value
+    /// shape still fails closed.
+    fn datatype_eq_at_sort(
+        &self,
+        left: &ModelValue,
+        right: &ModelValue,
+        datatype: &ay_core::DatatypeSort,
+        comparison_work: &mut usize,
+    ) -> Result<bool, String> {
+        let (
+            ModelValue::Datatype {
+                ctor: left_ctor,
+                args: left_args,
+            },
+            ModelValue::Datatype {
+                ctor: right_ctor,
+                args: right_args,
+            },
+        ) = (left, right)
+        else {
+            return Err(format!(
+                "datatype equality requires constructor-bearing values: left={left:?}, \
+                 right={right:?}"
+            ));
+        };
+        let left_schema = datatype
+            .constructors
+            .iter()
+            .find(|constructor| constructor.name.as_str() == left_ctor)
+            .ok_or_else(|| "datatype value names a foreign constructor".to_string())?;
+        let right_schema = datatype
+            .constructors
+            .iter()
+            .find(|constructor| constructor.name.as_str() == right_ctor)
+            .ok_or_else(|| "datatype value names a foreign constructor".to_string())?;
+        if left_schema.fields.len() != left_args.len()
+            || right_schema.fields.len() != right_args.len()
+        {
+            return Err("datatype value has the wrong constructor arity".to_string());
+        }
+        if left_ctor != right_ctor {
+            return Ok(false);
+        }
+
+        let mut unresolved = None;
+        for ((left_field, right_field), field) in
+            left_args.iter().zip(right_args).zip(&left_schema.fields)
+        {
+            let result = self.value_eq_for_typed_values(
+                left_field,
+                right_field,
+                &field.sort,
+                comparison_work,
+            );
+            match result {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(reason) if unresolved.is_none() => unresolved = Some(reason),
+                Err(_) => {}
+            }
+        }
+        match unresolved {
+            Some(reason) => Err(reason),
+            None => Ok(true),
         }
     }
 
@@ -1203,9 +1515,14 @@ impl<'a> Evaluator<'a> {
         left: &ArrayValue,
         right: &ArrayValue,
         sort: &ay_core::ArraySort,
+        comparison_work: &mut usize,
     ) -> Result<bool, String> {
-        let defaults_equal =
-            self.value_eq_at_sort(&left.default, &right.default, &sort.element_sort)?;
+        let defaults_equal = self.value_eq_for_typed_values(
+            &left.default,
+            &right.default,
+            &sort.element_sort,
+            comparison_work,
+        )?;
 
         // A finite override set cannot hide different defaults over an infinite
         // carrier. This proof needs no comparison between the stored keys.
@@ -1214,9 +1531,16 @@ impl<'a> Evaluator<'a> {
         }
 
         for (key, _) in left.store.iter().chain(&right.store) {
-            let left_value = self.array_select_at_sort(left, key, &sort.index_sort)?;
-            let right_value = self.array_select_at_sort(right, key, &sort.index_sort)?;
-            if !self.value_eq_at_sort(&left_value, &right_value, &sort.element_sort)? {
+            let left_value =
+                self.array_select_at_sort(left, key, &sort.index_sort, comparison_work)?;
+            let right_value =
+                self.array_select_at_sort(right, key, &sort.index_sort, comparison_work)?;
+            if !self.value_eq_for_typed_values(
+                &left_value,
+                &right_value,
+                &sort.element_sort,
+                comparison_work,
+            )? {
                 return Ok(false);
             }
         }
@@ -1224,10 +1548,9 @@ impl<'a> Evaluator<'a> {
             return Ok(true);
         }
 
-        let keys = self.distinct_array_keys(left, right, &sort.index_sort)?;
-        match Self::known_finite_index_cardinality(&sort.index_sort) {
-            Some(cardinality) if BigInt::from(keys.len()) >= cardinality => Ok(true),
-            Some(_) => Ok(false),
+        let keys = self.distinct_array_keys(left, right, &sort.index_sort, comparison_work)?;
+        match self.known_finite_index_is_covered(&sort.index_sort, keys.len()) {
+            Some(covered) => Ok(covered),
             None => Err(
                 "array equality with differing defaults needs index-domain coverage evidence"
                     .to_string(),
@@ -1240,9 +1563,10 @@ impl<'a> Evaluator<'a> {
         array: &ArrayValue,
         index: &ModelValue,
         index_sort: &Sort,
+        comparison_work: &mut usize,
     ) -> Result<ModelValue, String> {
         for (stored_index, value) in array.store.iter().rev() {
-            if self.value_eq_at_sort(stored_index, index, index_sort)? {
+            if self.value_eq_for_typed_values(stored_index, index, index_sort, comparison_work)? {
                 return Ok(value.clone());
             }
         }
@@ -1254,15 +1578,13 @@ impl<'a> Evaluator<'a> {
         left: &'b ArrayValue,
         right: &'b ArrayValue,
         index_sort: &Sort,
+        comparison_work: &mut usize,
     ) -> Result<Vec<&'b ModelValue>, String> {
         let mut distinct: Vec<&'b ModelValue> = Vec::new();
         for (key, _) in left.store.iter().chain(&right.store) {
-            if !Self::model_value_can_index_sort(key, index_sort) {
-                return Err("array store key does not inhabit the index sort".to_string());
-            }
             let mut duplicate = false;
             for &seen in &distinct {
-                if self.value_eq_at_sort(key, seen, index_sort)? {
+                if self.value_eq_for_typed_values(key, seen, index_sort, comparison_work)? {
                     duplicate = true;
                     break;
                 }
@@ -1278,53 +1600,29 @@ impl<'a> Evaluator<'a> {
         matches!(sort, Sort::Int | Sort::Real | Sort::String | Sort::Seq(_))
     }
 
-    /// Exact cardinality for the finite scalar carriers whose model values the
+    /// Whether `distinct_keys` covers a finite scalar carrier whose values the
     /// independent checker can validate without consulting solver state.
-    /// `None` means unknown here, not infinite; infinite carriers are handled
-    /// separately above.
-    fn known_finite_index_cardinality(sort: &Sort) -> Option<BigInt> {
-        match sort {
-            Sort::Bool => Some(BigInt::from(2u8)),
-            Sort::BitVec(bitvec) => Some(BigInt::from(1u8) << bitvec.width as usize),
-            Sort::Char => Some(BigInt::from(0x3_0000u32)),
-            Sort::FiniteDomain(_, size) => Some(BigInt::from(*size)),
-            Sort::Datatype(datatype)
-                if datatype
-                    .constructors
-                    .iter()
-                    .all(|constructor| constructor.fields.is_empty()) =>
-            {
-                Some(BigInt::from(datatype.constructors.len()))
-            }
-            _ => None,
+    ///
+    /// This compares bounded machine counts instead of materialising `2^width`:
+    /// a hostile `(_ BitVec 4294967295)` sort must produce an immediate `false`,
+    /// not attempt a half-gigabyte cardinality allocation. `None` means unknown
+    /// here, not infinite; infinite carriers are handled separately above.
+    fn known_finite_index_is_covered(&self, sort: &Sort, distinct_keys: usize) -> Option<bool> {
+        if let Some(datatype) = self.dt_of_sort(sort) {
+            return datatype
+                .constructors
+                .iter()
+                .all(|constructor| constructor.fields.is_empty())
+                .then(|| distinct_keys >= datatype.constructors.len());
         }
-    }
-
-    fn model_value_can_index_sort(value: &ModelValue, sort: &Sort) -> bool {
-        match (value, sort) {
-            (ModelValue::Bool(_), Sort::Bool) => true,
-            (ModelValue::Int(_), Sort::Int) => true,
-            (ModelValue::Real(_) | ModelValue::Algebraic(_), Sort::Real) => true,
-            (ModelValue::BitVec { width, value }, Sort::BitVec(bitvec)) => {
-                *width == bitvec.width
-                    && !value.is_negative()
-                    && value < &(BigInt::from(1u8) << bitvec.width as usize)
-            }
-            (ModelValue::Str(_), Sort::String) => true,
-            (ModelValue::Seq(_), Sort::Seq(_)) => true,
-            (ModelValue::Int(value), Sort::Char) => {
-                !value.is_negative() && value < &BigInt::from(0x3_0000u32)
-            }
-            (ModelValue::Int(value), Sort::FiniteDomain(_, size)) => {
-                !value.is_negative() && value < &BigInt::from(*size)
-            }
-            (ModelValue::Datatype { ctor, args }, Sort::Datatype(datatype)) => {
-                datatype.constructors.iter().any(|constructor| {
-                    constructor.name == *ctor && constructor.fields.len() == args.len()
-                })
-            }
-            (ModelValue::Uninterpreted(_), Sort::Uninterpreted(_) | Sort::TypeVar(_)) => true,
-            _ => false,
+        match sort {
+            Sort::Bool => Some(distinct_keys >= 2),
+            Sort::BitVec(bitvec) => Some(
+                bitvec.width < usize::BITS && distinct_keys >= (1usize << bitvec.width as usize),
+            ),
+            Sort::Char => Some(distinct_keys >= 0x3_0000),
+            Sort::FiniteDomain(_, size) => Some((distinct_keys as u128) >= u128::from(*size)),
+            _ => None,
         }
     }
 

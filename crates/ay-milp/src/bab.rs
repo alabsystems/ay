@@ -13226,6 +13226,15 @@ fn set_partition_improve(
     let wander: f64 = 0.03;
     let t_start = Instant::now();
     let mut last_gain = Instant::now();
+    // A SECOND, STRICTLY MORE PERMISSIVE progress clock, read only by the region-granularity
+    // stall check inside the descent (see there). It is reset everywhere `last_gain` is AND
+    // additionally on every landed move, so `last_progress.elapsed() <= last_gain.elapsed()`
+    // always. Keeping it separate is what makes the new check ONE-DIRECTIONAL: the walk can
+    // only ever stop at or before the moment it used to, never later, so no existing exit is
+    // delayed and no tuned trajectory is extended. Folding the move-reset into `last_gain`
+    // itself was tried first and is NOT inert — it makes `'outer`'s head more patient, and
+    // air05 (wide-tall, 60s stall) moved 28,643 -> 26,729 at `--limit 60`.
+    let mut last_progress = Instant::now();
     let mut since_gain = 0u64;
 
     // The floor the last LP-SUPPORT POLISH ran against — re-polish only after the walk has
@@ -13315,6 +13324,7 @@ fn set_partition_improve(
                         best_val = cur_val;
                         best_chosen.copy_from_slice(&chosen);
                         last_gain = Instant::now();
+                        last_progress = last_gain;
                         since_gain = 0;
                         if trace {
                             eprintln!(
@@ -13359,7 +13369,30 @@ fn set_partition_improve(
                 // The check is a single Instant::now() per region; recover_region dwarfs it,
                 // so wide-tall beneficiaries (air05) keep their full share unchanged — they
                 // just stop AT their deadline instead of up to 32 regions past it.
-                if deadline.is_some_and(|d| Instant::now() >= d) {
+                //
+                // THE STALL EXIT IS CHECKED HERE TOO, BECAUSE AT THE TOP OF `'outer` IT IS
+                // STRUCTURALLY UNREACHABLE ON A DENSE-ROW MODEL. `'outer`'s head tests
+                // `last_gain.elapsed() >= stall`, but control only reaches that head after a
+                // whole descent has CONVERGED (the inner `loop` exits only when a pass at
+                // `max_target` improves nothing) and a kick has run. On nw04 (36 rows,
+                // 87,482 columns) one region attempt costs seconds and the anchor list is
+                // tens of thousands long, so a single pass outlives any window: measured
+                // `passes=1 kicks=0` at BOTH `--limit 60` and `--limit 300`, i.e. `'outer`
+                // iterated exactly ZERO times and the stall guard never ran. The only exit
+                // was the deadline above — which is `share x REMAINING BUDGET`, so the
+                // caller's clock, not the walk's productivity, decided how long a walk that
+                // had already stopped producing kept going. Measured on nw04, one binary,
+                // interleaved, load 4.87..6.12: `--limit 60` -> `tried=3`, LNS exits 5.81s;
+                // `--limit 300` -> `tried=10`, exits 29.96s; `moves=0` and the seed 1054.75
+                // (found by the polish at 0.06s) in BOTH — 24s of wall for seven more dry
+                // region attempts, the same tree (2,571 nodes) and the same answer (16862).
+                //
+                // Checking it here makes an EXISTING, documented policy reachable; it adds
+                // no new budget. Wherever the window is shorter than `stall` the deadline
+                // still binds first and the walk is bit-identical (that is every model at
+                // the node gate's `--limit 60`, and nw04's own `--limit 60` arm).
+                if deadline.is_some_and(|d| Instant::now() >= d) || last_progress.elapsed() >= stall
+                {
                     break 'outer;
                 }
                 let mut queued_list: Vec<u32> = Vec::new();
@@ -13442,6 +13475,20 @@ fn set_partition_improve(
                     cur_val += new_cost - removed_cost;
                     moves += 1;
                     improved_this_pass = true;
+                    // A LANDED MOVE IS PROGRESS, so it resets the stall clock — "a productive
+                    // search resets the clock", as the stall's own definition above says. This
+                    // is what makes the region-granularity stall check SAFE for a long
+                    // productive pass: `recover_region` only ever returns a strictly cheaper
+                    // re-cover (`new_cost < removed_cost - 1e-6` is checked above), so a walk
+                    // that is still landing moves cannot be cut, however long its single pass
+                    // runs. Without this the guard would read only `best_val` updates, which
+                    // land AFTER the whole descent converges, and a 60s-stall wide-tall walk
+                    // (air05) mid-pass would be severed exactly where it is working.
+                    //
+                    // It touches ONLY `last_progress`. `last_gain`, which `'outer`'s head
+                    // reads, keeps its exact previous meaning, so nothing that used to stop
+                    // is now allowed to continue.
+                    last_progress = Instant::now();
                 } else {
                     for &c in &new_cols {
                         chosen[c as usize] = false;
@@ -13469,6 +13516,7 @@ fn set_partition_improve(
             best_val = cur_val;
             best_chosen.copy_from_slice(&chosen);
             last_gain = Instant::now();
+            last_progress = last_gain;
             since_gain = 0;
             if trace {
                 eprintln!(
@@ -25756,6 +25804,14 @@ fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
                     let rate = nodes as f64 / t_start.elapsed().as_secs_f64().max(1e-3);
                     (NODE_CUT_DRY_REPAY * _t_sep.elapsed().as_secs_f64() * rate) as usize
                 };
+                // MECHANISM D, site 0 (see `crate::dcensus`): the repayment is a NUMBER
+                // derived from the node RATE, and it steers only when it exceeds the pure
+                // node ladder. Erased in a default build.
+                crate::dcensus::value(
+                    crate::dcensus::Site::NodeCutRepay,
+                    repay as u64,
+                    repay > cut_every,
+                );
                 next_cut_node = nodes + cut_every.max(repay);
             }
             t_sep += _t_sep.elapsed();
@@ -26603,6 +26659,9 @@ fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
                         let elapsed_s = solve_start.elapsed().as_secs_f64();
                         let rate = pace_rate(&bound_hist, elapsed_s, bf);
                         let pace = rate.is_some_and(|r| (inf - bf) / r <= remaining);
+                        // MECHANISM D, site 1: the bound's ascent RATE per second decides
+                        // whether the endgame's Hamming-ball commitment is vetoed.
+                        crate::dcensus::eval(crate::dcensus::Site::EndgameOnPace, pace);
                         (inf - bf > 0.05 * (1.0 + inf.abs()), pace, rate, bf)
                     }
                     _ => (false, false, None, f64::NEG_INFINITY),
@@ -27004,7 +27063,7 @@ fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
                 let remaining = deadline.map_or(f64::INFINITY, |d| {
                     d.saturating_duration_since(Instant::now()).as_secs_f64()
                 });
-                (nodes as f64 + rate * remaining) < next_rins as f64
+                let rate_says_unreachable = (nodes as f64 + rate * remaining) < next_rins as f64
                     && stack
                         .peek()
                         .and_then(|nd| nd.bound.as_ref())
@@ -27013,7 +27072,12 @@ fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
                                 let (bf, inf) = (to_f64(b), to_f64(inc));
                                 inf - bf > 0.05 * (1.0 + inf.abs())
                             })
-                        })
+                        });
+                // MECHANISM D, site 2. Counted HERE rather than on `rins_rescue` itself so
+                // an `eval` means "the node rate was actually consulted" — the cheap
+                // `&&` guards above short-circuit on most nodes and never read a clock.
+                crate::dcensus::eval(crate::dcensus::Site::RinsRescue, rate_says_unreachable);
+                rate_says_unreachable
             };
         if rins_rescue && trace {
             eprintln!(
@@ -27039,6 +27103,11 @@ fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
                 let slow_tree = nodes >= 4096
                     && (nodes as f64 / solve_start.elapsed().as_secs_f64().max(0.1)) * 1.2
                         < (rins_cadence / 8) as f64;
+                // MECHANISM D, site 3. The node floor is part of the site's own policy
+                // ("below the floor the tree counts as FAST"), so an eval is recorded on
+                // every reach — a run that never passes 4,096 nodes shows `fires=0` against
+                // a nonzero `evals`, which is the honest reading: watched, never steered.
+                crate::dcensus::eval(crate::dcensus::Site::SlowTree, slow_tree);
                 // The dry-ball memo (see `dry_ball`). The arm/radius preview mirrors
                 // rins()'s default ladder selection; a flag-pinned variant
                 // (`--rins`) bypasses the ladder, so the memo stands down.
@@ -27247,6 +27316,9 @@ fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
                                 d.saturating_duration_since(Instant::now()).as_secs_f64()
                             });
                             let pace = proof_on_pace(&bound_hist, elapsed_s, bf, inf, remaining);
+                            // MECHANISM D, site 4: the same bound-ascent rate, here gating
+                            // the RINS cadence (`primal_bound_narrow`, the dry-pull backoff).
+                            crate::dcensus::eval(crate::dcensus::Site::RinsOnPace, pace);
                             bound_hist.push((elapsed_s, bf));
                             (inf - bf > 0.05 * (1.0 + inf.abs()), pace)
                         }
@@ -27275,7 +27347,19 @@ fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
                 )]
                 let wide_interval = {
                     let rate = nodes as f64 / elapsed_s.max(0.1);
-                    ((rate * 1.2) as usize).clamp(512, (rins_cadence / 8).max(512))
+                    let raw = (rate * 1.2) as usize;
+                    let lo = 512;
+                    let hi = (rins_cadence / 8).max(512);
+                    // MECHANISM D, site 5. Value-carrying: `fires` counts the evaluations
+                    // where NEITHER clamp bound bit, i.e. where the measured node rate — not
+                    // a tuned constant — chose the rung interval. A run whose rate always
+                    // saturates the cap is reading the tuned schedule and is not steered.
+                    crate::dcensus::value(
+                        crate::dcensus::Site::RinsWideInterval,
+                        raw.clamp(lo, hi) as u64,
+                        raw > lo && raw < hi,
+                    );
+                    raw.clamp(lo, hi)
                 };
                 // A NARROW gap is a tree that is the proof device (the ball-arm gate
                 // above already reads it that way), and on a narrow gap a DRY pull is

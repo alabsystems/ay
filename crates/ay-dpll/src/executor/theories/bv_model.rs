@@ -1454,6 +1454,59 @@ impl Executor {
         Self::build_store_chain_interp(terms, bv_model, to_term, array_values)
     }
 
+    /// Resolve the model value of a store-chain index or value operand.
+    ///
+    /// For a LEAF (`Var`/`Const`) the bit-blaster's own assignment is the model,
+    /// so `bv_model.values` is authoritative. For a COMPOUND term the value is a
+    /// FUNCTION of its leaves, and computing it from them is authoritative
+    /// instead — a cached entry for an interior node is not.
+    ///
+    /// #store-chain-dead-node: preferring the cached entry for a compound term
+    /// committed FABRICATED array cells. Preprocessing substitutes
+    /// `(= x #x00000007)` into `(bvadd x y)`, the folded node is never
+    /// constrained, and its bits read back all-zero — so `(store a i (bvadd x y))`
+    /// was extracted as `a[i] = #x00000000` while the true value is `#x0000000a`.
+    /// The independent gate then found the definition-derived candidate
+    /// disagreeing with the extracted interpretation, tainted the target AND —
+    /// through completion's taint propagation — the innocent store BASE, leaving
+    /// both `read_conflicted`. `array_from_model` refuses a read-conflicted term,
+    /// so the base became unresolvable, the defining store expression could not
+    /// be evaluated, and a trivially satisfiable query was reported
+    /// `unknown: model does not pin this leaf`. This is the whole reason a
+    /// `store` of any COMPUTED value (`bvadd` as much as `bvsdiv`) degraded, and
+    /// why a store of a bare variable did not.
+    ///
+    /// SOUND, and fail-closed in both directions. The computed value is exactly
+    /// what the model's own leaf assignments entail, and the gate still re-checks
+    /// every authored assertion against whatever is committed, so a wrong cell can
+    /// only produce `ModelViolates` (a downgrade to `unknown`), never a
+    /// confirmation. Declining to guess is equally safe: an omitted cell leaves
+    /// the chain INCOMPLETE, which is the honest report — the caller already
+    /// treats an incompletely-resolved chain as one that may not be published as
+    /// a total array — and the definitional-equality path then supplies the cell
+    /// from the definition itself, with no conflict to taint.
+    fn store_chain_operand_value(
+        terms: &TermStore,
+        bv_model: &BvModel,
+        t: TermId,
+    ) -> Option<BigInt> {
+        if matches!(terms.get(t), TermData::Var(_, _) | TermData::Const(_)) {
+            return bv_model
+                .values
+                .get(&t)
+                .cloned()
+                .or_else(|| Self::evaluate_bv_expr(terms, t, &bv_model.values));
+        }
+        // COMPOUND term: computed or nothing. `evaluate_bv_expr` models every BV
+        // operator, `ite`, and the ROW `select`-over-`store` fold, so it returns
+        // `None` only when the value genuinely depends on something this BV-level
+        // view cannot see — in practice a `select` on an array VARIABLE, whose
+        // contents live in the array model. That is precisely the case in which
+        // the cached interior-node entry is least trustworthy, so falling back to
+        // it FABRICATES a cell rather than recovering one.
+        Self::evaluate_bv_expr(terms, t, &bv_model.values)
+    }
+
     /// Build an [`ArrayInterpretation`] for a `store` chain term by resolving
     /// each stored (index, value) pair through `bv_model` and inheriting the
     /// base array's entry for indices the chain does not overwrite.
@@ -1462,7 +1515,7 @@ impl Executor {
     /// [`Self::populate_store_chain_array_models`] but is keyed on an arbitrary
     /// store *term* rather than a `(= var store)` assertion, so it can supply
     /// interpretations for substitution targets that never appear as the named
-    /// side of a defining equality. Returns `None` when `to_term` is not a
+    /// side of a defining equality. Returns `None` when `store_term` is not a
     /// BitVec-indexed BitVec/Bool-element store chain.
     fn build_store_chain_interp(
         terms: &TermStore,
@@ -1505,22 +1558,16 @@ impl Executor {
 
         // Store-chain entries (ground truth; outermost store wins).
         for (idx_term, val_term) in &chain_entries {
-            let idx_val = bv_model
-                .values
-                .get(idx_term)
-                .cloned()
-                .or_else(|| Self::evaluate_bv_expr(terms, *idx_term, &bv_model.values));
+            let idx_val = Self::store_chain_operand_value(terms, bv_model, *idx_term);
             let elem_val = match &arr_sort.element_sort {
                 Sort::Bool => bv_model
                     .bool_overrides
                     .get(val_term)
                     .map(|&b| if b { "true" } else { "false" }.to_string()),
-                Sort::BitVec(elem_bv) => bv_model
-                    .values
-                    .get(val_term)
-                    .cloned()
-                    .or_else(|| Self::evaluate_bv_expr(terms, *val_term, &bv_model.values))
-                    .map(|ev| format_bitvec(&ev, elem_bv.width)),
+                Sort::BitVec(elem_bv) => {
+                    Self::store_chain_operand_value(terms, bv_model, *val_term)
+                        .map(|ev| format_bitvec(&ev, elem_bv.width))
+                }
                 _ => None,
             };
             if let (Some(ref iv), Some(ref ev_str)) = (idx_val, &elem_val) {

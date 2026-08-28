@@ -80,15 +80,21 @@ impl Executor {
 
     /// Original assertion stack aligned with `assertions_parsed()`.
     pub(crate) fn proof_original_problem_assertions(&self) -> Vec<TermId> {
+        self.proof_original_problem_assertions_slice().to_vec()
+    }
+
+    /// Borrow the original assertion stack aligned with
+    /// `assertions_parsed()` without allocating a full copy.
+    pub(crate) fn proof_original_problem_assertions_slice(&self) -> &[TermId] {
         if let Some(provenance) = &self.proof_problem_assertion_provenance {
-            return provenance.original_problem_assertions.clone();
+            return &provenance.original_problem_assertions;
         }
         let parsed_len = self.ctx.assertions_parsed().len();
         if parsed_len == 0 {
-            self.ctx.assertions.clone()
+            &self.ctx.assertions
         } else {
             let prefix_len = parsed_len.min(self.ctx.assertions.len());
-            self.ctx.assertions[..prefix_len].to_vec()
+            &self.ctx.assertions[..prefix_len]
         }
     }
 

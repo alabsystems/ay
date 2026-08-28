@@ -628,7 +628,7 @@ pub const OPT_TREE_FLOAT_ITERS_PER_UNIT: u64 = 256;
 /// two orders of magnitude clear of what a node actually spends: measured over
 /// 28 instances, the median node spends 31 float iterations and the worst
 /// (`air03`) 366.
-pub const OPT_TREE_FLOAT_ITERS_PER_SOLVE: u64 = 65_536;
+const OPT_TREE_FLOAT_ITERS_PER_SOLVE: u64 = 65_536;
 
 /// WHY a derivation produced nothing.
 ///

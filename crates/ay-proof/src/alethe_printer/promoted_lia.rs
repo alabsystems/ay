@@ -10,6 +10,42 @@ use ay_core::{FarkasAnnotation, ProofId, TermId, TheoryLit};
 use super::{format_rational64, AlethePrinter};
 
 impl AlethePrinter<'_> {
+    /// Lower a unit integer-divisibility theorem to checked `la_generic`
+    /// steps. The native witness says `difference = lhs-rhs` occupies one
+    /// lattice residue class that skips zero. The first step proves the two
+    /// adjacent branches around zero; the next two show that either branch
+    /// contradicts `lhs = rhs`; resolution yields the exact disequality.
+    pub(super) fn format_lia_divisibility(&self, id: ProofId, clause: &[TermId]) -> Option<String> {
+        let witness =
+            ay_core::proof_validation::lia_divisibility_equality_witness(self.terms, clause)?;
+        let [literal] = clause else {
+            return None;
+        };
+        let equality = self.format_term(match self.terms.get(*literal) {
+            TermData::Not(equality) => *equality,
+            _ => return None,
+        });
+        let lhs = self.format_term(witness.lhs);
+        let rhs = self.format_term(witness.rhs);
+        let difference = format!("(- {lhs} {rhs})");
+        let lower = format_integer(&witness.lower);
+        let upper = format_integer(&witness.upper);
+        let low = format!("(<= {difference} {lower})");
+        let high = format!("(<= {upper} {difference})");
+        let not_equality = format!("(not {equality})");
+        if self.format_term(*literal) != not_equality {
+            return None;
+        }
+
+        Some(format!(
+            "(step {id}.split (cl {low} {high}) :rule la_generic :args (1 1))\n\
+             (step {id}.lo (cl {not_equality} (not {low})) :rule la_generic :args (1 1))\n\
+             (step {id}.hi (cl {not_equality} (not {high})) :rule la_generic :args ((- 1) 1))\n\
+             (step {id}.r (cl {not_equality} {high}) :rule resolution :premises ({id}.split {id}.lo))\n\
+             (step {id} (cl {not_equality}) :rule resolution :premises ({id}.r {id}.hi))"
+        ))
+    }
+
     /// Render an independently evaluated ground LIA unit through the exact
     /// rules implemented by the pinned external checker.
     pub(super) fn format_lia_ground_evaluate(
@@ -135,5 +171,15 @@ impl AlethePrinter<'_> {
             &existing,
             &farkas.coefficients,
         )
+    }
+}
+
+fn format_integer(value: &num_bigint::BigInt) -> String {
+    use num_traits::Signed;
+
+    if value.is_negative() {
+        format!("(- {})", value.magnitude())
+    } else {
+        value.to_string()
     }
 }

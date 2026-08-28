@@ -6,6 +6,10 @@
 //!
 //! Formats proof steps, clauses, terms, and constants as SMT-LIB/Alethe text.
 
+mod authored_assume;
+#[cfg(test)]
+#[path = "alethe_printer_authored_assume_tests.rs"]
+mod authored_assume_tests;
 mod bv_mul_zero;
 mod bv_ult_zero;
 #[cfg(test)]
@@ -23,10 +27,16 @@ mod resolution_args;
 #[path = "alethe_printer/store_permutation.rs"]
 mod store_permutation;
 mod surface_and_pos;
+mod surface_congruence;
 mod surface_implies_decomposition;
+mod surface_literal;
+mod surface_resolution;
 mod surface_symm;
 mod surface_tokens;
 mod term_format;
+#[cfg(test)]
+#[path = "alethe_printer_wire_regression_tests.rs"]
+mod wire_regression_tests;
 use surface_tokens::split_smt_terms;
 pub use surface_tokens::{split_alethe_application_bounded, AletheSurfaceParseError};
 // #8529: Use deterministic hash maps in all builds.
@@ -323,6 +333,16 @@ pub(crate) struct AlethePrinter<'a> {
     /// nothing else (it does not denote the folded term the rest of the
     /// document derives from).
     folded_assume_surfaces: std::cell::RefCell<HashMap<TermId, String>>,
+    /// Exact problem spellings confined to their own reachable `assume`.
+    /// [`Self::plan_equivalent_authored_assumes`] installs canonical rendering
+    /// document-wide and emits a checked local equivalence bridge.
+    authored_assume_surfaces: std::cell::RefCell<HashMap<TermId, String>>,
+    /// Exact proof ids whose authored assumptions are consumed and therefore
+    /// need a checked bridge back to canonical spelling. Kept per id rather
+    /// than per term: a proof may contain several consumed `Assume` rows for
+    /// one interned term, and each row emits (and must be charged for) its own
+    /// bridge.
+    authored_assume_bridged: std::cell::RefCell<HashSet<ProofId>>,
     /// Subset of [`Self::folded_assume_surfaces`] whose `assume` is a PREMISE
     /// of some step, and therefore owes the consumers a derivation of the
     /// folded clause. An assumption nothing consumes owes nothing and is
@@ -364,6 +384,8 @@ impl<'a> AlethePrinter<'a> {
             assume_terms: std::cell::RefCell::new(HashMap::default()),
             let_bridge_renderings: std::cell::RefCell::new(HashMap::default()),
             folded_assume_surfaces: std::cell::RefCell::new(HashMap::default()),
+            authored_assume_surfaces: std::cell::RefCell::new(HashMap::default()),
+            authored_assume_bridged: std::cell::RefCell::new(HashSet::default()),
             folded_assume_bridged: std::cell::RefCell::new(HashSet::default()),
             proof_clauses: std::cell::RefCell::new(HashMap::default()),
             work: std::cell::Cell::new(0),
@@ -396,6 +418,7 @@ impl<'a> AlethePrinter<'a> {
         // Must precede every emission: an authored conjunction that FOLDED may
         // not be substituted for the folded term in any step, including steps
         // printed before its own `assume`.
+        self.plan_equivalent_authored_assumes(proof)?;
         self.plan_folded_and_assumes(proof);
         crate::checker::quantifier::validate_sko_forall_uniqueness(proof, self.terms).map_err(
             |err| AlethePrintError::InvalidSkolemStep {
@@ -1721,6 +1744,9 @@ impl<'a> AlethePrinter<'a> {
         match step {
             ProofStep::Assume(term_id) => {
                 self.assume_terms.borrow_mut().insert(id, *term_id);
+                if let Some(bridge) = self.format_equivalent_authored_assume_bridge(id, *term_id)? {
+                    return Ok(bridge);
+                }
                 if let Some(bridge) = self.format_folded_and_assume_bridge(id, *term_id) {
                     return Ok(bridge);
                 }
@@ -1741,8 +1767,8 @@ impl<'a> AlethePrinter<'a> {
                 clause,
                 farkas,
                 kind,
-                ..
-            } => self.format_theory_lemma(id, theory, clause, farkas.as_ref(), kind),
+                lia,
+            } => self.format_theory_lemma(id, theory, clause, farkas.as_ref(), kind, lia.as_ref()),
             ProofStep::Step {
                 rule: ay_core::AletheRule::Skolem,
                 clause,
@@ -1896,6 +1922,10 @@ impl<'a> AlethePrinter<'a> {
                     "a printed distinct/equality pivot cannot be bridged to the authored operands"
                         .to_string(),
             });
+        }
+        if let Some(text) = self.symmetric_equality_resolution_bridge(id, clause, clause1, clause2)
+        {
+            return Ok(text);
         }
         if let Some((left, right)) =
             self.surface_order_resolution_pair(clause, pivot, clause1, clause2)
@@ -2144,6 +2174,7 @@ impl<'a> AlethePrinter<'a> {
         clause: &[TermId],
         farkas: Option<&ay_core::FarkasAnnotation>,
         kind: &ay_core::TheoryLemmaKind,
+        lia: Option<&ay_core::LiaAnnotation>,
     ) -> Result<String, AlethePrintError> {
         if matches!(kind, ay_core::TheoryLemmaKind::ArithEqTriangle) {
             return self.format_arith_eq_triangle(id, clause);
@@ -2221,6 +2252,21 @@ impl<'a> AlethePrinter<'a> {
                     return Err(AlethePrintError::InvalidCongruenceStep { id, reason });
                 }
             }
+        }
+
+        // The pinned checker treats bare `lia_generic` as a hole, but its
+        // checked `la_generic` rule can certify the exact integer lattice
+        // split behind a unit Divisibility theorem. Emit that derivation only
+        // when the shared publication predicate replays the native witness
+        // against an identity surface.
+        if crate::lia_divisibility_lowering_supported(self.terms, clause, lia, self.term_overrides)
+        {
+            return self.format_lia_divisibility(id, clause).ok_or_else(|| {
+                AlethePrintError::InvalidSurfaceStep {
+                    id,
+                    reason: "validated divisibility lowering lost its lattice witness".to_string(),
+                }
+            });
         }
 
         let clause_str = self.format_clause(clause);
@@ -4694,6 +4740,13 @@ impl<'a> AlethePrinter<'a> {
         // application with `comp_simplify`, apply same-operator congruence,
         // then compose the equalities.
         if matches!(rule, ay_core::AletheRule::Cong) {
+            match self.surface_ac_cong_bridge(id, clause, premises, args) {
+                Ok(Some(text)) => return Ok(text),
+                Ok(None) => {}
+                Err(reason) => {
+                    return Err(AlethePrintError::InvalidCongruenceStep { id, reason });
+                }
+            }
             if let Some(text) = self.surface_order_cong_bridge(id, clause, premises, args) {
                 return Ok(text);
             }
@@ -5089,74 +5142,6 @@ impl<'a> AlethePrinter<'a> {
         ))
     }
 
-    /// Detect the externally invalid fallback the order-normalization bridge
-    /// is meant to prevent. If the two printed applications use different
-    /// comparison operators, a plain `cong` can never justify the equality.
-    fn surface_cong_has_different_order_operators(&self, clause: &[TermId]) -> bool {
-        let [conclusion] = clause else {
-            return false;
-        };
-        let Some([left, right]) = split_application(&self.format_term(*conclusion), "=")
-            .and_then(|args| <[String; 2]>::try_from(args).ok())
-        else {
-            return false;
-        };
-        matches!(
-            (
-                surface_order_operator(left.as_str()),
-                surface_order_operator(right.as_str())
-            ),
-            (Some(left_op), Some(right_op)) if left_op != right_op
-        )
-    }
-
-    /// Detect a printed `cong` conclusion that no congruence rule can check,
-    /// returning the reason to DECLINE with.
-    ///
-    /// MEASURED against carcara 1.1.0 on a `(= x y)` premise, every shape below
-    /// is rejected outright, so this can never withhold a step the checker
-    /// would have accepted:
-    ///
-    /// | printed conclusion   | carcara                                        |
-    /// |----------------------|------------------------------------------------|
-    /// | `(= (g x) (f y))`    | `functions don't match: 'g' and 'f'`           |
-    /// | `(= zzz (f y))`      | `term is not an application or operation: 'zzz'`|
-    /// | `(= zzz x)`          | `term is not an application or operation: 'zzz'`|
-    ///
-    /// The bare-ATOM rows are why this does not simply compare head symbols:
-    /// a sibling guard that required BOTH sides to be applications let
-    /// `(= zzz (f y))` through to the default rendering, which shipped a step
-    /// carcara rejects. An operand that is not a printed application fails the
-    /// rule whatever the other side is, so it is reported here.
-    ///
-    /// `None` when the conclusion is not a printed binary `=`, when both heads
-    /// agree, or when the rendering is not parseable as an application — those
-    /// are left to the ordinary path rather than guessed at.
-    fn surface_cong_has_uncheckable_operands(&self, clause: &[TermId]) -> Option<String> {
-        let [conclusion] = clause else {
-            return None;
-        };
-        let [left, right] = split_application(&self.format_term(*conclusion), "=")
-            .and_then(|args| <[String; 2]>::try_from(args).ok())?;
-        match (printed_head_symbol(&left), printed_head_symbol(&right)) {
-            (Some(left_head), Some(right_head)) => {
-                if left_head == right_head {
-                    return None;
-                }
-                Some(format!(
-                    "surface rewriting gives the two congruence applications different operators \
-                     ('{left_head}' and '{right_head}')"
-                ))
-            }
-            // Exactly one side is an application, or neither is. carcara needs
-            // BOTH to be applications of the same operator.
-            (None, Some(_)) | (Some(_), None) | (None, None) => Some(format!(
-                "a congruence operand is not a printed application ('{left}' and '{right}'), \
-                 which no congruence rule can check"
-            )),
-        }
-    }
-
     /// Repair the exact `eq_congruent` surface mismatch produced when an
     /// authored multiplication keeps source operand order in one application
     /// while canonical interning uses the commuted order everywhere else.
@@ -5247,8 +5232,13 @@ impl<'a> AlethePrinter<'a> {
             };
             let expected_left = &left_args[index];
             let expected_right = &right_args[index];
-            if (hyp_left == expected_left && hyp_right == expected_right)
-                || (hyp_left == expected_right && hyp_right == expected_left)
+            if (surface_literal::equal_modulo_bitvec_literal_spelling(hyp_left, expected_left)
+                && surface_literal::equal_modulo_bitvec_literal_spelling(hyp_right, expected_right))
+                || (surface_literal::equal_modulo_bitvec_literal_spelling(hyp_left, expected_right)
+                    && surface_literal::equal_modulo_bitvec_literal_spelling(
+                        hyp_right,
+                        expected_left,
+                    ))
             {
                 continue;
             }
@@ -5269,10 +5259,13 @@ impl<'a> AlethePrinter<'a> {
             return Ok(None);
         };
         if hyp_left != hyp_right {
-            return Err(
-                "surface eq_congruent mismatch is not the exact reflexive-hypothesis shape"
-                    .to_string(),
-            );
+            let hyp_left = surface_congruence::bounded_surface_diagnostic(&hyp_left);
+            let hyp_right = surface_congruence::bounded_surface_diagnostic(&hyp_right);
+            let expected_left = surface_congruence::bounded_surface_diagnostic(&left_args[index]);
+            let expected_right = surface_congruence::bounded_surface_diagnostic(&right_args[index]);
+            return Err(format!(
+                "surface eq_congruent mismatch is not the exact reflexive-hypothesis shape; hypothesis=({hyp_left:?}, {hyp_right:?}); expected=({expected_left:?}, {expected_right:?})"
+            ));
         }
         if !matches!(
             self.terms.sort(left_internal_args[index]),

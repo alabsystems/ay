@@ -202,6 +202,14 @@ impl AlethePrinter<'_> {
         let mut surfaces = self.folded_assume_surfaces.borrow_mut();
         let mut bridged = self.folded_assume_bridged.borrow_mut();
         for (term, surface, folded, is_assumed, is_consumed) in planned {
+            // The exact-equivalence assume planner runs first and owns this
+            // term atomically if it admitted a checked source/canonical
+            // bridge. A term cannot be both plans' responsibility.
+            if self.authored_assume_surfaces.borrow().contains_key(&term)
+                || renderings.contains_key(&term)
+            {
+                continue;
+            }
             if is_assumed {
                 surfaces.insert(term, surface);
                 if is_consumed {

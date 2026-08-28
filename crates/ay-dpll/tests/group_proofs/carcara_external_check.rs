@@ -32,10 +32,20 @@ fn keep_alethe_artifacts() -> bool {
 }
 
 fn find_carcara() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("CARCARA_PATH") {
+    if let Some(path) = std::env::var_os("CARCARA_PATH") {
         let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
+        assert!(
+            path.is_file(),
+            "CARCARA_PATH is configured but does not name a checker file: {}",
+            path.display()
+        );
+        return Some(path);
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = PathBuf::from(home).join(".cargo/bin/carcara");
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
 
@@ -61,6 +71,16 @@ fn find_carcara() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn required_carcara_for_corpus() -> PathBuf {
+    find_carcara().unwrap_or_else(|| {
+        panic!(
+            "the canonical external UNSAT corpus requires the real Carcara checker; \
+             set CARCARA_PATH or install it with `cargo install --git \
+             https://github.com/ufmg-smite/carcara.git`"
+        )
+    })
 }
 
 fn require_carcara_or_skip() -> Option<PathBuf> {
@@ -121,6 +141,7 @@ include!("carcara_external_check/runner.rs");
 include!("carcara_external_check/ite_bv.rs");
 include!("carcara_external_check/uf_lia.rs");
 include!("carcara_external_check/corpus.rs");
+include!("carcara_external_check/authored_assume.rs");
 include!("carcara_external_check/normalized_bv.rs");
 
 /// Production gate for Trust's bounded E5 shift-count contradiction.

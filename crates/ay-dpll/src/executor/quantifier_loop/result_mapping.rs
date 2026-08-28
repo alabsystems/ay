@@ -5363,6 +5363,7 @@ impl Executor {
         self.clear_cegqi_inner_unsat_artifacts();
         self.last_negations = None;
         self.last_proof_rebuild_originals.clear();
+        self.last_proof_raw_original_assertions.clear();
         self.quant_expansion_records.clear();
         if self.proof_problem_assertion_provenance.is_some() {
             crate::executor::unsat_cert::probe_cert_reject(|| {

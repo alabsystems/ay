@@ -27,6 +27,29 @@ use crate::{
     CuttingPlaneAnnotation, FarkasAnnotation, LiaAnnotation, ProofId, TermId, TermStore, TheoryLit,
 };
 
+/// Exact lattice gap used to lower one checked integer-divisibility theorem.
+///
+/// For `equality = (= lhs rhs)`, `difference = lhs - rhs` ranges over one
+/// residue class modulo the GCD of its variable coefficients.  A validated
+/// divisibility theorem proves that zero is not in that class.  Consequently
+/// every valuation satisfies `difference <= lower` or `upper <= difference`,
+/// where `lower < 0 < upper` are the adjacent values in that residue class.
+///
+/// This is evidence, not a second recognizer: construction reruns the exact
+/// arithmetic used by [`recognize_lia_divisibility`] and returns `None` for
+/// every unsupported or non-tautological clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiaDivisibilityEqualityWitness {
+    /// The left operand of the certified equality.
+    pub lhs: TermId,
+    /// The right operand of the certified equality.
+    pub rhs: TermId,
+    /// Greatest attainable value of `lhs - rhs` below zero.
+    pub lower: num_bigint::BigInt,
+    /// Least attainable value of `lhs - rhs` above zero.
+    pub upper: num_bigint::BigInt,
+}
+
 /// Errors returned when an LIA proof certificate fails validation.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -481,6 +504,51 @@ fn recognize_rounded_integer_bounds_gap(terms: &TermStore, clause: &[TermId]) ->
 #[must_use]
 pub fn recognize_lia_divisibility(terms: &TermStore, clause: &[TermId]) -> bool {
     validate_divisibility(terms, ProofId(0), clause).is_ok()
+}
+
+/// Recover the adjacent lattice values around zero for a unit divisibility
+/// theorem `(not (= lhs rhs))`.
+///
+/// The returned split is suitable for a checked Alethe derivation: the split
+/// itself is an integer `la_generic` tautology, while each branch contradicts
+/// the equality over ordinary linear arithmetic.  Multi-literal bounded cuts
+/// remain outside this lowering and return `None`.
+#[must_use]
+pub fn lia_divisibility_equality_witness(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> Option<LiaDivisibilityEqualityWitness> {
+    use num_integer::Integer;
+    use num_traits::{Signed, Zero};
+
+    // Bind this carrier to the checker, including the all-Int sort guard.
+    validate_divisibility(terms, ProofId(0), clause).ok()?;
+    let [literal] = clause else {
+        return None;
+    };
+    let (lhs, rhs) = decode_negated_eq(terms, *literal)?;
+    let (coeffs, constant) = int_linear_diff(terms, lhs, rhs)?;
+    let gcd = coeffs
+        .values()
+        .fold(num_bigint::BigInt::zero(), |gcd, coefficient| {
+            gcd.gcd(&coefficient.abs())
+        });
+    if gcd.is_zero() || (&constant % &gcd).is_zero() {
+        return None;
+    }
+
+    // `mod_floor` gives the unique representative in [0,gcd). Divisibility
+    // rejection excludes zero, so these neighbors are strictly signed.
+    let upper = constant.mod_floor(&gcd);
+    let lower = &upper - &gcd;
+    debug_assert!(lower < num_bigint::BigInt::zero());
+    debug_assert!(upper > num_bigint::BigInt::zero());
+    Some(LiaDivisibilityEqualityWitness {
+        lhs,
+        rhs,
+        lower,
+        upper,
+    })
 }
 
 /// Validate a Divisibility LIA proof.

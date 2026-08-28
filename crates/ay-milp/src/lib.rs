@@ -62,6 +62,8 @@ pub mod attrib;
 mod bab;
 mod block_angular_route;
 mod cardinality_branch;
+/// Decision census for MECHANISM D (node-rate steering). Inert without `--features dcensus`.
+pub mod dcensus;
 pub mod debug_flags;
 pub mod engine_cli;
 #[doc(hidden)]

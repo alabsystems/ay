@@ -159,10 +159,41 @@ pub(super) fn model_value_work(value: &ModelValue) -> Option<usize> {
                 stack.extend(args.iter().map(|arg| (arg, depth + 1)));
                 ctor.len().saturating_add(2)
             }
-            ModelValue::FloatingPoint { .. }
-            | ModelValue::Algebraic(_)
-            | ModelValue::Array(_)
-            | ModelValue::Seq(_) => return None,
+            ModelValue::Array(array) => {
+                let Some(extra) = array
+                    .store
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|entries| entries.checked_add(1))
+                else {
+                    return None;
+                };
+                if stack
+                    .len()
+                    .checked_add(extra)
+                    .is_none_or(|pending| pending > MAX_RENDERED_DT_NODES.saturating_sub(nodes))
+                {
+                    return None;
+                }
+                stack.push((&array.default, depth + 1));
+                for (index, cell) in &array.store {
+                    stack.push((index, depth + 1));
+                    stack.push((cell, depth + 1));
+                }
+                1
+            }
+            ModelValue::Seq(elements) => {
+                if stack
+                    .len()
+                    .checked_add(elements.len())
+                    .is_none_or(|pending| pending > MAX_RENDERED_DT_NODES.saturating_sub(nodes))
+                {
+                    return None;
+                }
+                stack.extend(elements.iter().map(|element| (element, depth + 1)));
+                1
+            }
+            ModelValue::FloatingPoint { .. } | ModelValue::Algebraic(_) => return None,
         };
         bytes = match bytes.checked_add(payload) {
             Some(total) if total <= MAX_RENDERED_DT_BYTES => total,
@@ -258,4 +289,53 @@ pub(super) fn rendered_sexp_within_limits(input: &str) -> bool {
         }
     }
     depth == 0 && nodes > 0
+}
+
+#[cfg(test)]
+mod tests {
+    use ay_model_check::ArrayValue;
+    use num_bigint::BigInt;
+
+    use super::*;
+
+    #[test]
+    fn aggregate_model_value_work_accepts_bounded_arrays_and_sequences() {
+        let value = ModelValue::Datatype {
+            ctor: "Box".to_string(),
+            args: vec![ModelValue::Array(Box::new(ArrayValue {
+                default: ModelValue::Seq(vec![ModelValue::Int(BigInt::from(0))]),
+                store: vec![(
+                    ModelValue::Int(BigInt::from(1)),
+                    ModelValue::Seq(vec![ModelValue::Int(BigInt::from(2))]),
+                )],
+            }))],
+        };
+
+        assert!(
+            model_value_work(&value).is_some(),
+            "bounded Array/Seq fields are valid structured datatype payloads"
+        );
+    }
+
+    #[test]
+    fn aggregate_model_value_work_rejects_oversized_store() {
+        let entries = (0..MAX_RENDERED_DT_NODES)
+            .map(|index| {
+                (
+                    ModelValue::Int(BigInt::from(index)),
+                    ModelValue::Int(BigInt::from(index)),
+                )
+            })
+            .collect();
+        let value = ModelValue::Array(Box::new(ArrayValue {
+            default: ModelValue::Int(BigInt::from(0)),
+            store: entries,
+        }));
+
+        assert_eq!(
+            model_value_work(&value),
+            None,
+            "aggregate recovery must fail closed before an oversized walk"
+        );
+    }
 }

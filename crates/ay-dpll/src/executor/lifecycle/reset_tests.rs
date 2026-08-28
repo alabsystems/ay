@@ -18,6 +18,7 @@ fn direct_reset_revokes_every_query_artifact() {
     executor.last_model = Some(Model::empty());
     executor.last_lrat_certificate = Some(vec![1]);
     executor.last_proof_rebuild_originals.push(old_term);
+    executor.last_proof_raw_original_assertions.push(old_term);
     executor.pareto_state = Some(optimization::ParetoState::default());
 
     executor.reset();
@@ -27,6 +28,7 @@ fn direct_reset_revokes_every_query_artifact() {
     assert!(executor.last_sat_certificate.is_none());
     assert!(executor.last_lrat_certificate.is_none());
     assert!(executor.last_proof_rebuild_originals.is_empty());
+    assert!(executor.last_proof_raw_original_assertions.is_empty());
     assert!(executor.pareto_state.is_none());
     assert_eq!(executor.solve_deadline.get(), None);
     assert_eq!(executor.certification_deadline.get(), None);

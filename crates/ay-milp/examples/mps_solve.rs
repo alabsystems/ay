@@ -88,6 +88,11 @@ fn main() {
     impl Drop for Dump {
         fn drop(&mut self) {
             ay_milp::sepstat::dump();
+            // MECHANISM D census. Empty string in a default build (the probes are
+            // `#[cfg]`-erased); six lines under `--features dcensus`. Printed on EVERY
+            // exit path for the same reason `sepstat` is: a run that ends at its
+            // deadline is exactly the run whose steering counts are interesting.
+            emit_nonempty_stderr(ay_milp::dcensus::dump().trim_end().to_string());
             if std::env::args().any(|a| a == "--allocstat") {
                 eprintln!(
                     "AY_ALLOCSTAT allocs={} bytes={}",

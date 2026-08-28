@@ -31,9 +31,10 @@ pub use fresh_def_bound::{
 pub use fresh_def_eq::{recognize_fresh_def_eq, FreshDefEqShape, FreshDefEqShapeError};
 pub use lia::{
     arith_disequality_split_guard_multiplier, arith_disequality_split_has_primitive_guard,
-    recognize_arith_disequality_split, recognize_int_bounds_tautology, recognize_lia_bounds_gap,
-    recognize_lia_divisibility, recognize_lia_linear_identity, recognize_lia_mod_range,
-    validate_lia_mod_range, validate_lia_theory_lemma, LiaValidationError,
+    lia_divisibility_equality_witness, recognize_arith_disequality_split,
+    recognize_int_bounds_tautology, recognize_lia_bounds_gap, recognize_lia_divisibility,
+    recognize_lia_linear_identity, recognize_lia_mod_range, validate_lia_mod_range,
+    validate_lia_theory_lemma, LiaDivisibilityEqualityWitness, LiaValidationError,
 };
 pub use lia_bound_lattice::{
     int_bound_lattice_gap_core, recognize_int_bound_lattice_gap, IntBoundLatticeGap,

@@ -523,7 +523,7 @@ fn a_refused_subset_run_equals_the_never_spliced_run_and_latches() {
 fn the_decline_latch_is_scoped_to_document_size() {
     let mut exec = Executor::new();
     let atom = exec.ctx.terms.mk_var("scope_pad", ay_core::Sort::Bool);
-    let mut proof_at = |steps: usize| {
+    let proof_at = |steps: usize| {
         let mut proof = Proof::new();
         for _ in 0..steps {
             proof.add_rule_step(AletheRule::Trust, vec![atom], Vec::new(), Vec::new());

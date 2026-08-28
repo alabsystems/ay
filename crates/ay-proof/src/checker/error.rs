@@ -8,7 +8,12 @@ use ay_core::{ProofId, TermId, TheoryLemmaKind};
 use thiserror::Error;
 
 /// Validation failure returned by [`super::check_proof`].
-#[derive(Debug, Error, PartialEq, Eq)]
+///
+/// `Clone` exists for one consumer: the executor-side strict-walk memo
+/// (`ay-dpll` #strict-walk-memo) replays a stored verdict for a
+/// byte-identical document instead of re-walking it. Cloning changes no
+/// validation semantics; every variant carries only plain data.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProofCheckError {
     /// A caller-owned proof-validation envelope refused a work or scratch-space charge.

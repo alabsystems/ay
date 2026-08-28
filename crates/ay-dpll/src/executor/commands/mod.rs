@@ -874,6 +874,8 @@ impl Executor {
         let saved_proof_term_overrides = self.last_proof_term_overrides.take();
         let saved_proof_quality = self.last_proof_quality.take();
         let saved_proof_rebuild_originals = std::mem::take(&mut self.last_proof_rebuild_originals);
+        let saved_proof_raw_original_assertions =
+            std::mem::take(&mut self.last_proof_raw_original_assertions);
         let saved_clause_trace = self.last_clause_trace.take();
         let saved_checked_sat_refutation = self.last_checked_sat_refutation.take();
         let saved_var_to_term = self.last_var_to_term.take();
@@ -904,6 +906,7 @@ impl Executor {
         self.last_proof_term_overrides = saved_proof_term_overrides;
         self.last_proof_quality = saved_proof_quality;
         self.last_proof_rebuild_originals = saved_proof_rebuild_originals;
+        self.last_proof_raw_original_assertions = saved_proof_raw_original_assertions;
         self.last_clause_trace = saved_clause_trace;
         self.last_checked_sat_refutation = saved_checked_sat_refutation;
         self.last_var_to_term = saved_var_to_term;
@@ -1042,6 +1045,8 @@ impl Executor {
         let saved_proof_term_overrides = self.last_proof_term_overrides.take();
         let saved_proof_quality = self.last_proof_quality.take();
         let saved_proof_rebuild_originals = std::mem::take(&mut self.last_proof_rebuild_originals);
+        let saved_proof_raw_original_assertions =
+            std::mem::take(&mut self.last_proof_raw_original_assertions);
         let saved_clause_trace = self.last_clause_trace.take();
         let saved_checked_sat_refutation = self.last_checked_sat_refutation.take();
         let saved_var_to_term = self.last_var_to_term.take();
@@ -1071,6 +1076,7 @@ impl Executor {
         self.last_proof_term_overrides = saved_proof_term_overrides;
         self.last_proof_quality = saved_proof_quality;
         self.last_proof_rebuild_originals = saved_proof_rebuild_originals;
+        self.last_proof_raw_original_assertions = saved_proof_raw_original_assertions;
         self.last_clause_trace = saved_clause_trace;
         self.last_checked_sat_refutation = saved_checked_sat_refutation;
         self.last_var_to_term = saved_var_to_term;

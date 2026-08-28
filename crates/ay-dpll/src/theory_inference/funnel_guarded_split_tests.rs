@@ -9,7 +9,6 @@
 //! certificate it can never have — its negation is satisfiable over ℚ, so no
 //! Farkas row exists.
 
-use super::funnel;
 use super::*;
 use crate::proof_tracker::ProofTracker;
 use num_bigint::BigInt;
@@ -79,7 +78,7 @@ fn record_funnel_classified_lemma_types_the_census_integer_conflict() {
     let clause = census_phases_clause(&mut terms);
     let mut tracker = ProofTracker::new();
     let (kind, recorded) =
-        funnel::record_funnel_classified_lemma(&mut tracker, &terms, clause.clone(), None);
+        record_funnel_classified_lemma(&mut tracker, &terms, clause.clone(), None);
     assert_eq!(kind, TheoryLemmaKind::IntGuardedSplitGap);
     assert_eq!(recorded, clause);
 }
@@ -111,7 +110,7 @@ fn a_falsifiable_integer_conflict_is_never_promoted_by_the_funnel() {
 fn a_certificate_bearing_conflict_is_not_typed_as_a_guarded_split() {
     let mut terms = TermStore::new();
     let clause = census_phases_clause(&mut terms);
-    let farkas = ay_core::FarkasAnnotation::from_ints(&vec![1i64; clause.len()]);
+    let farkas = FarkasAnnotation::from_ints(&vec![1i64; clause.len()]);
     let (kind, _) =
         infer_theory_lemma_kind_from_clause_terms_and_farkas(&terms, &clause, Some(&farkas), None);
     assert_ne!(kind, TheoryLemmaKind::IntGuardedSplitGap);

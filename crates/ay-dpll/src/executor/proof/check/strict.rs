@@ -79,14 +79,39 @@ impl Executor {
         // A non-matching candidate must never inherit a narrow scope merely
         // because the current stored proof has a finite-enum capability.
         let problem = self.complete_problem_assertions_for_strict_proof();
-        check_with_executor_progress_reporting_work(
+        // #strict-walk-memo — the pipeline re-asks this exact question about
+        // an unchanged document many times per solve (measured: two 30-walk
+        // fans per `sal/bakery` solve, one 66-walk fan on
+        // `DTP/DTP_k2_n35_c245_s4`; see `check/strict_memo.rs`). Replay the
+        // stored verdict only when EVERY input the checker read — literal
+        // document, term-store snapshot stamp, the checker-visible term-store
+        // metadata generation, both datatype registries, the member
+        // signatures and the authored scope — is proven unchanged;
+        // any doubt is a miss and a real walk. The capability route above
+        // never consults the memo, and runs before it on every call, so a
+        // proof that acquires a finite-enum capability can never be answered
+        // with a stored general-route verdict.
+        let key = StrictWalkKey {
+            datatype_decls: decls.as_slice(),
+            selector_decls: selectors.as_slice(),
+            member_signatures: member_signatures.as_slice(),
+            problem: problem.as_slice(),
+        };
+        if let Some((outcome, work)) = self.strict_walk_memo_lookup(proof, &key) {
+            self.strict_check_memo_hits
+                .set(self.strict_check_memo_hits.get() + 1);
+            return (outcome, work);
+        }
+        let (outcome, work) = check_with_executor_progress_reporting_work(
             self,
             proof,
             (!decls.is_empty()).then_some(decls.as_slice()),
             (!selectors.is_empty()).then_some(selectors.as_slice()),
             member_signatures.as_slice(),
             Some(problem.as_slice()),
-        )
+        );
+        self.strict_walk_memo_store(proof, &key, &outcome, work);
+        (outcome, work)
     }
 
     /// Strictly validate a proof's derivation while deliberately postponing

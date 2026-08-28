@@ -93,8 +93,8 @@ impl Executor {
         if !self.commit_if_strictly_checked(proof, candidate, authored) {
             return false;
         }
-        self.restore_authored_root_surface_after_conjunct_rebuild(
-            root,
+        self.restore_authored_root_surfaces_after_rebuild(
+            &[root],
             &surfaces.originals,
             &surfaces.parsed,
         );
@@ -106,34 +106,36 @@ impl Executor {
     /// gate. Derived operands keep their checker-validated canonical spelling;
     /// the root override affects the `assume` line and the negative gate in
     /// `and_pos`, which the Alethe printer validates as exact complements.
-    fn restore_authored_root_surface_after_conjunct_rebuild(
+    pub(super) fn restore_authored_root_surfaces_after_rebuild(
         &mut self,
-        root: TermId,
+        roots: &[TermId],
         originals: &[TermId],
         parsed: &[FrontendTerm],
     ) {
         if !super::super::proof_surface_syntax::surface_override_roots_have_bounded_work(
             &self.ctx.terms,
-            [root],
+            roots.iter().copied(),
         ) {
             return;
         }
-        let Some(index) = originals.iter().position(|&term| term == root) else {
-            return;
-        };
-        let Some(source) = parsed.get(index) else {
-            return;
-        };
         let mut overrides = self.last_proof_term_overrides.clone().unwrap_or_default();
         if !super::super::proof_surface_syntax::surface_override_map_is_bounded(&overrides) {
             return;
         }
-        super::super::proof_surface_syntax::collect_root_surface_term_override(
-            &mut self.ctx,
-            root,
-            source,
-            &mut overrides,
-        );
+        for &root in roots {
+            let Some(index) = originals.iter().position(|&term| term == root) else {
+                return;
+            };
+            let Some(source) = parsed.get(index) else {
+                return;
+            };
+            super::super::proof_surface_syntax::collect_root_surface_term_override(
+                &mut self.ctx,
+                root,
+                source,
+                &mut overrides,
+            );
+        }
         if !super::super::proof_surface_syntax::surface_override_map_is_bounded(&overrides) {
             return;
         }

@@ -3397,6 +3397,7 @@ impl Executor {
         // assertion window here could authorize generated repair constraints.
         self.clear_preprocessing_proof_records();
         self.last_proof_rebuild_originals.clear();
+        self.last_proof_raw_original_assertions.clear();
         self.last_statistics = crate::executor_types::Statistics::default();
         self.last_statistics.num_assertions = self.ctx.assertions.len() as u64;
 

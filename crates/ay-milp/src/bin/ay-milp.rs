@@ -549,7 +549,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
             None => ay_milp::OptimalityTreeBudget::new(1).dual_grid_bits,
         };
         match &outcome {
-            ay_milp::Outcome::Optimal {
+            Outcome::Optimal {
                 value,
                 model_values,
                 ..

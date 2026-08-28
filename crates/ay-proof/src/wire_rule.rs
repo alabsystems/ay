@@ -6,11 +6,31 @@
 
 use ay_core::kani_compat::DetHashMap;
 use ay_core::{
-    FarkasAnnotation, ProofId, Symbol, TermData, TermId, TermStore, TheoryLemmaKind, TheoryLit,
-    UNPROVED_STEP_RULE,
+    FarkasAnnotation, LiaAnnotation, ProofId, Symbol, TermData, TermId, TermStore, TheoryLemmaKind,
+    TheoryLit, UNPROVED_STEP_RULE,
 };
 
 use crate::alethe_printer::ClauseSurfaceAgreement;
+
+/// Whether one native `Divisibility` lemma has the exact checked external
+/// lowering implemented by the Alethe printer.
+///
+/// This is consumed by both the printer and the publication wire-gap screen.
+/// Requiring an identity surface is deliberate: the lattice witness was
+/// derived from the internal term DAG, so a spelling channel that changes the
+/// clause must be bridged or purged before this certificate can publish.
+#[must_use]
+pub fn lia_divisibility_lowering_supported(
+    terms: &TermStore,
+    clause: &[TermId],
+    lia: Option<&LiaAnnotation>,
+    term_overrides: Option<&DetHashMap<TermId, String>>,
+) -> bool {
+    matches!(lia, Some(LiaAnnotation::Divisibility))
+        && crate::alethe_printer::clause_surface_agreement(terms, clause, term_overrides)
+            == ClauseSurfaceAgreement::Identical
+        && ay_core::proof_validation::lia_divisibility_equality_witness(terms, clause).is_some()
+}
 
 /// Select the externally meaningful wire rule for one complete theory lemma.
 ///

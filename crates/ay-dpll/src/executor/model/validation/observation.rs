@@ -148,6 +148,75 @@ impl Executor {
         }
 
         let has_datatype = flags & TERM_FLAG_DATATYPE != 0;
+
+        // (#dt-opaque-array-validation) Preserve evidence-grade validation for
+        // the two opaque datatype (dis)equality cases that are independently
+        // satisfiable below.  Their UF applications can carry array arguments,
+        // so TERM_FLAG_ARRAY propagates to the equality even though the result
+        // datatype values themselves are completely opaque.  The broad
+        // datatype-array performance skip immediately below used to mask these
+        // already-certified cases, leaving an otherwise genuine SAT result with
+        // `sat_model_validated = false` (and forcing strict consumers such as
+        // TrustVC to report Unknown).
+        //
+        // Keep this exception bit-for-bit within the existing soundness lane:
+        // ground assertions only, a datatype-sort equality with non-ground
+        // operands, no BV-comparison dispatch, and the same opaque-equality or
+        // model-true opaque-disequality predicates used by the fail-closed block
+        // below.  Every other datatype-array observation still takes the skip.
+        if has_datatype
+            && flags & TERM_FLAG_ARRAY != 0
+            && flags & TERM_FLAG_BV_CMP == 0
+            && self.dt_array_injectivity_gate_bypass
+            && matches!(target, ValidationTarget::GroundAssertion)
+            && self.datatype_sort_equality(term)
+            && !dt_equality_operands_fully_ground(self, model, term)
+        {
+            if self.dt_positive_eq_opaque_satisfiable(term) {
+                return ValidationObservation::independent(target, true);
+            }
+            if self.dt_diseq_opaque_satisfiable(term)
+                && matches!(self.evaluate_term(model, term), EvalValue::Bool(true))
+            {
+                return ValidationObservation::independent(target, true);
+            }
+        }
+
+        // (#dt-ground-array-equality-validation) Model completion can turn a
+        // datatype equality that was initially opaque into two fully-ground
+        // constructor values.  Validate that final value before the broad
+        // datatype-array skip: at this point structural evaluation is
+        // authoritative (the existing #dt-bv-congruence fail-closed rule below
+        // imposes exactly the same fully-ground boundary).  This keeps the
+        // large partially-ground datatype-array footprint on its performance
+        // skip while allowing a completed equality to mint independent model
+        // evidence for strict consumers.
+        if has_datatype
+            && flags & TERM_FLAG_ARRAY != 0
+            && flags & TERM_FLAG_BV_CMP == 0
+            && self.dt_array_injectivity_gate_bypass
+            && matches!(target, ValidationTarget::GroundAssertion)
+            && self.datatype_sort_equality(term)
+            && dt_equality_operands_fully_ground(self, model, term)
+        {
+            let term_str = self.format_term(term);
+            match self.evaluate_term(model, term) {
+                EvalValue::Bool(true) => {
+                    return ValidationObservation::independent(target, true);
+                }
+                EvalValue::Bool(false) => {
+                    return ValidationObservation::violated(
+                        target,
+                        format!(
+                            "{}: {term_str} fully-ground datatype (dis)equality evaluates to false",
+                            target.violated_entry(index),
+                        ),
+                    );
+                }
+                _ => {}
+            }
+        }
+
         // Witness-extensionality bypass fast-path (#dt-array-extensionality-witness;
         // companion of the soft-skip in `validate_model_attempt`). When the search
         // has soundly modeled the datatype-carrying-array fragment — the bypass

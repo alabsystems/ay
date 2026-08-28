@@ -403,7 +403,7 @@ fn merge_datatype_cell_completion(
 /// Exact extractor carrier spelling for `sort`: `@<name>!<canonical usize>`.
 /// Ascriptions, quoted spellings, whitespace, foreign sorts, overflow, and
 /// live constructor identities all decline.
-fn exact_datatype_carrier_token(
+pub(super) fn exact_datatype_carrier_token(
     guard: &RenderedDatatypeGuard,
     constructor_tokens: &HashSet<String>,
     sort: &Sort,

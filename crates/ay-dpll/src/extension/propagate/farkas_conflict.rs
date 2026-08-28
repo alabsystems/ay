@@ -61,7 +61,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
     }
 
     fn farkas_certificate_is_valid(&self, conflict: &TheoryConflict) -> bool {
-        let mut valid = match verify_theory_conflict_with_farkas(conflict) {
+        let valid = match verify_theory_conflict_with_farkas(conflict) {
             Ok(()) => true,
             Err(error) if error.is_missing_annotation() => {
                 tracing::debug!(
@@ -80,18 +80,22 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
             }
         };
         #[cfg(debug_assertions)]
-        if valid && self.theory.supports_farkas_semantic_check() {
-            if let Some(terms) = self.terms {
-                if let Err(error) = verify_theory_conflict_with_farkas_full(conflict, terms) {
-                    tracing::warn!(
-                        error = %error,
-                        conflict_len = conflict.literals.len(),
-                        "BUG(#4666): Farkas semantic verification failed in propagate(); using conflict clause without certificate (#8595)"
-                    );
-                    valid = false;
+        let valid = {
+            let mut valid = valid;
+            if valid && self.theory.supports_farkas_semantic_check() {
+                if let Some(terms) = self.terms {
+                    if let Err(error) = verify_theory_conflict_with_farkas_full(conflict, terms) {
+                        tracing::warn!(
+                            error = %error,
+                            conflict_len = conflict.literals.len(),
+                            "BUG(#4666): Farkas semantic verification failed in propagate(); using conflict clause without certificate (#8595)"
+                        );
+                        valid = false;
+                    }
                 }
             }
-        }
+            valid
+        };
         valid
     }
 

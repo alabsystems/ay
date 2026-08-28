@@ -675,5 +675,10 @@ impl Executor {
         let _derived_la_disequality_splits = self.derive_la_disequality_split_lemmas(proof);
         false_source::demote_unattributed_assumed_false(self, proof);
         self.demote_unrenderable_eq_transitive_lemmas(proof);
+        // Reintroduce exact source spellings only after every replacement and
+        // demotion is complete. The printer confines these entries to their
+        // own reachable `assume` and proves a checked bridge back to identity
+        // spelling before any synthesized clause consumes them.
+        self.restore_reachable_authored_assume_surface_overrides(proof);
     }
 }

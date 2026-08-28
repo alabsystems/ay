@@ -45,6 +45,7 @@ use num_traits::{ToPrimitive, Zero};
 use std::time::Duration;
 
 use super::datatype_cell_authority::ExactDatatypeCellCompletions;
+use super::dt_construct_budget::MAX_OPAQUE_DT_COLLECTION_ROOTS;
 use super::{string_witness, EvalValue, Model};
 use crate::executor::Executor;
 use crate::executor_types::SolveResult;
@@ -61,6 +62,23 @@ const MAX_CHECKED_PROJECTION_COMPLETION_WORK: usize = 10_000_000;
 
 /// Maximum proof-neutral completion operations between external stop polls.
 const CHECKED_PROJECTION_COMPLETION_POLL_INTERVAL: usize = 64;
+
+/// Append authenticated datatype roots only after proving the combined slice
+/// fits the exact root envelope consumed by the construction preflight. The
+/// size check deliberately precedes `Vec::with_capacity` and both extensions.
+fn checked_datatype_root_augmentation(
+    extra_roots: &[TermId],
+    authenticated_roots: &[TermId],
+) -> Option<Vec<TermId>> {
+    let combined = extra_roots.len().checked_add(authenticated_roots.len())?;
+    if combined > MAX_OPAQUE_DT_COLLECTION_ROOTS {
+        return None;
+    }
+    let mut roots = Vec::with_capacity(combined);
+    roots.extend_from_slice(extra_roots);
+    roots.extend_from_slice(authenticated_roots);
+    Some(roots)
+}
 
 /// Typed outcome of the output-only completion pass for a checked projection
 /// model.
@@ -434,7 +452,26 @@ impl Executor {
         // construction degrades SAT to Unknown exactly as an incomplete model
         // does today (see dt_construct.rs module docs for the soundness
         // argument).
-        let dt_constructed = self.construct_total_datatype_model(&mut model, extra_roots);
+        // Preprocessing may eliminate an authored ground seed equality before
+        // this pass runs, while the always-on independent gate correctly keeps
+        // that exact source root in its authenticated window. Retain only the
+        // narrow canonical array-cell equality lane here: a top-level/`and`
+        // conjunct `(= (select a i) d)` with an exactly typed registered
+        // datatype result. This is enough to put both source terms in the
+        // total-DT class builder without granting arbitrary preprocessed-away
+        // formulas construction authority.
+        let dt_constructed = if extra_roots.len() > MAX_OPAQUE_DT_COLLECTION_ROOTS {
+            0
+        } else {
+            let authenticated = self.authored_datatype_array_cell_equalities(extra_roots);
+            if authenticated.is_empty() {
+                self.construct_total_datatype_model(&mut model, extra_roots)
+            } else {
+                checked_datatype_root_augmentation(extra_roots, &authenticated).map_or(0, |roots| {
+                    self.construct_total_datatype_model(&mut model, &roots)
+                })
+            }
+        };
         if dt_constructed > 0 {
             self.last_statistics
                 .set_int("model_completion.dt_constructed", dt_constructed as u64);
@@ -514,6 +551,98 @@ impl Executor {
         }
 
         self.last_model = Some(model);
+    }
+
+    /// Authenticated source equalities that directly bind a canonical
+    /// datatype-valued array read. The returned roots are unconditionally hard
+    /// facts only (top-level roots and recursively flattened `and` conjuncts),
+    /// with bounded traversal and exact theory identity/signature checks.
+    fn authored_datatype_array_cell_equalities(&self, existing_roots: &[TermId]) -> Vec<TermId> {
+        const MAX_TERMS: usize = 4_096;
+
+        let Some(authored) = self.independent_gate_authored_assertions.as_ref() else {
+            return Vec::new();
+        };
+        if authored.len() > MAX_OPAQUE_DT_COLLECTION_ROOTS {
+            return Vec::new();
+        }
+        let guard = super::rendered_dt_guard::RenderedDatatypeGuard::new(self);
+        if !guard.is_bounded() {
+            return Vec::new();
+        }
+        let canonical_control_head_is_coherent = |identity: &str| {
+            self.ctx
+                .symbol_info_by_identity(identity)
+                .is_none_or(|info| {
+                    self.ctx.effective_declaration_kind(info.declaration_id())
+                        == Some(DeclarationKind::Theory)
+                })
+        };
+        let mut stack = authored.clone();
+        let mut seen = HashSet::default();
+        let mut roots = Vec::new();
+        while let Some(root) = stack.pop() {
+            if self.ctx.terms.entry_stamp(root).is_none() {
+                return Vec::new();
+            }
+            if !seen.insert(root) {
+                continue;
+            }
+            if seen.len() > MAX_TERMS {
+                return Vec::new();
+            }
+            let TermData::App(symbol, args) = self.ctx.terms.get(root) else {
+                continue;
+            };
+            if matches!(symbol, Symbol::Named(_)) && symbol.name() == "and" {
+                if !canonical_control_head_is_coherent("and")
+                    || !matches!(self.ctx.terms.sort(root), Sort::Bool)
+                    || args
+                        .iter()
+                        .any(|&arg| !matches!(self.ctx.terms.sort(arg), Sort::Bool))
+                    || stack
+                        .len()
+                        .checked_add(args.len())
+                        .is_none_or(|pending| pending > MAX_TERMS)
+                {
+                    return Vec::new();
+                }
+                stack.extend(args.iter().copied());
+                continue;
+            }
+            if !matches!(symbol, Symbol::Named(_)) || symbol.name() != "=" {
+                continue;
+            }
+            if !canonical_control_head_is_coherent("=")
+                || !matches!(self.ctx.terms.sort(root), Sort::Bool)
+                || args.len() != 2
+                || self.ctx.terms.sort(args[0]) != self.ctx.terms.sort(args[1])
+            {
+                return Vec::new();
+            }
+            let eligible =
+                [args[0], args[1]]
+                    .into_iter()
+                    .any(|select| match self.ctx.terms.get(select) {
+                        TermData::App(select_symbol, select_args) => self
+                            .dt_completion_array_select_application_guarded(
+                                &guard,
+                                select_symbol,
+                                select_args,
+                                select,
+                            ),
+                        _ => false,
+                    });
+            if eligible && !self.ctx.assertions.contains(&root) && !existing_roots.contains(&root) {
+                roots.push(root);
+                if roots.len() > MAX_OPAQUE_DT_COLLECTION_ROOTS {
+                    return Vec::new();
+                }
+            }
+        }
+        roots.sort_by_key(|term| term.index());
+        roots.dedup();
+        roots
     }
 
     /// Commit total interpretations for array terms that participate in the
@@ -4991,6 +5120,132 @@ impl Executor {
         for (&from, &to) in var_subst.substitutions() {
             self.recorded_var_substitutions.insert(from, to);
         }
+    }
+}
+
+#[cfg(test)]
+mod authored_datatype_array_cell_tests {
+    use super::{checked_datatype_root_augmentation, Executor, MAX_OPAQUE_DT_COLLECTION_ROOTS};
+    use ay_core::term::{Symbol, TermData};
+    use ay_core::Sort;
+    use ay_frontend::parse;
+
+    fn loaded_bridge_fixture() -> (Executor, ay_core::TermId) {
+        let commands = parse(
+            r#"
+            (set-logic ALL)
+            (declare-datatype BridgeCell
+                ((BridgeCell_mk (BridgeCell_value Int))))
+            (declare-const bridge_cells (Array Int BridgeCell))
+            (declare-const bridge_seed BridgeCell)
+            (assert (= (select bridge_cells 0) bridge_seed))
+            "#,
+        )
+        .expect("valid datatype array-cell bridge fixture");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("bridge fixture executes");
+        let root = *executor
+            .ctx
+            .assertions
+            .first()
+            .expect("fixture assertion root");
+        executor.ctx.assertions.clear();
+        executor.independent_gate_authored_assertions = Some(vec![root]);
+        (executor, root)
+    }
+
+    #[test]
+    fn authored_bridge_requires_canonical_and_owner() {
+        let (mut executor, equality) = loaded_bridge_fixture();
+        let conjunction = executor.ctx.terms.mk_app(
+            Symbol::named("and"),
+            vec![equality, executor.ctx.terms.true_term()],
+            Sort::Bool,
+        );
+        executor.independent_gate_authored_assertions = Some(vec![conjunction]);
+        assert_eq!(
+            executor.authored_datatype_array_cell_equalities(&[]),
+            vec![equality],
+            "a well-typed canonical conjunction may expose its hard equality conjunct"
+        );
+
+        let forged_owner = executor.ctx.terms.mk_fresh_named_var("and", Sort::Bool);
+        executor
+            .ctx
+            .register_symbol("and".to_string(), forged_owner, Sort::Bool);
+        assert!(
+            executor
+                .authored_datatype_array_cell_equalities(&[])
+                .is_empty(),
+            "an ordinary declaration forged at canonical `and` must poison source flattening"
+        );
+    }
+
+    #[test]
+    fn authored_bridge_requires_well_typed_canonical_equality() {
+        let (mut executor, equality) = loaded_bridge_fixture();
+        assert_eq!(
+            executor.authored_datatype_array_cell_equalities(&[]),
+            vec![equality]
+        );
+        assert!(
+            executor
+                .authored_datatype_array_cell_equalities(&[equality])
+                .is_empty(),
+            "an extra root already reaching construction must not be appended twice"
+        );
+        executor.ctx.assertions.push(equality);
+        assert!(
+            executor
+                .authored_datatype_array_cell_equalities(&[])
+                .is_empty(),
+            "a still-live assertion already reaches construction without the bridge"
+        );
+        executor.ctx.assertions.clear();
+        let TermData::App(_, args) = executor.ctx.terms.get(equality) else {
+            unreachable!("fixture equality is an application");
+        };
+        let malformed = executor
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), args.clone(), Sort::Int);
+        executor.independent_gate_authored_assertions = Some(vec![malformed]);
+        assert!(
+            executor
+                .authored_datatype_array_cell_equalities(&[])
+                .is_empty(),
+            "a wrong-result-sort equality must not grant construction authority"
+        );
+
+        executor.independent_gate_authored_assertions = Some(vec![equality]);
+        let forged_owner = executor.ctx.terms.mk_fresh_named_var("=", Sort::Bool);
+        executor
+            .ctx
+            .register_symbol("=".to_string(), forged_owner, Sort::Bool);
+        assert!(
+            executor
+                .authored_datatype_array_cell_equalities(&[])
+                .is_empty(),
+            "an ordinary declaration forged at canonical `=` must poison the bridge"
+        );
+    }
+
+    #[test]
+    fn datatype_root_augmentation_checks_exact_cap_before_allocation() {
+        let executor = Executor::new();
+        let root = executor.ctx.terms.true_term();
+        let at_boundary = vec![root; MAX_OPAQUE_DT_COLLECTION_ROOTS - 1];
+        let combined = checked_datatype_root_augmentation(&at_boundary, &[root])
+            .expect("the exact root boundary remains admissible");
+        assert_eq!(combined.len(), MAX_OPAQUE_DT_COLLECTION_ROOTS);
+
+        let at_cap = vec![root; MAX_OPAQUE_DT_COLLECTION_ROOTS];
+        assert!(
+            checked_datatype_root_augmentation(&at_cap, &[root]).is_none(),
+            "cap+1 must be rejected before allocating or extending a combined root vector"
+        );
     }
 }
 

@@ -130,6 +130,15 @@ impl Executor {
     /// Whether this is the exact canonical array-select shape whose element is
     /// the result: `(select : (Array I E) I -> E)`. A same-spelled declared UF
     /// has a private core identity and is handled only by the ordinary-UF arm.
+    ///
+    /// This is a construction boundary, so a bounded registered datatype is
+    /// sufficient: total-DT construction retains the full typed
+    /// [`ay_model_check::ModelValue`] (including array-valued constructor
+    /// fields), and the independent gate later checks the originating array
+    /// semantics. Rendering-dependent consumers keep their narrower exact-cell
+    /// check below. Requiring a scalar-only rendered round trip here excluded
+    /// `Array<I, D>` reads whenever `D` itself contained an array, leaving one
+    /// semantic value split between `@D!n` and a constructor tree.
     #[cfg(test)]
     pub(super) fn dt_completion_array_select_application(
         &self,
@@ -187,13 +196,13 @@ impl Executor {
                     self.ctx.effective_declaration_kind(info.declaration_id())
                         == Some(ay_frontend::DeclarationKind::Theory)
                 });
-        let exact_result = if rendered_array_cell {
+        let admissible_result = if rendered_array_cell {
             guard.is_exact_array_cell(self.ctx.terms.sort(result))
         } else {
-            guard.is_exact(self.ctx.terms.sort(result))
+            guard.is_registered(self.ctx.terms.sort(result))
         };
         canonical_binding_is_coherent
-            && exact_result
+            && admissible_result
             && matches!(self.ctx.terms.sort(args[0]), Sort::Array(array_sort)
                 if &array_sort.index_sort == self.ctx.terms.sort(args[1])
                     && &array_sort.element_sort == self.ctx.terms.sort(result))

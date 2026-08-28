@@ -16,10 +16,11 @@ impl Executor {
     pub(super) fn replace_with_exact_authored_divisibility_refutation(
         &mut self,
         proof: &mut Proof,
+        entry: RepairEntry,
     ) {
         const MAX_EQUALITY_ROOTS: usize = 6;
 
-        if self.check_proof_strict_with_datatypes(proof).is_ok() {
+        if entry == RepairEntry::Check && self.authored_cascade_publishable(proof) {
             return;
         }
 
@@ -205,6 +206,11 @@ impl Executor {
             && Self::proof_derives_empty_clause(&candidate)
             && self.check_proof_strict_with_datatypes(&candidate).is_ok()
         {
+            // Keep source spellings only where the problem checker needs
+            // them: the exact authored assumptions. Every synthesized
+            // arithmetic term must reach the external checker in the same
+            // canonical spelling the native witness validated.
+            self.purge_surface_overrides_for_certified_proof(&candidate);
             *proof = candidate;
         }
     }

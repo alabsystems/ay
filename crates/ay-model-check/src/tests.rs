@@ -21,16 +21,22 @@ use std::collections::HashMap;
 /// A trivial stub model: a fixed map from leaf `TermId` to value.
 struct StubModel {
     leaves: HashMap<TermId, ModelValue>,
+    datatypes: HashMap<String, DatatypeSort>,
 }
 
 impl StubModel {
     fn new() -> Self {
         Self {
             leaves: HashMap::new(),
+            datatypes: HashMap::new(),
         }
     }
     fn with(mut self, t: TermId, v: ModelValue) -> Self {
         self.leaves.insert(t, v);
+        self
+    }
+    fn with_datatype(mut self, datatype: DatatypeSort) -> Self {
+        self.datatypes.insert(datatype.name.clone(), datatype);
         self
     }
 }
@@ -38,6 +44,10 @@ impl StubModel {
 impl ModelView for StubModel {
     fn leaf_value(&self, t: TermId) -> Option<ModelValue> {
         self.leaves.get(&t).cloned()
+    }
+
+    fn datatype_def(&self, name: &str) -> Option<DatatypeSort> {
+        self.datatypes.get(name).cloned()
     }
 }
 
@@ -77,6 +87,481 @@ fn assert_cannot(v: &GateVerdict) {
         matches!(v, GateVerdict::CannotConfirm { .. }),
         "expected CannotConfirm, got {v:?}"
     );
+}
+
+/// Structured datatype fields compare recursively at their declared sort, so
+/// exact Array/Seq values preserve ordinary datatype equality. Constructor
+/// identity remains decisive, while opaque and wrong-arity encodings are still
+/// rejected instead of being coerced into the declared datatype.
+#[test]
+fn datatype_extensional_fields_are_typed_and_noncanonical_values_fail_closed() {
+    let cases = [
+        (
+            "ArrayBox",
+            "ArrayBox_mk",
+            Sort::array(Sort::Int, Sort::Int),
+            ModelValue::Array(Box::new(ArrayValue {
+                default: ModelValue::Int(int(0)),
+                store: Vec::new(),
+            })),
+            ModelValue::Array(Box::new(ArrayValue {
+                default: ModelValue::Int(int(1)),
+                store: Vec::new(),
+            })),
+        ),
+        (
+            "SeqBox",
+            "SeqBox_mk",
+            Sort::seq(Sort::Int),
+            ModelValue::Seq(vec![ModelValue::Int(int(0))]),
+            ModelValue::Seq(vec![ModelValue::Int(int(1))]),
+        ),
+    ];
+
+    for (datatype_name, constructor_name, field_sort, field_value, different_field_value) in cases {
+        let mut terms = TermStore::new();
+        let datatype = Sort::Datatype(DatatypeSort::new(
+            datatype_name,
+            vec![DatatypeConstructor::new(
+                constructor_name,
+                vec![DatatypeField::new("payload", field_sort)],
+            )],
+        ));
+        let left = terms.mk_var(format!("{datatype_name}_left"), datatype.clone());
+        let right = terms.mk_var(format!("{datatype_name}_right"), datatype.clone());
+        let equality = app(&mut terms, "=", &[left, right], Sort::Bool);
+        let canonical = ModelValue::Datatype {
+            ctor: constructor_name.to_string(),
+            args: vec![field_value],
+        };
+        assert_confirmed(&verdict(
+            &terms,
+            &StubModel::new()
+                .with(left, canonical.clone())
+                .with(right, canonical.clone()),
+            &[equality],
+        ));
+        assert_violates(&verdict(
+            &terms,
+            &StubModel::new().with(left, canonical).with(
+                right,
+                ModelValue::Datatype {
+                    ctor: constructor_name.to_string(),
+                    args: vec![different_field_value],
+                },
+            ),
+            &[equality],
+        ));
+
+        let wrong_arity = ModelValue::Datatype {
+            ctor: constructor_name.to_string(),
+            args: Vec::new(),
+        };
+        assert_cannot(&verdict(
+            &terms,
+            &StubModel::new()
+                .with(left, wrong_arity.clone())
+                .with(right, wrong_arity),
+            &[equality],
+        ));
+        assert_cannot(&verdict(
+            &terms,
+            &StubModel::new()
+                .with(left, ModelValue::Uninterpreted("@opaque!0".to_string()))
+                .with(right, ModelValue::Uninterpreted("@opaque!0".to_string())),
+            &[equality],
+        ));
+    }
+}
+
+#[test]
+fn datatype_constructor_identity_remains_decisive_with_extensional_fields() {
+    let mut terms = TermStore::new();
+    let array_sort = Sort::array(Sort::Int, Sort::Int);
+    let datatype = Sort::Datatype(DatatypeSort::new(
+        "ChoiceBox",
+        vec![
+            DatatypeConstructor::new(
+                "ChoiceBox_left",
+                vec![DatatypeField::new("left_payload", array_sort.clone())],
+            ),
+            DatatypeConstructor::new(
+                "ChoiceBox_right",
+                vec![DatatypeField::new("right_payload", array_sort)],
+            ),
+        ],
+    ));
+    let left = terms.mk_var("choice_left", datatype.clone());
+    let right = terms.mk_var("choice_right", datatype);
+    let equality = app(&mut terms, "=", &[left, right], Sort::Bool);
+    let array = || {
+        ModelValue::Array(Box::new(ArrayValue {
+            default: ModelValue::Int(int(0)),
+            store: Vec::new(),
+        }))
+    };
+    assert_violates(&verdict(
+        &terms,
+        &StubModel::new()
+            .with(
+                left,
+                ModelValue::Datatype {
+                    ctor: "ChoiceBox_left".to_string(),
+                    args: vec![array()],
+                },
+            )
+            .with(
+                right,
+                ModelValue::Datatype {
+                    ctor: "ChoiceBox_right".to_string(),
+                    args: vec![array()],
+                },
+            ),
+        &[equality],
+    ));
+}
+
+fn assert_identical_value_cannot_confirm(context: &str, sort: Sort, value: ModelValue) {
+    let mut terms = TermStore::new();
+    let left = terms.mk_var("typed_left", sort.clone());
+    let right = terms.mk_var("typed_right", sort);
+    let equality = app(&mut terms, "=", &[left, right], Sort::Bool);
+    let result = verdict(
+        &terms,
+        &StubModel::new()
+            .with(left, value.clone())
+            .with(right, value),
+        &[equality],
+    );
+    assert!(
+        matches!(result, GateVerdict::CannotConfirm { .. }),
+        "{context}: expected CannotConfirm, got {result:?}"
+    );
+}
+
+/// Identical payloads are not enough to confirm equality: both operands must
+/// recursively inhabit the sort attached to the equality. These are the exact
+/// scalar, sequence, array, and datatype-field mutations that the former
+/// shape-erasing fallback accepted as equal.
+#[test]
+fn typed_equality_rejects_identical_malformed_nested_values() {
+    let malformed_datatype_sort = Sort::Datatype(DatatypeSort::new(
+        "TypedBox",
+        vec![DatatypeConstructor::new(
+            "TypedBox_mk",
+            vec![DatatypeField::new("payload", Sort::Int)],
+        )],
+    ));
+
+    let cases = vec![
+        ("scalar", Sort::Int, ModelValue::Bool(true)),
+        (
+            "bitvector width",
+            Sort::bitvec(16),
+            ModelValue::BitVec {
+                width: 8,
+                value: int(1),
+            },
+        ),
+        (
+            "bitvector range",
+            Sort::bitvec(8),
+            ModelValue::BitVec {
+                width: 8,
+                value: BigInt::from(256u16),
+            },
+        ),
+        (
+            "floating-point payload",
+            Sort::FloatingPoint(8, 24),
+            ModelValue::FloatingPoint {
+                sign: false,
+                exponent: 256,
+                significand: 0,
+                exponent_bits: 8,
+                significand_bits: 24,
+            },
+        ),
+        (
+            "character range",
+            Sort::Char,
+            ModelValue::Int(BigInt::from(0x3_0000u32)),
+        ),
+        (
+            "finite-domain range",
+            Sort::FiniteDomain("Tiny".to_string(), 2),
+            ModelValue::Int(int(2)),
+        ),
+        (
+            "regular-language carrier",
+            Sort::RegLan,
+            ModelValue::Uninterpreted("@regex!0".to_string()),
+        ),
+        (
+            "sequence element",
+            Sort::seq(Sort::Int),
+            ModelValue::Seq(vec![ModelValue::Bool(true)]),
+        ),
+        (
+            "array default",
+            Sort::array(Sort::Int, Sort::Int),
+            ModelValue::Array(Box::new(ArrayValue {
+                default: ModelValue::Bool(false),
+                store: Vec::new(),
+            })),
+        ),
+        (
+            "array key",
+            Sort::array(Sort::Int, Sort::Int),
+            ModelValue::Array(Box::new(ArrayValue {
+                default: ModelValue::Int(int(0)),
+                store: vec![(ModelValue::Bool(false), ModelValue::Int(int(1)))],
+            })),
+        ),
+        (
+            "array cell",
+            Sort::array(Sort::Int, Sort::Int),
+            ModelValue::Array(Box::new(ArrayValue {
+                default: ModelValue::Int(int(0)),
+                store: vec![(ModelValue::Int(int(1)), ModelValue::Bool(true))],
+            })),
+        ),
+        (
+            "datatype field",
+            malformed_datatype_sort,
+            ModelValue::Datatype {
+                ctor: "TypedBox_mk".to_string(),
+                args: vec![ModelValue::Bool(true)],
+            },
+        ),
+    ];
+
+    for (description, sort, value) in cases {
+        assert_identical_value_cannot_confirm(description, sort, value);
+    }
+}
+
+/// Preserve canonical nested witnesses, including the exact Int-to-Real value
+/// coercion used by `to_real`, while authenticating every aggregate layer.
+#[test]
+fn typed_equality_accepts_valid_nested_values() {
+    let payload_sort = Sort::seq(Sort::array(Sort::Int, Sort::seq(Sort::Real)));
+    let datatype_sort = Sort::Datatype(DatatypeSort::new(
+        "NestedBox",
+        vec![DatatypeConstructor::new(
+            "NestedBox_mk",
+            vec![DatatypeField::new("payload", payload_sort.clone())],
+        )],
+    ));
+    let payload = ModelValue::Seq(vec![ModelValue::Array(Box::new(ArrayValue {
+        default: ModelValue::Seq(vec![
+            ModelValue::Int(int(1)),
+            ModelValue::Real(BigRational::new(int(3), int(2))),
+        ]),
+        store: vec![(
+            ModelValue::Int(int(4)),
+            ModelValue::Seq(vec![ModelValue::Real(BigRational::from_integer(int(7)))]),
+        )],
+    }))]);
+    let canonical = ModelValue::Datatype {
+        ctor: "NestedBox_mk".to_string(),
+        args: vec![payload],
+    };
+
+    let mut terms = TermStore::new();
+    let left = terms.mk_var("nested_left", datatype_sort.clone());
+    let right = terms.mk_var("nested_right", datatype_sort);
+    let equality = app(&mut terms, "=", &[left, right], Sort::Bool);
+    assert_confirmed(&verdict(
+        &terms,
+        &StubModel::new()
+            .with(left, canonical.clone())
+            .with(right, canonical),
+        &[equality],
+    ));
+}
+
+/// Sequence equality must retain the element sort while descending: otherwise
+/// a nested array falls back to the shape-only comparator and cannot prove that
+/// stores covering every Bool index make differing defaults unreachable.
+#[test]
+fn typed_sequence_elements_retain_nested_array_extensionality() {
+    let sequence_sort = Sort::seq(Sort::array(Sort::Bool, Sort::Int));
+    let array = |default: i64, true_value: i64| {
+        ModelValue::Array(Box::new(ArrayValue {
+            default: ModelValue::Int(int(default)),
+            store: vec![
+                (ModelValue::Bool(false), ModelValue::Int(int(7))),
+                (ModelValue::Bool(true), ModelValue::Int(int(true_value))),
+            ],
+        }))
+    };
+
+    let mut terms = TermStore::new();
+    let left = terms.mk_var("array_seq_left", sequence_sort.clone());
+    let right = terms.mk_var("array_seq_right", sequence_sort);
+    let equality = app(&mut terms, "=", &[left, right], Sort::Bool);
+    let left_value = ModelValue::Seq(vec![array(0, 8)]);
+    let extensionally_equal = ModelValue::Seq(vec![array(99, 8)]);
+    assert_confirmed(&verdict(
+        &terms,
+        &StubModel::new()
+            .with(left, left_value.clone())
+            .with(right, extensionally_equal),
+        &[equality],
+    ));
+
+    let different = ModelValue::Seq(vec![array(99, 9)]);
+    assert_violates(&verdict(
+        &terms,
+        &StubModel::new()
+            .with(left, left_value)
+            .with(right, different),
+        &[equality],
+    ));
+}
+
+#[test]
+fn registered_enum_indices_retain_finite_array_coverage() {
+    let datatype = DatatypeSort::new(
+        "RegisteredColor",
+        vec![
+            DatatypeConstructor::unit("RegisteredRed"),
+            DatatypeConstructor::unit("RegisteredBlue"),
+        ],
+    );
+    let array_sort = Sort::array(Sort::Uninterpreted(datatype.name.clone()), Sort::Int);
+    let constructor = |name: &str| ModelValue::Datatype {
+        ctor: name.to_string(),
+        args: Vec::new(),
+    };
+    let array = |default: i64| {
+        ModelValue::Array(Box::new(ArrayValue {
+            default: ModelValue::Int(int(default)),
+            store: vec![
+                (constructor("RegisteredRed"), ModelValue::Int(int(7))),
+                (constructor("RegisteredBlue"), ModelValue::Int(int(8))),
+            ],
+        }))
+    };
+
+    let mut terms = TermStore::new();
+    let left = terms.mk_var("registered_array_left", array_sort.clone());
+    let right = terms.mk_var("registered_array_right", array_sort);
+    let equality = app(&mut terms, "=", &[left, right], Sort::Bool);
+    assert_confirmed(&verdict(
+        &terms,
+        &StubModel::new()
+            .with_datatype(datatype)
+            .with(left, array(0))
+            .with(right, array(99)),
+        &[equality],
+    ));
+}
+
+/// Array equality must not materialise the full cardinality of a model-provided
+/// bitvector index sort merely to prove that an empty key set does not cover it.
+#[test]
+fn huge_bitvector_index_cardinality_is_not_allocated() {
+    let array_sort = Sort::array(Sort::bitvec(u32::MAX), Sort::Int);
+    let mut terms = TermStore::new();
+    let left = terms.mk_var("huge_bv_array_left", array_sort.clone());
+    let right = terms.mk_var("huge_bv_array_right", array_sort);
+    let equality = app(&mut terms, "=", &[left, right], Sort::Bool);
+    let array = |default: i64| {
+        ModelValue::Array(Box::new(ArrayValue {
+            default: ModelValue::Int(int(default)),
+            store: Vec::new(),
+        }))
+    };
+    assert_violates(&verdict(
+        &terms,
+        &StubModel::new().with(left, array(0)).with(right, array(1)),
+        &[equality],
+    ));
+}
+
+#[test]
+fn typed_array_comparison_budget_bounds_quadratic_unique_key_search() {
+    let array_sort = Sort::array(Sort::Int, Sort::Int);
+    let array = |stores: usize| {
+        ModelValue::Array(Box::new(ArrayValue {
+            default: ModelValue::Int(int(0)),
+            store: (0..stores)
+                .map(|index| {
+                    let value = BigInt::from(index);
+                    (ModelValue::Int(value.clone()), ModelValue::Int(value))
+                })
+                .collect(),
+        }))
+    };
+
+    // 300 authenticated stores fit comfortably inside the 8192-node shape
+    // budget, but two ordered-table searches for every union key are
+    // quadratic and must stop at the separate comparison meter.
+    assert_identical_value_cannot_confirm(
+        "typed array comparison budget",
+        array_sort.clone(),
+        array(300),
+    );
+
+    // Preserve useful headroom below the meter; this still exercises thousands
+    // of semantic key comparisons rather than a trivial short path.
+    let mut terms = TermStore::new();
+    let left = terms.mk_var("bounded_array_left", array_sort.clone());
+    let right = terms.mk_var("bounded_array_right", array_sort);
+    let equality = app(&mut terms, "=", &[left, right], Sort::Bool);
+    let value = array(100);
+    assert_confirmed(&verdict(
+        &terms,
+        &StubModel::new()
+            .with(left, value.clone())
+            .with(right, value),
+        &[equality],
+    ));
+}
+
+#[test]
+fn typed_array_comparison_budget_counts_nested_key_work() {
+    let key_sort = Sort::seq(Sort::Int);
+    let array_sort = Sort::array(key_sort, Sort::Int);
+    let mut stores = Vec::new();
+    for index in 0..30 {
+        let mut key = vec![ModelValue::Int(int(0)); 99];
+        key.push(ModelValue::Int(BigInt::from(index)));
+        stores.push((ModelValue::Seq(key), ModelValue::Int(BigInt::from(index))));
+    }
+    let value = ModelValue::Array(Box::new(ArrayValue {
+        default: ModelValue::Int(int(0)),
+        store: stores,
+    }));
+
+    // Each pair of distinct keys shares a 99-element prefix. Charging only
+    // top-level array comparisons would miss this multiplicative work; the
+    // recursive meter must decline the equality deterministically.
+    assert_identical_value_cannot_confirm("nested array-key comparison budget", array_sort, value);
+}
+
+#[test]
+fn typed_value_depth_and_work_limits_fail_closed() {
+    let oversized = ModelValue::Seq(
+        (0..9000)
+            .map(|index| ModelValue::Int(BigInt::from(index)))
+            .collect(),
+    );
+    assert_identical_value_cannot_confirm(
+        "typed value work budget",
+        Sort::seq(Sort::Int),
+        oversized,
+    );
+
+    let mut deep_sort = Sort::Int;
+    let mut deep_value = ModelValue::Int(int(0));
+    for _ in 0..300 {
+        deep_sort = Sort::seq(deep_sort);
+        deep_value = ModelValue::Seq(vec![deep_value]);
+    }
+    assert_identical_value_cannot_confirm("typed value depth budget", deep_sort, deep_value);
 }
 
 // ===========================================================================

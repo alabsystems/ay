@@ -18,6 +18,62 @@ use ay_lia::LiaModel;
 
 use crate::preprocess::VariableSubstitution;
 
+/// One shared fail-closed envelope for mutually-recursive Int/Bool/BV model
+/// evaluation.  Crossing `bv2nat`/`int2bv` or an `ite` condition never resets
+/// either limit.
+const MAX_LIA_MODEL_EVAL_WORK: usize = 16_384;
+const MAX_LIA_MODEL_EVAL_DEPTH: usize = 512;
+
+struct LiaModelEvalBudget {
+    remaining: usize,
+    depth: usize,
+    depth_limit: usize,
+    active: HashSet<TermId>,
+}
+
+impl LiaModelEvalBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_LIA_MODEL_EVAL_WORK,
+            depth: 0,
+            depth_limit: MAX_LIA_MODEL_EVAL_DEPTH,
+            active: HashSet::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn limited(remaining: usize, depth_limit: usize) -> Self {
+        Self {
+            remaining,
+            depth: 0,
+            depth_limit,
+            active: HashSet::default(),
+        }
+    }
+
+    fn enter(&mut self, term: TermId) -> bool {
+        if self.remaining == 0 || self.depth >= self.depth_limit || !self.active.insert(term) {
+            return false;
+        }
+        self.remaining -= 1;
+        self.depth += 1;
+        true
+    }
+
+    fn leave(&mut self, term: TermId) {
+        debug_assert!(self.active.remove(&term));
+        self.depth = self.depth.saturating_sub(1);
+    }
+}
+
+fn checked_bv_extract_width(high: u32, low: u32) -> Option<u32> {
+    high.checked_sub(low)?.checked_add(1)
+}
+
+fn checked_bv_width_sum(left: u32, right: u32) -> Option<u32> {
+    left.checked_add(right)
+}
+
 /// SMT-LIB integer division: floor division for positive divisor,
 /// negated floor division for negative divisor.
 fn smtlib_div(n: &num_bigint::BigInt, d: &num_bigint::BigInt) -> num_bigint::BigInt {
@@ -37,86 +93,105 @@ pub(in crate::executor) fn eval_lia_bool_under_values(
     tid: TermId,
     values: &HashMap<TermId, num_bigint::BigInt>,
 ) -> Option<bool> {
-    use ay_core::term::{Constant, TermData};
+    let mut budget = LiaModelEvalBudget::new();
+    eval_lia_bool_under_values_inner(terms, tid, values, &mut budget)
+}
 
-    match terms.get(tid) {
-        TermData::Const(Constant::Bool(b)) => Some(*b),
-        TermData::Not(inner) => eval_lia_bool_under_values(terms, *inner, values).map(|b| !b),
-        TermData::App(sym, args) => {
-            let name = sym.name();
-            match name {
-                "and" => {
-                    let mut saw_unknown = false;
-                    for &arg in args {
-                        match eval_lia_bool_under_values(terms, arg, values) {
-                            Some(false) => return Some(false),
-                            Some(true) => {}
-                            None => saw_unknown = true,
-                        }
-                    }
-                    (!saw_unknown).then_some(true)
-                }
-                "or" => {
-                    let mut saw_unknown = false;
-                    for &arg in args {
-                        match eval_lia_bool_under_values(terms, arg, values) {
-                            Some(true) => return Some(true),
-                            Some(false) => {}
-                            None => saw_unknown = true,
-                        }
-                    }
-                    (!saw_unknown).then_some(false)
-                }
-                "<" if args.len() == 2 => {
-                    let a = eval_lia_int_under_values(terms, args[0], values)?;
-                    let b = eval_lia_int_under_values(terms, args[1], values)?;
-                    Some(a < b)
-                }
-                "<=" if args.len() == 2 => {
-                    let a = eval_lia_int_under_values(terms, args[0], values)?;
-                    let b = eval_lia_int_under_values(terms, args[1], values)?;
-                    Some(a <= b)
-                }
-                ">" if args.len() == 2 => {
-                    let a = eval_lia_int_under_values(terms, args[0], values)?;
-                    let b = eval_lia_int_under_values(terms, args[1], values)?;
-                    Some(a > b)
-                }
-                ">=" if args.len() == 2 => {
-                    let a = eval_lia_int_under_values(terms, args[0], values)?;
-                    let b = eval_lia_int_under_values(terms, args[1], values)?;
-                    Some(a >= b)
-                }
-                "=" if args.len() == 2 => {
-                    if let (Some(a), Some(b)) = (
-                        eval_lia_int_under_values(terms, args[0], values),
-                        eval_lia_int_under_values(terms, args[1], values),
-                    ) {
-                        Some(a == b)
-                    } else if let (Some(a), Some(b)) = (
-                        eval_lia_bool_under_values(terms, args[0], values),
-                        eval_lia_bool_under_values(terms, args[1], values),
-                    ) {
-                        Some(a == b)
-                    } else {
-                        None
-                    }
-                }
-                "distinct" if args.len() == 2 => {
-                    if let (Some(a), Some(b)) = (
-                        eval_lia_int_under_values(terms, args[0], values),
-                        eval_lia_int_under_values(terms, args[1], values),
-                    ) {
-                        Some(a != b)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            }
-        }
-        _ => None,
+fn eval_lia_bool_under_values_inner(
+    terms: &ay_core::TermStore,
+    tid: TermId,
+    values: &HashMap<TermId, num_bigint::BigInt>,
+    budget: &mut LiaModelEvalBudget,
+) -> Option<bool> {
+    if !budget.enter(tid) {
+        return None;
     }
+    let result = (|| {
+        use ay_core::term::{Constant, TermData};
+
+        match terms.get(tid) {
+            TermData::Const(Constant::Bool(b)) => Some(*b),
+            TermData::Not(inner) => {
+                eval_lia_bool_under_values_inner(terms, *inner, values, budget).map(|b| !b)
+            }
+            TermData::App(sym, args) => {
+                let name = sym.name();
+                match name {
+                    "and" => {
+                        let mut saw_unknown = false;
+                        for &arg in args {
+                            match eval_lia_bool_under_values_inner(terms, arg, values, budget) {
+                                Some(false) => return Some(false),
+                                Some(true) => {}
+                                None => saw_unknown = true,
+                            }
+                        }
+                        (!saw_unknown).then_some(true)
+                    }
+                    "or" => {
+                        let mut saw_unknown = false;
+                        for &arg in args {
+                            match eval_lia_bool_under_values_inner(terms, arg, values, budget) {
+                                Some(true) => return Some(true),
+                                Some(false) => {}
+                                None => saw_unknown = true,
+                            }
+                        }
+                        (!saw_unknown).then_some(false)
+                    }
+                    "<" if args.len() == 2 => {
+                        let a = eval_lia_int_under_values_inner(terms, args[0], values, budget)?;
+                        let b = eval_lia_int_under_values_inner(terms, args[1], values, budget)?;
+                        Some(a < b)
+                    }
+                    "<=" if args.len() == 2 => {
+                        let a = eval_lia_int_under_values_inner(terms, args[0], values, budget)?;
+                        let b = eval_lia_int_under_values_inner(terms, args[1], values, budget)?;
+                        Some(a <= b)
+                    }
+                    ">" if args.len() == 2 => {
+                        let a = eval_lia_int_under_values_inner(terms, args[0], values, budget)?;
+                        let b = eval_lia_int_under_values_inner(terms, args[1], values, budget)?;
+                        Some(a > b)
+                    }
+                    ">=" if args.len() == 2 => {
+                        let a = eval_lia_int_under_values_inner(terms, args[0], values, budget)?;
+                        let b = eval_lia_int_under_values_inner(terms, args[1], values, budget)?;
+                        Some(a >= b)
+                    }
+                    "=" if args.len() == 2 => {
+                        if let (Some(a), Some(b)) = (
+                            eval_lia_int_under_values_inner(terms, args[0], values, budget),
+                            eval_lia_int_under_values_inner(terms, args[1], values, budget),
+                        ) {
+                            Some(a == b)
+                        } else if let (Some(a), Some(b)) = (
+                            eval_lia_bool_under_values_inner(terms, args[0], values, budget),
+                            eval_lia_bool_under_values_inner(terms, args[1], values, budget),
+                        ) {
+                            Some(a == b)
+                        } else {
+                            None
+                        }
+                    }
+                    "distinct" if args.len() == 2 => {
+                        if let (Some(a), Some(b)) = (
+                            eval_lia_int_under_values_inner(terms, args[0], values, budget),
+                            eval_lia_int_under_values_inner(terms, args[1], values, budget),
+                        ) {
+                            Some(a != b)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    })();
+    budget.leave(tid);
+    result
 }
 
 pub(in crate::executor) fn eval_lia_int_under_values(
@@ -124,83 +199,406 @@ pub(in crate::executor) fn eval_lia_int_under_values(
     tid: TermId,
     values: &HashMap<TermId, num_bigint::BigInt>,
 ) -> Option<num_bigint::BigInt> {
-    use ay_core::term::{Constant, TermData};
+    let mut budget = LiaModelEvalBudget::new();
+    eval_lia_int_under_values_inner(terms, tid, values, &mut budget)
+}
 
-    match terms.get(tid) {
-        TermData::Const(Constant::Int(n)) => Some(n.clone()),
-        TermData::Var(_, _) => values.get(&tid).cloned(),
-        TermData::Ite(cond, then_t, else_t) => {
-            let cond_val = eval_lia_bool_under_values(terms, *cond, values)?;
-            if cond_val {
-                eval_lia_int_under_values(terms, *then_t, values)
-            } else {
-                eval_lia_int_under_values(terms, *else_t, values)
-            }
-        }
-        TermData::App(sym, args) => {
-            let name = sym.name();
-            match name {
-                "+" => {
-                    let mut sum = num_bigint::BigInt::from(0);
-                    for &arg in args {
-                        sum += eval_lia_int_under_values(terms, arg, values)?;
-                    }
-                    Some(sum)
-                }
-                "-" if args.len() == 2 => {
-                    let a = eval_lia_int_under_values(terms, args[0], values)?;
-                    let b = eval_lia_int_under_values(terms, args[1], values)?;
-                    Some(a - b)
-                }
-                "-" if args.len() == 1 => {
-                    let a = eval_lia_int_under_values(terms, args[0], values)?;
-                    Some(-a)
-                }
-                "*" => {
-                    let mut prod = num_bigint::BigInt::from(1);
-                    for &arg in args {
-                        prod *= eval_lia_int_under_values(terms, arg, values)?;
-                    }
-                    Some(prod)
-                }
-                "div" if args.len() == 2 => {
-                    let lhs = eval_lia_int_under_values(terms, args[0], values)?;
-                    let rhs = eval_lia_int_under_values(terms, args[1], values)?;
-                    if rhs == num_bigint::BigInt::from(0) {
-                        return None;
-                    }
-                    Some(smtlib_div(&lhs, &rhs))
-                }
-                "mod" if args.len() == 2 => {
-                    let lhs = eval_lia_int_under_values(terms, args[0], values)?;
-                    let rhs = eval_lia_int_under_values(terms, args[1], values)?;
-                    if rhs == num_bigint::BigInt::from(0) {
-                        return None;
-                    }
-                    let q = smtlib_div(&lhs, &rhs);
-                    Some(lhs - &rhs * q)
-                }
-                "abs" if args.len() == 1 => {
-                    let v = eval_lia_int_under_values(terms, args[0], values)?;
-                    Some(if v < num_bigint::BigInt::from(0) {
-                        -v
-                    } else {
-                        v
-                    })
-                }
-                // Any OTHER Int-sorted application (an opaque array `select`, a
-                // UF application, ...) is not an arithmetic composite the walk can
-                // decompose: LIA models it as a fresh variable, so its value — if
-                // the model chose one — lives in `values` keyed by the app term
-                // itself. Read it back rather than failing the whole surrounding
-                // evaluation. (#arr-lia-subst-select-recover: a substituted var
-                // `i2 -> (+ (select A idx) k)` cannot recover unless the opaque
-                // read contributes its model value.)
-                _ => values.get(&tid).cloned(),
-            }
-        }
-        _ => None,
+fn eval_lia_int_under_values_inner(
+    terms: &ay_core::TermStore,
+    tid: TermId,
+    values: &HashMap<TermId, num_bigint::BigInt>,
+    budget: &mut LiaModelEvalBudget,
+) -> Option<num_bigint::BigInt> {
+    if !budget.enter(tid) {
+        return None;
     }
+    let result = (|| {
+        use ay_core::term::{Constant, TermData};
+
+        match terms.get(tid) {
+            TermData::Const(Constant::Int(n)) => Some(n.clone()),
+            TermData::Var(_, _) => values.get(&tid).cloned(),
+            TermData::Ite(cond, then_t, else_t) => {
+                let cond_val = eval_lia_bool_under_values_inner(terms, *cond, values, budget)?;
+                if cond_val {
+                    eval_lia_int_under_values_inner(terms, *then_t, values, budget)
+                } else {
+                    eval_lia_int_under_values_inner(terms, *else_t, values, budget)
+                }
+            }
+            TermData::App(sym, args) => {
+                let name = sym.name();
+                match name {
+                    "+" => {
+                        let mut sum = num_bigint::BigInt::from(0);
+                        for &arg in args {
+                            sum += eval_lia_int_under_values_inner(terms, arg, values, budget)?;
+                        }
+                        Some(sum)
+                    }
+                    "-" if args.len() == 2 => {
+                        let a = eval_lia_int_under_values_inner(terms, args[0], values, budget)?;
+                        let b = eval_lia_int_under_values_inner(terms, args[1], values, budget)?;
+                        Some(a - b)
+                    }
+                    "-" if args.len() == 1 => {
+                        let a = eval_lia_int_under_values_inner(terms, args[0], values, budget)?;
+                        Some(-a)
+                    }
+                    "*" => {
+                        let mut prod = num_bigint::BigInt::from(1);
+                        for &arg in args {
+                            prod *= eval_lia_int_under_values_inner(terms, arg, values, budget)?;
+                        }
+                        Some(prod)
+                    }
+                    "div" if args.len() == 2 => {
+                        let lhs = eval_lia_int_under_values_inner(terms, args[0], values, budget)?;
+                        let rhs = eval_lia_int_under_values_inner(terms, args[1], values, budget)?;
+                        if rhs == num_bigint::BigInt::from(0) {
+                            return None;
+                        }
+                        Some(smtlib_div(&lhs, &rhs))
+                    }
+                    "mod" if args.len() == 2 => {
+                        let lhs = eval_lia_int_under_values_inner(terms, args[0], values, budget)?;
+                        let rhs = eval_lia_int_under_values_inner(terms, args[1], values, budget)?;
+                        if rhs == num_bigint::BigInt::from(0) {
+                            return None;
+                        }
+                        let q = smtlib_div(&lhs, &rhs);
+                        Some(lhs - &rhs * q)
+                    }
+                    "abs" if args.len() == 1 => {
+                        let v = eval_lia_int_under_values_inner(terms, args[0], values, budget)?;
+                        Some(if v < num_bigint::BigInt::from(0) {
+                            -v
+                        } else {
+                            v
+                        })
+                    }
+                    // `bv2nat` is INTERPRETED, not opaque (#bv2nat-subst-recover).
+                    //
+                    // The Int<->BV bridge lets variable substitution eliminate a
+                    // definition like `(= V (bv2nat (bvand ((_ int2bv 64) a)
+                    // ((_ int2bv 64) b))))` by recording `V -> bv2nat(...)`. Model
+                    // recovery then has to replay that RHS. Falling into the opaque
+                    // arm below is WRONG here twice over: the surviving assertions
+                    // were rewritten by the SAME substitution pass, so the LIA model
+                    // keys its opaque atom by the REWRITTEN term id, not by this one
+                    // (`values.get` misses and recovery yields no value at all); and
+                    // even on a hit, an opaque assignment is free to disagree with
+                    // the bits, which is exactly the decoupled model the independent
+                    // soundness gate refutes. `V` was then left to model completion,
+                    // came back as a junk default (`V = 8` against `3 & 3`), and the
+                    // gate fail-closed a genuine `sat`/`unsat` to `unknown` —
+                    // 17,085 of 17,586 caught invalid models across the fleet's
+                    // verify logs are exactly this shape.
+                    //
+                    // Compute it instead. `bv2nat(t)` is a total function of `t`'s
+                    // bits, so whenever the argument is structurally evaluable from
+                    // the model's Int leaves there is exactly ONE correct answer and
+                    // the opaque assignment is either equal to it or wrong. Prefer
+                    // the computed value; keep the opaque read as the fallback for
+                    // arguments this walk cannot decompose (e.g. a free BitVec
+                    // variable, which carries no value in a LIA model).
+                    //
+                    // SOUNDNESS: evaluation-side only. It cannot create or remove a
+                    // model — it fills in the value an eliminated variable ALREADY
+                    // had by definition — and every promotion downstream is still
+                    // arbitrated by `validate_model` and by the independent
+                    // model-check gate, neither of which is touched here.
+                    "bv2nat" if args.len() == 1 => {
+                        eval_lia_bv_under_values_inner(terms, args[0], values, budget)
+                            .map(|(value, _width)| value)
+                            .or_else(|| values.get(&tid).cloned())
+                    }
+                    // Any OTHER Int-sorted application (an opaque array `select`, a
+                    // UF application, ...) is not an arithmetic composite the walk can
+                    // decompose: LIA models it as a fresh variable, so its value — if
+                    // the model chose one — lives in `values` keyed by the app term
+                    // itself. Read it back rather than failing the whole surrounding
+                    // evaluation. (#arr-lia-subst-select-recover: a substituted var
+                    // `i2 -> (+ (select A idx) k)` cannot recover unless the opaque
+                    // read contributes its model value.)
+                    _ => values.get(&tid).cloned(),
+                }
+            }
+            _ => None,
+        }
+    })();
+    budget.leave(tid);
+    result
+}
+
+/// Unsigned value (and width) of a BitVec-sorted term, computed STRUCTURALLY
+/// from the Int leaves already valued in `values` (#bv2nat-subst-recover).
+///
+/// This is the BV half of [`eval_lia_int_under_values`]. It exists so a
+/// substituted variable whose definition crossed the Int<->BV boundary —
+/// `V -> bv2nat(<bv expr over ((_ int2bv w) <int>) and bv literals>)`, the
+/// dominant shape in the fleet's verify logs — can be recovered at its true
+/// value instead of being defaulted by model completion.
+///
+/// Every arm is the SMT-LIB semantics of a TOTAL function of its operands'
+/// values, so the result is the unique value the term takes under this model.
+/// Anything not decomposable here — a free BitVec variable, an `ite` whose
+/// condition is unresolved, a `select` of a BV array, an unmodelled operator —
+/// returns `None`, and the caller falls back to whatever the model said. That
+/// keeps the pass ADDITIVE: it never contradicts a value it cannot recompute,
+/// and it never invents one.
+///
+/// Widths come from the term's own sort rather than from operand arithmetic, so
+/// a mis-sorted term degrades to `None` instead of silently producing a value
+/// at the wrong width.
+fn eval_lia_bv_under_values_inner(
+    terms: &ay_core::TermStore,
+    tid: TermId,
+    values: &HashMap<TermId, num_bigint::BigInt>,
+    budget: &mut LiaModelEvalBudget,
+) -> Option<(num_bigint::BigInt, u32)> {
+    if !budget.enter(tid) {
+        return None;
+    }
+    let result = (|| {
+        use ay_core::term::{Constant, TermData};
+        use num_bigint::BigInt;
+        use num_traits::{One, Signed, ToPrimitive, Zero};
+
+        /// `2^width - 1`.
+        fn mask(width: u32) -> BigInt {
+            (BigInt::one() << width as usize) - BigInt::one()
+        }
+        /// Euclidean reduction into `[0, 2^width)`.
+        fn wrap(value: BigInt, width: u32) -> BigInt {
+            let modulus = BigInt::one() << width as usize;
+            let r = value % &modulus;
+            if r.is_negative() {
+                r + modulus
+            } else {
+                r
+            }
+        }
+        /// Two's-complement signed reading of an in-range unsigned value.
+        fn signed(value: &BigInt, width: u32) -> BigInt {
+            let half = BigInt::one() << (width as usize - 1);
+            if *value >= half {
+                value - (BigInt::one() << width as usize)
+            } else {
+                value.clone()
+            }
+        }
+
+        let width = match terms.sort(tid) {
+            ay_core::Sort::BitVec(bv) => bv.width,
+            _ => return None,
+        };
+        if width == 0 || width > 1 << 16 {
+            // Degenerate or absurd widths are not worth materializing a BigInt for.
+            return None;
+        }
+
+        let value = match terms.get(tid) {
+            TermData::Const(Constant::BitVec {
+                value,
+                width: const_width,
+            }) => {
+                if *const_width != width {
+                    return None;
+                }
+                wrap(value.clone(), width)
+            }
+            TermData::Ite(cond, then_t, else_t) => {
+                let branch = if eval_lia_bool_under_values_inner(terms, *cond, values, budget)? {
+                    *then_t
+                } else {
+                    *else_t
+                };
+                let (v, w) = eval_lia_bv_under_values_inner(terms, branch, values, budget)?;
+                if w != width {
+                    return None;
+                }
+                v
+            }
+            TermData::App(sym, args) => {
+                fn operand(
+                    terms: &ay_core::TermStore,
+                    args: &[TermId],
+                    index: usize,
+                    values: &HashMap<TermId, BigInt>,
+                    budget: &mut LiaModelEvalBudget,
+                ) -> Option<(BigInt, u32)> {
+                    eval_lia_bv_under_values_inner(terms, *args.get(index)?, values, budget)
+                }
+                fn same_width_operand(
+                    terms: &ay_core::TermStore,
+                    args: &[TermId],
+                    index: usize,
+                    width: u32,
+                    values: &HashMap<TermId, BigInt>,
+                    budget: &mut LiaModelEvalBudget,
+                ) -> Option<BigInt> {
+                    let (v, w) = operand(terms, args, index, values, budget)?;
+                    (w == width).then_some(v)
+                }
+                match (sym, args.len()) {
+                    // `((_ int2bv w) s)` — the residue of the Int source mod 2^w.
+                    // This is the boundary the whole recovery hinges on.
+                    (ay_core::term::Symbol::Indexed(name, indices), 1)
+                        if name == "int2bv" && indices.len() == 1 && indices[0] == width =>
+                    {
+                        wrap(
+                            eval_lia_int_under_values_inner(terms, args[0], values, budget)?,
+                            width,
+                        )
+                    }
+                    (ay_core::term::Symbol::Indexed(name, indices), 1)
+                        if name == "extract" && indices.len() == 2 =>
+                    {
+                        let (high, low) = (indices[0], indices[1]);
+                        if checked_bv_extract_width(high, low) != Some(width) {
+                            return None;
+                        }
+                        let (v, source_width) = operand(terms, args, 0, values, budget)?;
+                        if high >= source_width {
+                            return None;
+                        }
+                        (v >> low as usize) & mask(width)
+                    }
+                    (ay_core::term::Symbol::Indexed(name, indices), 1)
+                        if name == "zero_extend" && indices.len() == 1 =>
+                    {
+                        let (v, source_width) = operand(terms, args, 0, values, budget)?;
+                        if checked_bv_width_sum(source_width, indices[0]) != Some(width) {
+                            return None;
+                        }
+                        v
+                    }
+                    (ay_core::term::Symbol::Indexed(name, indices), 1)
+                        if name == "sign_extend" && indices.len() == 1 =>
+                    {
+                        let (v, source_width) = operand(terms, args, 0, values, budget)?;
+                        if checked_bv_width_sum(source_width, indices[0]) != Some(width) {
+                            return None;
+                        }
+                        wrap(signed(&v, source_width), width)
+                    }
+                    (ay_core::term::Symbol::Indexed(name, indices), 1)
+                        if matches!(name.as_str(), "rotate_left" | "rotate_right")
+                            && indices.len() == 1 =>
+                    {
+                        let v = same_width_operand(terms, args, 0, width, values, budget)?;
+                        let by = u64::from(indices[0] % width) as usize;
+                        let left = if name == "rotate_left" {
+                            by
+                        } else {
+                            width as usize - by
+                        };
+                        ((v.clone() << left) | (v >> (width as usize - left))) & mask(width)
+                    }
+                    (ay_core::term::Symbol::Named(name), 2) if name == "concat" => {
+                        let (hi, hi_width) = operand(terms, args, 0, values, budget)?;
+                        let (lo, lo_width) = operand(terms, args, 1, values, budget)?;
+                        if checked_bv_width_sum(hi_width, lo_width) != Some(width) {
+                            return None;
+                        }
+                        (hi << lo_width as usize) | lo
+                    }
+                    (ay_core::term::Symbol::Named(name), 1) if name == "bvnot" => {
+                        !same_width_operand(terms, args, 0, width, values, budget)? & mask(width)
+                    }
+                    (ay_core::term::Symbol::Named(name), 1) if name == "bvneg" => wrap(
+                        -same_width_operand(terms, args, 0, width, values, budget)?,
+                        width,
+                    ),
+                    (ay_core::term::Symbol::Named(name), n)
+                        if n >= 2 && matches!(name.as_str(), "bvand" | "bvor" | "bvxor") =>
+                    {
+                        let mut acc = same_width_operand(terms, args, 0, width, values, budget)?;
+                        for i in 1..n {
+                            let rhs = same_width_operand(terms, args, i, width, values, budget)?;
+                            acc = match name.as_str() {
+                                "bvand" => acc & rhs,
+                                "bvor" => acc | rhs,
+                                _ => acc ^ rhs,
+                            };
+                        }
+                        acc & mask(width)
+                    }
+                    (ay_core::term::Symbol::Named(name), n)
+                        if n >= 2 && matches!(name.as_str(), "bvadd" | "bvmul") =>
+                    {
+                        let mut acc = same_width_operand(terms, args, 0, width, values, budget)?;
+                        for i in 1..n {
+                            let rhs = same_width_operand(terms, args, i, width, values, budget)?;
+                            acc = if name == "bvadd" {
+                                acc + rhs
+                            } else {
+                                acc * rhs
+                            };
+                        }
+                        wrap(acc, width)
+                    }
+                    (ay_core::term::Symbol::Named(name), 2) if name == "bvsub" => wrap(
+                        same_width_operand(terms, args, 0, width, values, budget)?
+                            - same_width_operand(terms, args, 1, width, values, budget)?,
+                        width,
+                    ),
+                    // Shifts: SMT-LIB defines an out-of-range shift amount as a full
+                    // flush (0 for the logical shifts; the sign bit for `bvashr`).
+                    (ay_core::term::Symbol::Named(name), 2)
+                        if matches!(name.as_str(), "bvshl" | "bvlshr" | "bvashr") =>
+                    {
+                        let v = same_width_operand(terms, args, 0, width, values, budget)?;
+                        let by = same_width_operand(terms, args, 1, width, values, budget)?;
+                        let by = by.to_u64().unwrap_or(u64::from(width));
+                        if by >= u64::from(width) {
+                            match name.as_str() {
+                                "bvashr" if signed(&v, width).is_negative() => mask(width),
+                                _ => BigInt::zero(),
+                            }
+                        } else {
+                            let by = by as usize;
+                            match name.as_str() {
+                                "bvshl" => (v << by) & mask(width),
+                                "bvlshr" => v >> by,
+                                _ => wrap(signed(&v, width) >> by, width),
+                            }
+                        }
+                    }
+                    // Division by zero is TOTALIZED by SMT-LIB, not undefined:
+                    // `bvudiv x 0 = all-ones`, `bvurem x 0 = x`.
+                    (ay_core::term::Symbol::Named(name), 2)
+                        if matches!(name.as_str(), "bvudiv" | "bvurem") =>
+                    {
+                        let a = same_width_operand(terms, args, 0, width, values, budget)?;
+                        let b = same_width_operand(terms, args, 1, width, values, budget)?;
+                        if b.is_zero() {
+                            if name == "bvudiv" {
+                                mask(width)
+                            } else {
+                                a
+                            }
+                        } else if name == "bvudiv" {
+                            a / b
+                        } else {
+                            a % b
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+
+        debug_assert!(
+            !value.is_negative() && value <= mask(width),
+            "structural BV evaluation escaped [0, 2^width)"
+        );
+        Some((value, width))
+    })();
+    budget.leave(tid);
+    result
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -687,10 +1085,44 @@ pub(in crate::executor) fn recover_substituted_lia_values_protecting(
                     let evaluator_descends = match terms.sort(term) {
                         ay_core::Sort::Int => {
                             matches!(sym.name(), "+" | "-" | "*" | "div" | "mod" | "abs")
+                                // `bv2nat` is decomposed by
+                                // `eval_lia_bv_under_values`, so its operands'
+                                // substitution keys are REAL dependencies: a
+                                // definition `V -> bv2nat(((_ int2bv 64) a))`
+                                // must wait for `a` to resolve, or it commits
+                                // from the masked view and never retries
+                                // (#bv2nat-subst-recover).
+                                || sym.name() == "bv2nat"
                         }
                         ay_core::Sort::Bool => matches!(
                             sym.name(),
                             "and" | "or" | "<" | "<=" | ">" | ">=" | "=" | "distinct"
+                        ),
+                        // Mirror of the BV walk in `eval_lia_bv_under_values`:
+                        // these are the operators it decomposes, so a
+                        // substitution key underneath one is reachable.
+                        ay_core::Sort::BitVec(_) => matches!(
+                            sym.name(),
+                            "int2bv"
+                                | "extract"
+                                | "zero_extend"
+                                | "sign_extend"
+                                | "rotate_left"
+                                | "rotate_right"
+                                | "concat"
+                                | "bvnot"
+                                | "bvneg"
+                                | "bvand"
+                                | "bvor"
+                                | "bvxor"
+                                | "bvadd"
+                                | "bvmul"
+                                | "bvsub"
+                                | "bvshl"
+                                | "bvlshr"
+                                | "bvashr"
+                                | "bvudiv"
+                                | "bvurem"
                         ),
                         _ => false,
                     };
@@ -1354,5 +1786,139 @@ mod tests {
                 Some(true)
             );
         }
+    }
+
+    #[test]
+    fn bv2nat_int2bv_round_trip_shares_one_depth_budget() {
+        let mut terms = TermStore::new();
+        let source = terms.mk_var("source", Sort::Int);
+        let as_bv = terms.mk_int2bv(8, source);
+        let round_trip = terms.mk_bv2nat(as_bv);
+        let values = HashMap::from_iter([(source, num_bigint::BigInt::from(5))]);
+
+        assert_eq!(
+            eval_lia_int_under_values(&terms, round_trip, &values),
+            Some(num_bigint::BigInt::from(5))
+        );
+
+        // Int(bv2nat) -> BV(int2bv) -> Int(source) is three frames. A
+        // per-sort budget would reset at each bridge and incorrectly succeed.
+        let mut budget = LiaModelEvalBudget::limited(100, 2);
+        assert_eq!(
+            eval_lia_int_under_values_inner(&terms, round_trip, &values, &mut budget),
+            None
+        );
+        assert_eq!(budget.depth, 0);
+        assert!(budget.active.is_empty());
+    }
+
+    #[test]
+    fn lia_model_evaluation_work_budget_is_fail_closed() {
+        let mut terms = TermStore::new();
+        let vars: Vec<_> = (0..4)
+            .map(|index| terms.mk_var(format!("work_{index}"), Sort::Int))
+            .collect();
+        let sum = terms.mk_add(vars.clone());
+        let values = HashMap::from_iter(
+            vars.iter()
+                .copied()
+                .enumerate()
+                .map(|(index, term)| (term, num_bigint::BigInt::from(index + 1))),
+        );
+
+        assert_eq!(
+            eval_lia_int_under_values(&terms, sum, &values),
+            Some(num_bigint::BigInt::from(10))
+        );
+        // The root plus four leaves needs five units of work.
+        let mut budget = LiaModelEvalBudget::limited(4, 32);
+        assert_eq!(
+            eval_lia_int_under_values_inner(&terms, sum, &values, &mut budget),
+            None
+        );
+        assert_eq!(budget.depth, 0);
+        assert!(budget.active.is_empty());
+    }
+
+    #[test]
+    fn lia_model_evaluation_cycle_guard_is_balanced() {
+        let mut terms = TermStore::new();
+        let term = terms.mk_var("cycle", Sort::Int);
+        let mut budget = LiaModelEvalBudget::limited(3, 3);
+
+        assert!(budget.enter(term));
+        assert!(!budget.enter(term), "an active TermId must not re-enter");
+        budget.leave(term);
+        assert!(budget.enter(term), "leaving restores the active-path guard");
+        budget.leave(term);
+        assert_eq!(budget.depth, 0);
+        assert!(budget.active.is_empty());
+    }
+
+    #[test]
+    fn malformed_bv_width_arithmetic_returns_none_without_overflow() {
+        let mut terms = TermStore::new();
+        let source = terms.mk_bitvec(num_bigint::BigInt::from(1), 8);
+        let malformed_extract = terms.mk_app(
+            ay_core::Symbol::indexed("extract", vec![u32::MAX, 0]),
+            [source],
+            Sort::bitvec(1),
+        );
+        let malformed_zero_extend = terms.mk_app(
+            ay_core::Symbol::indexed("zero_extend", vec![u32::MAX]),
+            [source],
+            Sort::bitvec(8),
+        );
+        let malformed_sign_extend = terms.mk_app(
+            ay_core::Symbol::indexed("sign_extend", vec![u32::MAX]),
+            [source],
+            Sort::bitvec(8),
+        );
+        let values = HashMap::default();
+
+        for malformed in [
+            malformed_extract,
+            malformed_zero_extend,
+            malformed_sign_extend,
+        ] {
+            let mut budget = LiaModelEvalBudget::new();
+            assert_eq!(
+                eval_lia_bv_under_values_inner(&terms, malformed, &values, &mut budget),
+                None
+            );
+            assert_eq!(budget.depth, 0);
+            assert!(budget.active.is_empty());
+        }
+
+        assert_eq!(checked_bv_extract_width(u32::MAX, 0), None);
+        assert_eq!(checked_bv_width_sum(u32::MAX, 1), None);
+    }
+
+    #[test]
+    fn bv_ite_with_bv_equality_condition_remains_outside_recovery_scope() {
+        let mut terms = TermStore::new();
+        let left_int = terms.mk_var("left_int", Sort::Int);
+        let right_int = terms.mk_var("right_int", Sort::Int);
+        let left = terms.mk_int2bv(8, left_int);
+        let right = terms.mk_int2bv(8, right_int);
+        let condition = terms.mk_eq(left, right);
+        let one = terms.mk_bitvec(num_bigint::BigInt::from(1), 8);
+        let two = terms.mk_bitvec(num_bigint::BigInt::from(2), 8);
+        let choice = terms.mk_ite(condition, one, two);
+        let values = HashMap::from_iter([
+            (left_int, num_bigint::BigInt::from(7)),
+            (right_int, num_bigint::BigInt::from(7)),
+        ]);
+        let mut budget = LiaModelEvalBudget::new();
+
+        // The recovery evaluator deliberately has no independent BV-relation
+        // lane. It must decline this condition instead of borrowing the
+        // producer's bitvector comparison authority.
+        assert_eq!(
+            eval_lia_bv_under_values_inner(&terms, choice, &values, &mut budget),
+            None
+        );
+        assert_eq!(budget.depth, 0);
+        assert!(budget.active.is_empty());
     }
 }

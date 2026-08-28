@@ -2167,6 +2167,13 @@ impl Context {
         self.retain_parsed_assertions = retain;
     }
 
+    /// Whether new assertions retain their parsed source trees for proof
+    /// surface alignment.
+    #[must_use]
+    pub const fn retains_parsed_assertions(&self) -> bool {
+        self.retain_parsed_assertions
+    }
+
     /// Replace the complete active query view with exact internal probe roots.
     ///
     /// This is a narrow cross-crate transaction primitive for solver probes

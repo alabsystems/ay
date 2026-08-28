@@ -23,6 +23,43 @@ use crate::executor_format::{
 use super::Executor;
 use super::{EvalValue, Model};
 
+/// Typed failure from the exact row pipeline shared by model output and the
+/// independent gate.  Coverage failures remain distinct from a semantic
+/// refutation that proves the candidate table is not a function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::executor) enum PrintedUfTableRowsError {
+    /// A placeholder or provenance value could not be resolved exactly.
+    Coverage(String),
+    /// One argument point resolves to two different results.
+    InconsistentFunctionTable {
+        name: String,
+        point: Vec<String>,
+        first: String,
+        second: String,
+    },
+}
+
+impl std::fmt::Display for PrintedUfTableRowsError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Coverage(detail) => formatter.write_str(detail),
+            Self::InconsistentFunctionTable {
+                name,
+                point,
+                first,
+                second,
+            } => write!(
+                formatter,
+                "inconsistent function table for {}: point ({}) resolves to both {} and {}",
+                quote_symbol(name),
+                point.join(" "),
+                first,
+                second
+            ),
+        }
+    }
+}
+
 /// Explicit non-value marker for an internal invariant violation: a formatting
 /// path asked for the printed form of a value the evaluator does not have
 /// (`EvalValue::Unknown`), on a path whose callers are contracted to guard
@@ -276,8 +313,9 @@ impl Executor {
         let params_str = params.join(" ");
         let result_sort_str = format_sort_surface(&self.ctx, result_sort);
 
-        let resolved_table =
-            self.printed_uf_table_rows(name, arg_sorts, result_sort, table, model)?;
+        let resolved_table = self
+            .printed_uf_table_rows(name, arg_sorts, result_sort, table, model)
+            .map_err(|error| error.to_string())?;
 
         // Build nested ite expression from resolved table.
         let body = if resolved_table.is_empty() {
@@ -319,7 +357,7 @@ impl Executor {
         result_sort: &Sort,
         table: &[(Vec<String>, String)],
         model: &Model,
-    ) -> Result<Vec<(Vec<String>, String)>, String> {
+    ) -> Result<Vec<(Vec<String>, String)>, PrintedUfTableRowsError> {
         // Resolve @?N placeholders in table entries (#5452).
         let mut resolved_table: Vec<(Vec<String>, String)> = Vec::with_capacity(table.len());
         for (args, result) in table {
@@ -351,9 +389,14 @@ impl Executor {
             let mut resolved_args: Vec<String> = Vec::with_capacity(args.len());
             for (i, arg) in args.iter().enumerate() {
                 let sort = arg_sorts.get(i).cloned().unwrap_or(Sort::Bool);
-                resolved_args.push(self.resolve_table_value(arg, &sort, model)?);
+                resolved_args.push(
+                    self.resolve_table_value(arg, &sort, model)
+                        .map_err(PrintedUfTableRowsError::Coverage)?,
+                );
             }
-            let resolved_result = self.resolve_table_value(result, result_sort, model)?;
+            let resolved_result = self
+                .resolve_table_value(result, result_sort, model)
+                .map_err(PrintedUfTableRowsError::Coverage)?;
             resolved_table.push((resolved_args, resolved_result));
         }
 
@@ -374,13 +417,12 @@ impl Executor {
             match seen_points.get(&args) {
                 Some(prev) if *prev == result => continue,
                 Some(prev) => {
-                    return Err(format!(
-                        "inconsistent function table for {}: point ({}) resolves to both {} and {}",
-                        quote_symbol(name),
-                        args.join(" "),
-                        prev,
-                        result
-                    ));
+                    return Err(PrintedUfTableRowsError::InconsistentFunctionTable {
+                        name: name.to_string(),
+                        point: args,
+                        first: prev.clone(),
+                        second: result,
+                    });
                 }
                 None => {
                     seen_points.insert(args.clone(), result.clone());

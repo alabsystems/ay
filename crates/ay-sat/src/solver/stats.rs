@@ -714,6 +714,7 @@ impl Solver {
         self.stats.level_at_conflict_sum
     }
 
+    /// Get the number of cold restarts performed.
     pub fn num_cold_restarts(&self) -> u64 {
         self.stats.cold_restarts
     }

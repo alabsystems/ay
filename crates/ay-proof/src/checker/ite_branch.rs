@@ -21,11 +21,12 @@
 //! `select E j = select (store A i v) j`, and the read-over-write axiom makes
 //! `F` true in both `ite` branches. This is the ROW axiom routed through one
 //! authored array equality — the shape ite-lowering of `select`-over-`store`
-//! leaves behind after definition substitution.
+//! leaves behind after definition substitution. When `A` is a CONSTANT array
+//! `((as const _) d)` the untouched-cell branch is spelled `(= d (select E j))`
+//! instead, because `mk_select` folds `(select (const-array d) j)` to `d` at
+//! construction time; [`const_array_fill_of`] re-derives exactly that fold.
 
-#[cfg(test)]
-use ay_core::Sort;
-use ay_core::{ProofId, Symbol, TermData, TermId, TermStore};
+use ay_core::{ProofId, Sort, Symbol, TermData, TermId, TermStore};
 
 use super::ProofCheckError;
 
@@ -147,6 +148,26 @@ fn decode_select(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
     }
 }
 
+/// The fill of `array` when `array` is an UNPEELED constant array
+/// `((as const (Array I E)) d)` whose payload really has the element sort `E`.
+///
+/// `TermStore::mk_select` folds `(select ((as const _) d) j)` to `d` at
+/// CONSTRUCTION time (`ay-core/src/term/array.rs:44`), so a guarded ROW
+/// expansion whose base array is a constant array never contains the
+/// syntactic `(select A j)` its untouched-cell branch would otherwise name —
+/// it already contains `d`. This re-derives exactly that fold, and nothing
+/// else: `(select ((as const (Array I E)) d) j) = d` holds at EVERY index
+/// unconditionally, so unlike `array_axiom::const_array_default_fill` — which
+/// PEELS stores and is therefore sound only under `sort_provably_infinite` —
+/// there is no carrier-cardinality side condition to discharge here.
+fn const_array_fill_of(terms: &TermStore, array: TermId) -> Option<TermId> {
+    let fill = terms.get_const_array(array)?;
+    let Sort::Array(array_sort) = terms.sort(array) else {
+        return None;
+    };
+    (terms.sort(fill) == &array_sort.element_sort).then_some(fill)
+}
+
 /// Validate a [`ay_core::TheoryLemmaKind::ArrayGuardedRowExpansion`] clause.
 pub(crate) fn validate_array_guarded_row_expansion(
     terms: &TermStore,
@@ -215,10 +236,14 @@ pub(crate) fn validate_array_guarded_row_expansion(
             let then_ok = decode_eq(terms, then_branch).is_some_and(|(left, right)| {
                 (left == stored_value && is_read(right)) || (right == stored_value && is_read(left))
             });
-            // else: `(= (select A j) (select E j))` — the untouched cell.
+            // else: `(= (select A j) (select E j))` — the untouched cell. When
+            // `A` is a constant array `mk_select` already folded that read to
+            // the fill, so the fill of THIS clause's own `base_array` reads as
+            // the base read it is.
             let is_base_read = |term: TermId| {
                 decode_select(terms, term)
                     .is_some_and(|(array, index)| array == base_array && index == probe_index)
+                    || const_array_fill_of(terms, base_array) == Some(term)
             };
             let else_ok = decode_eq(terms, else_branch).is_some_and(|(left, right)| {
                 (is_base_read(left) && is_read(right)) || (is_base_read(right) && is_read(left))
@@ -344,9 +369,12 @@ fn validate_three_literal_guarded_row(terms: &TermStore, literals: &[TermId]) ->
                 decode_select(terms, term)
                     .is_some_and(|(array, index)| array == read_array && index == probe)
             };
+            // Same const-array fold as in the `ite` spelling above: the fill
+            // is the base read at EVERY probe, so `probe` is not consulted.
             let is_base_read = |term: TermId, probe: TermId| {
                 decode_select(terms, term)
                     .is_some_and(|(array, index)| array == base_array && index == probe)
+                    || const_array_fill_of(terms, base_array) == Some(term)
             };
             for (index_lit, select_lit) in [(other_a, other_b), (other_b, other_a)] {
                 let (index_atom, index_negated) = strip_not(terms, index_lit);
@@ -390,93 +418,6 @@ pub fn recognize_array_guarded_row_expansion(terms: &TermStore, clause: &[TermId
 
 include!("ite_branch/base_tests.rs");
 
-#[cfg(test)]
-mod three_literal_guarded_row_tests {
-    use super::*;
-    use crate::checker::ite_branch::tests::{array_sort_for_tests, eq_for_tests};
-
-    #[test]
-    fn accepts_row_neg_shape() {
-        // `(or (not (= a (store e 0 1))) (= 0 d) (= (select e d) (select a d)))`
-        let mut terms = TermStore::new();
-        let a = terms.mk_var("a", array_sort_for_tests());
-        let e = terms.mk_var("e", array_sort_for_tests());
-        let d = terms.mk_var("d", Sort::BitVec(ay_core::BitVecSort { width: 64 }));
-        let zero = terms.mk_bitvec(0u32.into(), 64);
-        let one = terms.mk_bitvec(1u32.into(), 8);
-        let bv8 = Sort::BitVec(ay_core::BitVecSort { width: 8 });
-        let store = terms.mk_app(
-            Symbol::named("store"),
-            vec![e, zero, one],
-            array_sort_for_tests(),
-        );
-        let guard = eq_for_tests(&mut terms, a, store);
-        let not_guard = terms.mk_not(guard);
-        let index_eq = eq_for_tests(&mut terms, zero, d);
-        let sel_e = terms.mk_app(Symbol::named("select"), vec![e, d], bv8.clone());
-        let sel_a = terms.mk_app(Symbol::named("select"), vec![a, d], bv8);
-        let select_eq = eq_for_tests(&mut terms, sel_e, sel_a);
-        let unit = terms.mk_app(
-            Symbol::named("or"),
-            vec![not_guard, index_eq, select_eq],
-            Sort::Bool,
-        );
-        assert!(recognize_array_guarded_row_expansion(&terms, &[unit]));
-    }
-
-    #[test]
-    fn accepts_row_pos_shape() {
-        // `(cl (not (= a (store e 0 1))) (not (= 0 d)) (= 1 (select a d)))`
-        let mut terms = TermStore::new();
-        let a = terms.mk_var("a", array_sort_for_tests());
-        let e = terms.mk_var("e", array_sort_for_tests());
-        let d = terms.mk_var("d", Sort::BitVec(ay_core::BitVecSort { width: 64 }));
-        let zero = terms.mk_bitvec(0u32.into(), 64);
-        let one = terms.mk_bitvec(1u32.into(), 8);
-        let bv8 = Sort::BitVec(ay_core::BitVecSort { width: 8 });
-        let store = terms.mk_app(
-            Symbol::named("store"),
-            vec![e, zero, one],
-            array_sort_for_tests(),
-        );
-        let guard = eq_for_tests(&mut terms, a, store);
-        let not_guard = terms.mk_not(guard);
-        let index_eq = eq_for_tests(&mut terms, zero, d);
-        let not_index_eq = terms.mk_not(index_eq);
-        let sel_a = terms.mk_app(Symbol::named("select"), vec![a, d], bv8);
-        let select_eq = eq_for_tests(&mut terms, one, sel_a);
-        assert!(recognize_array_guarded_row_expansion(
-            &terms,
-            &[not_guard, not_index_eq, select_eq]
-        ));
-    }
-
-    #[test]
-    fn rejects_row_neg_reading_untouched_cell_from_wrong_array() {
-        // else-equality over TWO base reads (never the read array) is not the
-        // expansion — falsifiable, must reject.
-        let mut terms = TermStore::new();
-        let a = terms.mk_var("a", array_sort_for_tests());
-        let e = terms.mk_var("e", array_sort_for_tests());
-        let d = terms.mk_var("d", Sort::BitVec(ay_core::BitVecSort { width: 64 }));
-        let zero = terms.mk_bitvec(0u32.into(), 64);
-        let one = terms.mk_bitvec(1u32.into(), 8);
-        let bv8 = Sort::BitVec(ay_core::BitVecSort { width: 8 });
-        let store = terms.mk_app(
-            Symbol::named("store"),
-            vec![e, zero, one],
-            array_sort_for_tests(),
-        );
-        let guard = eq_for_tests(&mut terms, a, store);
-        let not_guard = terms.mk_not(guard);
-        let index_eq = eq_for_tests(&mut terms, zero, d);
-        let sel_e = terms.mk_app(Symbol::named("select"), vec![e, d], bv8);
-        let select_eq = eq_for_tests(&mut terms, sel_e, sel_e);
-        assert!(!recognize_array_guarded_row_expansion(
-            &terms,
-            &[not_guard, index_eq, select_eq]
-        ));
-    }
-}
+include!("ite_branch/three_literal_guarded_row_tests.rs");
 
 include!("ite_branch/store_pair_guarded_row_tests.rs");

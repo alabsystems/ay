@@ -26,7 +26,13 @@ pub struct TheoryLemmaProof {
 }
 
 /// A proof step (Alethe-compatible)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq`/`Eq` are LITERAL structural equality over every field —
+/// added for the strict-check memo's document-identity comparison
+/// (`ay-dpll` #strict-walk-memo), which deliberately compares the exact
+/// stored document instead of a hash so a stale cache hit is impossible
+/// rather than improbable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub enum ProofStep {
@@ -95,7 +101,10 @@ impl std::fmt::Display for ProofId {
 }
 
 /// A complete proof (Alethe-compatible)
-#[derive(Debug, Clone, Default)]
+///
+/// `PartialEq`/`Eq` are literal structural equality (see [`ProofStep`]'s
+/// derive note).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Proof {
     /// Proof steps

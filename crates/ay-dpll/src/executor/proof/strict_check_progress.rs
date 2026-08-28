@@ -70,6 +70,21 @@ fn probe_strict_check_refusal(message: impl FnOnce() -> String) {
 /// [`check_with_executor_progress`] for why the poll is not on every charge.
 const STOP_POLL_INTERVAL: u64 = 1_024;
 
+/// Whether the executor's stop signals (interrupt / solve deadline / memory)
+/// are asserted RIGHT NOW — the exact poll a strict walk performs on its
+/// first charge.
+///
+/// #strict-walk-memo consults this before answering from a stored verdict: a
+/// stopping caller must observe the same `Cancelled` outcome a real walk
+/// would produce (the walk's first-charge poll cancels it immediately), and a
+/// cancellation must keep its calibrated downstream meaning — revert, nothing
+/// learned, nothing latched. Answering from the cache while stopping would
+/// let cached knowledge change WHAT a dying solve decides.
+pub(in crate::executor) fn executor_stop_signals_asserted(executor: &Executor) -> bool {
+    let should_stop = executor.make_should_stop();
+    executor_stopped(executor, &should_stop)
+}
+
 /// The metered WORK a strict check may consume and still be considered cheap
 /// enough to RE-RUN many times over.
 ///

@@ -23,6 +23,10 @@ smt = ["dep:ay-dpll"]
 # branch-predicted, so a default build has bit-identical codegen in the hot loop. Only the
 # `alloc_census` measurement binary asks for it.
 acensus = []
+# DECISION CENSUS for MECHANISM D (node-rate steering). Compiles the six `nodes/elapsed`
+# decision probes into the node loop. OFF by default and `#[cfg]`-erased, not
+# branch-predicted, so a default build's hot loop is unchanged. See `src/dcensus.rs`.
+dcensus = []
 
 [dependencies]
 ay-dpll = { workspace = true, optional = true }

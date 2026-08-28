@@ -16,6 +16,7 @@ const MAX_OPAQUE_DT_WORK: usize = 32 * 1024 * 1024;
 const MAX_ROUNDTRIP_SCHEMA_NODES: usize = 1024;
 const MAX_BOUNDED_NODE_WORK: usize = 272;
 const MAX_CANDIDATE_WORK: usize = MAX_ROUNDTRIP_SCHEMA_NODES * MAX_BOUNDED_NODE_WORK;
+pub(super) const MAX_OPAQUE_DT_COLLECTION_ROOTS: usize = 1024;
 const MAX_OPAQUE_DT_COLLECTION_ITEMS: usize = 1024;
 const MAX_OPAQUE_DT_COLLECTION_RAW_ARGS: usize = 4096;
 const MAX_OPAQUE_DT_COLLECTION_TERMS: usize = 16 * 1024;
@@ -72,7 +73,7 @@ impl OpaqueDtCollectionBudget {
     }
 
     pub(super) fn record_roots(&mut self, count: usize) -> bool {
-        self.valid &= count <= MAX_OPAQUE_DT_COLLECTION_ITEMS;
+        self.valid &= count <= MAX_OPAQUE_DT_COLLECTION_ROOTS;
         self.charge_raw_args(count) && self.charge_work(count)
     }
 

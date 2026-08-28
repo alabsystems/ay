@@ -19,6 +19,8 @@ mod bv2nat_add_sub_modular_bridge;
 mod bv2nat_bvsub_bridge_9065;
 #[path = "group_bv/bv2nat_confirmed_invalid_model.rs"]
 mod bv2nat_confirmed_invalid_model;
+#[path = "group_bv/bv2nat_int2bv_subst_recovery.rs"]
+mod bv2nat_int2bv_subst_recovery;
 #[path = "group_bv/bv2nat_lia_bridge_sat_promotion_9065.rs"]
 mod bv2nat_lia_bridge_sat_promotion_9065;
 #[path = "group_bv/bv_array_assumption_roots_6739.rs"]

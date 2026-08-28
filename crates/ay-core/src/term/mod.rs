@@ -75,7 +75,7 @@ static NEXT_TERM_ENTRY_STAMP: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TermEntryStamp(u64);
 
-#[allow(clippy::panic)]
+#[allow(clippy::panic, deprecated)]
 fn fresh_term_entry_stamp() -> TermEntryStamp {
     // `fetch_update`, not `try_update`: identical semantics (the closure-CAS
     // loop returning the previous value), but stable since 1.45 — `try_update`
@@ -189,6 +189,31 @@ pub struct TermStore {
     /// across pop: deliberately conservative, fail-closed. Mirrors
     /// `to_real_shadowed`. (#isint-shadow)
     is_int_shadowed: bool,
+    /// Monotone modification counter over the CHECKER-VISIBLE metadata
+    /// families of this store — the TermStore state the strict proof checker
+    /// (`ay-proof`) reads BESIDES the immutable term entries/sorts: the
+    /// `to_real_shadowed` and `is_int_shadowed` latches and the
+    /// `skolem_symbols` / `skolem_choice` registries. Those families mutate
+    /// through their registration mutators WITHOUT appending a term or
+    /// advancing the structural generation, so [`Self::snapshot_stamp`]
+    /// equality alone does NOT prove them unchanged; any consumer replaying
+    /// checker-derived conclusions (the strict-walk memo,
+    /// `ay-dpll` #strict-walk-memo) must additionally compare
+    /// [`Self::checker_visible_metadata_generation`].
+    ///
+    /// CONTRACT (kept by construction, pinned by the memo's adversarial
+    /// tests): every mutation of these four families either bumps this
+    /// counter ([`Self::mark_to_real_shadowed`],
+    /// [`Self::mark_is_int_shadowed`], [`Self::mark_skolem_symbol`],
+    /// [`Self::register_skolem_choice`] — including a `skolem_choice`
+    /// OVERWRITE, which changes the table at unchanged size) or retires the
+    /// snapshot stamp ([`Self::rollback_to`] pruning, `mark_and_compact`
+    /// remapping — both advance the structural generation — and `Clone`,
+    /// which mints a fresh identity). Bumps happen only on an ACTUAL state
+    /// change, so a re-record of an identical value costs no consumer a
+    /// false invalidation; the counter never decreases.
+    /// (#checker-visible-metadata-generation)
+    checker_visible_metadata_generation: u64,
     /// Per-instance term memory counter (bytes). Not shared across instances.
     /// Tracks approximate allocation for THIS TermStore only, enabling
     /// per-solver memory budgets without cross-instance interference (#6563).
@@ -316,6 +341,7 @@ impl Clone for TermStore {
             false_term: self.false_term,
             to_real_shadowed: self.to_real_shadowed,
             is_int_shadowed: self.is_int_shadowed,
+            checker_visible_metadata_generation: self.checker_visible_metadata_generation,
             // These are conservative allocation ledgers, not a fresh capacity
             // census. A cloned Vec/HashMap may reserve less than its source,
             // so copying can overcount, but never undercounts the source's
@@ -504,6 +530,7 @@ impl TermStore {
             false_term: None,
             to_real_shadowed: false,
             is_int_shadowed: false,
+            checker_visible_metadata_generation: 0,
             instance_term_bytes: 0,
             heap_data_bytes: 0,
             bucket_capacity_bytes: 0,
@@ -555,6 +582,7 @@ impl TermStore {
             false_term: None,
             to_real_shadowed: false,
             is_int_shadowed: false,
+            checker_visible_metadata_generation: 0,
             instance_term_bytes: 0,
             heap_data_bytes: 0,
             bucket_capacity_bytes: 0,
@@ -719,7 +747,12 @@ impl TermStore {
     /// its exact substitution, freshness, uniqueness, and dependency provenance,
     /// so membership remains exact authority rather than a name heuristic.
     pub fn mark_skolem_symbol(&mut self, name: impl Into<String>) {
-        self.skolem_symbols.insert(name.into());
+        if self.skolem_symbols.insert(name.into()) {
+            // A NEW registration changes what the strict checker's
+            // `is_skolem_symbol` authority answers without touching the term
+            // arena; see #checker-visible-metadata-generation.
+            self.bump_checker_visible_metadata_generation();
+        }
     }
 
     /// Whether `name` was minted by Skolemization ([`Self::mark_skolem_symbol`]).
@@ -735,6 +768,16 @@ impl TermStore {
     /// stay unregistered so the printer fails closed.
     pub fn register_skolem_choice(&mut self, witness: TermId, choice: SkolemChoice) {
         if matches!(self.get(witness), TermData::Var(..)) {
+            // Both a FIRST registration and an OVERWRITE change what the
+            // strict checker's `skolem_choice` authority answers — and an
+            // overwrite leaves the table SIZE unchanged, so nothing but this
+            // bump makes the change observable to a stamp-keyed consumer;
+            // see #checker-visible-metadata-generation. Bump only on an
+            // actual value change so a re-registration of the identical
+            // choice costs no consumer a false invalidation.
+            if self.skolem_choice.get(&witness) != Some(&choice) {
+                self.bump_checker_visible_metadata_generation();
+            }
             self.skolem_choice.insert(witness, choice);
         }
     }
@@ -815,6 +858,26 @@ impl TermStore {
             generation: self.rollback_generation,
             len: self.terms.len(),
         }
+    }
+
+    /// Current value of the checker-visible-metadata modification counter —
+    /// see the `checker_visible_metadata_generation` field docs
+    /// (#checker-visible-metadata-generation) for the exact families it
+    /// covers and the mutation contract. A consumer replaying strict-checker
+    /// conclusions must require BOTH an equal [`Self::snapshot_stamp`] (term
+    /// arena) and an equal value here (checker-read metadata): neither
+    /// authority implies the other.
+    #[must_use]
+    pub fn checker_visible_metadata_generation(&self) -> u64 {
+        self.checker_visible_metadata_generation
+    }
+
+    /// Record one actual state change of a checker-visible metadata family.
+    fn bump_checker_visible_metadata_generation(&mut self) {
+        self.checker_visible_metadata_generation = self
+            .checker_visible_metadata_generation
+            .checked_add(1)
+            .expect("checker-visible metadata generation exhausted");
     }
 
     /// Retire every structural snapshot and affine rollback checkpoint minted
@@ -1070,6 +1133,12 @@ impl TermStore {
     /// Sticky (never cleared, even on pop): conservative, fail-closed.
     /// (#to-real-bridge)
     pub fn mark_to_real_shadowed(&mut self) {
+        if !self.to_real_shadowed {
+            // The latch flip changes what the strict checker's ground
+            // evaluator accepts without touching the term arena; see
+            // #checker-visible-metadata-generation.
+            self.bump_checker_visible_metadata_generation();
+        }
         self.to_real_shadowed = true;
     }
 
@@ -1085,6 +1154,11 @@ impl TermStore {
     /// for a free predicate (a confirmed wrong-UNSAT class). Sticky (never
     /// cleared, even on pop): conservative, fail-closed. (#isint-shadow)
     pub fn mark_is_int_shadowed(&mut self) {
+        if !self.is_int_shadowed {
+            // Same observability argument as `mark_to_real_shadowed`; see
+            // #checker-visible-metadata-generation.
+            self.bump_checker_visible_metadata_generation();
+        }
         self.is_int_shadowed = true;
     }
 
@@ -1164,6 +1238,7 @@ impl TermStore {
             false_term,
             to_real_shadowed: false,
             is_int_shadowed: false,
+            checker_visible_metadata_generation: 0,
             instance_term_bytes: 0,
             heap_data_bytes: 0,
             bucket_capacity_bytes: 0,

@@ -47,3 +47,5 @@ mod default_lambda_wrong_sat;
 mod qf_aufnia_nested_array_row_wrong_sat;
 #[path = "group_arrays/qf_ax_benchmark_suite.rs"]
 mod qf_ax_benchmark_suite;
+#[path = "group_arrays/store_chain_computed_value_dead_node.rs"]
+mod store_chain_computed_value_dead_node;

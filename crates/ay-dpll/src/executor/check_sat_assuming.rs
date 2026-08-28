@@ -546,10 +546,17 @@ impl Executor {
         // from an earlier public query.
         self.strict_check_invocations.set(0);
         self.strict_check_steps_validated.set(0);
+        // #strict-walk-memo: verdicts are per-publication too. The currency
+        // key would already retire cross-query entries (any interning changes
+        // the snapshot stamp), but clearing here bounds retained memory and
+        // keeps the memo's lifetime exactly the counters' lifetime.
+        self.strict_check_memo_hits.set(0);
+        self.strict_walk_memo.borrow_mut().clear();
         // Keep public-query authority immutable: subset re-solves must not
         // promote temporary assertion windows to authored premises.
         self.clear_preprocessing_proof_records();
         self.last_proof_rebuild_originals.clear();
+        self.last_proof_raw_original_assertions.clear();
         self.skip_model_eval = false;
         self.read_pin_repair_done = false;
         self.nra_algebraic_model.clear();

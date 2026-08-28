@@ -56,6 +56,12 @@ impl Executor {
                 RepairEntry::NativeStrictWireGap,
             );
         }
+        if self.proof_has_known_wire_gap(proof) {
+            self.replace_with_exact_authored_divisibility_refutation(
+                proof,
+                RepairEntry::NativeStrictWireGap,
+            );
+        }
         true
     }
 
@@ -102,7 +108,10 @@ impl Executor {
         );
         strict_gated_cascade_member!(replace_with_exact_authored_guarded_linear_refutation);
         strict_gated_cascade_member!(replace_with_exact_authored_linear_refutation);
-        strict_gated_cascade_member!(replace_with_exact_authored_divisibility_refutation);
+        strict_gated_cascade_member!(
+            replace_with_exact_authored_divisibility_refutation,
+            RepairEntry::Check
+        );
         strict_gated_cascade_member!(replace_with_exact_authored_affine_euf_refutation);
         strict_gated_cascade_member!(replace_with_exact_authored_bv_refutation);
         strict_gated_cascade_member!(replace_with_exact_authored_store_permutation_refutation);

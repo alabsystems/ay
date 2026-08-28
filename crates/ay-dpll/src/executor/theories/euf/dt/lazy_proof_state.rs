@@ -27,6 +27,7 @@ pub(super) struct DtLazyProofState {
     dt_context_conflicts: DtContextConflictSink,
     propagated_values: PropagationRecords,
     rebuild_originals: Vec<TermId>,
+    raw_original_assertions: Vec<TermId>,
     term_overrides: Option<HashMap<TermId, String>>,
     reconstruction_suppressed: bool,
     translation_incomplete: bool,
@@ -47,6 +48,7 @@ impl DtLazyProofState {
             dt_context_conflicts: executor.dt_context_conflict_records.clone(),
             propagated_values: executor.propagated_value_provenance.clone(),
             rebuild_originals: executor.last_proof_rebuild_originals.clone(),
+            raw_original_assertions: executor.last_proof_raw_original_assertions.clone(),
             term_overrides: executor.last_proof_term_overrides.clone(),
             reconstruction_suppressed: executor.last_unsat_proof_reconstruction_suppressed,
             translation_incomplete: executor.quantified_proof_translation_incomplete,
@@ -70,6 +72,7 @@ impl DtLazyProofState {
         executor.dt_context_conflict_records = self.dt_context_conflicts;
         executor.propagated_value_provenance = self.propagated_values;
         executor.last_proof_rebuild_originals = self.rebuild_originals;
+        executor.last_proof_raw_original_assertions = self.raw_original_assertions;
         executor.last_proof_term_overrides = self.term_overrides;
         executor.last_unsat_proof_reconstruction_suppressed = self.reconstruction_suppressed;
         executor.quantified_proof_translation_incomplete = self.translation_incomplete;

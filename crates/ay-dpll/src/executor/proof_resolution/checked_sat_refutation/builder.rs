@@ -217,6 +217,92 @@ fn prepare_strict_context(
 /// both namespaces, a derived index mismatch, a canonical id without a trace
 /// mapping) returns `None`, which keeps the historical EXHAUSTIVE
 /// authentication — strictly fail-closed.
+/// Refuse a refutation whose ORIGINAL cone rests on a CEGQI counterexample lemma.
+///
+/// CEGQI mints a fresh counterexample variable `__ay_ce_<binder>!<n>`
+/// (`cegqi/mod.rs`'s `mk_internal_symbol`) and asserts the NEGATED body of a
+/// `forall` at it (`create_ce_lemma` returns `mk_not(substituted)` for the
+/// universal case). That lemma is then pushed into the MAIN assertion set
+/// (`quantifier_loop/preprocess.rs`'s `self.ctx.assertions.push(ce_lemma)`), so
+/// its conjuncts reach the SAT solver as ORDINARY ORIGINAL CLAUSES.
+///
+/// Those clauses assert a fragment of `NOT F(e)` at a fresh `e`. The authored
+/// problem asserts `F`. So a resolution refutation that uses them refutes
+/// `problem AND NOT F(e)` -- very often just `F(e)` against `NOT F(e)` -- which
+/// is NOT a refutation of the authored problem. Such a cone must never mint a
+/// certificate, whatever else is true about it.
+///
+/// Measured on the verification-consumer ext_eq push/pop refutation: the empty-clause cone
+/// holds 21 originals, two of which are `(<= 0 __ay_ce_ext_eq_i_12!15)` and
+/// `(< __ay_ce_ext_eq_i_12!15 (seq_len vec))` -- both visible in the
+/// `--probe-cert-reject` census. AY still answers `unsat` there, correctly, via
+/// `disambiguate_cegqi_unsat`, which by design refuses to publish a
+/// CE-dependent conflict; only the CERTIFICATE is withheld.
+///
+/// This is defence in depth, not a new capability. Today the funnel already
+/// declines these cones, but only as an ACCIDENT of which recognizers happen to
+/// exist -- no lane currently authenticates `(<= 0 e)` for a fresh `e`. Any
+/// future recognizer that did would silently certify a non-entailed premise:
+/// the recognizer-without-validator hole, the worst class of bug in this
+/// codebase. Making the invariant CHECKED costs one cone walk and removes that
+/// standing hazard. It can only ever turn an authority walk into an earlier and
+/// better-named refusal; it can never admit a refutation the funnel would
+/// otherwise reject.
+fn reject_counterexample_contaminated_cone(
+    executor: &Executor,
+    validated: &ValidatedPremisedClauseTraceResolution,
+    original_id_cone: Option<&HashSet<u64>>,
+    meter: &mut CheckedRefutationMeter,
+) -> Result<(), CheckedSatRefutationError> {
+    let Some(cone) = original_id_cone else {
+        // No cone means the exhaustive fallback is in force, and every original
+        // is already in scope for the ordinary authority battery.
+        return Ok(());
+    };
+    let Some(var_to_term) = executor.last_var_to_term.as_ref() else {
+        return Ok(());
+    };
+    let terms = &executor.ctx.terms;
+    let dag = validated.dag();
+    for (id, literals) in &dag.original_clauses {
+        if !cone.contains(id) {
+            continue;
+        }
+        for literal in literals {
+            meter.charge(1, 0)?;
+            let variable = literal.variable().index() as u32;
+            let Some(&term) = var_to_term.get(&variable) else {
+                continue;
+            };
+            if let Some(symbol) = counterexample_symbol_in(terms, term) {
+                return Err(CheckedSatRefutationError::CounterexampleContaminatedCone {
+                    clause: *id,
+                    symbol,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The name of a CEGQI counterexample variable occurring in `root`, if any.
+fn counterexample_symbol_in(terms: &TermStore, root: TermId) -> Option<String> {
+    let mut stack = vec![root];
+    let mut seen: HashSet<TermId> = HashSet::default();
+    while let Some(term) = stack.pop() {
+        if !seen.insert(term) {
+            continue;
+        }
+        if let TermData::Var(name, _) = terms.get(term) {
+            if name.starts_with("__ay_ce_") {
+                return Some(name.clone());
+            }
+        }
+        stack.extend(terms.children(term));
+    }
+    None
+}
+
 fn original_cone_trace_ids(
     validated: &ValidatedPremisedClauseTraceResolution,
     meter: &mut CheckedRefutationMeter,
@@ -465,6 +551,13 @@ pub(super) fn build(
     let strict = prepare_strict_context(executor, &mut replay.meter)?;
     let original_id_cone = original_cone_trace_ids(&replay.validated, &mut replay.meter)?;
     phase("cone");
+    reject_counterexample_contaminated_cone(
+        executor,
+        &replay.validated,
+        original_id_cone.as_ref(),
+        &mut replay.meter,
+    )?;
+    phase("ce-cone-guard");
     let fragment = build_fragment(
         executor,
         &authority,

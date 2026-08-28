@@ -662,6 +662,12 @@ enum CheckedSatRefutationError {
     AuthoredRootMismatch,
     #[error("no SAT clause trace is available")]
     MissingClauseTrace,
+    #[error(
+        "original clause {clause} in the empty-clause cone rests on CEGQI counterexample \
+         symbol {symbol}, which asserts a fragment of the NEGATED quantifier body at a fresh \
+         variable and is not entailed by the authored problem"
+    )]
+    CounterexampleContaminatedCone { clause: u64, symbol: String },
     #[error("the SAT trace has no authoritative solver variable-namespace size")]
     MissingSatVariableNamespace,
     #[error("the SAT trace has no solver-minted active-scope authority")]
@@ -1418,6 +1424,7 @@ mod tests {
     use crate::executor::SkolemInstanceRecord;
     use crate::executor_types::SolveResult;
     include!("checked_sat_refutation/incremental_id_tests.rs");
+    include!("checked_sat_refutation/counterexample_cone_tests.rs");
     fn contradictory_unit_executor() -> (Executor, TermId, TermId) {
         let mut executor = Executor::new();
         let proposition = executor.ctx.terms.mk_var("p", Sort::Bool);

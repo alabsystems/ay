@@ -1,0 +1,414 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates
+// Licensed under the Apache License, Version 2.0
+
+//! Checked use-site bridges for exact authored assumption spellings.
+//!
+//! A source assertion can elaborate to an equivalent canonical term whose
+//! Alethe text differs (`(>= t 0)` becomes `(<= 0 t)`, or `(* 4 a)` is stored
+//! as `(* a 4)`). Carcara matches `assume` against the problem syntactically,
+//! while later resolution must consume the canonical clause. A document-wide
+//! override satisfies only one side of that boundary. This module confines the
+//! exact source text to `tK.a`, proves source=canonical with checked stock
+//! rules, and restores the original proof id `tK` as the canonical unit.
+
+use super::{split_application, AlethePrintError, AlethePrinter};
+use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
+use ay_core::{Proof, ProofId, ProofStep, Sort, TermData, TermId};
+
+mod bounds;
+mod equivalence;
+
+use bounds::{
+    account_authored_assume_emission, account_authored_assume_planning_input,
+    canonical_term_is_bounded_for_authored_assume, invalid_authored_assume_plan,
+};
+
+const MAX_AUTHORED_ASSUME_BRIDGES: usize = 8_192;
+const MAX_EQUIVALENCE_DEPTH: usize = 64;
+const MAX_EQUIVALENCE_NODES: usize = 256;
+const MAX_EQUIVALENCE_BYTES: usize = 64 * 1024;
+const MAX_EQUIVALENCE_TOTAL_INPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_EQUIVALENCE_TOTAL_NODES: usize = 64 * 1024;
+const MAX_EQUIVALENCE_TOTAL_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CANONICAL_RENDER_NODES: usize = 8 * 1024;
+const MAX_AUTHORED_ASSUME_PLANNER_STEPS: usize = 1_000_000;
+
+#[derive(Clone, Copy)]
+enum EquivalenceLeafSchema {
+    AuthoredAssume,
+    MultiplicationOnly,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum EquivalenceDirection {
+    SurfaceToCanonical,
+    CanonicalToSurface,
+}
+
+fn oriented_equivalence(surface: &str, canonical: &str, direction: EquivalenceDirection) -> String {
+    match direction {
+        EquivalenceDirection::SurfaceToCanonical => format!("(= {surface} {canonical})"),
+        EquivalenceDirection::CanonicalToSurface => format!("(= {canonical} {surface})"),
+    }
+}
+
+struct AuthoredAssumePlan {
+    surface: String,
+    canonical: String,
+    input_bytes: usize,
+}
+
+#[derive(Default)]
+struct AuthoredAssumeAccounting {
+    bridge_count: usize,
+    total_input_bytes: usize,
+    total_nodes: usize,
+    total_output_bytes: usize,
+}
+
+#[derive(Default)]
+struct AuthoredAssumePlanner {
+    planned: HashMap<TermId, AuthoredAssumePlan>,
+    unsupported: HashSet<TermId>,
+    bridged_ids: HashSet<ProofId>,
+    inspected_terms: usize,
+    accounting: AuthoredAssumeAccounting,
+}
+
+fn consumed_authored_assume_ids(proof: &Proof) -> Result<Vec<bool>, AlethePrintError> {
+    if proof.steps.len() > MAX_AUTHORED_ASSUME_PLANNER_STEPS {
+        return Err(invalid_authored_assume_plan(
+            ProofId(0),
+            "proof step count exceeds the authored assume planner bound",
+        ));
+    }
+    let mut consumed = vec![false; proof.steps.len()];
+    for (index, step) in proof.steps.iter().enumerate() {
+        let mut mark = |premise: ProofId| -> Result<(), AlethePrintError> {
+            let Some(slot) = consumed.get_mut(premise.0 as usize) else {
+                return Err(invalid_authored_assume_plan(
+                    ProofId(index as u32),
+                    "proof step references an out-of-range premise in authored assume planner",
+                ));
+            };
+            *slot = true;
+            Ok(())
+        };
+        match step {
+            ProofStep::Step { premises, .. } => {
+                for &premise in premises {
+                    mark(premise)?;
+                }
+            }
+            ProofStep::Resolution {
+                clause1, clause2, ..
+            } => {
+                mark(*clause1)?;
+                mark(*clause2)?;
+            }
+            ProofStep::Anchor { end_step, .. } => mark(*end_step)?,
+            ProofStep::Assume(_) | ProofStep::TheoryLemma { .. } => {}
+            _ => {
+                return Err(invalid_authored_assume_plan(
+                    ProofId(index as u32),
+                    "unrecognized proof-step dependency shape in authored assume planner",
+                ));
+            }
+        }
+    }
+    Ok(consumed)
+}
+
+impl AlethePrinter<'_> {
+    /// Materialize exactly the bridge `format_step` would emit for one proof
+    /// id. The planner uses the returned byte length and node count, so id
+    /// length, premise lists, and duplicate rows are accounted byte-for-byte
+    /// rather than through a shared per-term estimate.
+    fn render_authored_assume_bridge(
+        &self,
+        id: ProofId,
+        term: TermId,
+        surface: &str,
+        canonical: &str,
+    ) -> (Option<String>, usize) {
+        let mut equality_steps = Vec::new();
+        let mut nodes = 0;
+        let equality_id = format!("{id}.n");
+        if !self.build_authored_surface_equivalence(
+            &equality_id,
+            surface,
+            term,
+            EquivalenceLeafSchema::AuthoredAssume,
+            EquivalenceDirection::SurfaceToCanonical,
+            0,
+            &mut nodes,
+            &mut equality_steps,
+        ) {
+            return (None, nodes);
+        }
+        let equality = format!("(= {surface} {canonical})");
+        let mut output = format!("(assume {id}.a {surface})\n");
+        output.push_str(&equality_steps.join("\n"));
+        output.push('\n');
+        output.push_str(&format!(
+            "(step {id}.e (cl (not {equality}) (not {surface}) {canonical}) :rule equiv_pos2)\n\
+             (step {id} (cl {canonical}) :rule resolution :premises ({id}.e {equality_id} {id}.a))"
+        ));
+        (Some(output), nodes)
+    }
+
+    /// Charge the planner's exact dry run and the later emitted bridge for one
+    /// consumed assume id. Returns `false` only for a source/canonical pair
+    /// outside the supported checked equivalence schemas.
+    fn plan_authored_assume_use(
+        &self,
+        id: ProofId,
+        term: TermId,
+        plan: &AuthoredAssumePlan,
+        accounting: &mut AuthoredAssumeAccounting,
+    ) -> Result<bool, AlethePrintError> {
+        account_authored_assume_planning_input(id, plan.input_bytes, accounting)?;
+
+        let (rendered, nodes) =
+            self.render_authored_assume_bridge(id, term, &plan.surface, &plan.canonical);
+        let Some(planning_nodes) = accounting.total_nodes.checked_add(nodes) else {
+            return Err(invalid_authored_assume_plan(
+                id,
+                "authored assume bridge node accounting overflowed",
+            ));
+        };
+        if planning_nodes > MAX_EQUIVALENCE_TOTAL_NODES {
+            return Err(invalid_authored_assume_plan(
+                id,
+                "authored assume bridges exceed the aggregate node bound",
+            ));
+        }
+        accounting.total_nodes = planning_nodes;
+        let Some(rendered) = rendered else {
+            return Ok(false);
+        };
+        let output_bytes = rendered.len();
+        let Some(planning_output_bytes) = accounting.total_output_bytes.checked_add(output_bytes)
+        else {
+            return Err(invalid_authored_assume_plan(
+                id,
+                "authored assume bridge aggregate output size overflowed",
+            ));
+        };
+        if planning_output_bytes > MAX_EQUIVALENCE_TOTAL_OUTPUT_BYTES {
+            return Err(invalid_authored_assume_plan(
+                id,
+                "authored assume bridges exceed the aggregate output-size bound",
+            ));
+        }
+        accounting.total_output_bytes = planning_output_bytes;
+        account_authored_assume_emission(id, plan, nodes, output_bytes, accounting)?;
+        Ok(true)
+    }
+
+    fn plan_new_authored_assume_term(
+        &self,
+        id: ProofId,
+        term: TermId,
+        surface: &str,
+        planner: &mut AuthoredAssumePlanner,
+    ) -> Result<Option<AuthoredAssumePlan>, AlethePrintError> {
+        let Some(next_inspected) = planner.inspected_terms.checked_add(1) else {
+            return Err(invalid_authored_assume_plan(
+                id,
+                "authored assume inspected-term count overflowed",
+            ));
+        };
+        if next_inspected > MAX_AUTHORED_ASSUME_BRIDGES {
+            return Err(invalid_authored_assume_plan(
+                id,
+                "authored assume inspected-term count exceeds the planner bound",
+            ));
+        }
+        planner.inspected_terms = next_inspected;
+        if !matches!(self.terms.sort(term), Sort::Bool) {
+            return Err(invalid_authored_assume_plan(
+                id,
+                "an authored assume bridge root is not Boolean",
+            ));
+        }
+        if !canonical_term_is_bounded_for_authored_assume(self.terms, term) {
+            return Err(invalid_authored_assume_plan(
+                id,
+                "authored assume canonical term exceeds the structural rendering bound",
+            ));
+        }
+        let canonical = crate::render_term_canonical(self.terms, term);
+        let Some(input_bytes) = surface.len().checked_add(canonical.len()) else {
+            return Err(invalid_authored_assume_plan(
+                id,
+                "authored assume bridge input size overflowed",
+            ));
+        };
+        if input_bytes > MAX_EQUIVALENCE_BYTES {
+            return Err(invalid_authored_assume_plan(
+                id,
+                "one authored assume bridge exceeds the input-size bound",
+            ));
+        }
+        if surface == canonical {
+            account_authored_assume_planning_input(id, input_bytes, &mut planner.accounting)?;
+            return Ok(None);
+        }
+        let plan = AuthoredAssumePlan {
+            surface: surface.to_string(),
+            canonical,
+            input_bytes,
+        };
+        if !self.plan_authored_assume_use(id, term, &plan, &mut planner.accounting)? {
+            return Ok(None);
+        }
+        Ok(Some(plan))
+    }
+
+    fn plan_one_authored_assume_id(
+        &self,
+        id: ProofId,
+        term: TermId,
+        surface: &str,
+        planner: &mut AuthoredAssumePlanner,
+    ) -> Result<(), AlethePrintError> {
+        if planner.accounting.bridge_count >= MAX_AUTHORED_ASSUME_BRIDGES {
+            return Err(invalid_authored_assume_plan(
+                id,
+                "authored assume bridge count exceeds the planner bound",
+            ));
+        }
+        if let Some(plan) = planner.planned.get(&term) {
+            if !self.plan_authored_assume_use(id, term, plan, &mut planner.accounting)? {
+                return Err(invalid_authored_assume_plan(
+                    id,
+                    "planned authored assume equivalence lost its checked derivation",
+                ));
+            }
+            planner.bridged_ids.insert(id);
+            return Ok(());
+        }
+        if planner.unsupported.contains(&term) {
+            return Ok(());
+        }
+        let Some(plan) = self.plan_new_authored_assume_term(id, term, surface, planner)? else {
+            planner.unsupported.insert(term);
+            return Ok(());
+        };
+        planner.bridged_ids.insert(id);
+        planner.planned.insert(term, plan);
+        Ok(())
+    }
+
+    fn commit_authored_assume_plan(
+        &self,
+        proof_step_count: usize,
+        planner: AuthoredAssumePlanner,
+    ) -> Result<(), AlethePrintError> {
+        let accounting = &planner.accounting;
+        let Some(total_charge) = proof_step_count
+            .checked_mul(2)
+            .and_then(|work| work.checked_add(accounting.total_input_bytes))
+            .and_then(|work| {
+                accounting
+                    .total_nodes
+                    .checked_mul(32)
+                    .and_then(|node_work| work.checked_add(node_work))
+            })
+            .and_then(|work| work.checked_add(accounting.total_output_bytes))
+            .and_then(|work| u64::try_from(work).ok())
+        else {
+            return Err(invalid_authored_assume_plan(
+                ProofId(0),
+                "authored assume planner work accounting overflowed",
+            ));
+        };
+        self.charge(total_charge);
+        if self.work_budget_exhausted() {
+            return Err(self.work_budget_error(0));
+        }
+
+        let mut canonical_renderings = self.let_bridge_renderings.borrow_mut();
+        let mut surfaces = self.authored_assume_surfaces.borrow_mut();
+        let mut bridged = self.authored_assume_bridged.borrow_mut();
+        if planner.planned.keys().any(|term| {
+            canonical_renderings.contains_key(term)
+                || surfaces.contains_key(term)
+                || self.folded_assume_surfaces.borrow().contains_key(term)
+        }) || !bridged.is_empty()
+        {
+            return Err(invalid_authored_assume_plan(
+                ProofId(0),
+                "authored assume bridge conflicts with another assume rendering channel",
+            ));
+        }
+        for (term, plan) in planner.planned {
+            canonical_renderings.insert(term, plan.canonical);
+            surfaces.insert(term, plan.surface);
+        }
+        *bridged = planner.bridged_ids;
+        Ok(())
+    }
+
+    /// Atomically move supported source spellings into the assume-only channel.
+    ///
+    /// Every admitted equivalence is independently expressible through
+    /// `comp_simplify`, binary numeric-multiplication `aci_simp`, and `cong`.
+    /// Anything else is left to the existing fail-closed surface validators.
+    pub(super) fn plan_equivalent_authored_assumes(
+        &self,
+        proof: &Proof,
+    ) -> Result<(), AlethePrintError> {
+        let Some(overrides) = self.term_overrides else {
+            return Ok(());
+        };
+        if overrides.is_empty() {
+            return Ok(());
+        }
+        let consumed = consumed_authored_assume_ids(proof)?;
+        let mut planner = AuthoredAssumePlanner::default();
+        for (index, step) in proof.steps.iter().enumerate() {
+            let ProofStep::Assume(term) = step else {
+                continue;
+            };
+            if !consumed[index] {
+                continue;
+            }
+            let Some(surface) = overrides.get(term) else {
+                continue;
+            };
+            self.plan_one_authored_assume_id(ProofId(index as u32), *term, surface, &mut planner)?;
+        }
+        self.commit_authored_assume_plan(proof.steps.len(), planner)
+    }
+
+    pub(super) fn format_equivalent_authored_assume_bridge(
+        &self,
+        id: ProofId,
+        term: TermId,
+    ) -> Result<Option<String>, AlethePrintError> {
+        let Some(surface) = self.authored_assume_surfaces.borrow().get(&term).cloned() else {
+            return Ok(None);
+        };
+        if !self.authored_assume_bridged.borrow().contains(&id) {
+            return Ok(Some(format!("(assume {id} {surface})")));
+        }
+        let Some(canonical) = self.let_bridge_renderings.borrow().get(&term).cloned() else {
+            return Err(AlethePrintError::InvalidSurfaceStep {
+                id,
+                reason: "authored assume bridge lost its canonical rendering".to_string(),
+            });
+        };
+        let (output, _) = self.render_authored_assume_bridge(id, term, &surface, &canonical);
+        let Some(output) = output else {
+            return Err(AlethePrintError::InvalidSurfaceStep {
+                id,
+                reason: "planned authored assume equivalence no longer has a checked derivation"
+                    .to_string(),
+            });
+        };
+        Ok(Some(output))
+    }
+}

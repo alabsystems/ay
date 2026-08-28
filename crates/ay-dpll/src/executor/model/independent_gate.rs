@@ -37,7 +37,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use ay_core::kani_compat::DetHashMap;
+use ay_core::kani_compat::{DetHashMap, DetHashSet};
 use ay_core::term::{Symbol, TermData, TermEntryStamp, TermStoreSnapshotStamp};
 use ay_core::{Sort, TermId, TermStore};
 use ay_fp::FpModelValue;
@@ -119,6 +119,7 @@ struct SharedViewCaches {
     resolved_none: Rc<RefCell<HashSet<TermId>>>,
     def_index: Rc<RefCell<Option<HashMap<TermId, Vec<TermId>>>>>,
     datatype_guard: Rc<OnceCell<super::rendered_dt_guard::RenderedDatatypeGuard>>,
+    exact_datatype_cells: Rc<OnceCell<ExactDatatypeCellValues>>,
 }
 
 impl SharedViewCaches {
@@ -128,7 +129,40 @@ impl SharedViewCaches {
             resolved_none: Rc::new(RefCell::new(HashSet::new())),
             def_index: Rc::new(RefCell::new(None)),
             datatype_guard: Rc::new(OnceCell::new()),
+            exact_datatype_cells: Rc::new(OnceCell::new()),
         }
+    }
+}
+
+/// One unique, structurally typed datatype value per exact cell spelling.
+/// `None` poisons a spelling for which the fixed model supplied two different
+/// constructor trees. Both the raw EUF carrier (`@D!n`) and the exact rendered
+/// tree are indexed, so array extraction and completion may use either spelling
+/// without handing equality two encodings of the same semantic value.
+type ExactDatatypeCellValues = HashMap<Sort, HashMap<String, Option<ExactDatatypeCellValue>>>;
+
+#[derive(Clone)]
+struct ExactDatatypeCellValue {
+    rendered: String,
+    value: ModelValue,
+}
+
+fn merge_exact_datatype_cell_value(
+    values: &mut ExactDatatypeCellValues,
+    sort: &Sort,
+    spelling: &str,
+    candidate: &ExactDatatypeCellValue,
+) {
+    let slot = values
+        .entry(sort.clone())
+        .or_default()
+        .entry(spelling.to_string())
+        .or_insert_with(|| Some(candidate.clone()));
+    if slot
+        .as_ref()
+        .is_some_and(|existing| existing.rendered != candidate.rendered)
+    {
+        *slot = None;
     }
 }
 
@@ -169,6 +203,10 @@ struct IndependentModelView<'a> {
     /// One bounded datatype-schema snapshot and per-sort fragment memo for all
     /// rendered cells parsed by this fixed gate view.
     datatype_guard: Rc<OnceCell<super::rendered_dt_guard::RenderedDatatypeGuard>>,
+    /// Lazily indexed same-sort EUF carrier -> unique structured `dt_ground`
+    /// value. This is producer normalization, not opaque-token equality:
+    /// absent, malformed, foreign-sort, or conflicting classes stay unparsed.
+    exact_datatype_cells: Rc<OnceCell<ExactDatatypeCellValues>>,
     /// Array variables currently being resolved through their definitional
     /// equality — guards against cyclic/mutual array definitions (e.g.
     /// `(= a b)` with `(= b a)`), which would otherwise recurse forever.
@@ -748,6 +786,26 @@ impl ModelView for IndependentModelView<'_> {
             return None;
         }
         let pin = self.uf_app_value(t);
+        // #dt-ground-uf-canonical-pin: a datatype-sorted application must use
+        // the gate's canonical constructor-bearing encoding.  An opaque
+        // `Uninterpreted("@D!n")` carrier token is not a datatype value and
+        // must neither be compared to nor override the concrete constructor
+        // tree emitted by the ground-application model fallback.  Treat that
+        // non-canonical pin as absent so the reconciled PUBLIC interpretation
+        // below may supply its independently parsed value.  If no readable
+        // printed interpretation exists, the result remains `None` and the
+        // gate fails closed exactly as before; no opaque token is coerced.
+        let pin = match pin {
+            Some(ModelValue::Uninterpreted(_))
+                if self
+                    .exec
+                    .datatype_sort_name(self.exec.ctx.terms.sort(t))
+                    .is_some() =>
+            {
+                None
+            }
+            other => other,
+        };
         let Some(interp) = self.printed_uf_interpretation_for_app(t) else {
             return pin;
         };
@@ -821,6 +879,7 @@ impl<'a> IndependentModelView<'a> {
             exec,
             model,
             datatype_guard: caches.datatype_guard,
+            exact_datatype_cells: caches.exact_datatype_cells,
             resolving: RefCell::new(HashSet::new()),
             resolved: caches.resolved,
             resolved_none: caches.resolved_none,
@@ -836,6 +895,203 @@ impl IndependentModelView<'_> {
     fn datatype_guard(&self) -> &super::rendered_dt_guard::RenderedDatatypeGuard {
         self.datatype_guard
             .get_or_init(|| super::rendered_dt_guard::RenderedDatatypeGuard::new(self.exec))
+    }
+
+    /// Resolve one array-cell spelling only when Phase 5 produced a unique,
+    /// exactly typed constructor tree for that spelling's same-sort EUF class.
+    /// This deliberately runs before the generic scalar parser collapses a
+    /// datatype carrier to `ModelValue::Uninterpreted`.
+    fn exact_datatype_cell_value(&self, spelling: &str, sort: &Sort) -> Option<ModelValue> {
+        self.exact_datatype_cells
+            .get_or_init(|| self.build_exact_datatype_cell_values())
+            .get(sort)?
+            .get(spelling)?
+            .as_ref()
+            .map(|entry| entry.value.clone())
+    }
+
+    fn build_exact_datatype_cell_values(&self) -> ExactDatatypeCellValues {
+        const MAX_TERMS: usize = 4_096;
+        const MAX_GROUND: usize = 1_024;
+        const MAX_WORK: usize = 4 * 1_024 * 1_024;
+
+        let mut values = ExactDatatypeCellValues::new();
+        let Some(euf) = self.model.euf_model.as_ref() else {
+            return values;
+        };
+        if euf.term_values.len() > MAX_TERMS || self.model.dt_ground.len() > MAX_GROUND {
+            return values;
+        }
+        let guard = self.datatype_guard();
+        if !guard.is_bounded() {
+            return values;
+        }
+        let mut constructor_tokens = DetHashSet::default();
+        for (_, constructors) in self.exec.ctx.datatype_iter() {
+            for constructor in constructors {
+                constructor_tokens.insert(constructor.clone());
+                constructor_tokens.insert(self.exec.dt_surface(constructor).to_string());
+            }
+        }
+        let mut work = 0usize;
+        for (&term, value) in &self.model.dt_ground {
+            if self.exec.ctx.terms.entry_stamp(term).is_none() {
+                continue;
+            }
+            let sort = self.exec.ctx.terms.sort(term);
+            let registered = guard.is_registered(sort);
+            let shape_matches =
+                registered && self.structured_datatype_value_matches_sort(value, sort, guard);
+            if !shape_matches {
+                continue;
+            }
+            let Some(value_work) = super::rendered_dt_limits::model_value_work(value) else {
+                continue;
+            };
+            let Some(rendered) = self.exec.format_gate_model_value(value, sort) else {
+                continue;
+            };
+            let Some(next_work) = work
+                .checked_add(value_work)
+                .and_then(|next| next.checked_add(rendered.len()))
+            else {
+                return ExactDatatypeCellValues::new();
+            };
+            if next_work > MAX_WORK {
+                return ExactDatatypeCellValues::new();
+            }
+            work = next_work;
+            let entry = ExactDatatypeCellValue {
+                rendered: rendered.clone(),
+                value: value.clone(),
+            };
+            merge_exact_datatype_cell_value(&mut values, sort, &rendered, &entry);
+
+            let Some(carrier) = euf.term_values.get(&term) else {
+                continue;
+            };
+            if super::datatype_cell_authority::exact_datatype_carrier_token(
+                guard,
+                &constructor_tokens,
+                sort,
+                carrier,
+            ) {
+                let Some(next_work) = work.checked_add(carrier.len()) else {
+                    return ExactDatatypeCellValues::new();
+                };
+                if next_work > MAX_WORK {
+                    return ExactDatatypeCellValues::new();
+                }
+                work = next_work;
+                merge_exact_datatype_cell_value(&mut values, sort, carrier, &entry);
+            }
+        }
+        values
+    }
+
+    /// Re-check constructor owner, arity, every field sort, and all nested
+    /// container cells before an opaque carrier can be normalized. The walk is
+    /// bounded independently of the construction phase and rejects every
+    /// unsupported or mismatched shape.
+    fn structured_datatype_value_matches_sort(
+        &self,
+        root: &ModelValue,
+        root_sort: &Sort,
+        guard: &super::rendered_dt_guard::RenderedDatatypeGuard,
+    ) -> bool {
+        const MAX_NODES: usize = 1_024;
+        const MAX_DEPTH: usize = 32;
+
+        let mut stack = vec![(root, root_sort.clone(), 0usize)];
+        let mut nodes = 0usize;
+        while let Some((value, sort, depth)) = stack.pop() {
+            if depth > MAX_DEPTH {
+                return false;
+            }
+            nodes = match nodes.checked_add(1) {
+                Some(next) if next <= MAX_NODES => next,
+                _ => return false,
+            };
+            if let Some(expected_datatype) = guard.datatype_name(&sort) {
+                let ModelValue::Datatype { ctor, args } = value else {
+                    return false;
+                };
+                let Some((actual_datatype, internal_ctor)) = self.exec.ctx.is_constructor(ctor)
+                else {
+                    return false;
+                };
+                if actual_datatype != expected_datatype || internal_ctor.as_str() != ctor.as_str() {
+                    return false;
+                }
+                let Some(fields) = self.exec.ctx.constructor_selector_info(ctor) else {
+                    return false;
+                };
+                if fields.len() != args.len()
+                    || stack
+                        .len()
+                        .checked_add(args.len())
+                        .is_none_or(|pending| pending > MAX_NODES)
+                {
+                    return false;
+                }
+                stack.extend(
+                    args.iter()
+                        .zip(fields)
+                        .map(|(arg, (_, field_sort))| (arg, field_sort.clone(), depth + 1)),
+                );
+                continue;
+            }
+            match (value, &sort) {
+                (ModelValue::Bool(_), Sort::Bool)
+                | (ModelValue::Int(_), Sort::Int)
+                | (ModelValue::Real(_), Sort::Real)
+                | (ModelValue::Str(_), Sort::String)
+                | (ModelValue::Uninterpreted(_), Sort::Uninterpreted(_)) => {}
+                (ModelValue::BitVec { width, value }, Sort::BitVec(bitvec))
+                    if *width == bitvec.width
+                        && value.sign() != num_bigint::Sign::Minus
+                        && value.bits() <= u64::from(*width) => {}
+                (ModelValue::Array(array), Sort::Array(array_sort)) => {
+                    let extra = match array
+                        .store
+                        .len()
+                        .checked_mul(2)
+                        .and_then(|n| n.checked_add(1))
+                    {
+                        Some(extra) => extra,
+                        None => return false,
+                    };
+                    if stack
+                        .len()
+                        .checked_add(extra)
+                        .is_none_or(|pending| pending > MAX_NODES)
+                    {
+                        return false;
+                    }
+                    stack.push((&array.default, array_sort.element_sort.clone(), depth + 1));
+                    for (index, cell) in &array.store {
+                        stack.push((index, array_sort.index_sort.clone(), depth + 1));
+                        stack.push((cell, array_sort.element_sort.clone(), depth + 1));
+                    }
+                }
+                (ModelValue::Seq(elements), Sort::Seq(element_sort)) => {
+                    if stack
+                        .len()
+                        .checked_add(elements.len())
+                        .is_none_or(|pending| pending > MAX_NODES)
+                    {
+                        return false;
+                    }
+                    stack.extend(
+                        elements
+                            .iter()
+                            .map(|element| (element, element_sort.as_ref().clone(), depth + 1)),
+                    );
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Whether every live declaration at a canonical theory-operator identity
@@ -2098,7 +2354,8 @@ impl IndependentModelView<'_> {
 
     /// The PUBLISHED total interpretation of the function applied at `t`, or
     /// `None` when `t` is not a positive-arity application or `(get-model)`
-    /// would not print one through the EUF-table route
+    /// would not print one through either the EUF-table route or the exact
+    /// ground-application fallback
     /// (#g3-gate-reads-printed-uf).
     ///
     /// WHY THIS EXISTS. Commit 66538b006f turned the `CannotConfirm` arm of
@@ -2236,6 +2493,15 @@ impl IndependentModelView<'_> {
             {
                 return Some(v);
             }
+        }
+        // Producer-side datatype normalization: the exact same-sort EUF class
+        // may be spelled as an extractor carrier in an array interpretation
+        // while total-DT construction retains its constructor tree. Resolve
+        // only that unique, structurally rechecked class value. Generic opaque
+        // tokens, missing classes, and poisoned conflicts still fall through
+        // and remain incomparable with datatypes.
+        if let Some(value) = self.exact_datatype_cell_value(s, sort) {
+            return Some(value);
         }
         // Parse exact array-cell constructor text before the scalar parser collapses it to an
         // opaque `Element`; malformed trees and abstract carriers still fail closed.
@@ -3072,6 +3338,34 @@ impl Executor {
             // diagnostic only: even the string `confirmed` cannot discharge a
             // quantified leaf without this typed, current capability.
             || directly_confirmed;
+        // SINGLE-VALUEDNESS WHERE THE WINDOW NARROWS (#bv2nat-subst-recover,
+        // follow-on). `confirm_model`'s UF single-valuedness is a CROSS-conjunct
+        // property: it keys applications by their evaluated argument values over
+        // whatever window it is given. When `quantified_certified` holds, the
+        // window below DROPS every conjunct containing a quantifier, so the
+        // applications inside those conjuncts — including the instantiation
+        // copies the ground lane actually constrained — are never keyed at all,
+        // and a model can conflict with itself without any visible conjunct
+        // evaluating false.
+        //
+        // Measured: `v = a & 1` (so `v` in `{0,1}`), `forall x in [0,1]. f x >
+        // 100`, `f v < 50` came back `sat` with `v = 0`, `f(v) = 1`, `f(0) =
+        // 101` — an `f` that is not a function, on a query that is UNSAT.
+        //
+        // So when the window narrows, demand the one property the narrowing
+        // costs: the candidate's own function tables must BE functions.
+        // Fail-closed only (Sat -> Unknown), and deliberately NOT applied to the
+        // full-window case, where `confirm_model` establishes the property
+        // itself and where the gate's pre-completion view of a table is a
+        // coarser thing than the printer's (measured: two QF_UFLIA `Hash`
+        // benchmarks whose printed model IS a function).
+        if quantified_certified {
+            if let Some(detail) = view.non_functional_uf_interpretation() {
+                return GateVerdict::CannotConfirm {
+                    reason: format!("the candidate model is not a function: {detail}"),
+                };
+            }
+        }
         let mut independently_checkable = Vec::new();
         if quantified_certified {
             for &assertion in &query_roots {
@@ -8031,6 +8325,48 @@ mod tests {
     use num_rational::BigRational;
 
     use super::*;
+
+    #[test]
+    fn conflicting_exact_datatype_cell_spellings_are_poisoned() {
+        let sort = Sort::Uninterpreted("CellDatatype".to_string());
+        let first = ExactDatatypeCellValue {
+            rendered: "CellDatatype_first".to_string(),
+            value: ModelValue::Datatype {
+                ctor: "CellDatatype_first".to_string(),
+                args: Vec::new(),
+            },
+        };
+        let second = ExactDatatypeCellValue {
+            rendered: "CellDatatype_second".to_string(),
+            value: ModelValue::Datatype {
+                ctor: "CellDatatype_second".to_string(),
+                args: Vec::new(),
+            },
+        };
+        let mut values = ExactDatatypeCellValues::new();
+
+        merge_exact_datatype_cell_value(&mut values, &sort, "@CellDatatype!0", &first);
+        merge_exact_datatype_cell_value(&mut values, &sort, "@CellDatatype!0", &first);
+        assert_eq!(
+            values[&sort]["@CellDatatype!0"]
+                .as_ref()
+                .map(|entry| entry.rendered.as_str()),
+            Some("CellDatatype_first"),
+            "an identical repeat must retain the unique structured value"
+        );
+
+        merge_exact_datatype_cell_value(&mut values, &sort, "@CellDatatype!0", &second);
+        assert!(
+            values[&sort]["@CellDatatype!0"].is_none(),
+            "two constructor trees for one exact same-sort carrier must poison it"
+        );
+        assert!(
+            values
+                .get(&Sort::Uninterpreted("ForeignDatatype".to_string()))
+                .is_none(),
+            "carrier authority must remain sort-local"
+        );
+    }
 
     /// Solve `input` through the full executor pipeline (gate included).
     fn solved(input: &str) -> (Executor, Vec<String>) {

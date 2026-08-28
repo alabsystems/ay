@@ -172,6 +172,7 @@ impl Executor {
         self.proof_problem_assertion_provenance = None;
         self.clear_preprocessing_proof_records();
         self.last_proof_rebuild_originals.clear();
+        self.last_proof_raw_original_assertions.clear();
         self.last_proof_decline = None;
         self.last_proof_quality = None;
         self.last_unknown_reason = None;

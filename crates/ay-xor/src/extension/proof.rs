@@ -69,6 +69,7 @@ impl XorExtension {
     }
 
     /// Whether chunked (Tseitin-chain) proof emission is active.
+    #[cfg(test)]
     pub(crate) fn chunked_proof_active(&self) -> bool {
         self.chunked.is_some()
     }

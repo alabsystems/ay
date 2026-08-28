@@ -529,7 +529,7 @@ impl Solver {
                     if !self.cold.clause_ids_disabled {
                         // Split-borrow form: the ledger iteration above holds
                         // `cold.original_ledger` borrowed.
-                        super::cold::ColdState::grow_clause_ids(
+                        cold::ColdState::grow_clause_ids(
                             &mut self.cold.clause_ids,
                             self.cold.clause_ids_reserve_hint,
                             idx,
@@ -570,7 +570,7 @@ impl Solver {
                     if !self.cold.clause_ids_disabled {
                         // Split-borrow form: `clause` above borrows
                         // `cold.original_ledger`.
-                        super::cold::ColdState::grow_clause_ids(
+                        cold::ColdState::grow_clause_ids(
                             &mut self.cold.clause_ids,
                             self.cold.clause_ids_reserve_hint,
                             idx,

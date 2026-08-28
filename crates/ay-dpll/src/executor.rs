@@ -20,7 +20,7 @@ use ay_frontend::{Command, CommandResult, Context, OptionValue};
 use ay_proof::PartialProofCheck;
 use ay_sat::{ClauseTrace, SatUnknownReason};
 use proof_original_rebuild::bv_lia_recovery_state::ExactIteUfDefinitionRecovery;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Duration;
 
@@ -608,6 +608,17 @@ pub struct Executor {
     /// once during the rebuild (stable within the solve — no re-elaboration
     /// between capture and the gate) and cleared per check-sat.
     pub(crate) last_proof_rebuild_originals: Vec<TermId>,
+    /// Exact raw re-interns of top-level parsed problem assertions captured by
+    /// the last proof rebuild.
+    ///
+    /// This is deliberately narrower than `last_proof_rebuild_originals`,
+    /// which can also admit strictly checked derived repair premises. A raw
+    /// term may be printed directly as an Alethe `assume` only when it occurs
+    /// in both sets: the general set grants proof authority, while this set
+    /// proves that its identity rendering is an actual problem-file premise.
+    /// Cleared and rolled back at the same query boundaries as the general
+    /// rebuild scope.
+    pub(crate) last_proof_raw_original_assertions: Vec<TermId>,
     /// Why the last refutation carries no derivation, when it carries none.
     ///
     /// Diagnostic only: nothing consults this to decide a verdict, mint a
@@ -645,6 +656,17 @@ pub struct Executor {
     /// bound labelled "submitted", not a claim every step was individually
     /// accepted). Dumped as `proof.strict_check_steps_validated`.
     pub(in crate::executor) strict_check_steps_validated: Cell<u64>,
+    /// #strict-walk-memo — stored strict-check verdicts keyed on the complete
+    /// walk context (literal document, term-store snapshot stamp, datatype
+    /// registries, authored scope). Replays a verdict the checker already
+    /// established for a byte-identical input; any context drift is a miss
+    /// and a real walk. See `proof/check/strict_memo.rs` for the currency
+    /// argument. `RefCell` because the chokepoint takes `&self`.
+    pub(in crate::executor) strict_walk_memo: RefCell<proof::StrictWalkMemo>,
+    /// #strict-walk-memo companion counter: chokepoint entries answered from
+    /// the memo this publication. Real walks = invocations - hits. Dumped as
+    /// `proof.strict_check_memo_hits`.
+    pub(in crate::executor) strict_check_memo_hits: Cell<u64>,
     /// #cert-accounting item 3: the DECLARED consumer of the decision query
     /// currently executing on this executor.
     ///
@@ -1338,7 +1360,7 @@ pub struct Executor {
     /// `dt_theory_model` on first print/get-value use (interior-mutable
     /// memo; cleared whenever `dt_theory_model` changes). `Arc` so callers
     /// can hold the assignment without borrowing the executor.
-    dt_egraph_assignment: std::cell::RefCell<Option<Arc<model::DtEgraphAssignment>>>,
+    dt_egraph_assignment: RefCell<Option<Arc<model::DtEgraphAssignment>>>,
     /// Reentrancy latch for the assignment builder: while building, nested
     /// evaluation must not consult the (incomplete) assignment.
     dt_egraph_building: Cell<bool>,
@@ -1353,7 +1375,7 @@ pub struct Executor {
     /// O(selects × assertions); an n-ary `distinct` over N selects expands to
     /// ~N²/2 assertions, so validation cost exploded to tens of seconds by
     /// N≈400 on instances whose solve took 0.1s.
-    array_def_index: std::cell::RefCell<Option<model::ArrayDefIndexCache>>,
+    array_def_index: RefCell<Option<model::ArrayDefIndexCache>>,
     /// Exact-snapshot structural index of reserved integer div/mod witnesses.
     ///
     /// Zero-divisor evaluation remains keyed by independently evaluated
@@ -1371,8 +1393,7 @@ pub struct Executor {
     /// scanned the WHOLE term store per array to find its constrained reads —
     /// O(arrays × terms) during model-output completion.
     #[allow(clippy::type_complexity)]
-    select_by_array_index:
-        std::cell::RefCell<(usize, ay_core::kani_compat::DetHashMap<TermId, Vec<TermId>>)>,
+    select_by_array_index: RefCell<(usize, ay_core::kani_compat::DetHashMap<TermId, Vec<TermId>>)>,
     /// Cached ground-term reachability closure of `(assertions, assumptions)`
     /// behind `term_is_required_by_last_query`: `(assertions snapshot,
     /// assumptions snapshot, reachable set)`. Validated by BYTE-EXACT snapshot
@@ -1380,7 +1401,7 @@ pub struct Executor {
     /// DFS it replaces, which previously ran PER CANDIDATE READ during array
     /// completion — O(reads × forest) with fresh hash-set churn each time).
     #[allow(clippy::type_complexity)]
-    required_terms_index: std::cell::RefCell<
+    required_terms_index: RefCell<
         Option<(
             Vec<TermId>,
             Option<Vec<TermId>>,

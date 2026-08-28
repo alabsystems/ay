@@ -103,10 +103,9 @@ fn drop_floor_gate_refutation_is_sat() {
 // (`dt_diseq_opaque_satisfiable`), so the query is `sat` with a concrete model.
 // ---------------------------------------------------------------------------
 
-use ay_dpll::api::{DatatypeConstructor, DatatypeField, DatatypeSort, Logic, Solver, Sort};
+use ay_dpll::api::{DatatypeConstructor, DatatypeField, DatatypeSort, Logic, Solver, Sort, Term};
 
-#[test]
-fn datatype_valued_uf_disequality_with_assumption_binding_is_sat() {
+fn datatype_valued_uf_problem() -> (Solver, Term, Term) {
     let mut s = Solver::new(Logic::All);
     // ObjectiveEvalError (sole nullary ctor) and Result<i128, _> (Ok(BV128)|Err).
     s.try_declare_datatype(&DatatypeSort::new(
@@ -135,12 +134,30 @@ fn datatype_valued_uf_disequality_with_assumption_binding_is_sat() {
         ],
     ))
     .unwrap();
-    // PbTerm datatype (the array element sort) + ground-seeded element arrays.
+    // Exact TrustVC carrier topology: `PbTerm` contains a nested BV-indexed
+    // array of `PbLit`, and the outer terms slice is another BV-indexed array.
+    // Keeping the inner datatype array is load-bearing: a scalar-only PbTerm
+    // missed the model-completion collision exercised by the real proof.
+    s.try_declare_datatype(&DatatypeSort::new(
+        "PbLit",
+        vec![DatatypeConstructor::new(
+            "PbLit_PbLit",
+            vec![
+                DatatypeField::new("PbLit_PbLit_var", Sort::bitvec(32)),
+                DatatypeField::new("PbLit_PbLit_negated", Sort::Bool),
+            ],
+        )],
+    ))
+    .unwrap();
+    let lits_array = Sort::array(Sort::bitvec(64), Sort::Uninterpreted("PbLit".to_string()));
     s.try_declare_datatype(&DatatypeSort::new(
         "PbTerm",
         vec![DatatypeConstructor::new(
             "PbTerm_PbTerm",
-            vec![DatatypeField::new("PbTerm_PbTerm_coeff", Sort::bitvec(128))],
+            vec![
+                DatatypeField::new("PbTerm_PbTerm_coeff", Sort::bitvec(128)),
+                DatatypeField::new("PbTerm_PbTerm_lits", lits_array),
+            ],
         )],
     ))
     .unwrap();
@@ -168,7 +185,7 @@ fn datatype_valued_uf_disequality_with_assumption_binding_is_sat() {
     let sat_app = s.apply(&saturating, &[terms, assignment]);
     let chk_app = s.apply(&checked, &[terms, assignment]);
 
-    // Top-level assertions: ground seeds + the datatype disequality.
+    // Top-level assertions: ground seeds and the concrete body binding.
     let i0 = s.bv_const_u64(0, 64);
     let sel_a = s.select(assignment, i0);
     let ga = s.eq(sel_a, seed_assign);
@@ -178,17 +195,51 @@ fn datatype_valued_uf_disequality_with_assumption_binding_is_sat() {
     s.assert_term(gt);
     let eqd = s.eq(sat_app, chk_app);
     let diseq = s.not(eqd);
-    s.assert_term(diseq);
 
-    // The body binding `result == eval_terms_saturating(..)` as a check_sat_assuming
-    // ASSUMPTION (exactly how deductive-checks carries the return-value binding).
     let body_binding = s.eq(result, sat_app);
+    (s, body_binding, diseq)
+}
+
+#[test]
+fn datatype_valued_uf_disequality_with_assumption_binding_is_sat() {
+    let (mut pushed_solver, pushed_body, pushed_diseq) = datatype_valued_uf_problem();
+    pushed_solver.assert_term(pushed_body);
+
+    // TrustVC's ordinary obligation path carries the body at base scope, then
+    // asserts the refutation in a pushed frame.  Exercise that incremental
+    // publication path before the assumption control below: both authored
+    // equalities validate, and the independent gate must read the same concrete
+    // constructor-valued ground-UF table that `(get-model)` publishes.
+    pushed_solver.try_push().unwrap();
+    pushed_solver.assert_term(pushed_diseq);
+    let pushed = pushed_solver.check_sat_with_details();
+    assert!(
+        pushed.result.result().is_sat(),
+        "pushed datatype-UF distinguishability must retain its genuine SAT; got {:?} ({:?})",
+        pushed.result.result(),
+        pushed.unknown_diagnostic,
+    );
+    assert!(
+        pushed.verification.sat_model_validated,
+        "pushed SAT must carry sealed model-validation evidence: {pushed:#?}"
+    );
+    pushed_solver.try_pop().unwrap();
+
+    // Preserve the original assumption-rooted completion control in a fresh
+    // context: the `result == saturating(..)` body binding exists only in the
+    // assumption, while the distinct checked result is a base assertion.
+    let (mut s, body_binding, diseq) = datatype_valued_uf_problem();
+    s.assert_term(diseq);
     let r = s.check_sat_assuming(&[body_binding]);
     assert_eq!(
         format!("{:?}", r.result()),
         "Sat",
         "two distinct Result-valued UF applications must be distinguishable (concrete \
          datatype model), not unknown"
+    );
+    assert!(
+        r.was_model_validated(),
+        "SAT must carry sealed model-validation evidence for TrustVC consumers"
     );
     drop(r);
 
@@ -211,6 +262,74 @@ fn datatype_valued_uf_disequality_with_assumption_binding_is_sat() {
         !model.contains("@Result"),
         "opaque Result carrier token leaked into the public model: {model}"
     );
+}
+
+/// A pushed, redundant positive equality can become structurally ground only
+/// after datatype model completion.  The datatype-array performance shortcut
+/// must not mask that final independent observation: strict consumers require
+/// a sealed SAT witness even when either operand is selector-observed.
+#[test]
+fn pushed_observed_datatype_uf_equality_is_validated_sat() {
+    let mut s = Solver::new(Logic::All);
+    s.try_declare_datatype(&DatatypeSort::new(
+        "ObservedArg",
+        vec![DatatypeConstructor::new(
+            "ObservedArg_mk",
+            vec![DatatypeField::new("ObservedArg_value", Sort::bitvec(8))],
+        )],
+    ))
+    .unwrap();
+    s.try_declare_datatype(&DatatypeSort::new(
+        "ObservedResult",
+        vec![
+            DatatypeConstructor::new(
+                "ObservedResult_ok",
+                vec![DatatypeField::new(
+                    "ObservedResult_value",
+                    Sort::bitvec(128),
+                )],
+            ),
+            DatatypeConstructor::new("ObservedResult_err", vec![]),
+        ],
+    ))
+    .unwrap();
+
+    let arg_sort = Sort::array(
+        Sort::bitvec(64),
+        Sort::Uninterpreted("ObservedArg".to_string()),
+    );
+    let bools_sort = Sort::array(Sort::bitvec(64), Sort::Bool);
+    let result_sort = Sort::Uninterpreted("ObservedResult".to_string());
+    let args = s.declare_const("observed_args", arg_sort.clone());
+    let bools = s.declare_const("observed_bools", bools_sort.clone());
+    let result = s.declare_const("observed_result", result_sort.clone());
+    let checked = s.declare_fun("observed_checked", &[arg_sort, bools_sort], result_sort);
+    let checked_app = s.apply(&checked, &[args, bools]);
+
+    // Make `result` non-opaque to the datatype discipline while keeping the
+    // query satisfiable.  This is the shape that reaches TrustVC from a real
+    // Result-returning body whose constructor payload is observable.
+    let observed_value = s.datatype_selector("ObservedResult_value", result, Sort::bitvec(128));
+    let zero = s.bv_const_u64(0, 128);
+    let value_is_zero = s.eq(observed_value, zero);
+    s.assert_term(value_is_zero);
+
+    let body = s.eq(result, checked_app);
+    s.assert_term(body);
+    s.try_push().unwrap();
+    s.assert_term(body);
+    let details = s.check_sat_with_details();
+    assert!(
+        details.result.result().is_sat(),
+        "completed pushed equality must remain SAT, got {:?} ({:?})",
+        details.result.result(),
+        details.unknown_diagnostic,
+    );
+    assert!(
+        details.verification.sat_model_validated,
+        "completed pushed equality must carry sealed validation: {details:#?}"
+    );
+    s.try_pop().unwrap();
 }
 
 /// SOUNDNESS: applications of one datatype-valued UF must obey congruence.

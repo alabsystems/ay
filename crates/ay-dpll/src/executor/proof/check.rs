@@ -18,6 +18,12 @@ use ay_proof::{ProofCheckError, ProofQuality};
 mod internal;
 #[path = "check/strict.rs"]
 mod strict;
+#[path = "check/strict_memo.rs"]
+mod strict_memo;
+#[cfg(test)]
+#[path = "check/strict_memo_tests.rs"]
+mod strict_memo_tests;
+pub(in crate::executor) use self::strict_memo::{StrictWalkKey, StrictWalkMemo};
 #[path = "strict_check_progress.rs"]
 mod strict_check_progress;
 use self::strict_check_progress::check_with_executor_progress;
@@ -163,6 +169,13 @@ impl Executor {
             .set_int("proof.strict_check_invocations", invocations);
         self.last_statistics
             .set_int("proof.strict_check_steps_validated", steps);
+        // #strict-walk-memo companion: entries answered from a stored verdict
+        // instead of a fresh whole-document walk. Real checker walks this
+        // publication = invocations - hits.
+        self.last_statistics.set_int(
+            "proof.strict_check_memo_hits",
+            self.strict_check_memo_hits.get(),
+        );
         // (#ground-conflict-decomp) Exact meters for the two decomposition
         // arms: attempted = applied + declined, per inspected trust lemma.
         self.last_statistics.set_int(

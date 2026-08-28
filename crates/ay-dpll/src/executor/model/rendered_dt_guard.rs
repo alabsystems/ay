@@ -24,6 +24,7 @@ use super::rendered_dt_limits::{
 /// closed.
 pub(super) struct RenderedDatatypeGuard {
     schemas: Option<HashMap<String, DatatypeSchema>>,
+    #[cfg(test)]
     exact_by_sort: RefCell<HashMap<Sort, bool>>,
     exact_array_cell_by_sort: RefCell<HashMap<Sort, bool>>,
 }
@@ -103,6 +104,7 @@ impl RenderedDatatypeGuard {
         }
         Self {
             schemas: Some(schemas),
+            #[cfg(test)]
             exact_by_sort: RefCell::new(HashMap::default()),
             exact_array_cell_by_sort: RefCell::new(HashMap::default()),
         }
@@ -111,6 +113,7 @@ impl RenderedDatatypeGuard {
     fn invalid() -> Self {
         Self {
             schemas: None,
+            #[cfg(test)]
             exact_by_sort: RefCell::new(HashMap::default()),
             exact_array_cell_by_sort: RefCell::new(HashMap::default()),
         }
@@ -136,7 +139,8 @@ impl RenderedDatatypeGuard {
     /// total-DT construction produces typed [`ay_model_check::ModelValue`]s
     /// that the strict oracles and the independent gate evaluate directly, so
     /// it needs a bounded registered schema but NOT the exact rendered
-    /// round-trip fragment. Requiring [`Self::is_exact`] here (as the original
+    /// round-trip fragment. Requiring the test-only scalar rendered-exactness
+    /// predicate here (as the original
     /// opaque-lane landing did) silently excluded every datatype with a scalar
     /// payload field (e.g. `Cons(hd: Int, tl: List)`): construction bailed
     /// entirely, other completion passes still committed structured values for
@@ -148,6 +152,7 @@ impl RenderedDatatypeGuard {
         self.datatype_name(sort).is_some()
     }
 
+    #[cfg(test)]
     pub(super) fn is_exact(&self, sort: &Sort) -> bool {
         if self.datatype_name(sort).is_none() {
             return false;

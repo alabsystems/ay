@@ -224,6 +224,32 @@ fn mv_to_eval(mv: &ModelValue) -> EvalValue {
     }
 }
 
+/// Whether a structured datatype value has the exact scalar canonical form
+/// carried by [`EvalValue::Element`]. Arrays, sequences, floating-point, and
+/// algebraic values deliberately stay out of that comparison lane. They may
+/// still remain as exact [`ModelValue`] trees in `dt_ground`, where structural
+/// selector projection and the independent gate consume them without a lossy
+/// conversion.
+fn dt_canonical_pin_supported(value: &ModelValue) -> bool {
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            ModelValue::Bool(_)
+            | ModelValue::Int(_)
+            | ModelValue::Real(_)
+            | ModelValue::BitVec { .. }
+            | ModelValue::Str(_)
+            | ModelValue::Uninterpreted(_) => {}
+            ModelValue::Datatype { args, .. } => stack.extend(args),
+            ModelValue::Array(_)
+            | ModelValue::Seq(_)
+            | ModelValue::FloatingPoint { .. }
+            | ModelValue::Algebraic(_) => return false,
+        }
+    }
+    true
+}
+
 /// Convert a committed scalar [`EvalValue`] into a [`ModelValue`] guided by
 /// the term's sort. `None` when the value cannot be represented faithfully
 /// (fail closed — the field/class is then left unconstructed).
@@ -395,10 +421,18 @@ impl Executor {
             opaque_scope,
             datatype_guard,
             opaque_apps,
-            datatype_names,
+            mut datatype_names,
             datatype_members,
             strict_opaque_scope,
         ) = preflight.into_parts();
+        if strict_opaque_scope {
+            datatype_names = self.opaque_dt_constructible_names(
+                extra_roots,
+                &datatype_names,
+                &datatype_members,
+                &opaque_apps,
+            )?;
+        }
         let terms_store = &self.ctx.terms;
         let is_dt_sort = |t: TermId| {
             if !strict_opaque_scope {
@@ -798,6 +832,161 @@ impl Executor {
             values: HashMap::default(),
             work_budget,
         })
+    }
+
+    /// Keep opaque completion component-local when another datatype sort in
+    /// the same query has an unsupported producer.
+    ///
+    /// The collector used to bail out globally: one inexact datatype-valued
+    /// array read (for example `select` from `Array<BV64, PbTerm>` where
+    /// `PbTerm` itself contains an `Array<BV64, PbLit>`) prevented an unrelated
+    /// `Result<BV128, E>`-valued UF disequality from receiving any model
+    /// values. The SAT search then published the same completion default for
+    /// both Result applications and the independent gate correctly rejected
+    /// the model.
+    ///
+    /// This pass removes only the unsupported producer's registered datatype
+    /// sort and datatypes whose constructor fields depend on it. Other
+    /// components retain the exact pre-existing construction algorithm and all
+    /// downstream validation. A same-sort or schema-dependent unsupported term
+    /// still removes the opaque applications from collection, causing the
+    /// preflight/count match to fail closed exactly as before.
+    fn opaque_dt_constructible_names(
+        &self,
+        extra_roots: &[TermId],
+        all_names: &HashSet<String>,
+        datatype_members: &HashMap<String, ay_frontend::DeclarationKind>,
+        opaque_apps: &HashSet<TermId>,
+    ) -> Option<HashSet<String>> {
+        let registered_name = |term: TermId| match self.ctx.terms.sort(term) {
+            Sort::Uninterpreted(name) if all_names.contains(name) => Some(name.as_str()),
+            Sort::Datatype(datatype) if all_names.contains(&datatype.name) => {
+                Some(datatype.name.as_str())
+            }
+            _ => None,
+        };
+
+        let mut blocked = HashSet::default();
+        let mut seen = HashSet::default();
+        let mut stack: Vec<TermId> = self
+            .ctx
+            .assertions
+            .iter()
+            .copied()
+            .chain(extra_roots.iter().copied())
+            .collect();
+        while let Some(term) = stack.pop() {
+            if !seen.insert(term) {
+                continue;
+            }
+            let result_name = registered_name(term);
+            match self.ctx.terms.get(term) {
+                TermData::Var(_, _) => {}
+                TermData::App(symbol, args) => {
+                    if let Some(name) = result_name {
+                        let kind = datatype_members.get(symbol.name()).copied();
+                        let supported = kind
+                            == Some(ay_frontend::DeclarationKind::DatatypeConstructor)
+                            || (args.len() == 1
+                                && kind == Some(ay_frontend::DeclarationKind::DatatypeSelector))
+                            || opaque_apps.contains(&term);
+                        if !supported {
+                            blocked.insert(name.to_string());
+                        }
+                    }
+                    stack.extend(args.iter().copied());
+                }
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(condition, then_term, else_term) => {
+                    if let Some(name) = result_name {
+                        blocked.insert(name.to_string());
+                    }
+                    stack.push(*condition);
+                    stack.push(*then_term);
+                    stack.push(*else_term);
+                }
+                TermData::Forall(..) | TermData::Exists(..) => {}
+                TermData::Let(..) => {
+                    // The ground collector deliberately does not interpret
+                    // binder environments.  A datatype-valued `let` is
+                    // therefore an unsupported producer in this lane and
+                    // must block its component just like a datatype-valued
+                    // `ite`; retaining the sort here would let the preflight
+                    // count a term that collection silently omits.
+                    if let Some(name) = result_name {
+                        blocked.insert(name.to_string());
+                    }
+                }
+                _ => {
+                    if let Some(name) = result_name {
+                        blocked.insert(name.to_string());
+                    }
+                }
+            }
+        }
+
+        // Reverse schema dependencies once, then close the blocked set toward
+        // datatypes whose constructor values would embed a blocked datatype.
+        // The rendered-schema preflight already bounded every descriptor to 32
+        // levels / 1024 nodes; repeat those exact caps while borrowing them.
+        let mut reverse: HashMap<String, Vec<String>> = HashMap::default();
+        let mut sort_nodes = 0usize;
+        for owner in all_names {
+            for constructor in self.ctx.datatype_constructors(owner)? {
+                for (_, field_sort) in self.ctx.constructor_selector_info(constructor)? {
+                    let mut sorts = vec![(field_sort, 0usize)];
+                    while let Some((sort, depth)) = sorts.pop() {
+                        if depth > 32 {
+                            return None;
+                        }
+                        sort_nodes = sort_nodes.checked_add(1)?;
+                        if sort_nodes > 1024 {
+                            return None;
+                        }
+                        match sort {
+                            Sort::Uninterpreted(name) if all_names.contains(name) => {
+                                reverse.entry(name.clone()).or_default().push(owner.clone());
+                            }
+                            Sort::Datatype(datatype) if all_names.contains(&datatype.name) => {
+                                reverse
+                                    .entry(datatype.name.clone())
+                                    .or_default()
+                                    .push(owner.clone());
+                            }
+                            // Array/sequence fields are extensional model
+                            // boundaries, not direct constructor recursion.
+                            // A separately unsupported producer of their
+                            // element datatype does not make the owner
+                            // unconstructible: the owner retains the exact
+                            // structured container value, and the independent
+                            // array/sequence gate checks every observed cell.
+                            // Propagating through these carriers discarded
+                            // `PbObjective` merely because one `PbTerm` array
+                            // read was outside completion, hiding the objective's
+                            // otherwise exact `terms` projection.
+                            Sort::Array(_) | Sort::Seq(_) => {}
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        let mut pending: Vec<String> = blocked.iter().cloned().collect();
+        while let Some(name) = pending.pop() {
+            for dependent in reverse.get(&name).into_iter().flatten() {
+                if blocked.insert(dependent.clone()) {
+                    pending.push(dependent.clone());
+                }
+            }
+        }
+
+        Some(
+            all_names
+                .iter()
+                .filter(|name| !blocked.contains(*name))
+                .cloned()
+                .collect(),
+        )
     }
 
     fn exact_collected_datatype_sort_name(
@@ -1240,6 +1429,21 @@ impl DtBuilder<'_> {
                         continue;
                     }
                     let Some(mv) = eval_to_mv(&ev, fsort) else {
+                        // EUF extraction represents an array/sequence-sorted
+                        // selector by an opaque element token.  That token is
+                        // equality-class bookkeeping, not an exact container
+                        // value, so it must not poison an otherwise exact
+                        // constructor tree.  Treat only this sort-appropriate
+                        // opaque placeholder as absent and let the canonical
+                        // extensional default below own the field; observed
+                        // cells and congruence are rechecked independently.
+                        // Every other sort/value mismatch remains a hard
+                        // fail-closed conflict.
+                        if matches!(ev, EvalValue::Element(_))
+                            && matches!(fsort, Sort::Array(_) | Sort::Seq(_))
+                        {
+                            continue;
+                        }
                         return None; // unrepresentable committed value
                     };
                     match &chosen {
@@ -1507,7 +1711,41 @@ impl DtBuilder<'_> {
                 args: Vec::new(),
             });
         }
-        let j = k - nullary.len();
+        let mut j = k - nullary.len();
+        // A constructor can be perfectly inhabitable without carrying one of
+        // the variation sources below.  In particular, an array/sequence field
+        // has a canonical extensional default even though this completion lane
+        // deliberately does not invent distinct array/sequence values.  Give
+        // every such constructor its one exact base candidate before declaring
+        // the finite enumeration exhausted.  Different constructors remain
+        // pairwise-distinct by constructor identity; a second class requiring
+        // another value of the same constructor still fails closed.
+        for c in &non_nullary {
+            let fields = self.exec.ctx.constructor_selector_info(c)?;
+            let has_direct_recursion = fields
+                .iter()
+                .any(|(_, fs)| exact_datatype_sort_name(fs) == Some(dt_name));
+            let has_variable_scalar = fields.iter().any(|(_, fs)| {
+                matches!(fs, Sort::Int | Sort::Real | Sort::String | Sort::BitVec(_))
+            });
+            if has_direct_recursion || has_variable_scalar {
+                continue;
+            }
+            let args = fields
+                .iter()
+                .map(|(_, field_sort)| self.base_default(field_sort, &mut Vec::new()))
+                .collect::<Option<Vec<_>>>();
+            let Some(args) = args else {
+                continue;
+            };
+            if j == 0 {
+                return Some(ModelValue::Datatype {
+                    ctor: (*c).clone(),
+                    args,
+                });
+            }
+            j -= 1;
+        }
         // Variation constructor: prefer one with a directly-recursive field
         // (unbounded depth chain), else one with a variable scalar field.
         let mut visited = Vec::new();
@@ -1737,10 +1975,28 @@ impl DtBuilder<'_> {
             .position(|candidate| candidate == selector)
             .and_then(|index| args.get(index))
         {
-            return self
-                .work_budget
-                .charge_value(field)
-                .then(|| Some(mv_to_eval(field)));
+            if !self.work_budget.charge_value(field) {
+                return None;
+            }
+            let pin = mv_to_eval(field);
+            // `EvalValue` cannot carry an array and the active opaque lane
+            // deliberately does not admit sequence-valued scalar pins.  Do
+            // not let one such selector discard the completed datatype model
+            // for every independent component: retain the exact structured
+            // field in `dt_ground`, where the independent gate projects it
+            // from the constructor value itself, and omit only the lossy
+            // evaluator pin.  No value is coerced or defaulted here.
+            return Some(
+                matches!(
+                    &pin,
+                    EvalValue::Bool(_)
+                        | EvalValue::BitVec { .. }
+                        | EvalValue::Rational(_)
+                        | EvalValue::Element(_)
+                        | EvalValue::String(_)
+                )
+                .then_some(pin),
+            );
         }
         for &app in apps {
             let value = self.scalar_term_value(app);
@@ -1758,9 +2014,21 @@ impl DtBuilder<'_> {
         let Some(value) = self.base_default(&sort, &mut Vec::new()) else {
             return Some(None);
         };
-        self.work_budget
-            .charge_value(&value)
-            .then(|| Some(mv_to_eval(&value)))
+        if !self.work_budget.charge_value(&value) {
+            return None;
+        }
+        let pin = mv_to_eval(&value);
+        Some(
+            matches!(
+                &pin,
+                EvalValue::Bool(_)
+                    | EvalValue::BitVec { .. }
+                    | EvalValue::Rational(_)
+                    | EvalValue::Element(_)
+                    | EvalValue::String(_)
+            )
+            .then_some(pin),
+        )
     }
 
     fn finish_tester_pins(&mut self) -> Option<Vec<(TermId, EvalValue)>> {
@@ -1792,19 +2060,26 @@ impl DtBuilder<'_> {
             let Some(Some(value)) = self.values.get(&root) else {
                 continue;
             };
-            if !self.work_budget.charge_render(value) {
-                return None;
-            }
-            let canon = dt_canonical_string(value);
+            let canon = if dt_canonical_pin_supported(value) {
+                if !self.work_budget.charge_render(value) {
+                    return None;
+                }
+                Some(dt_canonical_string(value))
+            } else {
+                None
+            };
             for &m in self.members.get(&root).into_iter().flatten() {
                 let t = self.terms[m];
-                if !self.work_budget.charge_value(value)
-                    || !self.work_budget.charge_bytes(canon.len())
-                {
+                if !self.work_budget.charge_value(value) {
                     return None;
                 }
                 ground.push((t, value.clone()));
-                pins.push((t, EvalValue::Element(canon.clone())));
+                if let Some(canon) = &canon {
+                    if !self.work_budget.charge_bytes(canon.len()) {
+                        return None;
+                    }
+                    pins.push((t, EvalValue::Element(canon.clone())));
+                }
             }
         }
         Some(ground)
@@ -1889,5 +2164,430 @@ mod tests {
                     && dt_canonical_string(app_values[0]) == dt_canonical_string(app_values[1])),
             "a singleton sort cannot supply two distinct application values: {app_values:?}"
         );
+    }
+
+    #[test]
+    fn datatype_valued_let_blocks_same_sort_opaque_completion() {
+        let mut exec = loaded(
+            r#"
+                (declare-datatype D ((D_zero) (D_one)))
+                (declare-fun opaque ((_ BitVec 1)) D)
+                (assert (= (opaque #b0) D_zero))
+            "#,
+        );
+        let mut seen = HashSet::default();
+        let mut stack = exec.ctx.assertions.clone();
+        let mut opaque = None;
+        while let Some(term) = stack.pop() {
+            if !seen.insert(term) {
+                continue;
+            }
+            match exec.ctx.terms.get(term) {
+                TermData::App(symbol, args) => {
+                    if symbol.name() == "opaque" {
+                        opaque = Some(term);
+                    }
+                    stack.extend(args.iter().copied());
+                }
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(condition, then_term, else_term) => {
+                    stack.extend([*condition, *then_term, *else_term]);
+                }
+                _ => {}
+            }
+        }
+        let opaque = opaque.expect("fixture must contain the datatype-valued UF application");
+        // Parser elaboration normally substitutes source `let`s.  Inject the
+        // low-level form adversarially because internal rewrites can still
+        // construct it and the collector must fail closed for every TermData.
+        let opaque_let = exec.ctx.terms.mk_let(Vec::new(), opaque);
+        let extra_root = exec.ctx.terms.mk_eq(opaque_let, opaque);
+
+        let preflight = exec
+            .preflight_opaque_dt_collection(&[extra_root])
+            .expect("bounded adversarial fixture must pass resource preflight");
+        let (_, _, opaque_apps, names, members, strict) = preflight.into_parts();
+        assert!(strict, "fixture must exercise strict opaque collection");
+        assert!(opaque_apps.contains(&opaque));
+        let retained = exec
+            .opaque_dt_constructible_names(&[extra_root], &names, &members, &opaque_apps)
+            .expect("bounded datatype inventory must classify exactly");
+        assert!(
+            !retained.contains("D"),
+            "an unsupported datatype-valued let must block its same-sort component: {retained:?}"
+        );
+        assert!(
+            exec.dt_collect(&Model::empty(), &[extra_root]).is_none(),
+            "collection must fail closed instead of omitting the datatype-valued let"
+        );
+    }
+
+    #[test]
+    fn opaque_completion_retains_structured_datatype_for_gate_projection() {
+        let exec = loaded(
+            r#"
+                (declare-datatypes
+                    ((PbLit 0) (PbTerm 0) (PbObjective 0) (EvalError 0) (Result 0))
+                    (
+                        ((PbLit_mk
+                            (PbLit_var (_ BitVec 32))
+                            (PbLit_negated Bool)))
+                        ((PbTerm_mk
+                            (PbTerm_coeff (_ BitVec 128))
+                            (PbTerm_lits (Array (_ BitVec 64) PbLit))))
+                        ((PbObjective_empty)
+                         (PbObjective_mk
+                            (PbObjective_terms (Array (_ BitVec 64) PbTerm))))
+                        ((EvalError_overflow))
+                        ((Result_ok (Result_value (_ BitVec 128)))
+                         (Result_err (Result_error EvalError)))
+                    ))
+                (declare-const objective PbObjective)
+                (declare-const term PbTerm)
+                (declare-const assignment (Array (_ BitVec 64) Bool))
+                (declare-const result Result)
+                (declare-fun checked
+                    ((Array (_ BitVec 64) PbTerm) (Array (_ BitVec 64) Bool))
+                    Result)
+                (assert (= result
+                    (checked (PbObjective_terms objective) assignment)))
+                (assert ((_ is PbObjective_mk) objective))
+                (assert (= term
+                    (select (PbObjective_terms objective) #x0000000000000000)))
+            "#,
+        );
+        let preflight = exec
+            .preflight_opaque_dt_collection(&[])
+            .expect("bounded opaque fixture must pass preflight");
+        let (_, _, opaque_apps, names, members, strict) = preflight.into_parts();
+        assert!(strict, "the fixture must exercise strict opaque collection");
+        let retained = exec
+            .opaque_dt_constructible_names(&[], &names, &members, &opaque_apps)
+            .expect("bounded schemas must classify exactly");
+
+        assert!(
+            retained.contains("Result") && retained.contains("EvalError"),
+            "the unrelated scalar Result component must remain constructible: {retained:?}"
+        );
+        assert!(retained.contains("PbLit"));
+        assert!(
+            retained.contains("PbTerm"),
+            "an exactly typed canonical array select retains its structured datatype result: \
+             {retained:?}"
+        );
+        assert!(
+            retained.contains("PbObjective"),
+            "an array carrier is an extensional boundary, so its owner remains constructible: \
+             {retained:?}"
+        );
+
+        let probe_model = Model::empty();
+        let mut probe = exec
+            .dt_collect(&probe_model, &[])
+            .expect("the classified fixture must collect");
+        probe.force_constructors();
+        probe.add_observation_disequalities();
+        assert!(probe.construct_all(), "bounded fixture must construct");
+        let class_schemas: Vec<String> = probe
+            .members
+            .keys()
+            .map(|root| {
+                let sort_name = probe.class_sort_name(*root);
+                let constructors: Vec<String> = sort_name
+                    .as_ref()
+                    .and_then(|name| exec.ctx.datatype_constructors(name))
+                    .into_iter()
+                    .flatten()
+                    .map(|constructor| {
+                        format!(
+                            "{constructor}:{:?}",
+                            exec.ctx.constructor_selector_info(constructor)
+                        )
+                    })
+                    .collect();
+                let members: Vec<_> = probe
+                    .members
+                    .get(root)
+                    .into_iter()
+                    .flatten()
+                    .map(|member| {
+                        let term = probe.terms[*member];
+                        (term, exec.ctx.terms.sort(term).clone())
+                    })
+                    .collect();
+                format!("root={root} sort={sort_name:?} ctors={constructors:?} members={members:?}")
+            })
+            .collect();
+        let mut assertion_seen = HashSet::default();
+        let mut assertion_stack = exec.ctx.assertions.clone();
+        let mut assertion_rows = Vec::new();
+        while let Some(term) = assertion_stack.pop() {
+            if !assertion_seen.insert(term) {
+                continue;
+            }
+            assertion_rows.push(format!(
+                "{term:?} sort={:?} data={:?}",
+                exec.ctx.terms.sort(term),
+                exec.ctx.terms.get(term)
+            ));
+            match exec.ctx.terms.get(term) {
+                TermData::App(_, args) => assertion_stack.extend(args.iter().copied()),
+                TermData::Not(inner) => assertion_stack.push(*inner),
+                TermData::Ite(condition, then_term, else_term) => {
+                    assertion_stack.extend([*condition, *then_term, *else_term]);
+                }
+                _ => {}
+            }
+        }
+        let (objective_root, objective_ctor, objective_selector) = probe
+            .members
+            .keys()
+            .find_map(|root| {
+                let sort_name = probe.class_sort_name(*root)?;
+                let constructors = exec.ctx.datatype_constructors(&sort_name)?;
+                constructors.iter().find_map(|constructor| {
+                    let fields = exec.ctx.constructor_selector_info(constructor)?;
+                    let [(selector, Sort::Array(_))] = fields else {
+                        return None;
+                    };
+                    Some((*root, constructor.clone(), selector.clone()))
+                })
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "collector must retain the unique one-array-field class: names={names:?} \
+                     retained={retained:?} classes={class_schemas:#?} \
+                     assertions={assertion_rows:#?}"
+                )
+            });
+        let objective_sources: Vec<_> = probe
+            .sel_apps
+            .iter()
+            .filter(|(_, selector, argument)| {
+                selector == &objective_selector
+                    && probe
+                        .index
+                        .get(argument)
+                        .is_some_and(|index| probe.class_of[*index] == objective_root)
+            })
+            .map(|(app, _, _)| (*app, probe.scalar_term_value(*app)))
+            .collect();
+        assert!(
+            matches!(
+                probe.values.get(&objective_root),
+                Some(Some(ModelValue::Datatype { ctor, args }))
+                    if ctor == &objective_ctor
+                        && matches!(args.as_slice(), [ModelValue::Array(_)])
+            ),
+            "objective class must construct exactly: forced={:?} conflicted={} sources={:?} value={:?}",
+            probe
+                .info
+                .get(&objective_root)
+                .and_then(|info| info.forced.as_deref()),
+            probe
+                .info
+                .get(&objective_root)
+                .is_some_and(|info| info.conflicted),
+            objective_sources,
+            probe.values.get(&objective_root),
+        );
+
+        let mut model = Model::empty();
+        assert!(
+            exec.construct_total_datatype_model(&mut model, &[]) > 0,
+            "structured schema must not discard unrelated opaque completion"
+        );
+        let (objective, objective_value) = model
+            .dt_ground
+            .iter()
+            .find(|(_, value)| {
+                matches!(
+                    value,
+                    ModelValue::Datatype { ctor, args }
+                        if ctor == &objective_ctor
+                            && matches!(args.as_slice(), [ModelValue::Array(_)])
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "objective must retain its exact constructor/array value: {:?}",
+                    model.dt_ground
+                )
+            });
+        assert!(
+            matches!(
+                objective_value,
+                ModelValue::Datatype { ctor, args }
+                    if ctor == &objective_ctor
+                        && matches!(args.as_slice(), [ModelValue::Array(_)])
+            ),
+            "objective must retain its exact constructor/array value: {:?}",
+            objective_value
+        );
+        assert!(
+            !model
+                .dt_pins
+                .keys()
+                .any(|term| matches!(exec.ctx.terms.sort(*term), Sort::Array(_))),
+            "an array term has no lossless EvalValue pin; the structured gate path owns it"
+        );
+        assert!(
+            !model.dt_pins.contains_key(objective),
+            "an array-containing datatype has no scalar canonical pin; its exact dt_ground tree owns it"
+        );
+        let pbterm_values: Vec<_> = model
+            .dt_ground
+            .iter()
+            .filter(|(term, _)| {
+                exec.datatype_sort_name(exec.ctx.terms.sort(**term))
+                    .as_deref()
+                    == Some("PbTerm")
+            })
+            .map(|(_, value)| value)
+            .collect();
+        assert!(
+            pbterm_values.len() >= 2
+                && pbterm_values.iter().all(|value| {
+                    matches!(
+                        value,
+                        ModelValue::Datatype { ctor, args }
+                            if ctor == "PbTerm_mk"
+                                && matches!(
+                                    args.as_slice(),
+                                    [ModelValue::BitVec { width: 128, .. }, ModelValue::Array(_)]
+                                )
+                    )
+                })
+                && pbterm_values
+                    .windows(2)
+                    .all(|pair| dt_canonical_string(pair[0]) == dt_canonical_string(pair[1])),
+            "the seed and canonical select must share one exact constructor/arity value: \
+             {pbterm_values:?}"
+        );
+    }
+
+    #[test]
+    fn single_constructor_array_owner_flattens_to_validated_field_representation() {
+        let mut exec = loaded(
+            r#"
+                (declare-datatypes
+                    ((PbLit 0) (PbTerm 0) (PbObjective 0) (Result 0))
+                    (
+                        ((PbLit_mk
+                            (PbLit_var (_ BitVec 32))
+                            (PbLit_negated Bool)))
+                        ((PbTerm_mk
+                            (PbTerm_coeff (_ BitVec 128))
+                            (PbTerm_lits (Array (_ BitVec 64) PbLit))))
+                        ((PbObjective_mk
+                            (PbObjective_terms (Array (_ BitVec 64) PbTerm))))
+                        ((Result_ok (Result_value (_ BitVec 128)))
+                         (Result_err))
+                    ))
+                (declare-const objective PbObjective)
+                (declare-const assignment (Array (_ BitVec 64) Bool))
+                (declare-const result Result)
+                (declare-fun checked
+                    ((Array (_ BitVec 64) PbTerm) (Array (_ BitVec 64) Bool))
+                    Result)
+                (assert (= result
+                    (checked (PbObjective_terms objective) assignment)))
+            "#,
+        );
+
+        let (owner_name, field_sort) = exec
+            .ctx
+            .datatype_iter()
+            .find_map(|(name, constructors)| {
+                let [constructor] = constructors else {
+                    return None;
+                };
+                let fields = exec.ctx.constructor_selector_info(constructor)?;
+                let [(_, field_sort @ Sort::Array(_))] = fields else {
+                    return None;
+                };
+                Some((name.to_string(), field_sort.clone()))
+            })
+            .expect("fixture must contain one single-array-field datatype");
+
+        let mut seen = HashSet::default();
+        let mut stack = exec.ctx.assertions.clone();
+        let mut saw_owner = false;
+        let mut saw_exact_field = false;
+        while let Some(term) = stack.pop() {
+            if !seen.insert(term) {
+                continue;
+            }
+            saw_owner |= matches!(
+                exec.ctx.terms.sort(term),
+                Sort::Uninterpreted(name) if name == &owner_name
+            );
+            saw_exact_field |= exec.ctx.terms.sort(term) == &field_sort;
+            match exec.ctx.terms.get(term) {
+                TermData::App(_, args) => stack.extend(args.iter().copied()),
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(condition, then_term, else_term) => {
+                    stack.extend([*condition, *then_term, *else_term]);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !saw_owner && saw_exact_field,
+            "single-constructor lowering must validate the exact field array, not fabricate an \
+             absent {owner_name} owner (owner={saw_owner}, field={saw_exact_field})"
+        );
+
+        let probe_model = Model::empty();
+        let probe = exec
+            .dt_collect(&probe_model, &[])
+            .expect("flattened opaque fixture must still collect its Result component");
+        assert!(
+            probe
+                .members
+                .keys()
+                .all(|root| probe.class_sort_name(*root).as_deref() != Some(&owner_name)),
+            "completion must not synthesize a datatype owner absent from the lowered query"
+        );
+
+        let result = exec.check_sat().expect("tiny flattened fixture must solve");
+        assert_eq!(result, crate::executor_types::SolveResult::Sat);
+        assert!(
+            exec.last_model_validated,
+            "the exact flattened field-array representation must receive sealed independent \
+             model-validation evidence"
+        );
+    }
+
+    #[test]
+    fn structured_ground_finalization_exhaustion_is_atomic() {
+        let exec = loaded(
+            r#"
+                (declare-datatype Box
+                    ((Box_empty)
+                     (Box_mk (Box_payload (Array Int Int)))))
+                (declare-const input (Array Int Int))
+                (declare-fun opaque_box ((Array Int Int)) Box)
+                (assert ((_ is Box_mk) (opaque_box input)))
+            "#,
+        );
+        let model = Model::empty();
+        {
+            let mut builder = exec
+                .dt_collect(&model, &[])
+                .expect("bounded opaque fixture must enter construction");
+            assert!(!builder.terms.is_empty());
+            builder.force_constructors();
+            builder.add_observation_disequalities();
+            assert!(builder.construct_all());
+
+            // Exhaust exactly at the first retained ground clone. `finish`
+            // assembles into local vectors and must return no partial result;
+            // the caller cannot mutate the model until all charges succeed.
+            builder.work_budget = OpaqueDtConstructionBudget::with_limit(0);
+            assert!(builder.finish().is_none());
+        }
+        assert!(model.dt_ground.is_empty());
+        assert!(model.dt_pins.is_empty());
     }
 }

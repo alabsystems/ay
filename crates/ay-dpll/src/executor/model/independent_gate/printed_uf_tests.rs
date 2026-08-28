@@ -168,3 +168,47 @@ fn g3_pin_disagreeing_with_printed_table_is_refused() {
         ),
     }
 }
+
+/// DATATYPE CANONICALITY: printed UF rows are admitted only after the exact
+/// constructor tree has been parsed for the declared result sort. Constructor
+/// identity and arity remain semantic; opaque carrier tokens are never coerced
+/// into a datatype value. This is the local negative twin of TrustVC's pushed
+/// `Result<u128, _>` ground-UF integration probe.
+#[test]
+fn datatype_printed_uf_rows_preserve_constructor_identity_and_fail_closed() {
+    let exec = loaded("(declare-datatype Box ((Box_mk (Box_value (_ BitVec 8))) (Box_err)))");
+    let model = Model::empty();
+    let view = IndependentModelView::new(&exec, &model);
+    let result_sort = Sort::Uninterpreted("Box".to_string());
+    let arg_sorts = [Sort::array(Sort::Int, Sort::Int)];
+    let array_zero = "((as const (Array Int Int)) 0)".to_string();
+
+    let valid_rows = vec![
+        (vec![array_zero.clone()], "(Box_mk #x00)".to_string()),
+        (vec![array_zero.clone()], "Box_err".to_string()),
+    ];
+    let parsed = view
+        .read_printed_uf_rows(&arg_sorts, &result_sort, &valid_rows)
+        .expect("exact array key and declared constructors must parse");
+    assert!(matches!(
+        parsed.rows.as_slice(),
+        [(point, ModelValue::Datatype { ctor, args })]
+            if matches!(point.as_slice(), [ModelValue::Array(_)])
+                && ctor == "Box_mk"
+                && matches!(args.as_slice(), [ModelValue::BitVec { width: 8, .. }])
+    ));
+    assert!(matches!(
+        parsed.else_value,
+        ModelValue::Datatype { ref ctor, ref args }
+            if ctor == "Box_err" && args.is_empty()
+    ));
+
+    for malformed in ["@Box!0", "(Box_mk)", "(Box_err #x00)", "(Other #x00)"] {
+        let rows = vec![(vec![array_zero.clone()], malformed.to_string())];
+        assert!(
+            view.read_printed_uf_rows(&arg_sorts, &result_sort, &rows)
+                .is_none(),
+            "opaque, wrong-arity, or foreign constructor `{malformed}` must fail closed"
+        );
+    }
+}

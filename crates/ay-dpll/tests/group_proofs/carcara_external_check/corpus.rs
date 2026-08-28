@@ -31,20 +31,35 @@ const ORACLE_SAT_CORPUS_ROWS: &[&str] = &[
 /// execution failure, or an unchecked proof is a hard failure.
 const ORACLE_UNSAT_UNSUPPORTED_ROWS: &[&str] = &[
     "QF_ABV_csplit_repro_100selects_unsat",
-    "QF_ABV_csplit_repro_indirect_store_unsat",
-    "QF_ABV_csplit_repro_many_trivial_selects_unsat",
-    "QF_ABV_csplit_repro_store_chain_unsat",
-    "QF_ABV_csplit_repro_unsat",
-    "QF_LIA_ring_2exp12_3vars_deep_unsat",
     "QF_LIA_ring_2exp16_5vars_cascade_unsat",
     "QF_LIA_ring_2exp16_5vars_cascade_v2_unsat",
+];
+
+/// The six exact semantic-publication regressions that motivated the checked
+/// divisibility wire lowering and authored-surface repair. They are named here
+/// so none can silently slide back into an oracle-backed UNKNOWN bucket.
+const REQUIRED_DIVISIBILITY_PUBLICATION_ROWS: &[&str] = &[
+    "QF_LIA_ring_2exp12_3vars_deep_unsat",
+    "QF_LIA_ring_2exp4_3vars_0ite_unsat",
+    "QF_LIA_ring_2exp8_3vars_crt_unsat",
+    "QF_LIA_ring_2exp8_4vars_carry_unsat",
     "QF_LIA_ring_2exp8_5vars_modular_unsat",
-    "QF_NIA_simple_product_unsat",
     "QF_UFLIA_unsat_congruence_to_lia",
+];
+
+/// Rows discharged by the checked lattice lowering itself. The two remaining
+/// required rows exercise authored-root surface preservation in addition to
+/// this arithmetic wire certificate and stay in the six-row gate above.
+const CHECKED_DIVISIBILITY_WIRE_ROWS: &[&str] = &[
+    "QF_LIA_ring_2exp12_3vars_deep_unsat",
+    "QF_LIA_ring_2exp4_3vars_0ite_unsat",
+    "QF_LIA_ring_2exp8_4vars_carry_unsat",
+    "QF_LIA_ring_2exp8_5vars_modular_unsat",
 ];
 
 struct CorpusVerificationSummary {
     verified: usize,
+    verified_labels: Vec<String>,
     rejected_labels: Vec<String>,
     oracle_sat_labels: Vec<String>,
     unsupported_unsat_labels: Vec<String>,
@@ -188,6 +203,7 @@ fn benchmark_label(path: &Path) -> String {
 fn run_unsat_benchmark_corpus(carcara: &Path, smt2_files: &[PathBuf]) -> CorpusVerificationSummary {
     let mut summary = CorpusVerificationSummary {
         verified: 0,
+        verified_labels: Vec::new(),
         rejected_labels: Vec::new(),
         oracle_sat_labels: Vec::new(),
         unsupported_unsat_labels: Vec::new(),
@@ -203,6 +219,7 @@ fn run_unsat_benchmark_corpus(carcara: &Path, smt2_files: &[PathBuf]) -> CorpusV
                 if run_carcara(carcara, &label, &content, &proof) =>
             {
                 summary.verified += 1;
+                summary.verified_labels.push(label);
             }
             CorpusSolve::CertifiedProof(_) => summary.rejected_labels.push(label),
             CorpusSolve::Sat => {
@@ -265,6 +282,20 @@ fn assert_corpus_expectations(total: usize, summary: &CorpusVerificationSummary)
         eprintln!("  NOT A PROOF OBLIGATION (oracle SAT): {label}");
     }
 
+    let actual_certified: BTreeSet<&str> =
+        summary.verified_labels.iter().map(String::as_str).collect();
+    let required_certified: BTreeSet<&str> = REQUIRED_DIVISIBILITY_PUBLICATION_ROWS
+        .iter()
+        .copied()
+        .collect();
+    assert!(
+        required_certified.is_subset(&actual_certified),
+        "required semantic-publication rows were not externally certified: {:?}",
+        required_certified
+            .difference(&actual_certified)
+            .copied()
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         rejected, 0,
         "Carcara must not reject any UNSAT benchmark proof: {:?}",
@@ -304,14 +335,15 @@ fn assert_corpus_expectations(total: usize, summary: &CorpusVerificationSummary)
 /// Oracle-SAT filename matches are excluded from the proof denominator. Every
 /// oracle-UNSAT row must either have a Carcara-verified proof or return exact
 /// fail-closed UNKNOWN under the explicit unsupported list; there is no generic
-/// skip path.
+/// skip path. This is the authoritative external publication gate and is
+/// deliberately non-optional: unlike ancillary checker tests, a missing or
+/// misconfigured Carcara executable fails the test instead of silently
+/// returning.
 #[test]
 #[cfg_attr(debug_assertions, timeout(300_000))]
 #[cfg_attr(not(debug_assertions), timeout(120_000))]
 fn test_carcara_external_unsat_benchmark_corpus() {
-    let Some(carcara) = require_carcara_or_skip() else {
-        return;
-    };
+    let carcara = required_carcara_for_corpus();
 
     let smt2_files = collect_unsat_smt2_benchmarks();
     assert!(
@@ -322,6 +354,42 @@ fn test_carcara_external_unsat_benchmark_corpus() {
     let total = smt2_files.len();
     let summary = run_unsat_benchmark_corpus(&carcara, &smt2_files);
     assert_corpus_expectations(total, &summary);
+}
+
+/// Focused real-checker gate for the four exact corpus rows whose complete
+/// documents are discharged by the checked integer-lattice lowering. This is
+/// intentionally mandatory for the same reason as the canonical corpus gate.
+#[test]
+#[cfg_attr(debug_assertions, timeout(120_000))]
+#[cfg_attr(not(debug_assertions), timeout(60_000))]
+fn test_carcara_checked_divisibility_wire_rows() {
+    let carcara = required_carcara_for_corpus();
+    let smt2_files: Vec<PathBuf> = collect_unsat_smt2_benchmarks()
+        .into_iter()
+        .filter(|path| {
+            let label = benchmark_label(path);
+            CHECKED_DIVISIBILITY_WIRE_ROWS.contains(&label.as_str())
+        })
+        .collect();
+    let actual: BTreeSet<String> = smt2_files
+        .iter()
+        .map(|path| benchmark_label(path))
+        .collect();
+    let expected: BTreeSet<String> = CHECKED_DIVISIBILITY_WIRE_ROWS
+        .iter()
+        .map(|label| (*label).to_string())
+        .collect();
+    assert_eq!(actual, expected, "focused Carcara row set drifted");
+
+    let summary = run_unsat_benchmark_corpus(&carcara, &smt2_files);
+    assert_eq!(summary.verified, expected.len());
+    assert!(summary.rejected_labels.is_empty());
+    assert!(summary.unsupported_unsat_labels.is_empty());
+    assert!(summary.oracle_sat_labels.is_empty());
+    assert_eq!(
+        summary.verified_labels.into_iter().collect::<BTreeSet<_>>(),
+        expected
+    );
 }
 
 /// The eq_diamond family (SMT-COMP QF_UF): preprocessing derives per-segment

@@ -4,7 +4,9 @@
 
 use num_bigint::BigInt;
 
-use super::lia::{validate_lia_theory_lemma, LiaValidationError};
+use super::lia::{
+    lia_divisibility_equality_witness, validate_lia_theory_lemma, LiaValidationError,
+};
 use crate::{
     CuttingPlaneAnnotation, FarkasAnnotation, LiaAnnotation, ProofId, Sort, TermId, TermStore,
 };
@@ -339,6 +341,49 @@ fn divisibility_accepts_2y_eq_7() {
         check_div(&terms, &clause).is_ok(),
         "2y=7 is integer-infeasible"
     );
+}
+
+#[test]
+fn divisibility_witness_recovers_exact_adjacent_lattice_values() {
+    // `mk_eq` canonically orders this equality as `7 = 3x + 6y`, so the
+    // checked difference ranges over residue class 1 (mod 3), whose values
+    // adjacent to zero are -2 and 1. The wire lowering must recover these
+    // exact values from the same checked clause, not approximate a bound.
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let three = terms.mk_int(BigInt::from(3));
+    let six = terms.mk_int(BigInt::from(6));
+    let seven = terms.mk_int(BigInt::from(7));
+    let three_x = terms.mk_mul(vec![three, x]);
+    let six_y = terms.mk_mul(vec![six, y]);
+    let lhs = terms.mk_add(vec![three_x, six_y]);
+    let clause = div_lemma(&mut terms, lhs, seven);
+
+    let witness = lia_divisibility_equality_witness(&terms, &clause)
+        .expect("the validated unit divisibility lemma has a lattice witness");
+    assert_eq!(witness.lhs, seven);
+    assert_eq!(witness.rhs, lhs);
+    assert_eq!(witness.lower, BigInt::from(-2));
+    assert_eq!(witness.upper, BigInt::from(1));
+}
+
+#[test]
+fn divisibility_witness_declines_non_unit_and_satisfiable_shapes() {
+    let mut terms = TermStore::new();
+    let y = terms.mk_var("y", Sort::Int);
+    let two = terms.mk_int(BigInt::from(2));
+    let eight = terms.mk_int(BigInt::from(8));
+    let two_y = terms.mk_mul(vec![two, y]);
+    let satisfiable = div_lemma(&mut terms, two_y, eight);
+    assert!(lia_divisibility_equality_witness(&terms, &satisfiable).is_none());
+
+    let seven = terms.mk_int(BigInt::from(7));
+    let mut non_unit = div_lemma(&mut terms, two_y, seven);
+    let z = terms.mk_var("z", Sort::Int);
+    let z_eq_two = terms.mk_eq(z, two);
+    non_unit.push(terms.mk_not(z_eq_two));
+    assert!(lia_divisibility_equality_witness(&terms, &non_unit).is_none());
 }
 
 #[test]

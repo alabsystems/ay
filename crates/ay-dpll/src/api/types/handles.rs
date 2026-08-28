@@ -19,7 +19,7 @@ static NEXT_TERM_ARENA_STAMP: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct TermArenaStamp(u64);
 
 impl TermArenaStamp {
-    #[allow(clippy::panic)]
+    #[allow(clippy::panic, deprecated)]
     pub(crate) fn fresh() -> Self {
         // `fetch_update`, not `try_update`: same closure-CAS loop, stable
         // since 1.45 — see the twin note in ay-core/src/term/mod.rs.

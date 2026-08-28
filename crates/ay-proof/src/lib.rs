@@ -193,7 +193,7 @@ pub use scope::problem_scope_symbol_names;
 pub use terminal_trust::{
     terminal_trust_report, terminal_trust_report_with_provenance, TerminalTrustReport,
 };
-pub use wire_rule::promoted_wire_rule;
+pub use wire_rule::{lia_divisibility_lowering_supported, promoted_wire_rule};
 
 use alethe_printer::AlethePrinter;
 use variables::{

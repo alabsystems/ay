@@ -126,6 +126,263 @@ fn a_candidate_the_strict_gate_rejects_purges_nothing() {
     );
 }
 
+fn parsed_assertion(source: &str) -> FrontendTerm {
+    let commands = ay_frontend::parse(source).expect("assertion fixture parses");
+    let [Command::Assert(term)] = commands.as_slice() else {
+        panic!("fixture must contain one assertion")
+    };
+    term.clone()
+}
+
+fn comparison_surface_fixture(executor: &mut Executor) -> (TermId, TermId) {
+    let b = executor.ctx.terms.mk_var("b", Sort::Int);
+    let f_b = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("f"), [b], Sort::Int);
+    let zero = executor.ctx.terms.mk_int(BigInt::from(0));
+    let canonical = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("<="), [zero, f_b], Sort::Bool);
+    let negated = executor.ctx.terms.mk_not_raw(canonical);
+    (canonical, negated)
+}
+
+#[test]
+fn reachable_authored_assume_restores_its_exact_unique_source_index() {
+    let mut executor = Executor::new();
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (>= (f b) 0))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(negated, parsed_assertion("(assert (not (<= 0 (f b))))"));
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(canonical, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), canonical, positive, negative);
+    executor.last_proof_term_overrides = None;
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert_eq!(
+        executor
+            .last_proof_term_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&canonical))
+            .map(String::as_str),
+        Some("(>= (f b) 0)")
+    );
+    assert!(!executor.last_unsat_proof_reconstruction_suppressed);
+}
+
+#[test]
+fn duplicate_authored_root_indices_decline_assume_surface_restoration() {
+    let mut executor = Executor::new();
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (>= (f b) 0))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (<= 0 (f b)))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(negated, parsed_assertion("(assert (not (<= 0 (f b))))"));
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(canonical, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), canonical, positive, negative);
+    executor.last_proof_term_overrides = None;
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        executor.last_proof_term_overrides.is_none(),
+        "an ambiguous canonical root must not pick one authored spelling"
+    );
+    assert!(
+        executor.last_unsat_proof_reconstruction_suppressed,
+        "ambiguous source provenance must suppress external proof publication"
+    );
+}
+
+#[test]
+fn derived_rebuild_authority_is_not_exact_raw_problem_provenance() {
+    let mut executor = Executor::new();
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (>= (f b) 0))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(negated, parsed_assertion("(assert (not (<= 0 (f b))))"));
+
+    let derived = executor
+        .ctx
+        .terms
+        .mk_var("derived_repair_premise", Sort::Bool);
+    let not_derived = executor.ctx.terms.mk_not_raw(derived);
+    executor.record_rebuilt_authored_proof_premise(derived);
+    executor.record_rebuilt_authored_proof_premise(not_derived);
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(derived, None);
+    let negative = proof.add_assume(not_derived, None);
+    proof.add_resolution(Vec::new(), derived, positive, negative);
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        executor.last_unsat_proof_reconstruction_suppressed,
+        "general rebuild authority must not masquerade as a top-level problem-file premise"
+    );
+}
+
+#[test]
+fn anchor_edges_retain_reachable_authored_assume_provenance() {
+    let mut executor = Executor::new();
+    let (canonical, _) = comparison_surface_fixture(&mut executor);
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (>= (f b) 0))"));
+
+    let mut proof = Proof::new();
+    let assumed = proof.add_assume(canonical, None);
+    let anchor = proof.add_step(ProofStep::Anchor {
+        end_step: assumed,
+        variables: Vec::new(),
+    });
+    proof.add_rule_step(AletheRule::Trust, Vec::new(), vec![anchor], Vec::new());
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert_eq!(
+        executor
+            .last_proof_term_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&canonical))
+            .map(String::as_str),
+        Some("(>= (f b) 0)")
+    );
+}
+
+#[test]
+fn malformed_anchor_premise_suppresses_restoration_atomically() {
+    let mut executor = Executor::new();
+    let (canonical, _) = comparison_surface_fixture(&mut executor);
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (>= (f b) 0))"));
+
+    let unrelated = executor
+        .ctx
+        .terms
+        .mk_var("unrelated_surface_override", Sort::Bool);
+    let mut overrides = DetHashMap::default();
+    overrides.insert(unrelated, "unrelated_surface_override".to_string());
+    executor.last_proof_term_overrides = Some(overrides.clone());
+
+    let mut proof = Proof::new();
+    let assumed = proof.add_assume(canonical, None);
+    let malformed_anchor = proof.add_step(ProofStep::Anchor {
+        end_step: ProofId(u32::MAX),
+        variables: Vec::new(),
+    });
+    proof.add_rule_step(
+        AletheRule::Trust,
+        Vec::new(),
+        vec![assumed, malformed_anchor],
+        Vec::new(),
+    );
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert_eq!(executor.last_proof_term_overrides, Some(overrides));
+    assert!(
+        executor.last_unsat_proof_reconstruction_suppressed,
+        "an out-of-range anchor dependency must fail closed before any override is committed"
+    );
+}
+
+#[test]
+fn retention_off_has_no_external_surface_to_restore_or_suppress() {
+    let mut executor = Executor::new();
+    executor.ctx.set_retain_parsed_assertions(false);
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (>= (f b) 0))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(negated, parsed_assertion("(assert (not (<= 0 (f b))))"));
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(canonical, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), canonical, positive, negative);
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(executor.last_proof_term_overrides.is_none());
+    assert!(
+        !executor.last_unsat_proof_reconstruction_suppressed,
+        "canonical retention-off certification must keep native authority"
+    );
+}
+
+#[test]
+fn retention_off_cannot_bypass_an_explicit_external_proof_demand() {
+    let mut executor = Executor::new();
+    executor.set_produce_proofs(true);
+    executor.ctx.set_retain_parsed_assertions(false);
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (>= (f b) 0))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(negated, parsed_assertion("(assert (not (<= 0 (f b))))"));
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(canonical, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), canonical, positive, negative);
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        executor.last_unsat_proof_reconstruction_suppressed,
+        "an explicit proof request must not publish without its authored source ledger"
+    );
+}
+
+#[test]
+fn retained_but_empty_source_ledger_suppresses_external_publication() {
+    let mut executor = Executor::new();
+    executor.ctx.set_retain_parsed_assertions(false);
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (>= (f b) 0))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(negated, parsed_assertion("(assert (not (<= 0 (f b))))"));
+    assert!(executor.ctx.assertions_parsed().is_empty());
+    // Turning retention back on does not retroactively recreate the missing
+    // prefix. It changes this from intentional retention-off state into a
+    // retained-but-misaligned ledger, which must never authenticate export.
+    executor.ctx.set_retain_parsed_assertions(true);
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(canonical, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), canonical, positive, negative);
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        executor.last_unsat_proof_reconstruction_suppressed,
+        "an empty retained ledger beside nonempty authored roots is a publication failure"
+    );
+}
+
 // ===========================================================================
 // Authored-surface respelling
 //

@@ -5666,6 +5666,8 @@ impl Executor {
         let saved_proof_check_ok = self.proof_check_ok;
         let saved_last_proof_rebuild_originals =
             std::mem::take(&mut self.last_proof_rebuild_originals);
+        let saved_last_proof_raw_original_assertions =
+            std::mem::take(&mut self.last_proof_raw_original_assertions);
         let saved_verify_depth = self.post_split_verify_depth;
 
         self.post_split_verify_depth = saved_verify_depth + 1;
@@ -5705,6 +5707,7 @@ impl Executor {
         self.proof_check_result = saved_proof_check_result;
         self.proof_check_ok = saved_proof_check_ok;
         self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
+        self.last_proof_raw_original_assertions = saved_last_proof_raw_original_assertions;
 
         match result {
             Ok(result) => matches!(result, Ok(ref r) if r.is_unsat()),
@@ -6663,6 +6666,8 @@ impl Executor {
         let saved_proof_check_ok = self.proof_check_ok;
         let saved_last_proof_rebuild_originals =
             std::mem::take(&mut self.last_proof_rebuild_originals);
+        let saved_last_proof_raw_original_assertions =
+            std::mem::take(&mut self.last_proof_raw_original_assertions);
         let saved_quant_expansion_records = std::mem::take(&mut self.quant_expansion_records);
         let saved_consequence_replay_state = self.take_consequence_replay_state();
 
@@ -6715,6 +6720,7 @@ impl Executor {
                 self.proof_check_result = None;
                 self.proof_check_ok = false;
                 self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
+                self.last_proof_raw_original_assertions = saved_last_proof_raw_original_assertions;
                 self.quant_expansion_records = saved_quant_expansion_records;
                 self.restore_consequence_replay_state(saved_consequence_replay_state);
                 self.proof_problem_assertion_provenance = saved_proof_provenance;
@@ -6748,6 +6754,7 @@ impl Executor {
                 self.proof_check_result = saved_proof_check_result;
                 self.proof_check_ok = saved_proof_check_ok;
                 self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
+                self.last_proof_raw_original_assertions = saved_last_proof_raw_original_assertions;
                 self.quant_expansion_records = saved_quant_expansion_records;
                 self.restore_consequence_replay_state(saved_consequence_replay_state);
                 Ok(None)
@@ -6776,6 +6783,7 @@ impl Executor {
                 self.proof_check_result = saved_proof_check_result;
                 self.proof_check_ok = saved_proof_check_ok;
                 self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
+                self.last_proof_raw_original_assertions = saved_last_proof_raw_original_assertions;
                 self.quant_expansion_records = saved_quant_expansion_records;
                 self.restore_consequence_replay_state(saved_consequence_replay_state);
                 Err(err)
