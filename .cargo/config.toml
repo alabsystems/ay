@@ -1,14 +1,13 @@
 # AY build configuration.
 #
-# Design: portable defaults, optional local acceleration.
+# The repository default is the stock, distributable toolchain pinned in
+# rust-toolchain.toml. Source verification remains an explicit internal gate
+# against a commit-bound local compiler snapshot. A nightly-only flag or a
+# locally linked default channel would make ordinary Cargo depend on mutable
+# machine state and is forbidden by that gate's authority-boundary self-test.
 #
-# This file must let a fresh checkout run plain `cargo` without requiring
-# machine-local tools. Do not set `build.rustc-wrapper` here: if `sccache` is
-# useful on a given machine, opt into it with `RUSTC_WRAPPER=sccache` or a
-# user-local Cargo config.
-#
-# No `build.target-dir` lives here either. Shared target directories are
-# per-machine policy; use `CARGO_TARGET_DIR` or a user-local Cargo config.
+# Do not set `build.rustc-wrapper` or `build.target-dir` here. Those are
+# per-machine choices; use RUSTC_WRAPPER and CARGO_TARGET_DIR locally.
 
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=native"]

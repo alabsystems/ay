@@ -4089,6 +4089,32 @@ impl Executor {
         )
     }
 
+    /// Exact SMT-LIB problem bytes paired with the last exported Alethe proof.
+    ///
+    /// The proof scope and authenticated source-syntax override table are the
+    /// same ones consumed by
+    /// [`Self::try_export_last_proof_alethe_for_problem_scope`]. Consumers must
+    /// pass these returned bytes to an external checker; rebuilding the query
+    /// independently can change normalization, symbol spelling, or even the
+    /// asserted scope while leaving the proof text unchanged.
+    ///
+    /// Returns `None` when the proof/surface epoch is stale or when the exact
+    /// problem theory is outside the currently supported transport envelope.
+    #[must_use]
+    pub fn try_export_last_proof_alethe_problem_smt2(&self) -> Option<String> {
+        if self.last_unsat_proof_reconstruction_suppressed {
+            return None;
+        }
+        let proof = self.last_proof()?;
+        let scope = self.proof_export_scope_assertions_for(proof)?;
+        let overrides = if self.last_proof_has_finite_enum_sidecar() {
+            Some(self.finite_enum_surface_overrides_for_proof(proof)?.clone())
+        } else {
+            self.proof_export_term_overrides()
+        };
+        self.alethe_problem_smt2_for(&scope, overrides.as_ref())
+    }
+
     /// Streaming variant of
     /// [`Self::try_export_last_proof_alethe_for_problem_scope`]: renders the
     /// certificate directly into `out` instead of materializing it as one
@@ -6660,6 +6686,7 @@ fn build_bool_pterm(terms: &mut TermStore, pt: &FrontendTerm) -> Option<TermId> 
     }
 }
 
+pub(in crate::executor) use check::REPEATABLE_CHECK_WORK;
 #[cfg(all(test, feature = "proof-checker"))]
 use check::*;
 #[cfg(test)]

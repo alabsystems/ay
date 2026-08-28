@@ -15,6 +15,9 @@ fn emit(o: &Outcome) -> String {
     m.add_col(0.0, 1.0);
     let scale = BigRational::one();
     let (status, value, detail) = verdict_line(o, &m, &scale, 1.5, 7);
+    // `7` total nodes, of which `5` are proof tree and `2` heuristic sub-MIP —
+    // distinct stand-ins so a swapped pair of arguments shows up as a wrong value
+    // rather than as three equal sevens.
     solve_json_line(
         &status,
         value.as_deref(),
@@ -22,6 +25,8 @@ fn emit(o: &Outcome) -> String {
         detail.as_deref(),
         1.5,
         7,
+        5,
+        2,
         0,
     )
 }
@@ -140,6 +145,24 @@ fn every_status_emits_valid_json() {
             v["status"]
         );
         assert!(v["time"].is_number() && v["nodes"].is_number());
+        // THE COMPARABILITY SPLIT IS PART OF THE CONTRACT, and it is ADDITIVE:
+        // `nodes` keeps its historical meaning (every node the process explored,
+        // heuristic sub-MIP trees included) and the two new keys decompose it.
+        // `root_nodes` is the field that compares to Gurobi's `Model.NodeCount`,
+        // which excludes the sub-MIPs its heuristics run. A consumer that reads
+        // `nodes` alone is comparing two different quantities.
+        assert!(
+            v["root_nodes"].is_number() && v["submip_nodes"].is_number(),
+            "the json line must carry the root/sub-MIP split\n  {line}"
+        );
+        assert_eq!(
+            v["nodes"].as_u64(),
+            Some(
+                v["root_nodes"].as_u64().unwrap_or_default()
+                    + v["submip_nodes"].as_u64().unwrap_or_default()
+            ),
+            "nodes must remain the SUM of the split, not be redefined as its root part\n  {line}"
+        );
     }
 }
 
@@ -157,7 +180,7 @@ fn the_non_exhaustive_catch_all_emits_valid_json() {
             },
         }
     );
-    let line = solve_json_line("OTHER", None, None, Some(&blob), 1.5, 7, 0);
+    let line = solve_json_line("OTHER", None, None, Some(&blob), 1.5, 7, 5, 2, 0);
     let v = parse(&line);
     assert_eq!(v["status"], "OTHER");
     assert_eq!(v["detail"], blob);

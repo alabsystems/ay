@@ -29,7 +29,7 @@ pub enum LiteralError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Variable(u32);
 
-// Ties the literal bounds used in this file's `trust::requires` contracts to
+// Ties the literal bounds used in this file's Trust preconditions to
 // the constants they are supposed to mirror. A contract predicate cannot name
 // an associated constant (the frontend refuses to lower it -- see
 // `Variable::new`), so the bounds are duplicated as literals; these assertions
@@ -78,15 +78,53 @@ impl Variable {
     ///
     /// The bound is spelled as a LITERAL rather than as `Self::MAX_ID`, and
     /// that is forced, not stylistic. MEASURED on trust-e26541e3: a contract
-    /// predicate naming an associated constant is rejected by the frontend --
-    /// "compiler contract predicate was not lowered into a typed verifier
-    /// formula: unsupported contract predicate expression `id <=
-    /// Variable::MAX_ID`" -- and lands in UNKNOWN, discharging nothing. The
-    /// same precondition written `id <= 2_147_483_647` lowers and PROVES.
-    /// The `const _: ()` assertion above `impl Variable` makes the duplication
+    /// predicate naming an associated constant is rejected by the frontend
+    /// ("unsupported contract predicate expression
+    /// `id <= Variable::MAX_ID`") and discharges nothing. The
+    /// `const _: ()` assertion above `impl Variable` makes the duplication
     /// safe: if `MAX_ID` ever changes, this file stops compiling rather than
     /// silently carrying a contract that no longer matches the assertion it is
     /// supposed to justify.
+    ///
+    /// ── WHY THERE IS NO `requires` CLAUSE HERE, DESPITE ALL OF THE ABOVE ────
+    ///
+    /// There WAS one, as ``, and it never ran: the attribute form needs an
+    /// `--extern trust` overlay, so it fires only in the ratchet lane. A
+    /// verified probe made its runtime behavior observable and showed that it
+    /// CONTRADICTS this function's tested public behavior.
+    ///
+    /// A `requires` clause is not only a static claim. Where a caller cannot
+    /// discharge it, the compiler installs a kernel-certified RUNTIME MONITOR,
+    /// and that monitor is a NON-UNWINDING abort:
+    ///
+    /// ```text
+    /// thread '..' panicked at core/src/panicking.rs:225:5:
+    /// kernel-certified Trust monitor failed
+    /// thread caused non-unwinding panic. aborting.
+    /// process didn't exit successfully (signal: 6, SIGABRT)
+    /// ```
+    ///
+    /// `literal_tests::test_overflow_variable_panics` asserts the opposite, and
+    /// says why in its own body: "Invalid state is rejected at the Variable
+    /// boundary in every build mode". It calls `Variable::new(MAX_VAR + 1)`
+    /// under `#[should_panic(expected = "exceeds Variable::MAX_ID")]`. A
+    /// `should_panic` test cannot catch an abort — the process dies — so the
+    /// contract does not merely fail that test, it removes the recoverable,
+    /// catchable panic this API documents and guarantees.
+    ///
+    /// Both designs are coherent; they are just different APIs. "Out-of-range
+    /// input is a caller error the prover must rule out" and "out-of-range
+    /// input is a supported, tested, recoverable failure" cannot both hold.
+    /// Choosing between them is an API decision, not a verification-lane
+    /// decision, so turning verification on does not get to make it silently.
+    /// The precondition is left unstated here and the guarantee kept.
+    ///
+    /// The statically-checkable half is not lost: [`Self::try_new`] carries the
+    /// same bound in its return type, needs no precondition, and is what the
+    /// `# Panics` note above already tells external callers to prefer.
+    ///
+    /// To adopt the contract instead, the panic tests must first move to a
+    /// subprocess harness that can observe SIGABRT.
     #[inline]
     pub fn new(id: u32) -> Self {
         assert!(
@@ -232,15 +270,30 @@ impl Literal {
     /// Panics if `idx` exceeds `u32::MAX` on a platform where `usize` is wider
     /// than `u32`.
     ///
-    /// Spelled as a literal for the reason given on [`Variable::new`]: the
-    /// natural `idx <= u32::MAX as usize` is refused by the frontend (both the
-    /// associated constant AND the cast are unsupported in a contract
-    /// predicate). MEASURED: the literal form does NOT prove this assertion
-    /// either — it moves it from FAILED to runtime-checked, because
-    /// `u32::try_from(idx).is_ok()` in the body is an absent callee whose result
-    /// is havoc'd, so the precondition cannot reach the assertion that consumes
-    /// it. The contract is still worth stating: it is now a real, checked
-    /// precondition at call sites rather than a comment.
+    /// NO `requires` CLAUSE, for exactly the reason spelled out at length on
+    /// [`Variable::new`], and this is the second function where the explicit
+    /// verified probe exposed the incompatible runtime behavior.
+    ///
+    /// `literal_tests::test_from_index_never_silently_truncates` calls
+    /// `from_index(u32::MAX as usize + 1)` under
+    /// `#[should_panic(expected = "exceeds u32::MAX")]`. With
+    /// `requires idx <= 4294967295` the caller's obligation is undischargeable,
+    /// the compiler installs the kernel-certified runtime monitor, and the
+    /// monitor ABORTS (SIGABRT, non-unwinding) instead of panicking — which
+    /// `should_panic` cannot catch and which destroys the "never silently
+    /// truncates" guarantee the test's name states.
+    ///
+    /// Worth recording separately, because it means the contract was buying
+    /// less than it looked like even statically: MEASURED, the literal form
+    /// does NOT prove this function's assertion. It only moves it from FAILED
+    /// to runtime-checked, because `u32::try_from(idx).is_ok()` in the body is
+    /// an absent callee whose result is havoc'd, so the precondition never
+    /// reaches the assertion that consumes it. So the trade here was a real
+    /// behavioural regression for no static gain at all.
+    ///
+    /// (Had it been kept, the bound would have to stay a literal: the natural
+    /// `idx <= u32::MAX as usize` is refused by the frontend — the associated
+    /// constant AND the cast are both unsupported in a contract predicate.)
     #[inline]
     pub fn from_index(idx: usize) -> Self {
         assert!(
@@ -309,7 +362,7 @@ impl Literal {
         // because the havoc'd `unsigned_abs` result is unconstrained no matter
         // what is known about `dimacs`. The blocker is the absent callee, not the
         // erased `requires!`. That finding SURVIVES this file's migration to
-        // first-class contracts: `dimacs != 0` is now a real `trust::requires`
+        // first-class contracts: `dimacs != 0` is now a real checked attribute
         // the prover reads rather than a macro that expanded to nothing, and the
         // absent-callee havoc it could not defeat is precisely why the body still
         // has to avoid `unsigned_abs` rather than lean on the precondition.
@@ -359,7 +412,7 @@ impl Literal {
     /// [`Self::to_dimacs_i64`], or `Display` when extension variables may reach
     /// this boundary.
     ///
-    /// NOT EXPRESSIBLE as a `trust::requires` on this toolchain, and left
+    /// NOT EXPRESSIBLE as a Trust precondition on this toolchain, and left
     /// unstated rather than approximated. The exact precondition is
     /// `!(self.is_positive() && self.variable().id() == Literal::MAX_VAR)`:
     /// `to_dimacs_i64` returns `±(var_id + 1)`, so the positive branch leaves

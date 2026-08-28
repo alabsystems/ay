@@ -86,6 +86,11 @@ pub use bab::{
     nodes_explored,
     reset_drought_dives,
     reset_nodes_explored,
+    // The Gurobi-comparable decomposition of the same instrument: `nodes_explored`
+    // includes heuristic sub-MIP trees, `Model.NodeCount` does not. ADDITIVE — the
+    // frozen counter above keeps every value it ever reported.
+    root_nodes_explored,
+    submip_nodes_explored,
     BumpLuDiff,
     // STAGE-0 COLD-CLONE READINESS PoC (inert to the serial path; see bab.rs):
     // driven only by tests/parallel_ready.rs.

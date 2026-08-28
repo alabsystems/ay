@@ -677,6 +677,27 @@ fn every_refusal_names_itself() {
     assert!(none.0.is_none());
     assert!(OptTreeDecline::WorkCap.is_budget());
 
+    // AND WHEN BOTH ARE SPENT, THE WORK CAP WINS. This pins the ORDER, which is
+    // the whole determinism guarantee: `work-cap` says "this run is
+    // reproducible and its budget was too small", `deadline` says "this run's
+    // evidence was load-dependent after all". A build that reports the wall
+    // here would be telling every future reader the opposite of the truth about
+    // a certificate it declined to emit, and nothing else in the suite can see
+    // the difference — both spellings decline, both return `None`, and both are
+    // `is_budget()`. Verified to fail on the reverted ordering.
+    let both = OptimalityTreeBudget::new(4096)
+        .with_work(0)
+        .with_deadline(Some(
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        ));
+    assert_eq!(
+        derive_optimality_tree_reported(&m, &int(-1), &witness, &both)
+            .1
+            .decline,
+        Some(OptTreeDecline::WorkCap),
+        "a spent work budget must never be reported as the wall net binding"
+    );
+
     // The tags are distinct strings; a caller grepping for one must not match
     // another.
     let tags = [

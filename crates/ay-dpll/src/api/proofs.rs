@@ -124,6 +124,14 @@ pub struct UnsatProofArtifact {
     /// native proof IR; it is not a claim that Carcara returned `valid` for
     /// this text. [`Self::restricted_rule_subset`] stays false for such artifacts.
     pub alethe: String,
+    /// Exact SMT-LIB problem bytes authored for [`Self::alethe`].
+    ///
+    /// External-checker consumers must use this transport instead of
+    /// reconstructing a problem from their own normalized formula. `None`
+    /// means the current problem theory cannot yet be serialized without
+    /// losing semantic identity; it does not weaken the independent native
+    /// [`Self::strict_verdict`].
+    pub alethe_problem_smt2: Option<String>,
     /// Partial check result from the internal checker.
     pub partial_check: Option<PartialProofCheck>,
     /// Consumer-visible verdict from AY's native strict proof checker.
@@ -796,6 +804,7 @@ impl super::Solver {
         let ordinary_surface = self
             .executor
             .try_export_last_proof_alethe_for_problem_scope()?;
+        let alethe_problem_smt2 = self.executor.try_export_last_proof_alethe_problem_smt2();
         let alethe = match ordinary_surface {
             Ok(alethe) => alethe,
             Err(AlethePrintError::UnsupportedArrayExtensionality { id })
@@ -846,6 +855,7 @@ impl super::Solver {
 
         Some(UnsatProofArtifact {
             alethe,
+            alethe_problem_smt2,
             quality: evaluation.diagnostic_quality,
             partial_check: Some(evaluation.partial_check),
             strict_verdict,

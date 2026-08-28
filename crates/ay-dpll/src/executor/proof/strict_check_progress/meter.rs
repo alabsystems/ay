@@ -63,6 +63,13 @@ pub(super) fn describe_stop_signal(executor: &Executor) -> String {
 }
 
 impl StrictCheckMeter {
+    /// Aggregate metered work consumed so far. Read by the calibration
+    /// commit gate's `_reporting_work` wrapper; the deterministic figure
+    /// `REPEATABLE_CHECK_WORK` is defined against this value.
+    pub(super) fn work(&self) -> usize {
+        self.work
+    }
+
     pub(super) fn production() -> Self {
         Self::with_limits(MAX_CHECK_WORK, MAX_CHECK_BYTES)
     }

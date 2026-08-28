@@ -78,15 +78,25 @@
 // precondition that DOES lower is assumed inside the body, so a wrong one is
 // worse than none.
 //
-// WHAT IS NOT AVAILABLE, AND WHY THERE IS NO REPLACEMENT HERE FOR TWO OF THE
-// FOUR OLD MACROS. The resolver maps EXACTLY `requires` and `ensures`. The
-// `trust-spec` crate also exports `invariant`, but nothing maps it to a
-// builtin, so it stays a passthrough no-op — i.e. it would erase, which is the
-// defect this change exists to remove. There is no `decreases` attribute at
-// all. Loop invariants and termination measures therefore have NO first-class
-// spelling today; `leb128::read_u32`/`read_u64` still carry `termination`
-// obligations in the UNKNOWN class for that reason. Writing an erasing
-// `invariant!` back would not state them — it would only look like it did.
+// WHAT IS NOT AVAILABLE IN THE ATTRIBUTE FORM. The resolver maps exactly
+// `requires` and `ensures`. The `trust-spec` crate also exports `invariant`,
+// but nothing maps it to a builtin, so it remains an erasing passthrough; there
+// is no `decreases` attribute.
+//
+// The Trust compiler also has native clause grammar (`requires`, `ensures`,
+// `invariant`, `decreases`). It cannot live in this source while AY's
+// authority-honest default is stock Rust: raw grammar is parsed before cfg
+// stripping, so stock rustc rejects it and there is no fallback. Keep native
+// clauses in explicit Trust-only probes until the compiler is distributable
+// and its default build is complete.
+//
+// That boundary does not discard the useful 2026-08-27 findings. The two
+// nonzero-DIMACS preconditions in `literal.rs` remain first-class checked
+// attributes in the explicit overlay lane and prove. The former preconditions
+// on `Variable::new` and `Literal::from_index` remain deleted because their
+// runtime monitors changed documented recoverable panics into process aborts.
+// The measured native loop clause on `leb128::read_u64` also remains out:
+// it added five UNSUPPORTED rows and discharged nothing.
 //
 // See the development design notes
 

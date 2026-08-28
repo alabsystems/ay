@@ -115,7 +115,7 @@ pub(super) const AND_POS_SHALLOW_WORK_FACTOR: usize = 32;
 /// `General` product.
 pub(super) fn is_and_pos_shallow_match(step: &ProofStep, terms: &TermStore) -> bool {
     let ProofStep::Step {
-        rule: AletheRule::AndPos(_),
+        rule: AletheRule::AndPos(position),
         clause,
         args,
         ..
@@ -125,22 +125,44 @@ pub(super) fn is_and_pos_shallow_match(step: &ProofStep, terms: &TermStore) -> b
     };
     // `args.first()` is exactly what `validate_step` hands the validator as its
     // `source_term`; reading anything else here would decide a different step.
+    //
+    // TWO admission arms, each with its own no-recursion argument:
+    //  * `and_pos_matchers_are_shallow` — no `or`-headed literal or negand, so
+    //    neither De Morgan arm can open on ANY probe;
+    //  * `and_pos_is_emitted_identity_shape` — the clause is EXACTLY
+    //    `(cl (not source) args[index])` by `TermId` identity in that order, so
+    //    both ordered scans terminate on their FIRST probe and no matcher can
+    //    recurse whatever the conjunct's headedness is. This is the arm that
+    //    admits the QF_IDL `EqDiffVar`-spliced population, whose conjuncts are
+    //    `or`-headed and which the first arm therefore declines — measured at
+    //    39.7M-511.5M `General` work units per step for an O(1) validation.
     crate::checker::boolean_and_pos_shape::and_pos_matchers_are_shallow(
         terms,
         clause,
+        args.first().copied(),
+    ) || crate::checker::boolean_and_pos_shape::and_pos_is_emitted_identity_shape(
+        terms,
+        clause,
+        *position,
         args.first().copied(),
     )
 }
 
 /// Exact worst case of [`crate::checker::boolean::validate_and_pos`] on a step
-/// [`crate::checker::boolean_and_pos_shape::and_pos_matchers_are_shallow`] admits.
+/// [`crate::checker::boolean_and_pos_shape::and_pos_matchers_are_shallow`] or
+/// [`crate::checker::boolean_and_pos_shape::and_pos_is_emitted_identity_shape`]
+/// admits.
 ///
-/// On such a step both negation matchers return in `O(1)` — the derivation is
-/// on that predicate — and the whole validator costs at most `53 + 2n`
-/// primitives for a source arity `n`, which
+/// On a step the FIRST arm admits both negation matchers return in `O(1)` —
+/// the derivation is on that predicate — and the whole validator costs at most
+/// `53 + 2n` primitives for a source arity `n`, which
 /// [`AND_POS_SHALLOW_WORK_FACTOR`] copies of `payload.work` dominate because
 /// `payload.work >= n + 3`. See that constant for the primitive-by-primitive
-/// count.
+/// count. On a step the SECOND arm admits, both ordered scans terminate on
+/// their FIRST probe (the identity derivation is on that predicate), so the
+/// validator costs a CONSTANT ~25 primitives — below even this model's
+/// `+ AND_POS_SHALLOW_WORK_FACTOR` tail on its own, and far below `53 + 2n`.
+/// The same charge therefore covers both arms without change.
 ///
 /// The `+ AND_POS_SHALLOW_WORK_FACTOR` tail is not decoration: a payload with
 /// `work = 0` must still be charged for the constant-time guards, and the meter

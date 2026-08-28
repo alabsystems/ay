@@ -42,7 +42,20 @@ pub fn certify_opt_lin_lp_dual_floor(
     lp_dual_floor::certify_opt_lin_lp_dual_floor(instance, incumbent, optimum)
 }
 
-/// Reports why [`certify_opt_lin_lp_dual_floor`] did or did not fire; measurement-only.
+/// Reports what the LP RELAXATION says about `optimum` — NOT whether the
+/// emitter fired. Measurement-only.
+///
+/// READ THE NAME WITH CARE; it promises more than it delivers, and an audit
+/// caught a census quoting it as emitter behaviour. It answers "is there an
+/// LP-dual floor reaching the optimum, and if not why not", which is a fact
+/// about the relaxation. Whether a CERTIFICATE is emitted additionally depends
+/// on the incumbent, the denominator cap, and the search actually finishing —
+/// `fx57`/`fx60` are the standing counterexamples: this reports a usable floor
+/// while the run emits nothing, because what failed there was the search under
+/// `--proof`, not the floor.
+///
+/// A future rename to `lp_relaxation_diagnosis` would be an improvement; it is
+/// deferred only because the name appears in recorded measurements.
 pub fn lp_dual_floor_diagnosis(instance: &PbInstance, optimum: i128) -> String {
     lp_dual_floor::lp_dual_floor_diagnosis(instance, optimum)
 }
@@ -1572,6 +1585,154 @@ mod direct_floor_tests {
         assert!(
             proof.contains("conclusion BOUNDS 1 : ") && proof.contains(" 1 : "),
             "must conclude hinted BOUNDS 1 .. 1, got:\n{proof}"
+        );
+    }
+
+    /// Builds the PB25 `ihalainen/PBO-clique-coloring` shape at (n, t):
+    /// choose a graph on `n` vertices that is `t`-colourable and place vertices
+    /// into `n` clique slots; pay 1 per empty slot. Optimum is `n - t`, because
+    /// the occupied slots hold pairwise-adjacent vertices and a `t`-colourable
+    /// graph has no clique of size `t + 1` (this is `omega(G) <= chi(G)`, i.e.
+    /// pigeonhole). Variable layout, 1-based:
+    ///   `M[i][j] = 1 + i*n + j`             vertex `i` occupies slot `j`
+    ///   `o[j]    = 1 + n*n + j`             slot `j` is empty (the objective)
+    ///   `C[v][k] = 1 + n*n + n + v*t + k`   vertex `v` has colour `k`
+    ///   `e[p]    = 1 + n*n + n + n*t + p`   edge `p`, over pairs `i < i'`
+    fn clique_colouring(n: u32, t: u32) -> PbInstance {
+        let m = |i: u32, j: u32| 1 + i * n + j;
+        let o = |j: u32| 1 + n * n + j;
+        let c = |v: u32, k: u32| 1 + n * n + n + v * t + k;
+        let pairs: Vec<(u32, u32)> = (0..n)
+            .flat_map(|i| (i + 1..n).map(move |x| (i, x)))
+            .collect();
+        let e = |p: usize| 1 + n * n + n + n * t + u32::try_from(p).expect("pair index fits u32");
+        let mut rows = Vec::new();
+        for j in 0..n {
+            // slot `j` is occupied, or `o[j]` is paid
+            let mut r = vec![term(1, o(j))];
+            r.extend((0..n).map(|i| term(1, m(i, j))));
+            rows.push(ge(r, 1));
+        }
+        for i in 0..n {
+            // a vertex occupies at most one slot
+            rows.push(ge((0..n).map(|j| term(-1, m(i, j))).collect(), -1));
+        }
+        for (p, &(i, ii)) in pairs.iter().enumerate() {
+            // two vertices in DISTINCT slots must be adjacent
+            for a in 0..n {
+                for b in 0..n {
+                    if a != b {
+                        rows.push(ge(
+                            vec![term(1, e(p)), term(-1, m(i, a)), term(-1, m(ii, b))],
+                            -1,
+                        ));
+                    }
+                }
+            }
+        }
+        for v in 0..n {
+            // every vertex gets a colour
+            rows.push(ge((0..t).map(|k| term(1, c(v, k))).collect(), 1));
+        }
+        for (p, &(i, ii)) in pairs.iter().enumerate() {
+            // adjacent vertices do not share a colour
+            for k in 0..t {
+                rows.push(ge(
+                    vec![term(-1, e(p)), term(-1, c(i, k)), term(-1, c(ii, k))],
+                    -2,
+                ));
+            }
+        }
+        PbInstance {
+            num_vars: n * n + n + n * t + u32::try_from(pairs.len()).expect("pairs fit u32"),
+            num_constraints: u32::try_from(rows.len()).expect("row count fits u32"),
+            constraints: rows,
+            objective: Some(PbObjective {
+                terms: (0..n).map(|j| term(1, o(j))).collect(),
+            }),
+        }
+    }
+
+    /// THE NEGATIVE, made executable: for clique-coloring the LP relaxation
+    /// optimum is EXACTLY 0 while the integer optimum is `n - t`, so **no**
+    /// LP-dual floor certificate can ever fire on this family — not with more
+    /// budget, not with a better vertex, not with a bigger denominator cap.
+    ///
+    /// The witness is checkable by hand: put every vertex fractionally in every
+    /// slot (`M[i][j] = 1/n`), give every vertex every colour (`C[v][k] = 1/t`),
+    /// and leave every edge and payment variable at 0. Scaled by `n*t` (so the
+    /// arithmetic below is exact integer arithmetic) each row holds:
+    ///   slot   `o_j + sum_i M[i][j] >= 1`         -> `n * t >= n * t`
+    ///   vertex `sum_j M[i][j] <= 1`               -> `n * t <= n * t`
+    ///   edge   `e >= M[i][a] + M[i'][b] - 1`      -> `0 >= 2t - n*t`, true for n >= 2
+    ///   colour `sum_k C[v][k] >= 1`               -> `n * t >= n * t`
+    ///   proper `e + C[i][k] + C[i'][k] <= 2`      -> `2n <= 2*n*t`, true for t >= 1
+    /// and the objective is 0. Because every objective coefficient is `+1` and
+    /// `x >= 0`, `LP* >= 0` too, so `LP* = 0` exactly.
+    ///
+    /// Cross-checked 2026-08-27 against the four corpus members that deliver a
+    /// worthless dual point — n=7-t=3, n=8-t=3, n=10-t=3, n=10-t=9 — where an
+    /// independent LP engine and an exact rational primal witness both put
+    /// `LP* = 0` against optima 4/5/7/1.
+    #[test]
+    fn clique_colouring_lp_relaxation_is_exactly_zero_so_no_dual_floor_can_fire() {
+        for (n, t) in [(4u32, 2u32), (4, 3), (5, 2), (5, 3)] {
+            let instance = clique_colouring(n, t);
+            // The uniform witness, scaled by `n*t` to stay in exact integers.
+            let scale = i128::from(n) * i128::from(t);
+            let value = |var: u32| -> i128 {
+                if var <= n * n {
+                    i128::from(t) // M[i][j] = 1/n
+                } else if var <= n * n + n {
+                    0 // o[j] = 0
+                } else if var <= n * n + n + n * t {
+                    i128::from(n) // C[v][k] = 1/t
+                } else {
+                    0 // e[p] = 0
+                }
+            };
+            for row in &instance.constraints {
+                let lhs: i128 = row
+                    .terms
+                    .iter()
+                    .map(|term| {
+                        term.coeff * value(term.lits.first().expect("unit literal row").var)
+                    })
+                    .sum();
+                assert!(
+                    lhs >= row.rhs * scale,
+                    "uniform witness violates a row at n={n} t={t}: {lhs} < {}",
+                    row.rhs * scale
+                );
+            }
+            let objective: i128 = instance
+                .objective
+                .as_ref()
+                .expect("objective")
+                .terms
+                .iter()
+                .map(|term| term.coeff * value(term.lits.first().expect("unit literal").var))
+                .sum();
+            assert_eq!(objective, 0, "witness objective must be 0 at n={n} t={t}");
+        }
+    }
+
+    /// The companion behavioural half: with `LP* = 0` and optimum `n - t = 2`,
+    /// the LP-dual emitter must DECLINE rather than emit anything. A proof here
+    /// would be a proof of a bound the LP dual cannot support, which is the
+    /// worst defect this crate can have.
+    #[test]
+    fn clique_colouring_lp_dual_floor_declines_fail_closed() {
+        let instance = clique_colouring(4, 2);
+        // Optimum-2 model: vertices 0,1 in slots 0,1 with distinct colours and
+        // the edge between them present; slots 2,3 empty. Verified feasible.
+        let mut incumbent = vec![false; instance.num_vars as usize];
+        for var in [1u32, 6, 19, 20, 21, 24, 25, 27, 29] {
+            incumbent[var as usize - 1] = true;
+        }
+        assert!(
+            certify_opt_lin_lp_dual_floor(&instance, &incumbent, 2).is_none(),
+            "LP-dual floor must decline when LP* = 0 but the optimum is 2"
         );
     }
 }

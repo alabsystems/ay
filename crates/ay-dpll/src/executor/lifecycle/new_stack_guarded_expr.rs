@@ -77,6 +77,7 @@ macro_rules! new_stack_guarded_expr {
             last_proof_decline: None,
             last_proof_quality: None,
             strict_check_invocations: Cell::new(0),
+            eqdv_retention_off_declined_at_steps: Cell::new(0),
             strict_check_steps_validated: Cell::new(0),
             query_publication_role: Cell::new(QueryPublicationRole::default()),
             decision_command_depth: Cell::new(0),

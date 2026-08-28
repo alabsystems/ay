@@ -5,6 +5,7 @@
 //! Checked Alethe lowering for bounded bit-vector multiplication by zero.
 
 mod circuit;
+mod shift_monotonicity;
 #[cfg(test)]
 #[path = "bv_mul_zero/bv_mul_zero_tests.rs"]
 mod tests;
@@ -45,6 +46,7 @@ impl AlethePrinter<'_> {
     ) -> Option<String> {
         self.format_bv_constant_disequality(id, clause)
             .or_else(|| self.format_bv_mul_zero_bitblast(id, clause))
+            .or_else(|| self.format_bv_shift_monotonicity(id, clause))
             .or_else(|| self.format_bv_idempotent_gate_bitblast(id, clause))
             .or_else(|| self.format_bv_double_negation_bitblast(id, clause))
             .or_else(|| self.format_bv_ult_one_zero_equiv(id, clause))

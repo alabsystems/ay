@@ -70,7 +70,7 @@ impl TermStore {
     /// - Identity: bvlshr(x, 0) → x
     /// - Zero: bvlshr(0, x) → 0
     /// - Large shift: bvlshr(x, c) → 0 when c >= width
-    /// - Constant shift to extract: bvlshr(x, K) → zero_extend(K, extract(x, n-1, K))
+    /// - Constant shift to concat: bvlshr(x, K) → concat(bv_zero(K), extract(x, n-1, K))
     ///   Eliminates barrel-shifter circuit for constant shift amounts.
     ///   Reference: Z3 bv_rewriter, Yices2 term_manager.c:5298-5493
     pub fn mk_bvlshr(&mut self, args: Vec<TermId>) -> TermId {
@@ -101,10 +101,19 @@ impl TermStore {
                 if shift >= width {
                     return self.mk_bitvec(zero, width);
                 }
-                // Constant-shift-to-extract: bvlshr(x, K) → zero_extend(K, extract(x, n-1, K))
-                // This avoids building a barrel-shifter circuit for constant shifts.
+                // Constant-shift-to-concat: bvlshr(x, K) →
+                // concat(bv_zero(K), extract(x, n-1, K)). Keep the concat RAW:
+                // `mk_bvconcat` canonicalizes a zero high half back to
+                // `zero_extend`, while the pinned external Alethe checker has
+                // checked `bitblast_concat`/`bitblast_extract` rules but no
+                // `zero_extend` rule. This is a semantic normalization, not a
+                // proof assertion; the printer still has to derive every use.
                 let extracted = self.mk_bvextract(width - 1, shift, a);
-                return self.mk_bvzero_extend(shift, extracted);
+                let zero_bits = self.mk_bitvec(BigInt::zero(), shift);
+                return self.intern(
+                    TermData::App(Symbol::named("concat"), vec![zero_bits, extracted]),
+                    Sort::bitvec(width),
+                );
             }
         }
 

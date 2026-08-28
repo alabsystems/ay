@@ -288,6 +288,86 @@ impl Executor {
         out
     }
 
+    /// Serialize the exact assertion surface paired with an exported Alethe
+    /// proof.
+    ///
+    /// Unlike [`Self::to_smtlib2_for`], each assertion is rendered through the
+    /// Alethe printer with the proof's authenticated source-syntax override
+    /// table. This makes the returned bytes the checker input that the proof
+    /// was actually authored against, rather than a consumer-side
+    /// reconstruction that can silently normalize to a different term.
+    ///
+    /// Datatype and `define-fun` contexts currently decline this transport:
+    /// serializing either as an uninterpreted declaration would not preserve
+    /// the asserted theory. Ordinary core declarations, arrays, and free
+    /// programmatic constants remain self-contained.
+    pub(crate) fn alethe_problem_smt2_for(
+        &self,
+        assertions: &[TermId],
+        term_overrides: Option<&ay_core::kani_compat::DetHashMap<TermId, String>>,
+    ) -> Option<String> {
+        let public_signatures = self.ctx.public_symbol_signatures();
+        if public_signatures.iter().any(|signature| {
+            signature.is_definition
+                || signature
+                    .arguments
+                    .iter()
+                    .any(|sort| sort.contains_finite_set())
+                || signature.result.contains_finite_set()
+        }) {
+            return None;
+        }
+        let (plain_sorts, datatype_sorts) = self.referenced_uninterpreted_sorts(assertions);
+        if !datatype_sorts.is_empty() {
+            return None;
+        }
+
+        let mut out = String::from("(set-logic ALL)\n");
+        for name in &plain_sorts {
+            out.push_str(&format!("(declare-sort {} 0)\n", quote_symbol(name)));
+        }
+        let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (name, info) in self.ctx.symbols_iter() {
+            if ay_frontend::is_reserved_op_name(name) {
+                continue;
+            }
+            declared.insert(name.to_string());
+            let args = info
+                .arg_sorts
+                .iter()
+                .map(|sort| format_sort_surface(&self.ctx, sort))
+                .collect::<Vec<_>>();
+            out.push_str(&format!(
+                "(declare-fun {} ({}) {})\n",
+                quote_symbol(name),
+                args.join(" "),
+                format_sort_surface(&self.ctx, &info.sort),
+            ));
+        }
+        let mut extra = Vec::new();
+        for &assertion in assertions {
+            self.collect_undeclared_symbol_decls(assertion, &mut declared, &mut extra);
+        }
+        for declaration in extra {
+            out.push_str(&declaration);
+        }
+        for &assertion in assertions {
+            let rendered = term_overrides.map_or_else(
+                || ay_proof::format_term_alethe(&self.ctx.terms, assertion),
+                |overrides| {
+                    ay_proof::format_term_alethe_with_overrides(
+                        &self.ctx.terms,
+                        assertion,
+                        overrides,
+                    )
+                },
+            );
+            out.push_str(&format!("(assert {rendered})\n"));
+        }
+        out.push_str("(check-sat)\n");
+        Some(out)
+    }
+
     /// Serialize an explicit assertion list in the shape Z3's
     /// `Z3_solver_to_string` (and z3py's `Solver.sexpr()`) prints: one
     /// `(declare-fun NAME (ARGSORTS) RANGE)` line per declared symbol followed

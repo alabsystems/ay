@@ -263,6 +263,9 @@ mod metering_and_pos_bounds;
 #[path = "quality_tests/metering_and_pos_ledger.rs"]
 mod metering_and_pos_ledger;
 
+#[path = "quality_tests/metering_and_pos_identity.rs"]
+mod metering_and_pos_identity;
+
 #[test]
 fn test_premise_authentication_rejects_unauthorized_assume() {
     let mut terms = TermStore::new();

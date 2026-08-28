@@ -508,6 +508,21 @@ fn main() {
     // leaves every existing parser (which reads fields 0 and 1) working unchanged.
     let nodes = ay_milp::nodes_explored();
 
+    // THE GUROBI-COMPARABLE SPLIT, ON STDERR ONLY — never as a fifth stdout field.
+    // `scripts/milp_node_gate.py` parses this example's node count as `line[-1]`, so
+    // appending anything to stdout would silently re-point all twenty ratchet pins at
+    // the wrong number. stdout stays byte-identical; the decomposition rides stderr,
+    // where the rigorous dual bound already lives.
+    //
+    // `total` is `nodes` above (heuristic sub-MIP trees included, as it always has
+    // been); `submip` is the part spent inside RENS/RINS/ball/seed-repair sub-searches;
+    // `root` is the proof tree alone, which is what Gurobi's `Model.NodeCount` reports.
+    eprintln!(
+        "nodes: total={nodes} root={} submip={}",
+        ay_milp::root_nodes_explored(),
+        ay_milp::submip_nodes_explored()
+    );
+
     // The reader multiplied the objective through to make its coefficients exactly
     // representable. That scaling never moved the argmin, but it did rename the value, so undo
     // it -- exactly, with rationals -- before reporting a number anyone will compare.

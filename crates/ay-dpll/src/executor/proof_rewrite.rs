@@ -20,17 +20,6 @@ mod ordered_tail;
 mod surface_pairs;
 use surface_pairs::{MAX_OVERRIDE_PAIRS, MAX_OVERRIDE_SOURCE_SCAN};
 
-/// Largest proof the RETENTION-OFF authority subset offers to the `EqDiffVar`
-/// derivation lane (#4751).
-///
-/// The bound belongs to the CALL SITE, not to the lane: the retention-ON path
-/// has been running the lane unbounded since #4751 and keeps doing so, so this
-/// constant can only ever narrow the NEW wiring. The measurement that fixes the
-/// value, and why no other observable separates the two regimes, is written out
-/// at the call site in
-/// [`Executor::run_assumption_authority_passes_without_parsed_syntax`].
-const EQ_DIFFVAR_RETENTION_OFF_MAX_PROOF_STEPS: usize = 4_096;
-
 impl Executor {
     /// Whether a valid arithmetic `evaluate` is outside Carcara's portable evaluator.
     ///
@@ -325,17 +314,6 @@ impl Executor {
         self.finish_input_syntax_rewrite(proof, &rewrites, term_overrides, &aux_assume_steps);
     }
 
-    /// Whether the retention-off authority subset may offer `proof` to the
-    /// `EqDiffVar` derivation lane (#4751).
-    ///
-    /// A named predicate rather than an inline comparison so the bound can be
-    /// pinned two-sided by a test: a mutation that drops it comes back RED on
-    /// the "too large" row instead of passing unnoticed on the "small enough"
-    /// one. See the call site for the measurement that fixes the value.
-    pub(in crate::executor) fn eq_diffvar_lane_fits_retention_off_bound(proof: &Proof) -> bool {
-        proof.steps.len() < EQ_DIFFVAR_RETENTION_OFF_MAX_PROOF_STEPS
-    }
-
     /// The ASSUMPTION-AUTHORITY subset of
     /// [`Self::apply_input_syntax_rewrites_to_proof`] that is safe to run with
     /// no parsed-assertion prefix.
@@ -381,7 +359,10 @@ impl Executor {
     /// UNSAT fresh re-solve, full strict validation of every non-trust step,
     /// per-clause confirmation). `problem_assertions_for_strict_proof()` is not
     /// touched, so nothing solver-generated enters the frozen obligation.
-    fn run_assumption_authority_passes_without_parsed_syntax(&mut self, proof: &mut Proof) {
+    pub(in crate::executor) fn run_assumption_authority_passes_without_parsed_syntax(
+        &mut self,
+        proof: &mut Proof,
+    ) {
         debug_assert!(
             self.ctx.assertions_parsed().is_empty(),
             "BUG: the narrowed authority subset is only for the retention-off configuration"
@@ -461,46 +442,83 @@ impl Executor {
         // `InvalidTheoryLemma` in place of the rescuable `trust` it replaced.
         // `problem_assertions_for_strict_proof()` is not touched.
         //
-        // THE SIZE BOUND IS NOT A LATENCY NICETY — it is what keeps this
-        // wiring from LOSING correct `unsat` verdicts, and it is the reason the
-        // bound lives at THIS call site instead of inside the lane: the
-        // retention-ON path keeps its exact behaviour.
+        // THE COMMIT GATE IS NOT A LATENCY NICETY — it is what keeps this
+        // wiring from LOSING correct `unsat` verdicts.
         //
         // Mechanism, measured end to end on `ay solve --no-proof -T:10`. The
         // derivations do their job — they remove premiseless `trust` leaves —
         // and on a LARGE proof that is precisely the harm: with the early trust
         // leaf gone, the strict checker no longer fails fast on it and instead
-        // runs until its aggregate WORK envelope refuses a charge. That turns a
-        // trust-family rejection into `ProofCheckError::ResourceLimit`, and
-        // `unsat_cert`'s deferred lane reaches
-        // `discharge_trust_steps_for_certification` with NOTHING collected, so
-        // the mint falls through to a fresh-`Executor` whole-problem
-        // corroboration re-solve. The proof is no less correct and the
-        // derivations are no less valid; the certificate simply costs seconds
-        // it did not cost before. Splicing itself is 13-50 ms and the strict
-        // check 3-78 ms even at 54,767 steps, so neither is the expense.
+        // walks (and meters) the whole document, on EVERY proof assembly. Two
+        // measured failure shapes follow (SMT-LIB QF_IDL 900-file paired
+        // sample, 2026-08-27, with the `and_pos` charge fix already in):
         //
-        // Unbounded, on the SMT-LIB QF_IDL 900-file sample: 44 files degraded
-        // from a trust-family rejection to `ResourceLimit` (0 went the other
-        // way), and 5 of them crossed `-T:10` and published `unknown` in place
-        // of a correct `unsat` — `sal/bakery/inf-bakery-mutex-8` went 2.2 s to
-        // 10.0 s, reproduced unloaded at 1.5-1.8 s against 9.1-9.9 s over three
-        // reps each.
+        //  * the walk runs out of the aggregate WORK envelope: the
+        //    presentation degrades from a rescuable trust-family rejection to
+        //    `ProofCheckError::ResourceLimit`, `unsat_cert`'s deferred lane
+        //    reaches `discharge_trust_steps_for_certification` with NOTHING
+        //    collected, and the mint falls through to a whole-problem re-solve
+        //    (`planning/plan-8..14`, `sal/lpsat-goal-7`: correct `unsat`s
+        //    published `unknown`);
+        //  * the walk SUCCEEDS but is expensive, and the pipeline re-runs it
+        //    ~60 times across assemblies (`sal/bakery/inf-bakery-mutex-18`:
+        //    60 walks x 287-295M work = +6.4s, crossing `-T:10` with no
+        //    refusal anywhere).
         //
-        // The bound separates the two regimes on the one observable that
-        // actually tracks the checker's envelope, the size of the proof being
-        // enlarged: measured, `mathsat/fischer/FISCHER4-3-ninc` at **3,911
-        // steps** keeps its trust-family class, and `FISCHER5-3-ninc` at
-        // **5,117** is the smallest that degrades. Neither the number of steps
-        // spliced nor the growth RATIO separates them — `FISCHER4-3` grows by
-        // 13,250 steps (339%) and stays safe while `inf-bakery-mutex-8` grows
-        // by 4,152 (34%) and degrades — so the bound is on the pre-splice size
-        // and nothing else. Past it the strict checker refuses the document
-        // however many `trust` leaves come out of it, so the derivation buys no
-        // certificate at all and only spends the mint's budget.
-        if Self::eq_diffvar_lane_fits_retention_off_bound(proof) {
-            self.derive_eq_diffvar_rewritten_assertions(proof, &extended_assertions);
+        // This wiring used to carry a 4,096-step call-site size bound against
+        // the first shape (2026-08-25: 44 of 900 files degraded unbounded).
+        // The bound is gone: the dominant mis-billing was fixed at its source
+        // (`ay-proof`'s `and_pos_is_emitted_identity_shape` — 39.7M-511.5M
+        // work units per O(1) `and_pos` step), and the residual is decided by
+        // the commit gate BELOW, which prices the exact publication walk of
+        // the FINISHED document and reverts the splice when that walk refuses
+        // or is too expensive to keep re-running. A SIZE bound cannot express
+        // that criterion: `mathsat/fischer/FISCHER5-3-ninc` (5,117 pre-splice
+        // steps) was the smallest degrader under the old charge model and now
+        // commits, while `planning/plan-7.cvc` must revert however small it
+        // starts.
+        //
+        // The gate CANNOT sit inside the lane: at this point of the subset the
+        // proof still carries the premiseless leaves the passes BELOW derive,
+        // so a strict walk here fails fast on one of those and prices nothing
+        // (measured: every `sal/bakery` splice looked cheap mid-subset and
+        // cost 287M+ per walk once the tail lanes had cleared the early
+        // leaves). It prices the SUBSET'S OWN OUTPUT instead, after
+        // `rebuild_trust_leaf_proof_from_original_assertions`, and on a revert
+        // re-runs the tail exactly as the never-spliced path would have.
+        let eqdv_snapshot = (!self.eq_diffvar_retention_off_decline_covers(proof)
+            && self.eq_diffvar_lane_would_consider(proof))
+        .then(|| proof.clone());
+        let eqdv_spliced = if eqdv_snapshot.is_some() {
+            self.derive_eq_diffvar_rewritten_assertions(proof, &extended_assertions)
+        } else {
+            false
+        };
+        self.run_post_eqdv_authority_tail(proof, &extended_assertions);
+        if let (Some(snapshot), true) = (eqdv_snapshot, eqdv_spliced) {
+            match self.eq_diffvar_presentation_commit_decision(proof) {
+                super::proof_propagated_rewrite::EqDiffVarCommitDecision::Commit => {}
+                super::proof_propagated_rewrite::EqDiffVarCommitDecision::Revert { remember } => {
+                    *proof = snapshot;
+                    if remember {
+                        // Record the PRE-SPLICE size the decline was priced
+                        // at; see the field's doc for the scope rule.
+                        self.eqdv_retention_off_declined_at_steps
+                            .set(proof.steps.len().max(1));
+                    }
+                    // The tail's work above was built on the discarded splice;
+                    // rebuild it from the restored proof, exactly as the
+                    // never-spliced path would have.
+                    self.run_post_eqdv_authority_tail(proof, &extended_assertions);
+                }
+            }
         }
+    }
+
+    /// The authority passes that run AFTER the `EqDiffVar` lane in the
+    /// retention-off subset — factored out so the commit gate can re-run them
+    /// verbatim on the restored pre-splice proof when it reverts.
+    fn run_post_eqdv_authority_tail(&mut self, proof: &mut Proof, extended_assertions: &[TermId]) {
         // #rewritten-assertion-bridge — the residual the promotion above
         // correctly declines: a REWRITTEN authored assertion, whose definiendum
         // is an AUTHORED symbol, so no freshness argument applies to it at all.
@@ -512,26 +530,26 @@ impl Executor {
         // is re-validated by the UNTOUCHED strict checker, and the lane reverts
         // the whole rewrite if the rebuilt proof does not check or loses a
         // certification the original had.
-        self.derive_rewritten_assertions_by_congruence(proof, &extended_assertions);
+        self.derive_rewritten_assertions_by_congruence(proof, extended_assertions);
         // #rewritten-nonequality-bridge — the same repair for the rewritten
         // assertions whose goal is NOT a binary `=`, which the lane above
         // cannot take as a congruence-explanation conclusion. It runs after it
         // and never competes for a leaf it serves.
-        self.derive_rewritten_nonequality_assertions(proof, &extended_assertions);
+        self.derive_rewritten_nonequality_assertions(proof, extended_assertions);
         // #authored-conjunct-leaf — the residual BOTH bridges decline: a leaf
         // whose clause IS a nested `and`-conjunct of an authored assertion,
         // which is not a REWRITE of anything and so has no congruence to
         // explain. It is derived by `and_pos` from an `assume` of the authored
         // root. It runs last of the three so it never competes for a leaf a
         // bridge serves. See `proof/authored_conjunct_leaf`.
-        self.derive_authored_conjunct_leaves(proof, &extended_assertions);
+        self.derive_authored_conjunct_leaves(proof, extended_assertions);
         // #minted-definition-leaf — the LAST residual: a leaf that is an
         // authored assertion with a FRESH symbol substituted in, whose
         // definition the proof does not contain at all. The definition is
         // MINTED as a checked `fresh_def_eq` step, vetted by the checker's own
         // `FreshDefRegistry` over the FINISHED proof (Gate 2), which is why it
         // runs last of every derivation lane. See `proof/minted_definition_leaf`.
-        self.derive_leaves_over_minted_definitions(proof, &extended_assertions);
+        self.derive_leaves_over_minted_definitions(proof, extended_assertions);
         // #conjunct-decomposition-leaf — the residual the lane above
         // cannot reach: an `and`-headed leaf that differs from its
         // authored root at a position UNDER a `not`, which
@@ -541,13 +559,13 @@ impl Executor {
         // under an `App` head, and reassembled with one `and_neg`. It runs
         // after the whole-term lane and never competes for a leaf that one
         // serves. See `proof/conjunct_decomposition_leaf`.
-        self.derive_conjunctwise_decomposed_leaves(proof, &extended_assertions);
+        self.derive_conjunctwise_decomposed_leaves(proof, extended_assertions);
         // #ite-definition-leaf — the ITE-DEFINITION guard clauses
         // `name_non_bool_ites_all` appends over a fresh `__ay_ite_def_*`. Same
         // placement rule as the two lanes above and for the same reason: the
         // checker decides freshness against the FINISHED `assume` set. See
         // `proof/ite_definition_leaf`.
-        self.derive_ite_definition_guard_leaves(proof, &extended_assertions);
+        self.derive_ite_definition_guard_leaves(proof, extended_assertions);
         self.rebuild_trust_leaf_proof_from_original_assertions(proof);
     }
 }

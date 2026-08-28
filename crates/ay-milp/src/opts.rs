@@ -785,8 +785,43 @@ pub struct SolveOpts {
     /// consumes this budget when determinism is disabled; native branch-and-
     /// bound remains single-threaded.
     pub threads: u32,
-    /// When true (default), identical inputs give identical outcomes
-    /// run-to-run.
+    /// When true (default), no lane may use a source of run-to-run divergence
+    /// that this engine CHOOSES: worker threads race (the exact PB optimization
+    /// portfolio), and the lattice traversal takes its historical serial order.
+    ///
+    /// IT DOES NOT PROMISE A REPRODUCIBLE TREE, AND AN EARLIER SPELLING DID.
+    /// This field read "identical inputs give identical outcomes run-to-run",
+    /// which is a claim about the whole engine and is FALSE for the native
+    /// branch-and-bound lane at this default. The search reads the wall clock in
+    /// two categorically different ways, and only the first is a promise it
+    /// keeps:
+    ///
+    /// 1. ANYTIME STOP — `deadline` expiry ends new search work, so a budget too
+    ///    small for a proof returns `Feasible`/`Bound` instead of `Optimal`.
+    ///    That is the contract a time limit IS, and the verdict word says which
+    ///    happened, so nothing here is silent. Measured on `qiu`: `--limit 60`
+    ///    at 1-minute load 23-54 returns FEASIBLE twice, `--limit 300` returns
+    ///    OPTIMAL / -132.873136947 / 2,831 nodes twice, one binary.
+    ///
+    /// 2. BUDGET-DENOMINATED WORK — several devices size themselves as a SHARE
+    ///    of the remaining deadline or as a multiple of an OBSERVED wall
+    ///    (`RIM_SHARE`, `PUMP_SHARE`, `SETPART_TIME_SHARE`, `SPLNS_TIME_SHARE`,
+    ///    the root cut loop's share deadline and its per-family `half_tail` /
+    ///    `round_lp_secs` clamps, the endgame's fraction of `total_budget`, and
+    ///    the `nodes / solve_start.elapsed()` rate that gates `slow_tree`,
+    ///    `rins_rescue` and the node-cut repayment). Those change the TREE, so a
+    ///    run that proves optimality well inside its budget can still visit a
+    ///    different number of nodes — and, under `--proof`, emit different
+    ///    certificate bytes — because of the clock. The verdict stays right; the
+    ///    evidence is not reproducible, and nothing in the output says so.
+    ///
+    /// Measured (2) with a load-free instrument — same binary, one model, two
+    /// `--limit` values, so no load argument is needed: 20 of 25 gate-corpus
+    /// models are invariant in (verdict, objective, nodes) across a 60x budget
+    /// swing, and three are not (`misc07`, `nw04`, `p2756`). See
+    /// `scripts/milp_limit_invariance.py`, which is that instrument, and
+    /// `.milp_node_baseline.toml`'s `[flaky]` section, whose membership this
+    /// reproduces from first principles.
     pub determinism: bool,
     /// Seed for randomized heuristics (unused while `determinism` holds all
     /// current lanes fixed; reserved for the native engine).

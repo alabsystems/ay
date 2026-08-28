@@ -4,6 +4,8 @@
 
 #![allow(clippy::print_stderr)]
 
+use ay_core::Sort;
+use ay_dpll::api::{Logic, Solver, StrictProofVerdict};
 use ay_dpll::Executor;
 use ay_frontend::parse;
 use ntest::timeout;
@@ -76,11 +78,136 @@ fn require_carcara_or_skip() -> Option<PathBuf> {
     None
 }
 
+fn required_cargo_home_carcara() -> PathBuf {
+    let home = std::env::var_os("HOME").expect("HOME must be set for the production proof gate");
+    let path = PathBuf::from(home).join(".cargo/bin/carcara");
+    assert!(
+        path.is_file(),
+        "the production E5 proof gate requires the real checker at {}",
+        path.display()
+    );
+    path
+}
+
+fn exact_carcara_verdict(carcara: &Path, problem: &str, proof: &str) -> (bool, String) {
+    let directory = tempfile::tempdir().expect("temporary Carcara directory");
+    let problem_path = directory.path().join("problem.smt2");
+    let proof_path = directory.path().join("proof.alethe");
+    std::fs::write(&problem_path, problem).expect("write exact problem");
+    std::fs::write(&proof_path, proof).expect("write exact proof");
+    let output = std::process::Command::new(carcara)
+        .arg("check")
+        .arg("--no-color")
+        .arg("--")
+        .arg(&proof_path)
+        .arg(&problem_path)
+        .output()
+        .expect("run production Carcara checker");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let diagnostic = format!(
+        "status={:?}; stdout={}; stderr={}",
+        output.status.code(),
+        stdout.trim(),
+        stderr.trim()
+    );
+    (
+        trust_free_carcara_verdict_is_valid(output.status.success(), &stdout),
+        diagnostic,
+    )
+}
+
 include!("carcara_external_check/runner.rs");
 include!("carcara_external_check/ite_bv.rs");
 include!("carcara_external_check/uf_lia.rs");
 include!("carcara_external_check/corpus.rs");
 include!("carcara_external_check/normalized_bv.rs");
+
+/// Production gate for Trust's bounded E5 shift-count contradiction.
+///
+/// Native strict verification and external Carcara verification are separate
+/// verdicts. The latter consumes the exact problem bytes carried beside the
+/// proof artifact; both proof tampering and problem/surface substitution must
+/// be independently rejected.
+#[test]
+#[timeout(60_000)]
+fn test_e5_shift_exact_artifact_is_native_strict_and_carcara_valid() {
+    let carcara = required_cargo_home_carcara();
+    let mut solver = Solver::try_new(Logic::QfBv).expect("QF_BV solver");
+    solver.set_produce_proofs(true);
+    let x = solver.declare_const("x", Sort::bitvec(8));
+    let zero = solver.bv_const(0, 8);
+    let one = solver.bv_const(1, 8);
+    let positive = solver.bvult(zero, x);
+    let shifted = solver.bvlshr(x, one);
+    let non_strict = solver.bvule(x, shifted);
+    let contradiction = solver.and(positive, non_strict);
+    solver.assert_term(contradiction);
+
+    let details = solver.check_sat_with_details();
+    assert!(
+        details.result.is_unsat(),
+        "bounded shift contradiction must be UNSAT: {details:?}"
+    );
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("E5 UNSAT must export a proof artifact");
+    assert!(matches!(
+        artifact.strict_verdict,
+        StrictProofVerdict::Verified(ref quality) if quality.is_complete()
+    ));
+    assert!(
+        !artifact.alethe.contains(":rule hole") && !artifact.alethe.contains(":rule trust"),
+        "external artifact must contain no unchecked rule:\n{}",
+        artifact.alethe
+    );
+    let exact_problem = artifact
+        .alethe_problem_smt2
+        .as_deref()
+        .expect("QF_BV artifact must carry exact checker problem bytes");
+    let normalized_shift = "(concat #b0 ((_ extract 7 1) x))";
+    assert!(exact_problem.contains(normalized_shift), "{exact_problem}");
+    assert!(!exact_problem.contains("bvlshr"), "{exact_problem}");
+    assert!(!exact_problem.contains("zero_extend"), "{exact_problem}");
+
+    let (valid, diagnostic) = exact_carcara_verdict(&carcara, exact_problem, &artifact.alethe);
+    assert!(
+        valid,
+        "exact E5 artifact must be Carcara-valid: {diagnostic}"
+    );
+
+    let tampered_proof = artifact
+        .alethe
+        .replacen(":rule bitblast_const", ":rule false", 1);
+    assert_ne!(
+        tampered_proof, artifact.alethe,
+        "proof tamper target missing"
+    );
+    let (valid, diagnostic) = exact_carcara_verdict(&carcara, exact_problem, &tampered_proof);
+    assert!(!valid, "Carcara accepted a tampered proof: {diagnostic}");
+
+    let tampered_problem = exact_problem.replacen("#b00000000", "#b00000001", 1);
+    assert_ne!(
+        tampered_problem, exact_problem,
+        "problem tamper target missing"
+    );
+    let (valid, diagnostic) = exact_carcara_verdict(&carcara, &tampered_problem, &artifact.alethe);
+    assert!(!valid, "Carcara accepted a tampered problem: {diagnostic}");
+
+    // A consumer rebuilding the pre-normalization source formula produces an
+    // equivalent SMT proposition, but not the exact assumption surface bound
+    // into this Alethe certificate. That pair must be refused.
+    let rebuilt_problem = exact_problem.replacen(normalized_shift, "(bvlshr x #x01)", 1);
+    assert_ne!(
+        rebuilt_problem, exact_problem,
+        "normalization-binding target missing"
+    );
+    let (valid, diagnostic) = exact_carcara_verdict(&carcara, &rebuilt_problem, &artifact.alethe);
+    assert!(
+        !valid,
+        "Carcara accepted proof against consumer-rebuilt problem: {diagnostic}"
+    );
+}
 
 /// The external-codegen GUARDED-division obligation, verbatim from a captured bridge
 /// query. `(and (not (= b 0)) (not (= X X)))` folds to `false` at elaboration

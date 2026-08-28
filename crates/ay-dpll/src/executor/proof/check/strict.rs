@@ -6,6 +6,8 @@
 
 use super::*;
 
+use super::strict_check_progress::check_with_executor_progress_reporting_work;
+
 impl Executor {
     /// Strict proof check that also validates datatype constructor-distinctness lemmas (#8419).
     /// `DatatypeDistinct` steps (promoted from `Generic` at proof finalization
@@ -25,6 +27,19 @@ impl Executor {
         &self,
         proof: &Proof,
     ) -> Result<ProofQuality, ProofCheckError> {
+        self.check_proof_strict_with_datatypes_reporting_work(proof)
+            .0
+    }
+
+    /// As [`Self::check_proof_strict_with_datatypes`], additionally reporting
+    /// the aggregate metered WORK the walk consumed — the deterministic figure
+    /// [`REPEATABLE_CHECK_WORK`] is defined against. The finite-enum
+    /// capability route reports 0: it is separately bounded by its own
+    /// capability budget and never enters the aggregate meter.
+    pub(in crate::executor) fn check_proof_strict_with_datatypes_reporting_work(
+        &self,
+        proof: &Proof,
+    ) -> (Result<ProofQuality, ProofCheckError>, usize) {
         // M0(a) attribution counters (the development design notes):
         // every strict-check entry through this wrapper is counted, including
         // the finite-enum route below and the mint-time re-check in
@@ -35,26 +50,36 @@ impl Executor {
             .set(self.strict_check_steps_validated.get() + proof.steps.len() as u64);
         if let Some(capability) = self.checked_finite_enum_capability_for_proof(proof) {
             let assumptions: Vec<TermId> = capability.assumptions().collect();
-            return self.check_bounded_finite_enum_proof(
-                proof,
-                &assumptions,
-                &capability.datatype_decls,
-                &capability.selector_decls,
-                &capability.member_signatures,
+            return (
+                self.check_bounded_finite_enum_proof(
+                    proof,
+                    &assumptions,
+                    &capability.datatype_decls,
+                    &capability.selector_decls,
+                    &capability.member_signatures,
+                ),
+                0,
             );
         }
         let decls = self.datatype_decls_for_strict_proof();
         let selectors = self.ctor_selector_decls_for_strict_proof();
-        let member_signatures = self
-            .datatype_member_signatures_for_strict_proof()
-            .ok_or_else(|| ProofCheckError::InvalidDatatypeSignatureContext {
-                reason: "executor datatype registries lack an exact sticky member signature"
-                    .to_string(),
-            })?;
+        let member_signatures = match self.datatype_member_signatures_for_strict_proof() {
+            Some(member_signatures) => member_signatures,
+            None => {
+                return (
+                    Err(ProofCheckError::InvalidDatatypeSignatureContext {
+                        reason: "executor datatype registries lack an exact sticky member \
+                                 signature"
+                            .to_string(),
+                    }),
+                    0,
+                )
+            }
+        };
         // A non-matching candidate must never inherit a narrow scope merely
         // because the current stored proof has a finite-enum capability.
         let problem = self.complete_problem_assertions_for_strict_proof();
-        check_with_executor_progress(
+        check_with_executor_progress_reporting_work(
             self,
             proof,
             (!decls.is_empty()).then_some(decls.as_slice()),

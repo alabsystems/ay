@@ -757,6 +757,26 @@ pub(crate) fn lp_dual_raw_diagnosed(
                 // is not the optimal one, so it licenses no `ceil(LP*)` reading.
                 converged = false;
                 tier = "denominator-reduced";
+            } else if let Some(exact) = model.solve_dual(should_stop, target) {
+                // THE SNAP FAILED, SO DO NOT HAND BACK A POINT THE EMITTER IS
+                // GUARANTEED TO REFUSE. We are only here because the bound is
+                // already TIGHT (`bound == want`) and the sole obstacle is that
+                // this point's denominators exceed the emitter's cap. Returning
+                // it unchanged spends the whole derivation to produce a
+                // certificate that is then discarded on a representation
+                // technicality -- the `hw32-vm25p` shape, where floor == optimum
+                // and only the cap refuses.
+                //
+                // The exact tier reaches DIFFERENT vertices, so it is a real
+                // second chance rather than a retry of the same computation.
+                // Accept it only if it is at least as good; a worse bound is not
+                // an improvement and `converged` must not be borrowed from it.
+                if exact.bound >= bound {
+                    converged = exact.optimal;
+                    bound = exact.bound;
+                    duals = exact.duals;
+                    tier = "exact-after-snap-refused";
+                }
             }
         }
     }

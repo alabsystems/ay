@@ -625,6 +625,20 @@ pub struct Executor {
     /// Reset with `last_statistics`, dumped through
     /// `publish_strict_check_counters` as `proof.strict_check_invocations`.
     pub(in crate::executor) strict_check_invocations: Cell<u64>,
+    /// Size-scoped decline latch for the retention-off `EqDiffVar` lane
+    /// (#4751): 0 until its commit gate deterministically reverts a splice
+    /// (strict envelope refused it, or the spliced walk is too expensive to
+    /// keep re-checking), then the PRE-SPLICE step count of the declined
+    /// document. Rebuilds of a similar-sized document skip the lane instead of
+    /// re-paying the gate's whole-proof metered walk for the same answer
+    /// (measured ~40-110 ms, ~30 rebuilds per solve on `QF_IDL/sal/bakery`).
+    /// The scope is the point: a LATER assembly can rebuild a much SMALLER
+    /// document whose splice is cheap and commits — measured on
+    /// `queens_bench/super_queen5-1` and `sal/lpsat/lpsat-goal-1`, whose final
+    /// documents shrink to 201/21 steps and strict-certify, 3/3 deterministic
+    /// — so a document under HALF the declined size re-asks the gate (and, if
+    /// declined again, narrows the scope; at most log2 re-asks per executor).
+    pub(in crate::executor) eqdv_retention_off_declined_at_steps: Cell<usize>,
     /// M0(a) companion counter: total proof steps submitted across those
     /// strict-check invocations (the strict checker walks every step of an
     /// accepted proof; a rejected proof stops early, so this is an upper

@@ -56,6 +56,87 @@ use super::boolean::{decode_app, strip_not};
 /// This grants NO proof authority and changes NOTHING the checker accepts: it is
 /// read only by the charge model. It fails CLOSED — every step it declines keeps
 /// the conservative `General` tree-unfolded product.
+/// Decide, in `O(1)`, whether `clause` is EXACTLY the emitted `and_pos` shape
+/// `(cl (not source) source_args[index])` — gate first, indexed conjunct
+/// second, both by `TermId` IDENTITY — against an `and`-headed `source`.
+///
+/// # Why this shape cannot reach a matcher recursion, whatever the conjunct is
+///
+/// [`and_pos_matchers_are_shallow`] above kills every recursive edge by
+/// requiring that no clause literal (and no negand) is `or`-headed. That
+/// declines the emitted step whose indexed conjunct IS a disjunction — and on
+/// QF_IDL's folded assertion bodies that is the POPULATION: the `EqDiffVar`
+/// derivation lane splices `and_pos` steps whose conjunct is an `or` of
+/// guards, and each such step was billed the `General` tree product
+/// (`work * unfolded_work`, measured 39,695,940 per step on
+/// `sal/bakery/inf-bakery-mutex-8` and 511,491,267 on ONE step of
+/// `mathsat/fischer/FISCHER5-3-ninc`) for a validation that is O(1). This arm
+/// admits that population by pinning the ORDER and the IDENTITIES, which
+/// makes headedness irrelevant:
+///
+///  * `has_gate` scans the clause IN ORDER and short-circuits. Its first
+///    probe is `matches_negation_of_term(clause[0], source)`, which opens
+///    with `strip_not(lit) == Some(term)` — exactly the identity this arm
+///    requires — so it returns `true` on its first comparison and NO other
+///    gate probe runs. The second literal is never handed to a matcher here.
+///  * `has_conjunct` also scans in order. Its first probe is
+///    `matches_positive_literal_of_term((not source), args[index])`:
+///    - the identity test fails (`(not source)` cannot equal a strict
+///      subterm of `source`: the term DAG is acyclic);
+///    - if `args[index]` is not `and`-headed the guard fails in O(1);
+///    - if it IS `and`-headed, the recursion is
+///      `matches_negation_of_term(source, args[index])`, which is O(1):
+///      `strip_not(source)` is `None` (an `and` application),
+///      `decode_ite(args[index])` is `None` (`and`-headed), and the `and`
+///      arm demands `source` be `or`-headed, which it is not.
+///    Its second probe is `clause[1] == args[index]` — the other identity
+///    this arm requires — so it returns `true` with no matcher call.
+///
+/// So on an admitted step the validator performs a constant number of
+/// primitives (about two dozen: the length guard, `decode_and_source`'s first
+/// branch, the index guard, one `strip_not` identity hit, one O(1)
+/// `matches_positive_literal_of_term` miss and one `TermId` identity hit),
+/// and the existing `AndPosShallowMatch` charge `32 * payload.work + 32`
+/// covers it from its constant tail alone.
+///
+/// The ORDER is load-bearing, not pedantry: with the clause REVERSED,
+/// `has_gate` evaluates the conjunct literal FIRST, and an `or`-headed
+/// conjunct whose arity equals the source's enters
+/// `matches_negated_components` — the unmemoized De Morgan recursion the
+/// doubling refutations in `metering_and_pos.rs` cost at `2^k`. A reversed or
+/// otherwise non-identical clause therefore keeps the `General` product.
+///
+/// This grants NO proof authority and changes NOTHING the checker accepts: it
+/// is read only by the charge model, and it fails CLOSED — every step it
+/// declines keeps the conservative `General` tree-unfolded product.
+pub(crate) fn and_pos_is_emitted_identity_shape(
+    terms: &TermStore,
+    clause: &[TermId],
+    position: u32,
+    source_term: Option<TermId>,
+) -> bool {
+    // The bound is stated over exactly two literals, like the sibling gate.
+    if clause.len() != 2 {
+        return false;
+    }
+    let Some(source) = source_term else {
+        return false;
+    };
+    // `and`-headed source: `decode_ite(source)` is structurally `None` and
+    // `decode_and_source` is pinned to its first branch.
+    let Some(args) = decode_app(terms, source, "and") else {
+        return false;
+    };
+    // A `position` past the argument list is rejected by the validator's own
+    // index guard before either scan runs; decline rather than reason about it.
+    let Some(&target) = args.get(position as usize) else {
+        return false;
+    };
+    // Gate first, indexed conjunct second, both by identity — see above for
+    // why each scan then terminates on its FIRST probe.
+    strip_not(terms, clause[0]) == Some(source) && clause[1] == target
+}
+
 pub(crate) fn and_pos_matchers_are_shallow(
     terms: &TermStore,
     clause: &[TermId],

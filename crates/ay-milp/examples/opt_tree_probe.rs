@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              solve_nodes={nodes}\trule={tag}\tbudget={b}\tleaf_cap={leaf_cap}\t\
              derive_secs={dt:.3}\tresult={}\tcert_leaves={}\tleaves={}\tdepth={}\t\
              float_lps={}\trim_lps={}\tnodes_visited={}\tfloat_iters={}\trim_iters={}\t\
-             work={}\troot_gap={}",
+             work={}\troot_gap={}\tgrid={}\tgrid_fallbacks={}",
                 model.num_rows(),
                 model.num_cols(),
                 cert.as_ref().map_or_else(
@@ -140,6 +140,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rep.work,
                 rep.root_gap_rel
                     .map_or_else(|| "n/a".to_string(), |g| format!("{g:.8}")),
+                // THE GRID BELONGS ON THIS LINE. Without it the probe silently
+                // measures whatever the shipped default is (2^-12) and reports a
+                // table that reads as if the grid were off -- the same
+                // "labelled with one arm, measured with the other" defect the
+                // knob census exists to catch, in the very harness used to
+                // calibrate the budget.
+                budget
+                    .dual_grid_bits
+                    .map_or_else(|| "off".to_string(), |b| format!("2^-{b}")),
+                rep.grid_fallbacks,
             );
         }
     }

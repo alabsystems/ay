@@ -30,12 +30,28 @@
 //! * this file's own fixture — 5 folded leaves under retention OFF against 0
 //!   under retention ON, from one solve of the same script.
 //!
-//! # MUTATION LEDGER — 2 mutations, both RED
+//! # MUTATION LEDGER — measured, `cargo test -p ay-dpll --lib` UNFILTERED
+//!
+//! (Mutation G was re-measured against the retention suite after its wiring
+//! fixture gained the tail-observable conjunct leaf; every other row is the
+//! unfiltered harness's own output.)
 //!
 //! | # | guard | mutation | result |
 //! |---|---|---|---|
-//! | 1 | the `derive_eq_diffvar_rewritten_assertions` call in `run_assumption_authority_passes_without_parsed_syntax` | delete it | **RED**, 2 tests: `a_rewritten_assertion_is_derived_with_the_parsed_prefix_dropped`, `the_retention_off_derivation_cites_its_definition` |
-//! | 2 | `Executor::eq_diffvar_lane_fits_retention_off_bound` | make it `true` unconditionally | **RED** `a_proof_past_the_retention_off_bound_is_not_offered_to_the_lane` |
+//! | 1 | the `derive_eq_diffvar_rewritten_assertions` call in the retention-off subset | delete it | **RED**, 2 tests: `a_rewritten_assertion_is_derived_with_the_parsed_prefix_dropped`, `the_retention_off_derivation_cites_its_definition` (measured at the bound-era wiring; the call is now also load-bearing for the commit-gate tests) |
+//! | A | `eq_diffvar_presentation_commit_decision` | always `Commit` | **RED x2** — `the_commit_gate_decides_all_four_tiers_against_the_real_walk`, `a_refused_subset_run_equals_the_never_spliced_run_and_latches` |
+//! | B | the decision | always `Revert` | **RED x3** — the four-tiers test and BOTH solve-level capability tests (`a_rewritten_assertion_is_derived_with_the_parsed_prefix_dropped`, `the_retention_off_derivation_cites_its_definition`): a gate that always reverts undoes the lane |
+//! | C | the decision | revert on ANY `Err` (cheap typed included) | **RED x3** — the same three: the real solve's finished document is a cheap typed rejection, which must COMMIT |
+//! | D | the `REPEATABLE_CHECK_WORK` comparison | dropped (every typed verdict commits) | **RED** — the four-tiers test's budget tier |
+//! | E | `remember` | never latch | **RED x2** — the four-tiers test (both remembered tiers) and the wiring test's latch assertion |
+//! | F | `remember` | latch on `Cancelled` too | **RED** — the four-tiers test's cancellation tier |
+//! | G | the tail RE-RUN after a revert | deleted | **RED** — `a_refused_subset_run_equals_the_never_spliced_run_and_latches`: the authored-conjunct leaf its fixture carries is the TAIL's work, and skipping the re-run leaves it a premiseless `trust` step |
+//! | H | the `eqdv_spliced` conjunct on the gate | gate runs even when the lane spliced nothing | measured **GREEN**, recorded honestly: with no splice the revert restores a byte-identical proof and the re-run tail reproduces the same output, so no behavioural test can see it. The conjunct is COST, not correctness — it is what keeps a no-candidate rebuild from paying a whole-document walk — and the paired corpus wall measurement is its evidence |
+//!
+//! (The pre-gate ledger row for the former 4,096-step call-site size bound is
+//! superseded: the charge-accuracy fix in `ay-proof` and the commit gate above
+//! replace the bound, and `the_commit_gate_decides_all_four_tiers_against_the_real_walk`
+//! documents why a size bound cannot express the criterion.)
 //!
 //! The retention-ON row of `a_rewritten_assertion_is_derived_with_the_parsed_prefix_dropped`
 //! is the CONTROL: it passed before the call was added and must keep passing,
@@ -62,6 +78,8 @@ const GUARDED_UNSAT: &str = r#"
     (declare-const y Int)
     (declare-const a Int)
     (declare-const b Int)
+    (declare-const h1 Bool)
+    (declare-const h2 Bool)
     (assert (or (not g1) (= a x)))
     (assert (or (not g1) (= b y)))
     (assert (or g1 (= a y)))
@@ -69,6 +87,7 @@ const GUARDED_UNSAT: &str = r#"
     (assert (or (not g2) (= (+ x y) 1)))
     (assert (or g2 (= (+ a b) 1)))
     (assert (not (= (+ x y) 1)))
+    (assert (and h1 h2))
     (check-sat)
 "#;
 
@@ -225,39 +244,313 @@ fn the_retention_off_promotion_never_produces_a_rejected_fresh_definition() {
     }
 }
 
-/// TWO-SIDED pin on the retention-off size bound.
-///
-/// The bound is what stops this wiring from LOSING correct `unsat` verdicts:
-/// unbounded, on the SMT-LIB QF_IDL 900-file sample, 44 files degraded from a
-/// trust-family rejection to `ResourceLimit` — which reaches the deferred
-/// discharge lane with nothing collected and falls through to a whole-problem
-/// re-solve — and 5 crossed `-T:10` and published `unknown` where a correct
-/// `unsat` had published before. Both rows are asserted, so a mutation that
-/// removes the bound fails the second and a mutation that clamps it to zero
-/// fails the first.
-#[test]
-fn a_proof_past_the_retention_off_bound_is_not_offered_to_the_lane() {
-    let mut small = Proof::new();
-    let mut large = Proof::new();
-    let mut exec = Executor::new();
-    let atom = exec.ctx.terms.mk_var("padding", ay_core::Sort::Bool);
-    for index in 0..4_096 {
-        if index < 4_095 {
-            small.add_rule_step(AletheRule::Trust, vec![atom], Vec::new(), Vec::new());
-        }
-        large.add_rule_step(AletheRule::Trust, vec![atom], Vec::new(), Vec::new());
+/// A crafted proof whose strict walk REFUSES on the aggregate envelope after
+/// the leading `trust` leaf is derived: one derivable leaf FIRST, then a step
+/// whose General/Farkas precharge is cubic in its tree-unfolded payload (a
+/// ~1,500-node chain unfolds past 3,000 nodes and precharges >= 2.7e10 — two
+/// orders of magnitude over the 350M envelope), then the foreign closer.
+fn envelope_refused_fixture(exec: &mut Executor, rewritten: TermId) -> Proof {
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, vec![rewritten], Vec::new(), Vec::new());
+    let zero = exec.ctx.terms.mk_int(0.into());
+    let mut chain = exec.ctx.terms.mk_var("envelope_pad", ay_core::Sort::Int);
+    for _ in 0..1_500 {
+        chain = exec.ctx.terms.mk_app(
+            ay_core::Symbol::named("+"),
+            vec![chain, chain],
+            ay_core::Sort::Int,
+        );
     }
-    assert_eq!(small.steps.len(), 4_095);
-    assert_eq!(large.steps.len(), 4_096);
+    let wide_atom = exec.ctx.terms.mk_app(
+        ay_core::Symbol::named("<="),
+        vec![chain, zero],
+        ay_core::Sort::Bool,
+    );
+    proof.add_theory_lemma_with_farkas_and_kind(
+        "LIA",
+        vec![wide_atom],
+        ay_core::FarkasAnnotation::from_ints(&[1]),
+        TheoryLemmaKind::LraFarkas,
+    );
+    let negated = exec.ctx.terms.mk_not_raw(rewritten);
+    proof.add_rule_step(AletheRule::Trust, vec![negated], Vec::new(), Vec::new());
+    proof.add_rule_step(
+        AletheRule::Resolution,
+        Vec::new(),
+        vec![ay_core::ProofId(0), ay_core::ProofId(2)],
+        Vec::new(),
+    );
+    proof
+}
+
+/// A crafted proof whose strict walk reaches a TYPED verdict (the trailing
+/// foreign leaf) but only after consuming more metered work than
+/// `REPEATABLE_CHECK_WORK`: valid `eq_reflexive` steps over a large unshared
+/// term chain accumulate their linearithmic `ClauseIdentityRoute` charges
+/// past the repeatable budget while staying inside the full envelope.
+fn repeat_budget_exceeded_fixture(
+    exec: &mut Executor,
+    rewritten: TermId,
+    extra_leaves: &[TermId],
+) -> Proof {
+    let mut proof = Proof::new();
+    proof.add_rule_step(AletheRule::Trust, vec![rewritten], Vec::new(), Vec::new());
+    let mut chain = exec.ctx.terms.mk_var("repeat_pad", ay_core::Sort::Int);
+    for level in 0..30_000 {
+        let leaf = exec
+            .ctx
+            .terms
+            .mk_var(format!("repeat_pad_{level}"), ay_core::Sort::Int);
+        chain = exec.ctx.terms.mk_app(
+            ay_core::Symbol::named("+"),
+            vec![chain, leaf],
+            ay_core::Sort::Int,
+        );
+    }
+    let reflexive = exec.ctx.terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![chain, chain],
+        ay_core::Sort::Bool,
+    );
+    proof.add_rule_step(
+        AletheRule::EqReflexive,
+        vec![reflexive],
+        Vec::new(),
+        Vec::new(),
+    );
+    let negated = exec.ctx.terms.mk_not_raw(rewritten);
+    proof.add_rule_step(AletheRule::Trust, vec![negated], Vec::new(), Vec::new());
+    // Extra premiseless leaves sit BEFORE the closer so the proof keeps its
+    // terminal empty clause — the whole-proof gates every tail lane runs
+    // reject a non-terminal document outright.
+    for &leaf in extra_leaves {
+        proof.add_rule_step(AletheRule::Trust, vec![leaf], Vec::new(), Vec::new());
+    }
+    proof.add_rule_step(
+        AletheRule::Resolution,
+        Vec::new(),
+        vec![ay_core::ProofId(0), ay_core::ProofId(2)],
+        Vec::new(),
+    );
+    proof
+}
+
+/// The COMMIT-GATE DECISION, all four tiers, against the real strict walk.
+///
+/// The decision is `Executor::eq_diffvar_presentation_commit_decision`, which
+/// the retention-off subset consults on its FINISHED output (see
+/// `run_assumption_authority_passes_without_parsed_syntax`). Each tier is put
+/// to the real gate on a proof the strict checker genuinely walks:
+///
+///  * an envelope refusal reverts AND is remembered — at mint time that exact
+///    outcome reaches `discharge_trust_steps_for_certification` with nothing
+///    collected and falls through to a whole-problem re-solve (the measured
+///    `planning/plan-8..14` degradation);
+///  * a typed verdict past `REPEATABLE_CHECK_WORK` reverts AND is remembered —
+///    the walk is re-run ~60 times across assemblies, and a near-envelope walk
+///    multiplies into seconds (`inf-bakery-mutex-18`: 60 x 287-295M = +6.4s,
+///    crossing `-T:10` with no refusal anywhere);
+///  * a CHEAP typed verdict commits — same rescuable trust-family class as
+///    pre-splice, affordable to re-check;
+///  * a cancellation reverts WITHOUT being remembered — it is load-dependent,
+///    and letting it latch would make WHICH leaves get derived depend on
+///    machine load.
+#[test]
+fn the_commit_gate_decides_all_four_tiers_against_the_real_walk() {
+    use super::EqDiffVarCommitDecision;
+
+    // Tier 1: envelope refusal -> revert, remembered. The decision is made
+    // on the SPLICED document (the subset's finished output), so splice the
+    // leading leaf first; the walk then gets past it and meets the envelope.
+    let (mut exec, rewritten) = retention_off_fixture();
+    let scope = exec.complete_problem_assertions_for_strict_proof();
+    let mut refused = envelope_refused_fixture(&mut exec, rewritten);
     assert!(
-        Executor::eq_diffvar_lane_fits_retention_off_bound(&small),
-        "a proof the strict checker can still finish must reach the lane"
+        exec.derive_eq_diffvar_rewritten_assertions(&mut refused, &scope),
+        "the lane must splice the leading leaf, or the tier is not exercised"
+    );
+    let (outcome, _) = exec.check_proof_strict_with_datatypes_reporting_work(&refused);
+    assert!(
+        matches!(outcome, Err(ay_proof::ProofCheckError::ResourceLimit)),
+        "the fixture must genuinely refuse on the envelope: {outcome:?}"
+    );
+    assert_eq!(
+        exec.eq_diffvar_presentation_commit_decision(&refused),
+        EqDiffVarCommitDecision::Revert { remember: true },
+    );
+
+    // Tier 2: typed verdict past the repeatable budget -> revert, remembered.
+    let mut expensive = repeat_budget_exceeded_fixture(&mut exec, rewritten, &[]);
+    assert!(
+        exec.derive_eq_diffvar_rewritten_assertions(&mut expensive, &scope),
+        "the lane must splice the leading leaf, or the tier is not exercised"
+    );
+    let (outcome, consumed) = exec.check_proof_strict_with_datatypes_reporting_work(&expensive);
+    let error = outcome.expect_err("the trailing foreign leaf must keep the walk rejected");
+    assert!(
+        !matches!(
+            error,
+            ay_proof::ProofCheckError::ResourceLimit | ay_proof::ProofCheckError::Cancelled
+        ),
+        "the fixture must reach a TYPED verdict, not an envelope refusal: {error}"
     );
     assert!(
-        !Executor::eq_diffvar_lane_fits_retention_off_bound(&large),
-        "a proof past the measured degradation threshold must NOT be enlarged: \
-         `FISCHER4-3-ninc` stays trust-family at 3,911 steps and \
-         `FISCHER5-3-ninc` degrades at 5,117"
+        consumed > crate::executor::proof::REPEATABLE_CHECK_WORK,
+        "the fixture must genuinely exceed the repeatable budget: {consumed}"
+    );
+    assert_eq!(
+        exec.eq_diffvar_presentation_commit_decision(&expensive),
+        EqDiffVarCommitDecision::Revert { remember: true },
+    );
+
+    // Tier 3: cheap typed verdict -> commit.
+    let cheap = leaf_proof(&mut exec, rewritten);
+    let (outcome, consumed) = exec.check_proof_strict_with_datatypes_reporting_work(&cheap);
+    assert!(outcome.is_err(), "the two trust leaves keep it rejected");
+    assert!(consumed <= crate::executor::proof::REPEATABLE_CHECK_WORK);
+    assert_eq!(
+        exec.eq_diffvar_presentation_commit_decision(&cheap),
+        EqDiffVarCommitDecision::Commit,
+    );
+
+    // Tier 4: cancellation -> revert, NOT remembered.
+    let now = std::time::Instant::now();
+    let expired = now
+        .checked_sub(std::time::Duration::from_millis(50))
+        .unwrap_or(now);
+    exec.set_solve_controls(None, Some(expired));
+    assert_eq!(
+        exec.eq_diffvar_presentation_commit_decision(&cheap),
+        EqDiffVarCommitDecision::Revert { remember: false },
+        "a stop must revert without latching: nothing was learned"
+    );
+}
+
+/// The COMMIT-GATE WIRING: a subset run whose finished output the gate
+/// refuses must be INDISTINGUISHABLE from a subset run in which the lane
+/// never fired — the "outcome not worse than pre-lane" contract, asserted as
+/// literal proof equality against a latched control — and the decline must
+/// latch so later assemblies skip the same doomed walk.
+///
+/// A mutant that deletes the gate (always commit) diverges from the control
+/// on the spliced derivation; a mutant that skips the tail re-run after a
+/// revert diverges on the tail lanes' missing work; a mutant that never
+/// latches fails the latch assertion.
+/// The conjunct of the fixture problem's authored `(and h1 h2)` assertion —
+/// a leaf the TAIL's authored-conjunct lane derives, which is what makes a
+/// skipped tail re-run OBSERVABLE in the wiring test below.
+fn authored_conjunct(exec: &Executor) -> TermId {
+    exec.ctx
+        .assertions
+        .iter()
+        .copied()
+        .find_map(|assertion| match exec.ctx.terms.get(assertion) {
+            ay_core::term::TermData::App(symbol, args)
+                if symbol.name() == "and" && !args.is_empty() =>
+            {
+                Some(args[0])
+            }
+            _ => None,
+        })
+        .expect("the fixture problem asserts (and h1 h2)")
+}
+
+#[test]
+fn a_refused_subset_run_equals_the_never_spliced_run_and_latches() {
+    // The arm under test: lane eligible, gate must revert on the envelope.
+    // The extra premiseless leaf over the authored `(and h1 h2)` conjunct is
+    // the TAIL's work — `derive_authored_conjunct_leaves` derives it — so a
+    // mutant that skips the tail re-run after the revert leaves it a bare
+    // `trust` step and diverges from the control.
+    let (mut exec, rewritten) = retention_off_fixture();
+    let conjunct = authored_conjunct(&exec);
+    let mut proof = repeat_budget_exceeded_fixture(&mut exec, rewritten, &[conjunct]);
+    exec.run_assumption_authority_passes_without_parsed_syntax(&mut proof);
+    assert!(
+        exec.eqdv_retention_off_declined_at_steps.get() != 0,
+        "the deterministic decline must latch"
+    );
+    assert!(
+        !proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::Step {
+                rule: AletheRule::Trust,
+                clause,
+                premises,
+                ..
+            } if premises.is_empty() && clause.as_slice() == [conjunct]
+        )),
+        "the tail must have run after the revert: the authored-conjunct leaf \
+         must be DERIVED, not left a premiseless trust step"
+    );
+
+    // The CONTROL arm: an identical executor and proof, with the lane
+    // pre-latched so it never fires. The fixture solve is deterministic, so
+    // the two executors' stores build identical fixtures.
+    let (mut control, control_rewritten) = retention_off_fixture();
+    let control_conjunct = authored_conjunct(&control);
+    let mut control_proof =
+        repeat_budget_exceeded_fixture(&mut control, control_rewritten, &[control_conjunct]);
+    control.eqdv_retention_off_declined_at_steps.set(usize::MAX);
+    control.run_assumption_authority_passes_without_parsed_syntax(&mut control_proof);
+
+    assert_eq!(
+        format!("{:?}", proof.steps),
+        format!("{:?}", control_proof.steps),
+        "a reverted subset run must be indistinguishable from one in which \
+         the lane never fired"
+    );
+
+    // And a latched executor keeps skipping: a proof the lane WOULD splice
+    // stays unspliced on the next assembly.
+    let mut later = leaf_proof(&mut exec, rewritten);
+    let mut later_control = leaf_proof(&mut control, control_rewritten);
+    exec.run_assumption_authority_passes_without_parsed_syntax(&mut later);
+    control.run_assumption_authority_passes_without_parsed_syntax(&mut later_control);
+    assert_eq!(
+        format!("{:?}", later.steps),
+        format!("{:?}", later_control.steps),
+        "a remembered decline must keep skipping the lane on later assemblies"
+    );
+}
+
+/// The decline latch's SIZE SCOPE, two-sided: a similar-sized document is
+/// covered (skip: same economic question), and a document under half the
+/// declined size re-asks (measured: `super_queen5-1`'s final assembly shrinks
+/// to 201 steps, splices cheaply and strict-certifies; an unscoped latch
+/// deterministically cost it that certification, 3/3 reps).
+#[test]
+fn the_decline_latch_is_scoped_to_document_size() {
+    let mut exec = Executor::new();
+    let atom = exec.ctx.terms.mk_var("scope_pad", ay_core::Sort::Bool);
+    let mut proof_at = |steps: usize| {
+        let mut proof = Proof::new();
+        for _ in 0..steps {
+            proof.add_rule_step(AletheRule::Trust, vec![atom], Vec::new(), Vec::new());
+        }
+        proof
+    };
+    let same = proof_at(1_000);
+    let boundary = proof_at(500);
+    let smaller = proof_at(499);
+
+    assert!(
+        !exec.eq_diffvar_retention_off_decline_covers(&same),
+        "no decline recorded yet: nothing is covered"
+    );
+    exec.eqdv_retention_off_declined_at_steps.set(1_000);
+    assert!(
+        exec.eq_diffvar_retention_off_decline_covers(&same),
+        "a same-sized document re-asks nothing"
+    );
+    assert!(
+        exec.eq_diffvar_retention_off_decline_covers(&boundary),
+        "half the declined size is still covered (2x rule, inclusive)"
+    );
+    assert!(
+        !exec.eq_diffvar_retention_off_decline_covers(&smaller),
+        "under half the declined size is a different economic question and \
+         must re-ask the gate"
     );
 }
 
@@ -336,7 +629,7 @@ fn the_retention_off_lane_derives_a_complete_refutations_only_foreign_leaf() {
         "the fixture must start rejected FOR the trust step: {before}"
     );
 
-    exec.derive_eq_diffvar_rewritten_assertions(&mut proof, &scope);
+    let _spliced = exec.derive_eq_diffvar_rewritten_assertions(&mut proof, &scope);
 
     assert_eq!(
         premiseless_unit_trust_leaves(&proof),
@@ -372,7 +665,7 @@ fn the_retention_off_derivation_prints_no_trust_on_the_wire() {
     let (mut exec, rewritten) = retention_off_fixture();
     let scope = exec.complete_problem_assertions_for_strict_proof();
     let mut proof = leaf_proof(&mut exec, rewritten);
-    exec.derive_eq_diffvar_rewritten_assertions(&mut proof, &scope);
+    let _spliced = exec.derive_eq_diffvar_rewritten_assertions(&mut proof, &scope);
 
     // The bound atoms are passed as extra problem scope ON PURPOSE: a proof
     // carrying `fresh_def_bound` is free in the introduced symbol and the
@@ -412,8 +705,8 @@ fn the_retention_off_derivation_prints_no_trust_on_the_wire() {
         document.lines().next().unwrap_or_default()
     );
     for expected in [
-        "(step t1 (cl (<= __ay_eqdv!6 (+ x (- a)))) :rule hole)",
-        "(step t2 (cl (<= (+ x (- a)) __ay_eqdv!6)) :rule hole)",
+        "(step t1 (cl (<= __ay_eqdv!8 (+ x (- a)))) :rule hole)",
+        "(step t2 (cl (<= (+ x (- a)) __ay_eqdv!8)) :rule hole)",
         ":rule la_disequality",
         ":rule equiv_neg1",
         ":rule equiv_neg2",

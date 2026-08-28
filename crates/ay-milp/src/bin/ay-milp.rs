@@ -74,7 +74,8 @@ solve options
                                in exact-arithmetic passes (0 = off). Default 24000000/nnz,
                                because one pass costs O(nnz). The evidence a run emits is a
                                function of this, never of machine load.
-  --opt-tree-grid <bits>       snap optimality-tree duals to 2^-bits before exactifying (0 = off).
+  --opt-tree-grid <bits>       snap optimality-tree duals to 2^-bits before exactifying
+                               (default 12; 0 = off).
                                Halves certificate bytes at no leaf cost; weak duality holds for
                                ANY feasible y, so a snapped y is a valid bound, never a wrong one.
   --opt-tree-leaves <n>        leaf budget for the same (default 20000; 0 = off)
@@ -181,12 +182,24 @@ const OPT_TREE_LEAVES: usize = 20_000;
 /// The wall-clock SAFETY NET, in seconds. NOT the budget.
 ///
 /// It exists only so that a model whose per-unit cost is far outside anything
-/// measured cannot make a `solve` appear to hang. It is sized NOT TO BIND: the
-/// worst derivation predicted at [`OPT_TREE_WORK_NNZ`] across the calibration
-/// corpus is `mas76` at 102.5 s and the median is 10.1 s, so this is ~6x the
-/// worst case there. If it ever fires the run reports `deadline` rather than
-/// `work-cap` — the two are deliberately different tags — which is the signal
-/// that this run's evidence was load-dependent after all.
+/// measured cannot make a `solve` appear to hang.
+///
+/// SAY WHAT WAS MEASURED, NOT WHAT IS PREDICTED. An earlier draft called this
+/// "sized NOT TO BIND", which is a claim about every future model and cannot be
+/// supported. What was actually observed: it did NOT bind on 17 declines
+/// spanning 1-minute load 3..102, and the margin on the worst instance
+/// (`mod008`, 243 s at load ~100) is only ~2.5x — not the ~6x a quiet-box
+/// calibration suggests, because the rim's per-iteration cost is itself
+/// load-sensitive. On a quiet box the worst derivation measured is `nw04` at
+/// 100.8 s and the median is 10.1 s.
+///
+/// Note also that the net can be overshot: the descent and the rim are two
+/// phases, each checking the deadline, so in principle a run can spend up to
+/// ~2x this before stopping.
+///
+/// If it ever fires the run reports `deadline` rather than `work-cap` — the two
+/// are deliberately different tags — which is the signal that this run's
+/// evidence was load-dependent after all.
 const OPT_TREE_BACKSTOP_SECS: f64 = 600.0;
 
 /// Wall clock at the first instruction of `main` in the FINAL (post-`arm`)
@@ -830,6 +843,8 @@ fn cmd_solve(args: &[String]) -> ExitCode {
                 detail.as_deref(),
                 dt,
                 nodes,
+                ay_milp::root_nodes_explored(),
+                ay_milp::submip_nodes_explored(),
                 s.replay_claims().len(),
             )
         );
@@ -929,6 +944,13 @@ fn verdict_line(
 ///
 /// `value` and `dual_bound` are pre-rendered JSON numbers (or `None` → `null`);
 /// `status` and `detail` are free text and go through [`json_escape`].
+///
+/// `nodes` KEEPS ITS MEANING — every node the process explored, heuristic sub-MIP
+/// trees included. `root_nodes` and `submip_nodes` are an ADDITIVE decomposition
+/// of it (`nodes == root_nodes + submip_nodes`), added because Gurobi's
+/// `Model.NodeCount` excludes its heuristics' sub-MIPs and `root_nodes` is the
+/// field that compares to it. Keys are added, never redefined or reordered away:
+/// this line is consumed by key, and the frozen text line above is untouched.
 fn solve_json_line(
     status: &str,
     value: Option<&str>,
@@ -936,10 +958,12 @@ fn solve_json_line(
     detail: Option<&str>,
     dt: f64,
     nodes: u64,
+    root_nodes: u64,
+    submip_nodes: u64,
     replay_claims: usize,
 ) -> String {
     format!(
-        "{{\"status\":\"{}\",\"value\":{},\"dual_bound\":{},\"detail\":{},\"time\":{dt:.3},\"nodes\":{nodes},\"replay_claims\":{replay_claims}}}",
+        "{{\"status\":\"{}\",\"value\":{},\"dual_bound\":{},\"detail\":{},\"time\":{dt:.3},\"nodes\":{nodes},\"root_nodes\":{root_nodes},\"submip_nodes\":{submip_nodes},\"replay_claims\":{replay_claims}}}",
         json_escape(status),
         value.unwrap_or("null"),
         dual_bound.unwrap_or("null"),

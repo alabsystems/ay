@@ -74,6 +74,7 @@ mod clause;
 mod connective_reorder;
 mod eq_diffvar_bridge;
 mod eq_diffvar_lane;
+pub(in crate::executor) use eq_diffvar_lane::EqDiffVarCommitDecision;
 mod eq_diffvar_mint;
 #[cfg(test)]
 #[path = "proof_propagated_rewrite/eq_diffvar_retention_tests.rs"]

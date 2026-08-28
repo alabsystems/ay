@@ -70,6 +70,39 @@ fn probe_strict_check_refusal(message: impl FnOnce() -> String) {
 /// [`check_with_executor_progress`] for why the poll is not on every charge.
 const STOP_POLL_INTERVAL: u64 = 1_024;
 
+/// The metered WORK a strict check may consume and still be considered cheap
+/// enough to RE-RUN many times over.
+///
+/// The envelope above bounds ONE check. The certification pipeline does not
+/// run one: every proof assembly re-runs the surgery revert gates and the
+/// mint's presentation over the whole document — measured 30 assemblies and
+/// ~60 whole-proof walks on `QF_IDL/sal/bakery` solves — so a proof whose
+/// single walk consumes a large fraction of the envelope multiplies into
+/// seconds of wall even when every walk SUCCEEDS. Measured on
+/// `inf-bakery-mutex-18` (`--no-proof -T:10`): 60 walks at 287-295M work each
+/// = 17.5G metered units ≈ 6.4s of added wall, which crossed `-T:10` and
+/// published `unknown` over a correct `unsat` with no envelope refusal
+/// anywhere.
+///
+/// HALF of [`GENERAL_CHECK_WORK`]. Each assembly's FINISHED document is
+/// priced fresh by its consumer (today: the `EqDiffVar` retention-off commit
+/// gate), and the size-scoped decline latch stops the pricing walks once a
+/// document past this bound has been declined, so the figure needs to cover
+/// repetition of an ADMITTED document only: ~60 repetitions of a walk at this
+/// bound cost under three seconds on the machines the calibration was
+/// measured on, and every corpus file observed to cross `-T:10` through
+/// repeated walks consumed 2.3x-2.6x more than this per walk
+/// (`inf-bakery-mutex-18`: 60 walks x 287-295M = +6.4s). The bound must not
+/// be tighter than the documents whose committed splices downstream surgery
+/// then SHRINKS into outright strict certifications: measured on
+/// `queens_bench/super_queen5-1`, the subset's finished documents walk at
+/// 2,547-2,565 steps mid-pipeline and the mint's final document is 7 steps
+/// and `strict=ok` — an eighth-envelope bound deterministically reverted that
+/// splice and LOST the strict certification, 3/3 reps. Consumers treat a
+/// TYPED verdict that consumed more than this as "true but too expensive to
+/// keep re-deriving" and fall back to the cheaper pre-splice presentation.
+pub(in crate::executor) const REPEATABLE_CHECK_WORK: usize = GENERAL_CHECK_WORK / 2;
+
 /// Run one strict check under the executor's active solve controls and one
 /// aggregate, checked-arithmetic resource envelope.
 pub(super) fn check_with_executor_progress(
@@ -80,6 +113,29 @@ pub(super) fn check_with_executor_progress(
     datatype_member_signatures: &[DatatypeMemberSignature],
     problem_assertions: Option<&[TermId]>,
 ) -> Result<ProofQuality, ProofCheckError> {
+    check_with_executor_progress_reporting_work(
+        executor,
+        proof,
+        datatype_decls,
+        selector_decls,
+        datatype_member_signatures,
+        problem_assertions,
+    )
+    .0
+}
+
+/// As [`check_with_executor_progress`], additionally reporting the aggregate
+/// WORK the meter recorded for the walk — the deterministic figure
+/// [`REPEATABLE_CHECK_WORK`] is compared against. Reporting only: the check's
+/// outcome, envelope and cancellation behaviour are byte-identical.
+pub(super) fn check_with_executor_progress_reporting_work(
+    executor: &Executor,
+    proof: &Proof,
+    datatype_decls: Option<&[(String, Vec<String>)]>,
+    selector_decls: Option<&[(String, Vec<String>)]>,
+    datatype_member_signatures: &[DatatypeMemberSignature],
+    problem_assertions: Option<&[TermId]>,
+) -> (Result<ProofQuality, ProofCheckError>, usize) {
     let should_stop = executor.make_should_stop();
     let mut meter = StrictCheckMeter::production();
     // The WORK/BYTE budget is charged on EVERY call (exact, fail-closed). The
@@ -133,14 +189,15 @@ pub(super) fn check_with_executor_progress(
     };
     // The progress closure's scope has ended, so name WHICH meter limb refused.
     // The checker only sees a `bool`; this is the one place that knows both.
-    match outcome {
+    let outcome = match outcome {
         Err(ProofCheckError::ResourceLimit)
             if meter.refusal == Some(StrictCheckRefusal::Cancelled) =>
         {
             Err(ProofCheckError::Cancelled)
         }
         other => other,
-    }
+    };
+    (outcome, meter.work())
 }
 
 /// Run the DIAGNOSTIC (non-strict) whole-proof walk under the same

@@ -508,27 +508,68 @@ fn test_bvshl_constant_shift_to_concat() {
 }
 
 #[test]
-fn test_bvlshr_constant_shift_to_zero_extend() {
-    // bvlshr(x, 2) for 8-bit should rewrite to zero_extend(2, extract(x, 7, 2))
+fn test_bvlshr_constant_shift_to_raw_concat() {
+    // bvlshr(x, 2) for 8-bit rewrites to the raw
+    // concat(#b00, extract(x, 7, 2)) surface used by checked Alethe export.
     let mut store = TermStore::new();
     let x = store.mk_var("x", Sort::bitvec(8));
     let two = store.mk_bitvec(BigInt::from(2), 8);
     let result = store.mk_bvlshr(vec![x, two]);
 
-    // Result should NOT be a bvlshr application
-    if let TermData::App(sym, _) = store.get(result) {
-        assert_ne!(
-            sym.name(),
-            "bvlshr",
-            "bvlshr(x, 2) should be rewritten, not kept as bvlshr"
-        );
-    }
+    let TermData::App(Symbol::Named(operator), operands) = store.get(result) else {
+        panic!("symbolic constant lshr must normalize to concat")
+    };
+    assert_eq!(operator, "concat");
+    let [high, extract] = operands.as_slice() else {
+        panic!("concat must have exactly two operands")
+    };
+    assert!(matches!(
+        store.get(*high),
+        TermData::Const(Constant::BitVec { value, width })
+            if *value == BigInt::from(0) && *width == 2
+    ));
+    assert!(matches!(
+        store.get(*extract),
+        TermData::App(Symbol::Indexed(name, indices), args)
+            if name == "extract" && indices.as_slice() == [7, 2] && args.as_slice() == [x]
+    ));
 
     assert_eq!(
         store.sort(result),
         &Sort::bitvec(8),
         "rewritten bvlshr should preserve 8-bit width"
     );
+}
+
+#[test]
+fn test_bvlshr_raw_concat_rewrite_is_exhaustively_value_preserving() {
+    // Exhaust every symbolic constant-shift rewrite through width 8. Replacing
+    // x with a concrete value rebuilds concat/extract through the ordinary
+    // canonical constructors, giving a direct constant-folding oracle for the
+    // raw-concat representation used solely to retain the external proof
+    // surface.
+    for width in 2_u32..=8 {
+        let modulus = 1_u64 << width;
+        let mut store = TermStore::new();
+        let x = store.mk_var("x", Sort::bitvec(width));
+        for shift in 1..width {
+            let shift_term = store.mk_bitvec(BigInt::from(shift), width);
+            let rewritten = store.mk_bvlshr(vec![x, shift_term]);
+            assert!(matches!(
+                store.get(rewritten),
+                TermData::App(Symbol::Named(name), _) if name == "concat"
+            ));
+            for value in 0..modulus {
+                let concrete = store.mk_bitvec(BigInt::from(value), width);
+                let got = store.substitute(rewritten, &[x], &[concrete]);
+                let expected = store.mk_bitvec(BigInt::from(value >> shift), width);
+                assert_eq!(
+                    got, expected,
+                    "bad raw-concat lshr rewrite: width={width}, shift={shift}, value={value}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -587,7 +628,7 @@ fn test_bvshl_constant_shift_width_minus_1() {
 
 #[test]
 fn test_bvlshr_constant_shift_width_minus_1() {
-    // Edge case: bvlshr(x, 7) for 8-bit -> zero_extend(7, extract(x, 7, 7))
+    // Edge case: bvlshr(x, 7) for 8-bit -> concat(#b0000000, extract(x, 7, 7))
     let mut store = TermStore::new();
     let x = store.mk_var("x", Sort::bitvec(8));
     let seven = store.mk_bitvec(BigInt::from(7), 8);

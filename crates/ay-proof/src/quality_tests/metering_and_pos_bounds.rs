@@ -358,8 +358,11 @@ fn the_metering_still_refuses_an_oversized_and_pos_proof() {
 /// This pass changes a CHARGE, and a charge must be invisible on the wire. The
 /// step still prints `:rule and_pos` with its position `:args`, carries no
 /// `hole` and no `trust`, and is unchanged whether or not the step is admitted
-/// to the new class — the second assertion uses an `or`-headed conjunct, which
-/// `and_pos_matchers_are_shallow` refuses, and gets the same shape of output.
+/// to the new class — the second assertion uses an `or`-headed conjunct with
+/// the clause REVERSED, which both admission arms refuse (the identity arm is
+/// ORDER-pinned; the emitted-order or-headed conjunct is now admitted by
+/// `and_pos_is_emitted_identity_shape` and its printer invariance is carried
+/// by the first pinned string), and gets the same shape of output.
 #[test]
 fn the_and_pos_wire_text_is_unchanged_by_the_charge_model() {
     let mut terms = TermStore::new();
@@ -373,11 +376,18 @@ fn the_and_pos_wire_text_is_unchanged_by_the_charge_model() {
     );
     let disjunction = app(&mut terms, "or", vec![a, b]);
     let wide_source = app(&mut terms, "and", vec![disjunction, b]);
-    let (declined, _) = emitted_and_pos(&mut terms, wide_source, 0);
+    let wide_gate = terms.mk_not_raw(wide_source);
+    let declined = ProofStep::Step {
+        rule: AletheRule::AndPos(0),
+        clause: vec![disjunction, wide_gate],
+        premises: Vec::new(),
+        args: vec![wide_source],
+    };
     assert_eq!(
         select_semantic_charge_class(&declined, &terms),
         SemanticChargeClass::General,
-        "an or-headed conjunct literal is declined by the gate"
+        "a reversed clause with an or-headed conjunct literal is declined by \
+         both admission arms"
     );
 
     let printer = crate::AlethePrinter::new(&terms);
@@ -394,6 +404,10 @@ fn the_and_pos_wire_text_is_unchanged_by_the_charge_model() {
     let declined_text = printer
         .format_step(&declined, ProofId(7))
         .expect("a declined and_pos step prints identically in shape");
+    // The printer canonicalizes the gate literal first, so the DECLINED
+    // (reversed-clause) step prints byte-identically to how the previously
+    // pinned declined fixture printed — the charge boundary is invisible on
+    // the wire in both directions.
     assert_eq!(
         declined_text,
         "(step t7 (cl (not (and (or wire_a wire_b) wire_b)) (or wire_a wire_b)) \

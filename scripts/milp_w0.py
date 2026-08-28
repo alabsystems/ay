@@ -175,7 +175,25 @@ def run_ay(inst: dict, secs: float, env_extra: dict[str, str] | None = None,
             nodes = int(f[3])
         except ValueError:
             nodes = None
-    return {"status": st, "obj": val, "bound": bound, "t": wall, "nodes": nodes}
+    # THE GUROBI-COMPARABLE SPLIT. `nodes` above is `nodes_explored()`, which is
+    # process-global and CUMULATIVE ACROSS RENS/RINS SUB-MIPS; Gurobi's
+    # `Model.NodeCount` (recorded by `run_gurobi` below) excludes the sub-MIPs its
+    # heuristics run. Comparing the two biases the result in BOTH directions at once
+    # — it inflates ay's node count and, off the same numbers, deflates ay's per-node
+    # cost. `root_nodes` is the field that compares to Gurobi's; `nodes` keeps its
+    # historical meaning so every recorded run stays readable.
+    #
+    # The split rides STDERR by design (see `examples/mps_solve`): a fifth stdout
+    # field would re-point `scripts/milp_node_gate.py`'s `line[-1]` parse and with it
+    # all twenty node ratchet pins. `None` here means an older ay binary that predates
+    # the counter — a missing datum, never silently folded into `nodes`.
+    root_nodes = submip_nodes = None
+    mn = re.search(r"^nodes: total=(\d+) root=(\d+) submip=(\d+)\s*$", r.stderr or "",
+                   re.M)
+    if mn:
+        root_nodes, submip_nodes = int(mn.group(2)), int(mn.group(3))
+    return {"status": st, "obj": val, "bound": bound, "t": wall, "nodes": nodes,
+            "root_nodes": root_nodes, "submip_nodes": submip_nodes}
 
 
 # --------------------------------------------------------------------------- gurobi

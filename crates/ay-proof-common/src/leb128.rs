@@ -19,14 +19,41 @@ pub fn read_u64(data: &[u8], mut pos: usize) -> Result<(u64, usize), ParseError>
         // check, so every input produces the identical `Result` -- but it left the
         // bound reachable only ACROSS THE BACK-EDGE. Relating it to the use then
         // requires an inductive loop invariant (`shift ≡ 0 mod 7 ∧ shift ≤ 63`),
-        // which the verifier cannot infer and which STILL has no first-class
-        // spelling: the resolver maps only `requires` and `ensures` to contract
-        // builtins, `trust::invariant` stays a passthrough no-op, and there is no
-        // `decreases` attribute at all (see contracts.rs). The erasing
-        // `invariant!` macro that this comment used to name is gone, but nothing
-        // replaced it, so the hoist is still load-bearing rather than a
-        // workaround awaiting a macro. Hoisted here, no invariant is needed: the
-        // guard and the use are on one path.
+        // which the verifier cannot infer.
+        //
+        // THE TRUST-ONLY SPELLING EXISTS AND THE HOIST STAYS ANYWAY (measured
+        // 2026-08-27, trust-e26541e3). The attribute surface still has no
+        // checked invariant/decreases pair; the Trust compiler's native grammar
+        // does. Raw native clauses cannot live in this stock-Rust source, but
+        // the explicit Trust lane can probe the equivalent function.
+        //
+        // It was tried. This `loop` was rewritten as
+        //   `while shift < 64 invariant shift <= 64 decreases (64 - shift)`
+        // — a faithful rewrite, since the hoisted guard IS the loop condition —
+        // and the result was 10 obligations instead of 5, with all 5 new ones
+        // UNSUPPORTED. The compiler names the gap itself:
+        //
+        //     e45.transition.call-effect: bb6: loop invariant `shift <= 64` has
+        //     no complete exact transition model at bb1
+        //
+        // The CHC construction emits no transition relation for a loop whose
+        // body contains a call with effects; it falls back to a flattened
+        // single-formula encoding where the loop-carried locals are free
+        // variables, and then correctly refuses to read a refutation of that
+        // over-approximation as a refutation of the program. The modular half
+        // of the invariant is refused outright — `invariant shift % 7 == 0`
+        // gives "references an unsupported or ambiguous MIR value".
+        //
+        // So the clause would be honest but inert: five UNSUPPORTED rows and a
+        // rewrite of hot parsing code for zero proof gain. The hoist remains
+        // load-bearing. Revisit when the loop-transition model lands; the
+        // blocker is the CHC construction, no longer the grammar.
+        //
+        // The bare `loop invariant P` form was newer than the measured
+        // trust-e26541e3 snapshot; only the `while` probe parsed there.
+        //
+        // Hoisted here, no invariant is needed: the guard and the use are on
+        // one path.
         if shift >= 64 {
             return Err(ParseError::Leb128Overflow { position: start });
         }

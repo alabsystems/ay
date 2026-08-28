@@ -11283,7 +11283,42 @@ const MAX_POOL: usize = 400;
 /// Process-global and cumulative, in the manner of the simplex counters. One solve per
 /// process (the measurement harness's shape) makes it exactly the solve's node count;
 /// [`reset_nodes_explored`] is there for in-process callers that solve more than once.
+///
+/// IT COUNTS HEURISTIC SUB-MIP NODES TOO, and that is NOT what Gurobi's
+/// `Model.NodeCount` reports — see [`submip_nodes_explored`] for the companion
+/// counter that makes the two comparable. This counter's MEANING IS FROZEN:
+/// twenty ratchet pins in `scripts/milp_node_gate.py` and the whole recorded
+/// measurement history are denominated in it, so it is never redefined, only
+/// decomposed.
 pub(crate) static NODES_EXPLORED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The part of [`NODES_EXPLORED`] that was spent inside a HEURISTIC SUB-MIP.
+///
+/// THE ASYMMETRY THIS FIXES. `nodes_explored()` is process-global and cumulative
+/// across nested solves, so a RENS/RINS/ball sub-MIP's own tree lands in the same
+/// number as the proof tree. Gurobi's `Model.NodeCount` does not work that way: it
+/// reports the nodes of the main branch-and-bound tree and excludes the sub-MIPs its
+/// heuristics run. Comparing the two therefore biases published figures in BOTH
+/// directions at once — it inflates ay's node count (making tree-quality gaps look
+/// worse than they are) and, by the same tokens, deflates ay's per-node cost (making
+/// throughput gaps look better than they are).
+///
+/// THE DISCRIMINANT is the one the `--trace` incumbent line has always used
+/// (`in_rens() || mode.depth > 0`): a node is a sub-MIP node exactly when the frame
+/// exploring it is a nested primal-heuristic search — RENS (`RensGuard`, a full
+/// `solve_milp` on a rounded neighbourhood) or one of the three `depth: 1` sites
+/// (the RINS ball / local-branching sub-MIP, the diversified-RINS sub-MIP, and the
+/// 64-node incumbent-seed repair). Everything else is PROOF work and counts as root
+/// tree: the user's solve, the exact-reduction / decomposition re-solves, the
+/// zero-pin projection restarts and the tree-certificate retry all run at
+/// `depth == 0` outside a `RensGuard`, and Gurobi would charge their nodes to its
+/// main tree too.
+///
+/// ADDITIVE BY CONSTRUCTION. Root nodes are `nodes_explored() -
+/// submip_nodes_explored()`; nothing here changes a single value the old counter
+/// ever reported.
+pub(crate) static SUBMIP_NODES_EXPLORED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// Branch-and-bound nodes explored since process start (or the last reset).
@@ -11293,10 +11328,31 @@ pub fn nodes_explored() -> u64 {
     NODES_EXPLORED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Zero the node counter — for a caller measuring several solves in one process.
+/// Nodes of [`nodes_explored`] that were explored inside a heuristic sub-MIP
+/// (RENS / RINS / ball / seed-repair). See [`SUBMIP_NODES_EXPLORED`].
+#[doc(hidden)]
+#[must_use]
+pub fn submip_nodes_explored() -> u64 {
+    SUBMIP_NODES_EXPLORED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Nodes of the PROOF tree only — the Gurobi-`NodeCount`-comparable counter.
+/// `nodes_explored() - submip_nodes_explored()`, saturating (the two are
+/// incremented at one site, in that order, so the difference cannot go negative
+/// except under a torn read from another thread).
+#[doc(hidden)]
+#[must_use]
+pub fn root_nodes_explored() -> u64 {
+    nodes_explored().saturating_sub(submip_nodes_explored())
+}
+
+/// Zero the node counters — for a caller measuring several solves in one process.
+/// Zeroes the sub-MIP companion as well; the two are one instrument and a reset
+/// that left them out of step would report a nonsense root count.
 #[doc(hidden)]
 pub fn reset_nodes_explored() {
     NODES_EXPLORED.store(0, std::sync::atomic::Ordering::Relaxed);
+    SUBMIP_NODES_EXPLORED.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Leaf-drought plunge launches since process start (see `drought_class`).
@@ -24058,6 +24114,15 @@ fn solve_milp_in_impl(request: MilpSolveRequest<'_>) -> Outcome {
         crate::acensus::mark(2);
         nodes += 1;
         NODES_EXPLORED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // COMPARABILITY SPLIT (see `SUBMIP_NODES_EXPLORED`). Same predicate the
+        // `--trace INCUMBENT` line uses for its `sub`/`TOP` tag, evaluated here so
+        // that `root_nodes_explored()` means what Gurobi's `Model.NodeCount` means.
+        // Read, not cached before the loop: `in_rens()` is a thread-local whose
+        // value is fixed for the lifetime of this frame either way, and one
+        // relaxed TLS read per node is unmeasurable against a node LP.
+        if mode.depth > 0 || in_rens() {
+            SUBMIP_NODES_EXPLORED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if trace && mode.depth == 0 && !mode.cheap {
             depth_census(0, node.depth);
         }
@@ -29892,6 +29957,92 @@ mod tests {
         let c = m.add_binary_col();
         m.add_row(1.5, 1.5, &[(a, 1.0), (b, 1.0), (c, 1.0)]);
         m
+    }
+
+    /// THE COMPARABILITY SPLIT IS WIRED (see `SUBMIP_NODES_EXPLORED`).
+    ///
+    /// Without this test the split degrades SILENTLY into the bug it fixes: if the
+    /// increment inside the node loop is ever dropped or its predicate inverted,
+    /// `submip_nodes_explored()` returns 0 forever, `root_nodes_explored()` becomes
+    /// an alias for the cumulative counter, and every ay-vs-Gurobi node comparison
+    /// quietly reverts to comparing two different quantities — with no test failing
+    /// and no number looking wrong. So the MECHANISM is pinned, not a value.
+    ///
+    /// The same model is solved twice: once as a user solve (`depth == 0`, outside
+    /// any `RensGuard`), whose nodes are PROOF nodes and must not be charged to the
+    /// sub-MIP counter; and once inside a `RensGuard`, where every node the search
+    /// takes is by definition a heuristic sub-MIP node.
+    ///
+    /// RACE NOTE. Both counters are process-global, so a solve on another test
+    /// thread can inflate a delta measured here. `lock_env()` serialises this test
+    /// against the solving tests that take it, and the two assertions that could
+    /// still be perturbed are one-sided in the safe direction: a foreign top-level
+    /// solve adds to the TOTAL only, which cannot make `sub_submip >= 1` fail, and
+    /// firing the sub-MIP counter from a foreign solve needs a RINS pull at
+    /// `RINS_EVERY` = 20,000 nodes or a `RensGuard` no other test takes.
+    #[test]
+    fn submip_nodes_are_charged_to_the_sub_mip_and_not_to_the_proof_tree() {
+        let _env_lock = lock_env();
+        let opts = SolveOpts::new().with_time_limit(Duration::from_secs(10));
+        let model = case_split_only_model();
+
+        // ARM 1 — the user's solve. Branching finds the infeasibility (that is what
+        // the gadget is for), so the tree is non-empty and all of it is proof work.
+        let (t0, s0) = (nodes_explored(), submip_nodes_explored());
+        let top = solve_milp(&model, &opts);
+        assert!(
+            matches!(top, Outcome::Infeasible { .. }),
+            "the case-split-only gadget is infeasible: {top:?}"
+        );
+        let (top_total, top_submip) = (nodes_explored() - t0, submip_nodes_explored() - s0);
+        assert!(
+            top_total >= 1,
+            "the gadget must BRANCH or this test measures nothing"
+        );
+        assert_eq!(
+            top_submip, 0,
+            "a depth-0 solve outside RENS is proof work and must charge the sub-MIP \
+             counter nothing (top_total={top_total})"
+        );
+
+        // ARM 2 — the identical solve, run inside a RENS frame. RENS is a full
+        // `solve_milp` on a rounded neighbourhood, so its whole tree is heuristic
+        // spend and Gurobi would not report any of it in `Model.NodeCount`.
+        let (t1, s1) = (nodes_explored(), submip_nodes_explored());
+        {
+            let _guard = RensGuard::enter().expect("a test is never already inside RENS");
+            let _ = solve_milp(&model, &opts);
+        }
+        let (sub_total, sub_submip) = (nodes_explored() - t1, submip_nodes_explored() - s1);
+        assert!(
+            sub_submip >= 1,
+            "nodes explored inside a RensGuard must be charged to the sub-MIP counter \
+             (sub_total={sub_total}, sub_submip={sub_submip})"
+        );
+        assert!(
+            sub_total >= sub_submip,
+            "the cumulative counter is incremented unconditionally at the same site, so \
+             it can never fall behind its own sub-MIP part"
+        );
+
+        // The frozen counter keeps its meaning — it is the SUM. Read once so a
+        // foreign increment between the two loads cannot make this a flake.
+        let (total, submip) = (nodes_explored(), submip_nodes_explored());
+        assert!(
+            total >= submip && root_nodes_explored() <= total,
+            "root_nodes_explored() is nodes_explored() minus its sub-MIP part \
+             (total={total}, submip={submip})"
+        );
+        reset_nodes_explored();
+        assert_eq!(
+            (
+                nodes_explored(),
+                submip_nodes_explored(),
+                root_nodes_explored()
+            ),
+            (0, 0, 0),
+            "reset must zero the pair; a half-reset reports a nonsense root count"
+        );
     }
 
     /// THE COST GATE ON DUAL FIXING'S TREE-CERTIFICATE HARVEST

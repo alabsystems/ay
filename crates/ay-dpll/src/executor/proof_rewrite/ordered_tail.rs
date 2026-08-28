@@ -84,8 +84,10 @@ impl Executor {
         // the checker decides freshness against the finished `assume` set, and
         // a definiens already bound by a promoted step must be ADOPTED rather
         // than competed with. Its own Gate-2 reverts the whole lane if the
-        // checker's `FreshDefRegistry` declines the result.
-        self.derive_eq_diffvar_rewritten_assertions(proof, &extended_assertions);
+        // checker's `FreshDefRegistry` declines the result. This retention-ON
+        // path has run the lane unbounded since #4751 and keeps its exact
+        // behaviour; the retention-OFF subset's commit gate does not apply.
+        let _spliced = self.derive_eq_diffvar_rewritten_assertions(proof, &extended_assertions);
         // #rewritten-assertion-bridge — the same repair for the assertions
         // `VariableSubstitution` rewrote, which carry no `EqDiffVar` record and
         // no fresh definiendum: DERIVE the rewrite from the authored
