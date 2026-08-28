@@ -12,9 +12,12 @@ Reference solver for comparative rows: **Z3 5.0.0** (the latest release,
 2026-07-17, official binaries). Where a row's recorded evidence was executed
 against Z3 4.15.4 and not yet re-run on 5.0.0, the row says so — every
 comparative claim is being migrated to 5.0.0, and no new comparison uses an
-older Z3. Known still-at-4.15.4 surfaces: the `z3-audit` reference transcript
-cache and `crates/ay/z3-compatibility.json` parity baselines (re-baseline
-tracked for 0.1.x); the `opt_epsilon` baselines are already Z3 5.0.0.
+older Z3. The surfaces this file once listed as still-at-4.15.4 have been
+re-baselined: the `z3-audit` reference transcript cache
+(`tests/z3-audit/reference-cache.json`) records `Z3 version 5.0.0`,
+`crates/ay/z3-compatibility.json` names 5.0.0 and nothing older, and the
+`opt_epsilon` baselines are Z3 5.0.0 too. Individual rows below that still
+rest on 4.15.4-measured evidence say so in the row.
 
 This file records *capability*, not competition results. AY has not yet
 entered these competitions; official result packets will be linked from the
@@ -85,7 +88,7 @@ printf 'p cnf 2 2\na 1 0\ne 2 0\n1 2 0\n-1 -2 0\n' > /tmp/t.qdimacs && ay qbf so
 | SMT-COMP 2026 | Single Query — QF_Equality (QF_AX, QF_UF) | ready — both logics accepted, in planned entry; ay's strongest division (QF_UF 1606/1778 ≈90% at 10 s, 0 soundness conflicts) |
 | SMT-COMP 2026 | Single Query — QF_Datatypes (QF_DT, QF_UFDT) | ready — QF_DT accepted+entered; QF_UFDT absent from accepted list but parses and solves correctly |
 | SMT-COMP 2026 | Single Query — QF_Equality+Bitvec (QF_ABV, QF_AUFBV, QF_UFBV, QF_UFBVDT) | ready — 3/4 logics accepted (QF_UFBVDT unlisted) and all three entered in 2026 SQ |
-| SMT-COMP 2026 | Single Query — QF_Equality+LinearArith (QF_ALIA, QF_AUFLIA, QF_UFDTLIA, QF_UFDTLIRA, QF_UFIDL, QF_UFLIA, QF_UFLRA) | partial — QF_AUFLIA entered and correct; QF_UFLIA WITHDRAWN 2026-06-15 for a confirmed false-SAT (EUF+LIA ite-chain); 3/7 division logics in accepted list |
+| SMT-COMP 2026 | Single Query — QF_Equality+LinearArith (QF_ALIA, QF_AUFLIA, QF_UFDTLIA, QF_UFDTLIRA, QF_UFIDL, QF_UFLIA, QF_UFLRA) | partial — QF_AUFLIA entered and correct; QF_UFLIA was withdrawn 2026-06-15 for a confirmed false-SAT (EUF+LIA ite-chain) and RE-ADDED 2026-07-28 once `IteDefinitionOracle` fixed it (`crates/ay/src/cmd_submission.rs:7527-7548`); 3/7 division logics in accepted list |
 | SMT-COMP 2026 | Single Query — QF_Equality+NonLinearArith (QF_ANIA, QF_AUFNIA, QF_UFDTNIA, QF_UFNIA, QF_UFNRA) | partial — 2/5 division logics accepted (QF_UFNIA, QF_UFNRA), tiny instance correct; division not in planned 2026 entry |
 | SMT-COMP 2026 | Single Query — QF_FPArith (QF_ABVFP, QF_ABVFPLRA, QF_AUFBVFP, QF_BVFP, QF_BVFPLRA, QF_FP, QF_FPLRA, QF_UFFP, QF_UFFPDTNIRA) | partial — 2/9 division logics accepted (QF_FP, QF_BVFP), both correct on tiny instances; array/UF/LRA FP combos unlisted; not in planned entry |
 | SMT-COMP 2026 | Single Query — QF_NonLinearIntArith (QF_NIA, QF_NIRA) | partial — both logics accepted and tiny instance correct, but division not in planned 2026 entry |
@@ -218,12 +221,12 @@ ay submission worker --help
 | PB Competition | OPT-LIN | ready — incremental o-lines, correct optimum, rc=30 |
 | PB Competition | OPT-NLC | ready — nonlinear objective and constraint optimized correctly |
 | PB Competition | WBO soft (SOFT-LIN) + partial (PARTIAL-LIN) | ready — both pure-soft and hard+soft .wbo solved with correct minimum violation cost |
-| PB Competition | DEC-LIN-CERT (certified decision) | ready — emits VeriPB 'pseudo-Boolean proof version 3.0' with correct conclusions; not machine-checked locally (no VeriPB installed; third_party ships only cake_lpr/dpr-trim/dsr-trim) |
-| PB Competition | OPT-LIN-CERT (certified optimization) | ready — proof logs incumbents (soli), cutting-planes derivation (pol), and a BOUNDS conclusion; same local-verification caveat |
+| PB Competition | DEC-LIN-CERT (certified decision) | ready — emits VeriPB 'pseudo-Boolean proof version 3.0' with correct conclusions, and the proofs ARE machine-checked: `ci/veripb.pin` pins the checker (upstream commit `4bb10c2ce…`, v3.0.2, plus two sha256-pinned patches) and `scripts/ci/pb_certified_gate.sh` is a six-phase gate that builds it, self-tests it, requires all 22 soundness fixtures to be REJECTED, and verifies every proof in `ci/cert-instances/manifest.tsv`; last recorded run PASSED at 11/11 checker-verified proofs. The checker is built from the pin rather than vendored, so `third_party` ships only cake_lpr/dpr-trim/dsr-trim |
+| PB Competition | OPT-LIN-CERT (certified optimization) | ready — proof logs incumbents (soli), cutting-planes derivation (pol), and a BOUNDS conclusion; machine-checked by the same gate — the OPT-LIN `BOUNDS` rows are `ci/cert-instances/manifest.tsv:41-43,57-58` |
 | MaxSAT Evaluation (track list from established knowledge: exact uw/w, anytime uw/w, certified; MSE 2025/2026 pages fetched empty) | Exact unweighted | ready — new-format h-line WCNF, MSE-2022+ bitstring v-line, correct optimum |
 | MaxSAT Evaluation | Exact weighted | ready — weighted softs optimized correctly |
 | MaxSAT Evaluation | Anytime / incomplete | partial — genuine anytime engine (improving o-lines during search; best o + s UNKNOWN + v incumbent at its own --timeout), but no SIGTERM handler: killed externally it dies without the v-line, so it only fits the track if run with an internal --timeout under the external limit; no dedicated incomplete-mode flag |
-| MaxSAT Evaluation | Certified | not yet — no proof output of any kind for MaxSAT; absence verified in both CLI and source |
+| MaxSAT Evaluation | Certified | partial — `ay maxsat solve --proof STEM` writes `<stem>.opb` plus a VeriPB v3 `<stem>.opb.pbp` (`sol` line and a `conclusion BOUNDS`), and `ay maxsat bench --proof-check` replays it through the pinned checker (`crates/ay/src/maxsat_proof.rs`, `crates/ay/src/maxsat_cert.rs`). Not ready because the LOWER bound is emitted only when it can be derived (the `#core-mine` floor); otherwise it is 0, and `BOUNDS 0 <= obj <= k` does not entail optimality — so not every instance gets an optimality-proving certificate |
 | Model Counting Competition (MC-2026 tracks 1/1F, 2B, 3, 4, 5B confirmed at mccompetition.org/2026/mc_description.html) | Track 1/1F: mc (exact unweighted) | ready — exact arbitrary-precision count with the official output convention |
 | Model Counting Competition | Track 2B: wmc (weighted, incl. negative weights) | ready — exact rationals, verified numerically; note the model-count --help one-liner ('exact unweighted MC/PMC') is stale vs actual behavior (cmd_model_count.rs:8-10 documents wmc/pwmc with zero/negative weights) |
 | Model Counting Competition | Track 3: pmc (projected) | ready — `c p show` header honored, exact projected count |
@@ -277,8 +280,9 @@ ay maxsat solve --timeout 2 <some-hard.wcnf>
 ```
 **Certified**
 ```bash
-ay maxsat solve --help
+printf 'h 1 2 0\nh -1 -2 0\n1 1 0\n2 2 0\n' > /tmp/c.wcnf && ay maxsat solve --proof /tmp/c /tmp/c.wcnf && veripb --opb /tmp/c.opb /tmp/c.opb.pbp
 ```
+(`veripb` is the checker `scripts/ci/pb_certified_gate.sh` builds from `ci/veripb.pin`; the gate's own MaxSAT lane is `ay maxsat bench --proof-check`.)
 **Track 1/1F: mc (exact unweighted)**
 ```bash
 printf 'c t mc\np cnf 3 2\n1 2 0\n-1 -2 0\n' > /tmp/mc.cnf && ay model-count /tmp/mc.cnf
@@ -321,7 +325,6 @@ Stated plainly: the solving cores exist; the input frontends do not.
 | --- | --- | --- |
 | XCSP³ Competition (CP'25; xcsp.org) | CSP / COP over XCSP³-core (integer variables) | not yet — no XCSP³ (XML) parser; the CP/FlatZinc solving core is the same class. Frontend is the only missing piece; roadmap. |
 | CASC (CADE/IJCAR ATP system competition) | FOF/FNT first-order divisions (TPTP syntax) | not yet — no TPTP parser; quantified UF/UFLIA solving overlaps but ATP-grade quantifier search is unproven here. Watch-item, not near-term. |
-
 | SyGuS (syntax-guided synthesis; SyGuS-IF format) | PBE / invariant / general tracks | not yet — no SyGuS-IF frontend or synthesis engine. Recorded because **cvc5 competes here** (dominantly), and the benchmark corpus is public and usable. |
 
 ## Benchmark corpora we can use before any competition entry
@@ -345,7 +348,7 @@ roadmap, distinct from what ships today:
 | Future capability | Unlocks |
 | --- | --- |
 | Quantified-path Alethe replay (proofs the engine currently refuses to emit rather than emit unverifiably) | SMT-COMP proof story beyond QF; the pigeonhole-class wins become independently checkable |
-| MaxSAT certificates (VeriPB-for-MaxSAT) + IPAMIR incremental API | MaxSAT Evaluation certified + incremental tracks |
+| Always-derivable MaxSAT lower bounds (certificates ship today, but when no `#core-mine` derivation is available the proof falls back to `BOUNDS 0 <= obj <= k`, which does not entail optimality) + IPAMIR incremental API | MaxSAT Evaluation certified + incremental tracks |
 | QBF certificates (Skolem/Herbrand emission at the CLI) + QCIR + DQBF parsers | QBF Gallery certified / non-CNF / DQBF tracks |
 | Distributed SAT engine | SAT Competition cloud track |
 | FlatZinc float variables; broader global-constraint natives; parallel CP optimization | MiniZinc Challenge full classes |
@@ -353,11 +356,10 @@ roadmap, distinct from what ships today:
 | XCSP³ (XML) frontend | XCSP³ Competition entry (solving core exists) |
 | TPTP frontend + ATP-grade quantifier search | CASC entry (cvc5 precedent) |
 | SyGuS-IF frontend + synthesis engine | SyGuS (cvc5 precedent) |
-| FiniteSets theory (new in Z3 5.0.0) | parity with the latest Z3 surface |
 | `ay bench compare run/refs/import/report` (the runner half of the comparison system) | one-command replay-class runs on the benchmark machine |
 
-Entered-but-withdrawn is tracked separately: QF_UFLIA (SMT-COMP) returns when
-the false-SAT fix is proven.
+Nothing is currently entered-but-withdrawn: QF_UFLIA (SMT-COMP), withdrawn
+2026-06-15, was re-added 2026-07-28 once the false-SAT fix was proven.
 
 Reference points, researched 2026-07-21: XCSP³ 2025 ran at CP'25 (proceedings
 arXiv:2511.06918; CoSoCo among the medalists). CASC 2025: Vampire swept every
@@ -377,7 +379,7 @@ Capabilities with no competition home, verified the same way:
 | MaxSMT via assert-soft | ready — weighted (assert-soft ... :weight N) solved to the true optimum; cost reported via (get-objectives) as __ay_soft_cost |
 | AllSAT enumeration (full + projected) | ready — full and projected enumeration both work with exhaustive/capped reporting; one stale-binary vs HEAD discrepancy on don't-care expansion (see evidence) |
 | Incremental solving via native API (push/pop across check-sat) | ready — push/assert/check/pop verified live in-process through four language surfaces; sat→unsat→sat round-trip correct |
-| Exact + projected model counting (MCC output format) | ready — exact unweighted mc and projected pmc both correct; weighted (wmc) not supported (help says "exact unweighted MC/PMC") |
+| Exact + projected + weighted model counting (MCC output format) | ready — exact unweighted `mc`, projected `pmc`, and weighted `wmc`/`pwmc` (exact rationals, zero and negative weights) are all correct; only the `model-count --help` one-liner is stale, still reading "exact unweighted MC/PMC" (`crates/ay/src/main.rs:754`) |
 | LP/MILP solving on MPS + CPLEX LP formats | ready — MPS LP and CPLEX-LP MILP both solved to correct optima with MIPLIB-style exit codes; format auto-detected |
 | 7-language binding surface (Rust, C, C++, Python, Java, JavaScript/WASM, OCaml) | partial — 6 of 7 surfaces live-verified in this environment; JS/WASM has a checked-in test harness but needs `npm i` (koffi) or a wasm32 build, neither present locally |
 | Native Rust in-process API | ready — the checked-in example runs and returns a correct model; note `cargo run` at HEAD did not finish within 4 min here (stale target cache vs HEAD), so the Jul 20 prebuilt example binary was run instead |

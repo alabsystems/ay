@@ -154,3 +154,78 @@ fn test_fp_to_ubv_unsupported_composite_bv_predicate_not_sat_8870() {
         "unsupported composite BV operands must fail closed instead of returning SAT, got {result:?}"
     );
 }
+
+/// THE INCREMENTAL VARIANT of ay#8870 — a canary for a bug that does not exist
+/// yet, added before the code that could introduce it.
+///
+/// The six canaries above are all SINGLE `check-sat` scripts: zero `push`/`pop`
+/// between them. They pin the congruence for sites registered within ONE solve,
+/// which is the only thing that can go wrong while `solve_fp` builds a fresh
+/// `FpSolver` every check-sat — the site list starts empty, so every site is
+/// re-registered and re-paired.
+///
+/// That protection evaporates the moment the FP lane becomes incremental.
+/// `register_to_bv_unspec_site` (`ay-theories/fp/src/bitblast.rs`) relates each
+/// NEW site only to the sites already in `self.to_bv_unspec_sites`, then appends.
+/// If a future `IncrementalFpState` retains the CLAUSES but not that site list,
+/// a `to_ubv` created in the second check-sat is never related to one created in
+/// the first — while the first's clauses are still in the solver — and the two
+/// conversions are free to differ under an asserted input equality. That is a
+/// wrong `sat`, and it is the same defect ay#8870 fixed, re-opened by
+/// incrementality.
+///
+/// Below, the site for `x` is registered in the base scope and the site for `y`
+/// inside a `push`. With `x = y` and `k` pinned to `to_ubv(x)`, congruence forces
+/// `to_ubv(y) = k`, so the second query is UNSAT. It passes today; it is designed
+/// to FAIL if persistence is added without persisting the site list.
+///
+/// See the development design notes.
+#[test]
+#[timeout(30_000)]
+fn fp_to_ubv_congruence_survives_a_push_8870_incremental() {
+    use ay_dpll::Executor;
+    use ay_frontend::parse;
+
+    let script = r#"
+        (set-logic QF_BVFP)
+        (declare-const x (_ FloatingPoint 5 11))
+        (declare-const y (_ FloatingPoint 5 11))
+        (declare-const k (_ BitVec 8))
+        (assert (= x y))
+        (assert (= k ((_ fp.to_ubv 8) RNE x)))
+        (check-sat)
+        (push 1)
+        (assert (not (= k ((_ fp.to_ubv 8) RNE y))))
+        (check-sat)
+        (pop 1)
+    "#;
+
+    let commands = parse(script).expect("script should parse");
+    let mut executor = Executor::new();
+    let outputs = executor
+        .execute_all(&commands)
+        .expect("incremental congruence canary should run");
+
+    let verdicts: Vec<&String> = outputs
+        .iter()
+        .filter(|o| matches!(o.as_str(), "sat" | "unsat" | "unknown"))
+        .collect();
+    assert_eq!(
+        verdicts.len(),
+        2,
+        "expected exactly two check-sat verdicts, got {outputs:?}"
+    );
+
+    assert_eq!(
+        verdicts[0], "sat",
+        "the base scope alone is satisfiable; if this is not `sat` the fixture no \
+         longer registers a to_ubv site before the push and proves nothing"
+    );
+    assert_eq!(
+        verdicts[1], "unsat",
+        "x = y forces to_ubv(x) = to_ubv(y) = k, so negating it inside the push is \
+         UNSAT. A `sat` here means a to_ubv site created in the second query was \
+         never related to the one from the first — ay#8870 re-opened across a \
+         scope boundary"
+    );
+}

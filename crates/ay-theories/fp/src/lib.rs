@@ -354,6 +354,35 @@ impl<'a> FpSolver<'a> {
         self.next_var - 1
     }
 
+    /// Set the next variable counter.
+    ///
+    /// The FP analogue of [`ay_bv::BvState::set_next_var`], and the reason it is
+    /// needed is the same: an INCREMENTAL lane must restore its variable counter
+    /// so a name allocated in one check-sat still denotes the same SAT variable
+    /// in the next one.
+    ///
+    /// Both constructors hard-code `next_var: 1`, so today the word-blast cache
+    /// has per-call lifetime BY CONSTRUCTION — `solve_fp` builds a fresh
+    /// `FpSolver` every check-sat and numbering restarts. That is safe only
+    /// because nothing is retained; the moment any FP clause outlives a solve,
+    /// a counter that restarts makes the same FP variable denote a DIFFERENT SAT
+    /// variable, which mis-wires the retained clause. That is a silent
+    /// wrong-`sat` generator and is exactly the failure `IncrementalBvState`'s
+    /// `bv_var_offset` + `sync_next_bv_var` pair exists to prevent (#7892).
+    ///
+    /// Adding the setter does not make the lane incremental and changes no
+    /// behaviour on its own — `solve_fp` does not call it. It removes the API
+    /// asymmetry that currently makes the FP lane the only bit-blasting
+    /// subsystem that CANNOT be made incremental. Design:
+    /// the development design notes.
+    ///
+    /// The counter must only ever move FORWARD. Lowering it re-issues names
+    /// already handed out, so this method keeps the current frontier when a
+    /// stale or otherwise smaller saved value is supplied.
+    pub fn set_next_var(&mut self, next_var: u32) {
+        self.next_var = self.next_var.max(next_var);
+    }
+
     /// Get the mapping from term IDs to decomposed FP representations.
     pub fn term_to_fp(&self) -> &HashMap<TermId, FpDecomposed> {
         &self.term_to_fp

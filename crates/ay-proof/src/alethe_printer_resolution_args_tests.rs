@@ -154,35 +154,201 @@ fn generic_resolution_export_rejects_surface_changed_pivot_depth() {
     }
 }
 
+/// An `(or p p ... p)` of `arity` arguments, both polarities mapped to a tiny
+/// surface spelling, resolved against each other. The canonical rendering of
+/// the root is ~2 bytes per argument, so the term is cheap to BUILD and
+/// expensive to RENDER — which is the whole point: it separates a gate that
+/// inspects structure from one that formats it.
+struct WideOverrideCase {
+    terms: TermStore,
+    wide: TermId,
+    not_wide: TermId,
+    proof: Proof,
+    overrides: DetHashMap<TermId, String>,
+}
+
+impl WideOverrideCase {
+    fn new(arity: usize) -> Self {
+        let mut terms = TermStore::new();
+        let p = terms.mk_var("p", Sort::Bool);
+        let wide = terms.mk_app(Symbol::Named("or".to_string()), vec![p; arity], Sort::Bool);
+        let not_wide = terms.mk_not_raw(wide);
+        let yes = terms.mk_bool(true);
+        let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+        overrides.insert(wide, "p".to_string());
+        overrides.insert(not_wide, "(not p)".to_string());
+
+        let mut proof = Proof::new();
+        let h1 = proof.add_assume(wide, None);
+        let h2 = proof.add_assume(not_wide, None);
+        proof.add_rule_step(
+            AletheRule::Resolution,
+            Vec::new(),
+            vec![h1, h2],
+            vec![wide, yes],
+        );
+        Self {
+            terms,
+            wide,
+            not_wide,
+            proof,
+            overrides,
+        }
+    }
+
+    fn export(&self, work_budget: Option<u64>) -> Result<String, AlethePrintError> {
+        try_export_alethe_with_problem_scope_overrides_and_budget(
+            &self.proof,
+            &self.terms,
+            &[self.wide, self.not_wide],
+            Some(&self.overrides),
+            work_budget,
+        )
+    }
+}
+
+/// Smallest wall of `rounds` repetitions, in microseconds. The minimum (not the
+/// mean) is what makes these ratios usable under a loaded test harness: a
+/// scheduler steal can only ever inflate a sample, never deflate one.
+fn min_wall_us(rounds: usize, mut body: impl FnMut()) -> f64 {
+    let mut best = f64::MAX;
+    for _ in 0..rounds {
+        let started = std::time::Instant::now();
+        body();
+        let us = started.elapsed().as_secs_f64() * 1e6;
+        if us < best {
+            best = us;
+        }
+    }
+    best
+}
+
+/// Smallest per-export wall over several rounds, abandoning a round as soon as
+/// it has already blown `ceiling_us` per export. The early exit is what keeps a
+/// REGRESSED gate honest: without it a gate that started rendering would make
+/// this test grind for minutes through the very formatting it forbids before
+/// reporting. With it, the returned figure is >= `ceiling_us` and the caller's
+/// assertion fails in well under a second.
+fn per_rejection_wall_us(case: &WideOverrideCase, ceiling_us: f64) -> f64 {
+    const ITERS: usize = 512;
+    const ROUNDS: usize = 9;
+    const CLOCK_STRIDE: usize = 64;
+    let _ = case.export(Some(64));
+    let mut best = f64::MAX;
+    for _ in 0..ROUNDS {
+        let started = std::time::Instant::now();
+        let mut done = 0usize;
+        for _ in 0..ITERS {
+            let _ = std::hint::black_box(case.export(Some(64)));
+            done += 1;
+            if (done == 1 || done.is_multiple_of(CLOCK_STRIDE))
+                && started.elapsed().as_secs_f64() * 1e6 > ceiling_us * done as f64
+            {
+                break;
+            }
+        }
+        let us = started.elapsed().as_secs_f64() * 1e6 / done as f64;
+        if us < best {
+            best = us;
+        }
+    }
+    best
+}
+
+/// Wall of the single `render_term_canonical` call the structural pre-flight
+/// exists to prevent — measured here, on this machine, under this load, so the
+/// comparison below is self-calibrating rather than a hard-coded millisecond
+/// budget that drifts with hardware.
+fn one_canonical_render_wall_us(case: &WideOverrideCase) -> f64 {
+    min_wall_us(3, || {
+        std::hint::black_box(crate::render_term_canonical(&case.terms, case.wide));
+    })
+}
+
+/// Two bounded gates can claim this input: the authored-assume structural
+/// pre-flight and the annotated-resolution override gate. Which one fires
+/// first is an internal ordering this test deliberately does NOT pin — both
+/// reject without formatting, and the timing assertions below are what prove
+/// that, rather than the spelling of a message. What IS pinned is that the
+/// rejection came from a gate that inspected the step at all.
+fn is_bounded_gate_rejection(reason: &str) -> bool {
+    reason.contains("canonical term exceeds the structural rendering bound")
+        || reason.contains("effective surface overrides are active")
+}
+
 #[test]
 fn annotated_resolution_override_gate_does_not_render_huge_canonical_term() {
-    let mut terms = TermStore::new();
-    let p = terms.mk_var("p", Sort::Bool);
-    let wide = terms.mk_app(Symbol::Named("or".to_string()), vec![p; 8_192], Sort::Bool);
-    let not_wide = terms.mk_not_raw(wide);
-    let yes = terms.mk_bool(true);
-    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
-    overrides.insert(wide, "p".to_string());
-    overrides.insert(not_wide, "(not p)".to_string());
+    const SCALED_ARITY: usize = 8_192;
+    const HUGE_ARITY: usize = 1_000_000;
+    /// One guarded rejection must be at least this many times cheaper than the
+    /// single canonical render it prevents. Measured margin on this shape is
+    /// ~90_000x (0.22us per rejection against a 20ms render at 1_000_000
+    /// arguments); a gate that formatted the term before refusing lands at ~1x,
+    /// so the threshold sits three orders of magnitude clear of the failure.
+    const MIN_REJECT_SPEEDUP_OVER_ONE_RENDER: f64 = 1_000.0;
+    /// Growing the `or` from 8_192 to 1_000_000 arguments multiplies arity by
+    /// 122; the per-rejection wall may not follow it. Measured 0.97x. A gate
+    /// that walked every argument before refusing lands near 122x.
+    const MAX_REJECT_WALL_GROWTH: f64 = 16.0;
 
-    let mut proof = Proof::new();
-    let h1 = proof.add_assume(wide, None);
-    let h2 = proof.add_assume(not_wide, None);
-    proof.add_rule_step(
-        AletheRule::Resolution,
-        Vec::new(),
-        vec![h1, h2],
-        vec![wide, yes],
+    let huge = WideOverrideCase::new(HUGE_ARITY);
+
+    // Fail closed, and do so independently of the emission work budget.
+    // Budget exhaustion is a REACHABLE outcome on this shape — the same
+    // construction at arity 2 under `Some(64)` returns
+    // `EmissionBudgetExhausted` — so pinning the variant is what stops this
+    // test from passing on an emission stall that never inspected the term.
+    for work_budget in [Some(64u64), Some(1_000_000u64), None] {
+        let error = huge
+            .export(work_budget)
+            .expect_err("annotated resolution with any active override must fail closed");
+        assert!(
+            matches!(
+                error,
+                AlethePrintError::InvalidSurfaceStep { ref reason, .. }
+                    if is_bounded_gate_rejection(reason)
+            ),
+            "budget {work_budget:?}: {error}"
+        );
+    }
+
+    // NO HUGE RENDER, asserted directly rather than through a message proxy:
+    // one rejection has to be orders of magnitude cheaper than one render of
+    // the very term it refused. If any gate on the path formatted the term
+    // before refusing, this ratio collapses to ~1.
+    let one_render_us = one_canonical_render_wall_us(&huge);
+    let ceiling_us = one_render_us / MIN_REJECT_SPEEDUP_OVER_ONE_RENDER;
+    let per_rejection_us = per_rejection_wall_us(&huge, ceiling_us);
+    let speedup = one_render_us / per_rejection_us;
+    assert!(
+        speedup >= MIN_REJECT_SPEEDUP_OVER_ONE_RENDER,
+        "rejecting a {HUGE_ARITY}-argument term cost {per_rejection_us:.4}us against a \
+         {one_render_us:.1}us canonical render of the same term ({speedup:.1}x); a gate that \
+         refuses without rendering must be at least {MIN_REJECT_SPEEDUP_OVER_ONE_RENDER:.0}x cheaper"
     );
 
-    let error = try_export_alethe_with_problem_scope_overrides_and_budget(
-        &proof,
-        &terms,
-        &[wide, not_wide],
-        Some(&overrides),
-        Some(64),
-    )
-    .expect_err("annotated resolution with any active override must fail in constant time");
+    // ...and the same wall, held flat across a 122x arity increase, so a gate
+    // that merely renders CHEAPLY still cannot satisfy this test.
+    let scaled = WideOverrideCase::new(SCALED_ARITY);
+    let scaled_us = per_rejection_wall_us(&scaled, ceiling_us);
+    let growth = per_rejection_us / scaled_us;
+    assert!(
+        growth <= MAX_REJECT_WALL_GROWTH,
+        "the rejection wall tracked arity: {scaled_us:.4}us at {SCALED_ARITY} arguments vs \
+         {per_rejection_us:.4}us at {HUGE_ARITY} ({growth:.1}x for a 122x arity increase)"
+    );
+}
+
+/// Companion to the huge-term case above, which now lands on the structural
+/// pre-flight and so no longer reaches the override gate at all. Without this,
+/// widening that test's reason to accept either gate would silently retire the
+/// only coverage the annotated-resolution override gate had.
+#[test]
+fn annotated_resolution_override_gate_rejects_a_small_surface_override() {
+    let case = WideOverrideCase::new(2);
+    let error = case
+        .export(None)
+        .expect_err("an annotated resolution under active surface overrides must fail closed");
     assert!(
         matches!(
             error,

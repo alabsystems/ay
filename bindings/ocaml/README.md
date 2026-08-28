@@ -68,7 +68,7 @@ Expected output for the named test cases:
 
 ```
 AY OCaml binding test
-  linked AY version: 0.1.0+build....
+  linked AY version: <workspace version>+build....
   PASS: lia_sat -> sat
   PASS: lia_sat:model_present
     model: (model   (define-fun y () Int 2)   (define-fun x () Int 1) )

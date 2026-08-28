@@ -110,12 +110,50 @@ impl Executor {
         }
 
         // --- Phase 1: Tseitin transformation ---
+        //
+        // `encode_assertion`, not `assert_term`, so DEFINITIONS and ACTIVATION
+        // are separable (#fp-incremental-subsystem, prerequisite step).
+        //
+        // The two calls differ in exactly one respect: `encode_and_assert`
+        // (which `assert_term` wraps) is `encode(t, true)` followed by
+        // `add_clause(unit(lit))`, while `encode_assertion` is the same
+        // `encode(t, true)` and hands the root literal BACK instead of pushing
+        // it. So re-pushing the unit here in the same position reproduces the
+        // previous clause sequence exactly — this is behaviour-preserving, and
+        // `fp_tseitin_split_reconstructs_the_flat_encoding` pins that.
+        //
+        // Why it has to exist before the FP lane can ever retain anything:
+        // definitional clauses are scope-INDEPENDENT and belong in
+        // `add_clause_global` (they constrain only fresh Tseitin variables, so
+        // they remove no model of the user's formula), whereas the root unit is
+        // the ASSERTION and must stay scope-guarded. `TseitinEncodedAssertion`'s
+        // own documentation states that split. While the two are fused into one
+        // flat vector there is no way to make the definitions survive a pop
+        // without also making the assertion survive it — which is a wrong
+        // answer, not an optimisation. See
+        // the development design notes.
+        //
+        // Nothing is retained yet: both halves are recombined immediately below
+        // and handed to a fresh solver exactly as before.
         let mut tseitin = Tseitin::new(&self.ctx.terms);
+        let mut tseitin_definitions: Vec<CnfClause> = Vec::new();
+        let mut tseitin_activations: Vec<CnfClause> = Vec::new();
+        let mut tseitin_clauses: Vec<CnfClause> = Vec::new();
         for &assertion in &self.ctx.assertions {
-            tseitin.assert_term(assertion);
+            let encoded = tseitin.encode_assertion(assertion);
+            let activation = CnfClause::unit(encoded.root_lit);
+            tseitin_clauses.extend(encoded.def_clauses.iter().cloned());
+            tseitin_clauses.push(activation.clone());
+            tseitin_definitions.extend(encoded.def_clauses);
+            tseitin_activations.push(activation);
         }
+        debug_assert_eq!(
+            tseitin_clauses.len(),
+            tseitin_definitions.len() + tseitin_activations.len(),
+            "the def/activation split must partition the flat encoding"
+        );
         let tseitin_result = ay_core::TseitinResult::new(
-            tseitin.all_clauses().to_vec(),
+            tseitin_clauses,
             tseitin.term_to_var().clone(),
             tseitin.var_to_term().clone(),
             0,

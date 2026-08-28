@@ -444,23 +444,23 @@ vectors. `SearchSpec::from_json` itself must allocate the document, so Rust
 callers should still cap bytes before parsing. The C ABI applies a separate
 fixed whole-document limit before it invokes the JSON parser.
 
-| Resource                                                        |   SearchSpec v1 limit |
-| --------------------------------------------------------------- | --------------------: |
-| variables                                                       |               100,000 |
-| non-trivial constraints                                         |               100,000 |
-| dense span of one domain, including holes in an explicit domain |                65,536 |
-| aggregate internal domain-encoding slots                        |             1,000,000 |
-| scalar cells across one table                                   |             1,000,000 |
-| absolute domain bound, coefficient, constant, or constraint RHS | 2,305,843,009,213,951 |
-| conservative aggregate backend-work units                       |             1,000,000 |
-| UTF-8 bytes in one equation                                     |                65,536 |
-| tokens in one equation                                          |                 4,096 |
-| parenthesis nesting in one equation                             |                   128 |
-| retained enumeration solutions                                  |                10,000 |
-| retained `solutions * variables` assignment cells               |             1,000,000 |
-| conservative serialized enumeration result                      |      16,777,216 bytes |
-| SearchSpec SMT-LIB rendering                                     |      16,777,216 bytes |
-| whole SearchSpec document at the C ABI                          |      16,777,216 bytes |
+| Resource                                                          |       SearchSpec v1 limit |
+| ----------------------------------------------------------------- | ------------------------: |
+| variables                                                         |                   100,000 |
+| non-trivial constraints                                           |                   100,000 |
+| dense span of one domain, including holes in an explicit domain   |                    65,536 |
+| aggregate internal domain-encoding slots                          |                 1,000,000 |
+| scalar cells across one table                                     |                 1,000,000 |
+| absolute domain bound, coefficient, constant, or constraint RHS   | 2,305,843,009,213,693,951 |
+| conservative aggregate backend-work units                         |                 1,000,000 |
+| UTF-8 bytes in one equation                                       |                    65,536 |
+| tokens in one equation                                            |                     4,096 |
+| parenthesis nesting in one equation                               |                       128 |
+| retained enumeration solutions                                    |                    10,000 |
+| retained `solutions * variables` assignment cells                 |                 1,000,000 |
+| conservative serialized enumeration result                        |          16,777,216 bytes |
+| SearchSpec SMT-LIB rendering                                      |          16,777,216 bytes |
+| whole SearchSpec document at the C ABI                            |          16,777,216 bytes |
 
 The backend-work estimate charges hidden lowering and explanation shapes,
 including linear arity, table propagation, element arrays, pairwise

@@ -2195,3 +2195,90 @@ fn qf_bvfp_cset_bvor_reflexive_sat() {
     );
     assert_eq!(results, vec!["sat"]);
 }
+
+/// The def/activation split in `solve_fp`'s Phase 1 must reconstruct EXACTLY the
+/// clause sequence the old flat `assert_term` path produced
+/// (#fp-incremental-subsystem).
+///
+/// `assert_term` wraps `encode_and_assert`, which is `encode(t, true)` followed by
+/// `add_clause(unit(lit))`. `encode_assertion` performs the same `encode(t, true)`
+/// but hands the root literal back instead of pushing it. So interleaving
+/// `def_clauses` then `unit(root_lit)` per assertion must be byte-identical to the
+/// flat encoding — otherwise the "prerequisite refactor" silently changed what the
+/// SAT solver sees, and every downstream FP verdict moved with it.
+///
+/// This is the guard that lets the split land before anything is retained. It
+/// compares CLAUSE VECTORS, not verdicts: a verdict test would pass under a
+/// reordering that changes search behaviour, which is exactly what must not slip
+/// through unnoticed.
+#[test]
+fn fp_tseitin_split_reconstructs_the_flat_encoding() {
+    use ay_core::{CnfClause, Tseitin};
+
+    let commands = parse(
+        r#"
+        (set-logic QF_FP)
+        (declare-const a (_ FloatingPoint 8 24))
+        (declare-const b (_ FloatingPoint 8 24))
+        (assert (fp.lt a b))
+        (assert (or (fp.isNaN a) (fp.geq b ((_ to_fp 8 24) RNE 1.0))))
+        (assert (not (fp.eq a b)))
+        "#,
+    )
+    .expect("script should parse");
+    let mut exec = Executor::new();
+    let _ = exec.execute_all(&commands).expect("asserts should execute");
+    let assertions = exec.ctx.assertions.clone();
+    assert!(
+        assertions.len() >= 3,
+        "the fixture must actually load several assertions, got {}",
+        assertions.len()
+    );
+
+    // OLD PATH: flat encode-and-assert.
+    let mut flat = Tseitin::new(&exec.ctx.terms);
+    for &assertion in &assertions {
+        flat.assert_term(assertion);
+    }
+    let flat_clauses = flat.all_clauses().to_vec();
+
+    // NEW PATH: split, then recombine in the same positions.
+    let mut split = Tseitin::new(&exec.ctx.terms);
+    let mut recombined: Vec<CnfClause> = Vec::new();
+    let mut definitions: Vec<CnfClause> = Vec::new();
+    let mut activations: Vec<CnfClause> = Vec::new();
+    for &assertion in &assertions {
+        let encoded = split.encode_assertion(assertion);
+        let activation = CnfClause::unit(encoded.root_lit);
+        recombined.extend(encoded.def_clauses.iter().cloned());
+        recombined.push(activation.clone());
+        definitions.extend(encoded.def_clauses);
+        activations.push(activation);
+    }
+
+    assert_eq!(
+        recombined, flat_clauses,
+        "the recombined split must reproduce the flat encoding exactly — if this \
+         fails, solve_fp's Phase 1 refactor changed what the SAT solver sees"
+    );
+    assert_eq!(
+        definitions.len() + activations.len(),
+        flat_clauses.len(),
+        "defs and activations must PARTITION the encoding, with nothing dropped \
+         or double-counted"
+    );
+    assert_eq!(
+        activations.len(),
+        assertions.len(),
+        "exactly one activation unit per assertion"
+    );
+    assert!(
+        !definitions.is_empty(),
+        "the fixture must produce definitional clauses, or this proves nothing"
+    );
+    assert_eq!(
+        split.num_vars(),
+        flat.num_vars(),
+        "both paths must allocate the same Tseitin variables"
+    );
+}

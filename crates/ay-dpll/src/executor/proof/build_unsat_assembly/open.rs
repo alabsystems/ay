@@ -58,11 +58,31 @@ impl Executor {
             {
                 return AssemblyGate::Stop;
             }
+            // SURFACE THE SILENT DECLINE. Both exits below stop the funnel
+            // before it ever runs, so `--probe-cert-reject` printed NEITHER a
+            // mint nor a decline and the run was indistinguishable from one
+            // that never had a refutation to certify. Measured on a stratified
+            // 987-file corpus census: 62 of 517 UNSATs (12.0%) end here,
+            // silently -- the third-largest certification outcome after
+            // minted and declined, and the only one with no diagnostic at all.
+            // The mechanism was already computed and stored in
+            // `last_proof_decline`; it simply had no stdout surface.
+            crate::executor::unsat_cert::probe_cert_reject(|| {
+                format!("assembly gate STOPPED before certification: {mechanism:?}")
+            });
             self.install_uncertifiable_proof_poison(mechanism);
             return AssemblyGate::Stop;
         }
         if self.last_clause_trace.is_some() {
             self.refresh_checked_sat_refutation();
+        } else {
+            // The other silent exit: no clause trace, so the checked-refutation
+            // builder is never even consulted.
+            crate::executor::unsat_cert::probe_cert_reject(|| {
+                "assembly gate PROCEEDED without certification: no SAT clause trace \
+                 is recorded, so the checked-refutation builder never runs"
+                    .to_string()
+            });
         }
         AssemblyGate::Proceed
     }

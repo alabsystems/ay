@@ -29,6 +29,26 @@ compatibility. Wholesale copies of upstream tools live only under
   attribution in their file headers.
 - **CVC5** (BSD-3-Clause) — consulted for string solving and quantifier
   strategy.
+- **Kissat** (MIT) — the hash-cons term-store mark-compact collector
+  (`crates/ay-core/src/term/compact.rs`) ports Kissat's arena-compaction
+  strategy from `compact.c`, and dense occurrence-list propagation for
+  inprocessing (`crates/ay-sat/src/solver/propagation_dense.rs`) is a port of
+  `propdense.c`. Both carry the attribution in their file headers.
+- **CryptoMiniSat** (MIT) — intree probing
+  (`crates/ay-sat/src/solver/inprocessing/intree.rs`) is ported from
+  CryptoMiniSat's `intree.cpp` and carries the attribution in its file header.
+- **Pumpkin** (MIT) — the disjunctive (unary resource) edge-finding propagator
+  and its Theta-Lambda tree
+  (`crates/ay-cp/src/propagators/disjunctive/mod.rs` and
+  `theta_lambda_tree.rs`) are ported from Pumpkin's propagators of the same
+  names, with the attribution in their file headers.
+- **OpenSMT** (MIT) — decomposed Farkas interpolation
+  (`crates/ay-chc/src/farkas_decomposition/mod.rs`) is ported from OpenSMT's
+  `FarkasInterpolator.cc` and carries the attribution in its file header.
+- **Eldarica** (BSD-3-Clause) — forward/backward interval propagation over
+  integer CHC systems
+  (`crates/ay-chc/src/transform/interval_propagation.rs`) ports the idea of
+  Eldarica's `IntervalPropagator`, with the attribution in its file header.
 
 ## Vendored Components (`third_party/`)
 
@@ -77,6 +97,18 @@ origin:
   `crates/ay-cp/src/propagators/shifted_alldifferent.rs` — Choco-solver.
 - `crates/ay-theories/euf/src/explain.rs` and
   `crates/ay-theories/lia/src/gcd_tableau.rs` — Z3 EUF and arithmetic.
+- `crates/ay-core/src/term/compact.rs` and
+  `crates/ay-sat/src/solver/propagation_dense.rs` — Kissat arena compaction
+  and dense propagation.
+- `crates/ay-sat/src/solver/inprocessing/intree.rs` — CryptoMiniSat intree
+  probing.
+- `crates/ay-cp/src/propagators/disjunctive/mod.rs` and
+  `crates/ay-cp/src/propagators/disjunctive/theta_lambda_tree.rs` — Pumpkin
+  disjunctive edge-finding.
+- `crates/ay-chc/src/farkas_decomposition/mod.rs` — OpenSMT Farkas
+  interpolation.
+- `crates/ay-chc/src/transform/interval_propagation.rs` — Eldarica interval
+  propagation.
 
 ## A Note On GPL-Sensitive Material
 

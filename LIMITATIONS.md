@@ -51,7 +51,7 @@ built to become a universal Z3 replacement and to outperform mature specialist
 solvers in their domains; each step toward that goal must earn its claim with
 reproducible results and independently checked evidence.
 
-## Known limitations (0.1.0)
+## Known limitations
 
 - **Quantified search remains incomplete; public SAT publication fails closed
   unless a complete checked evidence lane succeeds.** Runtime-checked recovery
@@ -168,8 +168,8 @@ reproducible results and independently checked evidence.
   corpus family SHA-256
   `ef9912b78e493410189a3bfa733987a873a1e7ca5d36a529f42426f312391dd9`.
   Evidence:
-  [the development design notes](the development design notes)
-  and [raw JSON](the development design notes).
+  the development design notes
+  and raw JSON.
 
   | declared → AY | count |
   | --- | ---: |
@@ -197,7 +197,7 @@ reproducible results and independently checked evidence.
   membership has fully turned over.** Full family sweep, all 121 UFBV
   `wintersteiger fmsd13 fixpoint` files, 15s, `ay 0.5.0+build.6235` @ `de03e266`,
   default mode. Evidence and reproduction:
-  [the development design notes](the development design notes).
+  the development design notes.
 
   | | `2068d68d` | HEAD `de03e266` | after the multi-point probe fix |
   | --- | --- | --- | --- |

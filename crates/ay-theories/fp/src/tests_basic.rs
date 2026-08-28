@@ -274,3 +274,60 @@ fn test_fp_standalone_push_pop_restores_trail() {
     // Doing a second pop with no scope to pop is a no-op and must not panic.
     <FpSolverStandalone as TheorySolver>::pop(&mut solver);
 }
+
+/// `set_next_var` must actually move the allocator, because an incremental FP
+/// lane will use it to make a variable name mean the same SAT variable across
+/// check-sats.
+///
+/// Both `FpSolver` constructors hard-code `next_var: 1`. That is safe today only
+/// because nothing is retained between solves — `solve_fp` builds a fresh solver
+/// every check-sat. Once any FP clause outlives a solve, a counter that restarts
+/// makes the same FP variable denote a DIFFERENT SAT variable and silently
+/// mis-wires the retained clause: a wrong-`sat` generator, and the failure
+/// `IncrementalBvState`'s `bv_var_offset` / `sync_next_bv_var` pair exists to
+/// prevent (#7892).
+///
+/// This pins the allocator contract only. It does NOT claim the lane is
+/// incremental — `solve_fp` does not call the setter.
+#[test]
+fn set_next_var_moves_the_allocator_so_names_can_survive_a_solve() {
+    let terms = TermStore::new();
+
+    let mut fresh = FpSolver::new(&terms);
+    assert_eq!(fresh.num_vars(), 0, "a new solver has issued no names");
+    let first = fresh.fresh_var();
+
+    // Restore to a frontier as an incremental caller would, then allocate.
+    let mut restored = FpSolver::new(&terms);
+    restored.set_next_var(500);
+    let after_restore = restored.fresh_var();
+
+    assert_ne!(
+        after_restore, first,
+        "set_next_var did not move the allocator: a restored solver re-issued the \
+         SAME name as a fresh one, so a retained clause would be mis-wired"
+    );
+    assert_eq!(
+        after_restore, 500,
+        "the restored frontier must be honoured exactly"
+    );
+    assert_eq!(
+        restored.fresh_var(),
+        501,
+        "allocation must continue forward from the restored frontier"
+    );
+    assert_eq!(
+        restored.num_vars(),
+        501,
+        "num_vars is next_var - 1 and must reflect the restored frontier"
+    );
+
+    // A stale snapshot must not rewind the allocator. Rewinding here would
+    // re-issue 500 and 501, silently changing what retained clauses mean.
+    restored.set_next_var(1);
+    assert_eq!(
+        restored.fresh_var(),
+        502,
+        "a stale restore rewound the allocator and re-issued an existing name"
+    );
+}
