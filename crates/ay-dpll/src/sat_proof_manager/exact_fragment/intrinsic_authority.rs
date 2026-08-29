@@ -98,6 +98,42 @@ impl SatProofManager<'_> {
                 )));
             }
         }
+        if let Some(euf) = self.emit_direct_euf_original_clause(proof, clause, progress)? {
+            return Ok(Some(euf));
+        }
+        // DEAD LAST, behind every arm that predates it, so every label this
+        // function already produced stays byte-identical: this arm can only
+        // claim a clause each earlier arm refused. `recognize_array_theory_lemma`
+        // is the checker's own classifier (`ay_proof::checker::array_axiom`),
+        // the exact inverse of the `validate_array_*` entry points strict mode
+        // dispatches, so no recognizer surface is added here and none can drift
+        // — recognizer and validator are the same call. Deliberately OUTSIDE the
+        // `clause.len() < 2` guard the EUF arm needs: array originals arrive as
+        // a single packed `(or ..)` literal that `flatten_clause_literals`
+        // expands checker-side. Skolemized extensionality stays unrecognized by
+        // construction (`array_axiom.rs:739-742`) — its soundness is provenance,
+        // not shape, so such clauses correctly remain unauthenticated.
+        if let Some(kind) = ay_proof::recognize_array_theory_lemma(self.terms, clause) {
+            let (work, bytes) = Self::unit_chain_charge(clause.len(), clause.len())?;
+            progress(work, bytes)?;
+            return Ok(Some(Self::add_intrinsic_original_clause(
+                proof,
+                "array",
+                clause.to_vec(),
+                kind,
+            )));
+        }
+        Ok(None)
+    }
+
+    /// The pre-existing direct-EUF arm, lifted verbatim so the array arm below
+    /// it can be reached by fall-through. Charge point and condition unchanged.
+    fn emit_direct_euf_original_clause(
+        &mut self,
+        proof: &mut Proof,
+        clause: &[TermId],
+        progress: &mut dyn FnMut(usize, usize) -> Result<(), ResolutionValidationError>,
+    ) -> Result<Option<ProofId>, ExactOriginalProofError> {
         if clause.len() < 2 {
             return Ok(None);
         }

@@ -32,7 +32,7 @@ pub use proof::ProofDeclineMechanism;
 // Format helpers - format_sort, format_symbol now used in executor/commands.rs
 
 // Incremental state types
-use crate::incremental_state::{IncrementalBvState, IncrementalTheoryState};
+use crate::incremental_state::{IncrementalBvState, IncrementalFpState, IncrementalTheoryState};
 
 include!("executor/config.rs");
 
@@ -782,6 +782,31 @@ pub struct Executor {
     pub(crate) no_lra_theory_propagation: bool,
     /// Persistent state for incremental BV solving with rebuild-on-pop invalidation
     incr_bv_state: Option<IncrementalBvState>,
+    /// Persistent state for the incremental FP lane (fifth incremental subsystem).
+    ///
+    /// Only ever populated while [`Self::fp_persistent_armed`] authorized the
+    /// current `solve_fp`; every other FP entry point runs the untouched
+    /// stateless pipeline and never observes this field.
+    pub(crate) incr_fp_state: Option<IncrementalFpState>,
+    /// One-shot authorization for the persistent FP lane.
+    ///
+    /// FAIL-SAFE POLARITY, and that is the whole point. `solve_fp` is reachable
+    /// from six callers that substitute `ctx.assertions` out from under it —
+    /// symbolic-RoundingMode enumeration (mutually contradictory branches),
+    /// the pinned-Real UNSAT probe, `check-sat-assuming`'s scoped merge,
+    /// ABVFP store expansion, constant-index read flattening, and the
+    /// symbol-disjoint partition rescue. Sharing session state with any of them
+    /// is a wrong answer (a persistent activation unit for branch `RNE` is
+    /// still installed when branch `RTZ` runs).
+    ///
+    /// Rather than enumerate those callers and hope none is missed, the lane is
+    /// OFF unless something explicitly turned it on: set at exactly one site
+    /// (the primary `route_to_solver` dispatch, over the authored assertion
+    /// set), cleared immediately after that dispatch returns, and CONSUMED by
+    /// `std::mem::take` at the top of `solve_fp` so every re-entrant call sees
+    /// `false`. Missing a substituting caller therefore costs performance, not
+    /// correctness.
+    pub(crate) fp_persistent_armed: bool,
     /// Persistent state for incremental theory solving (UF/LRA/LIA)
     pub(crate) incr_theory_state: Option<IncrementalTheoryState>,
     /// Style for counterexample generation (model minimization)

@@ -96,6 +96,8 @@ macro_rules! new_stack_guarded_expr {
             lra_persist_sat_active: false,
             no_lra_theory_propagation: false,
             incr_bv_state: None,
+            incr_fp_state: None,
+            fp_persistent_armed: false,
             incr_theory_state: None,
             counterexample_style: crate::CounterexampleStyle::default(),
             proof_tracker: crate::proof_tracker::ProofTracker::new(),

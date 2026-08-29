@@ -17,6 +17,8 @@ mod core_evolution_push_pop_8311;
 mod dt_lazy_incremental_soundness;
 #[path = "group_incremental/ematching_pushscope_repro.rs"]
 mod ematching_pushscope_repro;
+#[path = "group_incremental/fp_persistent_lane.rs"]
+mod fp_persistent_lane;
 #[path = "group_incremental/incremental_multi_check_sat_8154.rs"]
 mod incremental_multi_check_sat_8154;
 #[path = "group_incremental/incremental_needlemmas_proof_6717.rs"]

@@ -1272,6 +1272,15 @@ pub struct MiscCliFlags {
     /// chain-under-equality split. UNSAT-only producer surgery; disabling
     /// restores the baseline Generic/trust lemmas byte-for-byte.
     pub no_ground_conflict_decomp: bool,
+    /// `--no-fp-incremental` — persistent incremental FP lane kill switch.
+    ///
+    /// With it set, every `check-sat` runs the stateless FP pipeline that
+    /// predates the lane: a fresh `Tseitin`, `FpSolver` and `SatSolver` per
+    /// call. It exists for two reasons. It is the A/B control — the primary
+    /// metric is check-sats per CPU-second measured INTERLEAVED, which two
+    /// separate builds cannot give honestly — and it is the operational escape
+    /// hatch for a change whose failure mode is a silent wrong answer.
+    pub no_fp_incremental: bool,
     /// `--vacuous-marker-narrow` — staged marker narrowing (B66).
     pub vacuous_marker_narrow: bool,
     /// `--proj-axiom-budget <n>` — projection axiom cap (default 50000; B66).
@@ -1593,6 +1602,7 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         no_quantified_shedding_yield: false,
         no_negated_exists_ground_inst: false,
         no_ground_conflict_decomp: false,
+        no_fp_incremental: false,
         vacuous_marker_narrow: false,
         proj_axiom_budget: None,
         uflia_witness_complete: false,

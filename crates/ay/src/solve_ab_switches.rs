@@ -284,6 +284,8 @@ pub(super) struct SolveAbSwitches {
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     no_ground_conflict_decomp: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
+    no_fp_incremental: bool,
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
     vacuous_marker_narrow: bool,
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     proj_axiom_budget: Option<usize>,

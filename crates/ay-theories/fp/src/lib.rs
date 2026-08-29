@@ -271,13 +271,69 @@ pub struct FpSolver<'a> {
 }
 
 /// A recorded `fp.to_{s,u}bv` site for congruence Ackermannization.
-struct ToBvUnspecSite {
+///
+/// `pub` (opaque fields) only so an incremental caller can carry the vector
+/// across check-sat calls inside [`FpEncodingCache`]. Dropping it between
+/// calls is a WRONG-SAT: `register_to_bv_unspec_site` relates each new site to
+/// all PRIOR ones, so a site first seen on check-sat #2 would never be made
+/// congruent with one from check-sat #1 (ay#8870).
+#[derive(Debug, Clone)]
+pub struct ToBvUnspecSite {
     /// Decomposed FP input to the conversion.
     input: FpDecomposed,
     /// The fresh "unspecified" output bits used for NaN/Inf/out-of-range.
     unspec: Vec<CnfLit>,
     /// Whether this is a signed (`fp.to_sbv`) conversion.
     is_signed: bool,
+}
+
+/// Every `FpSolver` field whose contents name specific CNF variables and must
+/// therefore survive across check-sat calls when the SAT solver does.
+///
+/// `FpSolver<'a>` borrows the `TermStore`, so it cannot be stored in a field of
+/// the executor next to `ctx.terms` (self-referential borrow). The persisted
+/// object is therefore the CACHE, not the solver — the same shape
+/// `bv_incremental.rs` uses for `BvSolver`.
+///
+/// The cache is exported/imported WHOLE. Adding a field here without adding it
+/// to both [`FpSolver::import_cache`] and [`FpSolver::export_cache`] is a
+/// compile error, because both destructure exhaustively (no `..`).
+#[derive(Debug, Clone)]
+pub struct FpEncodingCache {
+    /// Word-blast cache: FP term → its sign/exponent/significand literals.
+    pub term_to_fp: HashMap<TermId, FpDecomposed>,
+    /// BV bits allocated inside FP conversions (`to_fp`, `fp.to_sbv`, ...).
+    pub bv_term_bits: HashMap<TermId, Vec<CnfLit>>,
+    /// Next fresh FP variable. MUST never go backwards while any emitted clause
+    /// still references the space below it.
+    pub next_var: u32,
+    /// Canonical false literal (names one specific, already-pinned variable).
+    pub cached_false: Option<CnfLit>,
+    /// Canonical true literal (names one specific, already-pinned variable).
+    pub cached_true: Option<CnfLit>,
+    /// One consistent literal per free Bool input reached only below a theory
+    /// atom. See the `TermData::Var` arm of `encode_bool_condition`.
+    pub bool_input_lits: HashMap<TermId, CnfLit>,
+    /// `fp.to_{s,u}bv` sites already Ackermannized against each other.
+    pub to_bv_unspec_sites: Vec<ToBvUnspecSite>,
+    /// The single fixed-but-unspecified NaN encoding per FP format.
+    pub ieee_nan_encodings: HashMap<(usize, usize), Vec<CnfLit>>,
+}
+
+impl Default for FpEncodingCache {
+    fn default() -> Self {
+        Self {
+            term_to_fp: HashMap::default(),
+            bv_term_bits: HashMap::default(),
+            // 1-indexed for DIMACS, matching both `FpSolver` constructors.
+            next_var: 1,
+            cached_false: None,
+            cached_true: None,
+            bool_input_lits: HashMap::default(),
+            to_bv_unspec_sites: Vec::new(),
+            ieee_nan_encodings: HashMap::default(),
+        }
+    }
 }
 
 impl<'a> FpSolver<'a> {
@@ -332,6 +388,72 @@ impl<'a> FpSolver<'a> {
     /// Returns true if the encoding encountered an unresolvable ITE condition.
     pub fn has_encoding_gap(&self) -> bool {
         self.has_encoding_gap
+    }
+
+    /// Read AND CLEAR the encoding-gap flag.
+    ///
+    /// The flag is sticky by construction (set in ~11 places, cleared only by
+    /// the constructors). A caller that reuses one solver's caches across
+    /// several encodes must drain it per encode, or the first gap latches
+    /// `Unknown` for the rest of the session.
+    pub fn take_encoding_gap(&mut self) -> bool {
+        std::mem::replace(&mut self.has_encoding_gap, false)
+    }
+
+    /// Restore a previously exported encoding cache.
+    ///
+    /// Every field named here points at specific CNF variable numbers, so this
+    /// is only sound when the caller ALSO keeps the FP variable offset and the
+    /// SAT solver fixed. See `IncrementalFpState` in `ay-dpll`.
+    pub fn import_cache(&mut self, cache: FpEncodingCache) {
+        let FpEncodingCache {
+            term_to_fp,
+            bv_term_bits,
+            next_var,
+            cached_false,
+            cached_true,
+            bool_input_lits,
+            to_bv_unspec_sites,
+            ieee_nan_encodings,
+        } = cache;
+        self.term_to_fp = term_to_fp;
+        self.bv_term_bits = bv_term_bits;
+        // Monotone: never hand back a smaller frontier than this solver has
+        // already handed out, or two distinct bits alias one variable.
+        self.next_var = self.next_var.max(next_var);
+        self.cached_false = cached_false;
+        self.cached_true = cached_true;
+        self.bool_input_lits = bool_input_lits;
+        self.to_bv_unspec_sites = to_bv_unspec_sites;
+        self.ieee_nan_encodings = ieee_nan_encodings;
+    }
+
+    /// Snapshot every cache field that names a CNF variable.
+    pub fn export_cache(&self) -> FpEncodingCache {
+        // Exhaustive by construction: adding a field to `FpEncodingCache`
+        // without listing it here fails to compile.
+        FpEncodingCache {
+            term_to_fp: self.term_to_fp.clone(),
+            bv_term_bits: self.bv_term_bits.clone(),
+            next_var: self.next_var,
+            cached_false: self.cached_false,
+            cached_true: self.cached_true,
+            bool_input_lits: self.bool_input_lits.clone(),
+            to_bv_unspec_sites: self.to_bv_unspec_sites.clone(),
+            ieee_nan_encodings: self.ieee_nan_encodings.clone(),
+        }
+    }
+
+    /// Free Boolean inputs that were given an UNLINKED fresh literal because
+    /// the Tseitin walk had not named them when their enclosing theory atom was
+    /// decomposed.
+    ///
+    /// An incremental caller must re-check these on every check-sat: once a
+    /// later assertion gives such a term a Tseitin variable, the two names must
+    /// be tied together or the mux and the Boolean structure disagree about the
+    /// same symbol — a wrong `sat` no model gate can see (R7).
+    pub fn bool_input_lits(&self) -> &HashMap<TermId, CnfLit> {
+        &self.bool_input_lits
     }
 
     /// Get the generated CNF clauses.

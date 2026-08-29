@@ -14,6 +14,7 @@ mod blocking;
 mod congruence;
 mod flatten_reads;
 mod forward_error;
+mod incremental;
 mod pin_reals;
 mod rm_expand;
 mod support;
@@ -44,6 +45,14 @@ impl Executor {
     /// 3. Link FP predicate results to Tseitin variables
     /// 4. Feed combined CNF to SAT solver
     pub(in crate::executor) fn solve_fp(&mut self) -> Result<SolveResult> {
+        // CONSUME the persistent-lane authorization here, at the single shared
+        // entry point, before anything can re-enter. `try_solve_fp_symbolic_rm`
+        // (5^k mutually contradictory RM branches) and `try_fp_pin_unsat_probe`
+        // both call back into `solve_fp` further down this very function with a
+        // substituted `ctx.assertions`; taking the flag now guarantees those
+        // branches never share session state with each other or with the
+        // authored query. See `Executor::fp_persistent_armed`.
+        let persistent_authorized = std::mem::take(&mut self.fp_persistent_armed);
         if self.should_abort_theory_loop() {
             return Ok(SolveResult::Unknown);
         }
@@ -107,6 +116,24 @@ impl Executor {
                 return self.solve_fp_to_real();
             }
             FpSupportStatus::FullySupported => {}
+        }
+
+        // --- Persistent incremental lane (fifth incremental subsystem) ---
+        // Engages only for an authorized, push/pop-scoped solve whose session
+        // state has not opted out. Everything below this point is the original
+        // stateless pipeline, byte-for-byte, and remains the behaviour for
+        // every single-shot solve and every declined incremental one.
+        if persistent_authorized
+            && self.incremental_mode
+            && !ay_core::misc_cli_flags().no_fp_incremental
+            && !self
+                .incr_fp_state
+                .as_ref()
+                .is_some_and(|state| state.disabled)
+        {
+            if let Some(result) = self.try_solve_fp_incremental()? {
+                return Ok(result);
+            }
         }
 
         // --- Phase 1: Tseitin transformation ---
@@ -436,6 +463,13 @@ impl Executor {
     /// before the BVFP path, so symbolic EXTERNAL_CODEGEN memory reads of FP values expose
     /// the BV index guard and FP value equality to the bit-blast solver.
     pub(in crate::executor) fn solve_abvfp(&mut self) -> Result<SolveResult> {
+        // Belt for R3: every route out of this function substitutes
+        // `ctx.assertions` before reaching `solve_fp` — read-over-write store
+        // expansion, constant-index read flattening, finite-array closure. The
+        // substituted TermIds are not the authored ones and the flattened set
+        // is not model-equivalent to the original, so nothing here may share
+        // the session's persistent FP encoding.
+        self.fp_persistent_armed = false;
         if self.should_abort_theory_loop() {
             return Ok(SolveResult::Unknown);
         }

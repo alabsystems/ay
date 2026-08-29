@@ -9,6 +9,7 @@ use ay_sat::{ClauseTrace, Literal, Variable};
 
 mod finite_select_unit_authority;
 mod folded_unit_authority;
+mod intrinsic_array_clause_authority;
 mod intrinsic_datatype_clause_authority;
 mod intrinsic_euf_clause_authority;
 mod propagation_unit_authority;

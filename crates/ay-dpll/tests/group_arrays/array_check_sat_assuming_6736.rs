@@ -82,11 +82,18 @@ fn test_qf_auflia_assuming_closes_nested_finite_arrays_before_unsat_quarantine()
     let outputs = exec
         .execute_all(&commands)
         .expect("nested finite-array assumption script should execute");
-    assert_eq!(outputs, vec!["unknown"]);
-    assert_eq!(
-        exec.unknown_reason(),
-        Some(ay_dpll::UnknownReason::Incomplete)
-    );
+    // STRENGTHENED POST-CONDITION. `a` and `b` are Bool-indexed nested arrays
+    // whose four leaves are all asserted equal, so they ARE extensionally
+    // equal and the assumption `(not (= a b))` is genuinely UNSAT. The verdict
+    // used to be quarantined to `unknown` because the refutation could not
+    // authenticate its array originals; the dead-last array arm in
+    // `sat_proof_manager::exact_fragment::intrinsic_authority` now mints a
+    // `CheckedSatRefutation` for them, which is exactly the authority
+    // `executor::check_sat::nested_array_quarantine` demands before releasing
+    // the answer. Asserting `unsat` here is what keeps that release wired to a
+    // certificate: if the mint regresses, this reverts to `unknown` and fails.
+    assert_eq!(outputs, vec!["unsat"]);
+    assert_eq!(exec.unknown_reason(), None);
     let stats = exec.statistics();
     assert_eq!(
         stats.get_int("smt.array.finite_ext.route_deferrals"),
@@ -95,11 +102,12 @@ fn test_qf_auflia_assuming_closes_nested_finite_arrays_before_unsat_quarantine()
     assert_eq!(
         stats.get_int("smt.array.finite_ext.emitted_equalities"),
         Some(3),
-        "the outer equality and both array-valued cells must close before the independent UNSAT quarantine fires"
+        "the outer equality and both array-valued cells must still close before the independent UNSAT quarantine is consulted"
     );
     assert_eq!(
         stats.get_string("unknown.cost_center"),
-        Some("nested-array-unsat-quarantine")
+        None,
+        "a released, certificate-backed unsat must not be charged to the quarantine cost center"
     );
 }
 

@@ -1485,6 +1485,15 @@ impl Executor {
         combined_assertions.extend(assumptions.iter().copied());
 
         let original_assertions = std::mem::replace(&mut self.ctx.assertions, combined_assertions);
+        // Belt for R1: this route merges query-local ASSUMPTIONS into the
+        // assertion vector. The persistent FP lane would encode each one into
+        // `encoded_assertions` and install its activation unit at the current
+        // scope depth — at depth 0 a PERMANENT unit, so the next check-sat is
+        // solved under the previous query's assumptions (wrong UNSAT at once,
+        // wrong SAT as soon as a negated assumption is retained). The primary
+        // dispatch already declines to arm while `last_assumptions` is set;
+        // this makes the sub-solve stateless no matter how it was reached.
+        self.fp_persistent_armed = false;
         // The scoped route merges the assumptions INTO `ctx.assertions`, so
         // the inner solve sees the complete problem exactly as a plain
         // `check-sat (base ∧ A)` would. Clear `last_assumptions` for the

@@ -317,6 +317,11 @@ impl Executor {
     fn solve_partition_component(&mut self, component: &[TermId]) -> Result<SolveResult> {
         let saved_assertions = std::mem::replace(&mut self.ctx.assertions, component.to_vec());
         let saved_incr = self.incr_theory_state.take();
+        // Belt for R3: this component's assertions are a SUBSET of the query,
+        // so the persistent FP lane must not encode or activate them into the
+        // session state. `route_to_solver` below is the same dispatch the
+        // primary call goes through, so disarm explicitly.
+        self.fp_persistent_armed = false;
         self.last_model = None;
 
         let (category, features) = self.detect_logic_category(component);

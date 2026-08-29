@@ -161,6 +161,7 @@ impl SolveArgs {
             no_quantified_shedding_yield: self.ab_switches.no_quantified_shedding_yield,
             no_negated_exists_ground_inst: self.ab_switches.no_negated_exists_ground_inst,
             no_ground_conflict_decomp: self.ab_switches.no_ground_conflict_decomp,
+            no_fp_incremental: self.ab_switches.no_fp_incremental,
             vacuous_marker_narrow: self.ab_switches.vacuous_marker_narrow,
             proj_axiom_budget: self.ab_switches.proj_axiom_budget,
             uflia_witness_complete: self.ab_switches.uflia_witness_complete,

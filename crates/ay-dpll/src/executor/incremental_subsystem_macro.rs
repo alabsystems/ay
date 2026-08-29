@@ -24,6 +24,12 @@ macro_rules! for_each_incremental_subsystem {
         // NOTE: Theory state has special pre-push assertion logic handled
         // by the caller before this macro invocation. The push itself is
         // dispatched here.
+        let fp = $self
+            .incr_fp_state
+            .get_or_insert_with(IncrementalFpState::new);
+        for _ in 0..$n {
+            fp.push();
+        }
         let ts = $self
             .incr_theory_state
             .get_or_insert_with(IncrementalTheoryState::new);
@@ -45,6 +51,11 @@ macro_rules! for_each_incremental_subsystem {
     (pop $self:expr, $n:expr) => {{
         let mut ok = true;
         if let Some(ref mut s) = $self.incr_bv_state {
+            for _ in 0..$n {
+                ok &= s.pop();
+            }
+        }
+        if let Some(ref mut s) = $self.incr_fp_state {
             for _ in 0..$n {
                 ok &= s.pop();
             }
@@ -72,6 +83,9 @@ macro_rules! for_each_incremental_subsystem {
         if let Some(ref mut s) = $self.incr_bv_state {
             s.reset();
         }
+        if let Some(ref mut s) = $self.incr_fp_state {
+            s.reset();
+        }
         if let Some(ref mut s) = $self.incr_theory_state {
             s.reset();
         }
@@ -84,6 +98,7 @@ macro_rules! for_each_incremental_subsystem {
     // Used by ResetAssertions which discards all state.
     (drop $self:expr) => {{
         $self.incr_bv_state = None;
+        $self.incr_fp_state = None;
         $self.incr_theory_state = None;
         $self.quantifier_manager = None;
         $self.proof_tracker.reset();

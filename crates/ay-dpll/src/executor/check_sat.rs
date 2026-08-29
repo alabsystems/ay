@@ -1225,7 +1225,31 @@ impl Executor {
             // arm is a no-op (`--dpll-no-int-coloring` opts out entirely).
             Ok(SolveResult::Sat)
         } else {
-            self.route_to_solver(category, &features)
+            // THE ONLY SITE THAT ARMS THE PERSISTENT FP LANE. This is the
+            // primary dispatch, over `pre_dispatch_assertions` — the authored
+            // assertion set plus the pre-dispatch soundness axioms, i.e. the
+            // one assertion vector whose push/pop structure the FP lane's
+            // scoped activation units actually describe. Every other
+            // `route_to_solver` caller (partition rescue, the DT certificate
+            // ground core) and every assertion-substituting helper inside the
+            // FP pipeline itself sees the flag `false` and runs stateless.
+            //
+            // Quantified problems are excluded: `process_quantifiers` injects
+            // ground instances into `ctx.assertions` that are NOT push/pop
+            // scoped, so an instance activated at depth 0 for one check-sat
+            // would survive as a permanent unit after the quantifier that
+            // spawned it is popped away — a wrong UNSAT. `check-sat-assuming`
+            // is excluded for the same reason at one remove: its assumptions
+            // are merged into `ctx.assertions` and would install permanent
+            // activation units for a query-local hypothesis.
+            //
+            // Cleared unconditionally on return, so the flag can never leak
+            // into a later dispatch that this reasoning does not cover.
+            self.fp_persistent_armed =
+                !self.original_problem_had_quantifiers && self.last_assumptions.is_none();
+            let dispatched = self.route_to_solver(category, &features);
+            self.fp_persistent_armed = false;
+            dispatched
         };
         self.record_phase_duration("phase.solver_dispatch.seconds", solver_started_at);
         if ay_core::misc_cli_flags().f1_diag {

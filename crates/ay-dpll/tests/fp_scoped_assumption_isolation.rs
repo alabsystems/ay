@@ -46,11 +46,30 @@
 //! mutation-verified: the site-list mechanism it guards exists today, so emptying
 //! the prior-site list breaks it exactly as designed.
 //!
-//! So treat these as INVARIANT ASSERTIONS, not proven guards. They state
-//! something true and load-bearing, they cost ~0.1 s, and they will discriminate
-//! the moment `IncrementalFpState` lands — at which point whoever lands it should
-//! re-run this file under a mutation that persists the assumption, and only then
-//! record it as verified.
+//! UPDATE — `IncrementalFpState` HAS NOW LANDED, the promised re-verification was
+//! done, and the prediction above was WRONG. What actually happened:
+//!
+//! Mutating the persistent lane's assertion activation from scoped `add_clause`
+//! to `add_clause_global` — literally "the assertion survives its scope" — leaves
+//! both tests PASSING. The statistics say why: running the first fixture through
+//! the CLI emits no `fp-incremental` counter at all. **The persistent lane does
+//! not engage for the `check-sat-assuming` route.**
+//!
+//! That is the DESIGNED behaviour, not an oversight: design bucket 3a says
+//! assumption literals must never enter the clause database, and the lane
+//! correctly leaves that route on the stateless path. So these canaries still
+//! cannot be broken by mutating the lane — because the lane is not in their path.
+//!
+//! Their value changed rather than vanished. They are now standing EVIDENCE that
+//! the assumption route stays outside persistence: if a later change routes
+//! `check-sat-assuming` through the persistent lane without moving assumptions to
+//! `Solver::solve_with_assumptions`, the leak they describe becomes reachable and
+//! they become discriminating. Until then they remain INVARIANT ASSERTIONS, not
+//! proven guards, and this file keeps saying so.
+//!
+//! The verified guards for persistence are the lane's own controls `nc1`-`nc6`;
+//! an independent review confirmed the activation-to-global mutation is killed by
+//! five of six.
 
 mod common;
 
