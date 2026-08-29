@@ -550,3 +550,41 @@ fn test_divisibility_lowers_to_checked_integer_lattice_steps() {
     assert!(!output.contains(":rule hole"), "{output}");
     assert!(!output.contains(":rule lia_generic"), "{output}");
 }
+
+/// The bridge's cross-check proves the two literals are COMPLEMENTARY; it does
+/// not prove they are printed in different ORDERS. A self-equality satisfies it
+/// with all four operands spelled identically, and the emitted `symm` then
+/// concludes a clause byte-identical to its own premise: a step that reorients
+/// nothing, injected into every self-equality refutation.
+/// `distinct_eq_resolution_bridge` already requires its `swapped` flag before
+/// emitting `symm`; an aligned pivot here must likewise fall through to the
+/// ordinary resolution rendering.
+#[test]
+fn aligned_self_equality_pivot_resolves_without_a_no_op_symm() {
+    use ay_core::Symbol;
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let equality = terms.mk_app(Symbol::named("="), [x, x], Sort::Bool);
+    let negated = terms.mk_not_raw(equality);
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(equality, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), equality, positive, negative);
+
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &scope_covering_proof(&proof),
+        None,
+    )
+    .expect("an aligned self-equality pivot has an ordinary resolution rendering");
+    assert!(
+        !output.contains(":rule symm"),
+        "a `symm` whose conclusion equals its premise reorients nothing:\n{output}"
+    );
+    assert!(
+        output.contains("(step t2 (cl) :rule resolution :premises (t0 t1))"),
+        "the aligned pivot must resolve directly against its two premises:\n{output}"
+    );
+}

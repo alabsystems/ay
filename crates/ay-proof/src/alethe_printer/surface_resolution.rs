@@ -52,6 +52,18 @@ impl AlethePrinter<'_> {
         {
             return None;
         }
+        // The cross-check above only proves the two literals are complementary;
+        // it does not prove they are printed in DIFFERENT orders. A
+        // self-equality `(= X X)` against `(not (= X X))` satisfies it with all
+        // four operands spelled identically, and the step below would then
+        // conclude a clause byte-identical to its own premise — a `symm` that
+        // reorients nothing, injected into every self-equality refutation.
+        // `distinct_eq_resolution_bridge` already computes this `swapped`
+        // condition before emitting `symm`; require it here too and leave the
+        // aligned pivot to the ordinary resolution rendering.
+        if positive_left == negative_left && positive_right == negative_right {
+            return None;
+        }
         let oriented = format!("(= {negative_left} {negative_right})");
         Some(format!(
             "(step {id}.s (cl {oriented}) :rule symm :premises ({positive_id}))\n\

@@ -9,7 +9,9 @@ use crate::executor::{proof_surface_syntax, NATIVE_API_ASSERTION_PLACEHOLDER};
 use ay_core::kani_compat::{DetHashMap, DetHashSet};
 
 const MAX_REACHABLE_AUTHORED_ASSUMES: usize = 8_192;
-const MAX_AUTHORED_ORIGINAL_INDEX_ROWS: usize = 100_000;
+// `pub(super)` only so the sibling regression module can pin the cap by name
+// instead of restating its value.
+pub(super) const MAX_AUTHORED_ORIGINAL_INDEX_ROWS: usize = 100_000;
 const MAX_AUTHORED_REACHABILITY_STEPS: usize = 1_000_000;
 const MAX_REBUILD_AUTHORITY_ROWS: usize = 300_000;
 
@@ -18,6 +20,27 @@ enum ReachableAuthoredSource {
     Identity(TermId),
     /// Re-render the parsed source row as an assume-scoped override.
     Parsed(TermId, FrontendTerm),
+    /// An authored premise this presentation-only pass has nothing to restore
+    /// for. It is NOT an authority failure, so it must not suppress
+    /// publication: the root keeps exactly the rendering every replacement
+    /// pass before this one left on it.
+    ///
+    /// Two shapes reach here, both authenticated before the variant is built:
+    /// a `check-sat-assuming` literal of the CURRENT query (an authored
+    /// premise with no `(assert ...)` row of its own -- the same premise
+    /// `proof_export_scope_assertions` already admits from
+    /// `last_assumptions`), and a root whose authored spelling the Alethe
+    /// printer cannot confine to its own `assume`.
+    ///
+    /// "Nothing to restore" is load-bearing in BOTH directions, so this arm
+    /// deliberately does not clear a surviving entry the way `Identity` does.
+    /// An earlier replacement pass is the ONLY writer that can have left one
+    /// here, and on the folded-conjunction shape that entry is the authored
+    /// text the published `assume` has to carry: clearing it prints the bare
+    /// folded term, which is no assertion of the problem. That is measured, not
+    /// assumed -- see
+    /// `a_composite_fold_root_keeps_the_spelling_an_earlier_pass_installed`.
+    Untouched,
 }
 
 /// How one argument position's premise literal is discharged.
@@ -104,6 +127,91 @@ fn reachable_authored_assume_roots(proof: &Proof) -> Option<Vec<TermId>> {
         }
     }
     Some(roots)
+}
+
+/// Whether restoring `source` as the printed spelling of `root` keeps the
+/// literal's top-level Boolean shape, so the Alethe printer's authored-assume
+/// channel can confine it to its own `assume` step.
+///
+/// A surface override re-spells ONE `TermId` for the WHOLE document
+/// (`proof_export_term_overrides` hands `last_proof_term_overrides` to the
+/// printer as `term_overrides`). The printer removes that hazard by proving
+/// `source = canonical` with stock rules and resolving the `assume` back to
+/// the canonical unit -- but only for the spellings it can actually derive:
+/// a comparison reversal (`comp_simplify`), a numeric multiplication reorder
+/// (`aci_simp`), or `cong` UNDER THE CANONICAL ROOT'S OWN OPERATOR
+/// (`alethe_printer/authored_assume/equivalence.rs` splits the surface text
+/// with `split_application(surface, canonical_operator)` and gives up when
+/// that fails). A source whose top-level connective is not the canonical
+/// root's reaches none of those arms: the printer records it `unsupported`,
+/// the entry stays document-wide, and it re-spells every other printed
+/// occurrence of the same term.
+///
+/// Measured shape, `qfax_store_permutation_*`: `(assert (! (distinct i j)
+/// :named neq))` elaborates to `(not (= i j))`. Restoring `(distinct i j)` on
+/// that root prints the assume literal as an opaque `distinct` atom while the
+/// resolution's other premise still prints `(= i j)`, and the printer's own
+/// pre-existing guard `surface_resolution_needs_distinct_bridge` correctly
+/// refuses the document with "a printed distinct/equality pivot cannot be
+/// bridged to the authored operands". Withholding restores nothing and
+/// removes nothing: the root keeps the canonical spelling the strict checker
+/// validated, exactly the state
+/// `purge_surface_overrides_for_certified_proof` established.
+///
+/// This is a NARROWING of a presentation-only pass, never a relaxation of an
+/// authority check: an unconfinable root is still required to have exactly one
+/// immutable authored source row before it gets here.
+fn authored_surface_is_assume_confinable(
+    terms: &TermStore,
+    root: TermId,
+    source: &FrontendTerm,
+) -> bool {
+    let canonical_operator = match terms.get(root) {
+        TermData::Not(_) => "not",
+        TermData::App(symbol, _) => symbol.name(),
+        // A variable / constant / ite / binder root has no top-level operator
+        // an override could rewrite, so there is nothing to compare and the
+        // decision stays where it already lives: `override_would_hijack_atom`
+        // refuses whole-assertion spellings on an ATOMIC canonical, exempting
+        // exactly the VARIABLE fold result
+        // (`authored_conjunction_folded_onto_variable`), which the printer then
+        // confines with `plan_folded_and_assumes`.
+        //
+        // That exemption is about ATOMS ONLY, and this arm inherits no more
+        // than it. A COMPOSITE fold result -- `(and (not p) (= x x))` interns
+        // as `(not p)`, `(and (= a b) (= x x))` as `(= a b)` -- is a `Not`/`App`
+        // root, so it reaches the head comparison below and is WITHHELD
+        // wherever the authored head differs, which is where this pass used to
+        // install. Measured on both, at `dacc7939c7` and here:
+        //
+        // * `(assert (and (not p) (= x x)))` + `(assert p)`: the earlier
+        //   `proof_original_rebuild` collection already holds the authored
+        //   conjunction on the folded root, `Untouched` removes nothing, and
+        //   the published document is byte-identical to the base -- `(assume
+        //   t0.a (and (not p) (= x x)))` bridged onto `(not p)` with `and_pos`
+        //   (`folded_authored_conjunction_assume_is_the_problem_assertion`).
+        // * `(assert (and (= a b) (= x x)))` + `(assert (not (= a b)))`: at the
+        //   base this pass DECLINED that root and the query published `(error
+        //   "proof was not generated for this independently certified result")`
+        //   with no transport at all. Withheld, it publishes `(assume t0
+        //   (= a b))` ... `(cl)` and the exported problem transport carries
+        //   `(assert (= a b))`. Withholding is what lets that refutation be
+        //   published, not a spelling this pass gives up.
+        _ => return true,
+    };
+    let FrontendTerm::App(operator, _) = proof_surface_syntax::strip_frontend_annotations(source)
+    else {
+        return false;
+    };
+    operator == canonical_operator || is_comparison_reversal(operator, canonical_operator)
+}
+
+/// The one top-level head rewrite the printer bridges, with `comp_simplify`.
+fn is_comparison_reversal(left: &str, right: &str) -> bool {
+    matches!(
+        (left, right),
+        ("<=", ">=") | (">=", "<=") | ("<", ">") | (">", "<")
+    )
 }
 
 impl Executor {
@@ -335,10 +443,14 @@ impl Executor {
     ) -> Option<Vec<ReachableAuthoredSource>> {
         let parsed = self.ctx.assertions_parsed();
         let originals = self.proof_original_problem_assertions_slice();
-        if parsed.is_empty()
-            || originals.len() != parsed.len()
-            || originals.len() > MAX_AUTHORED_ORIGINAL_INDEX_ROWS
-        {
+        // The two ledgers must stay index-aligned, and a RETAINED but short
+        // ledger beside authored roots is still a provenance failure -- an
+        // empty `assertions_parsed()` next to a nonempty original stack fails
+        // this very test. But a query that authored no `(assert ...)` at all
+        // (`(check-sat-assuming (false))`, a native `check_sat_assuming`,
+        // an RM-axiom query) aligns two EMPTY ledgers: it has nothing to
+        // restore, which is not the same as failing to restore something.
+        if originals.len() != parsed.len() || originals.len() > MAX_AUTHORED_ORIGINAL_INDEX_ROWS {
             return None;
         }
         if !crate::executor::proof_trust_surgery_surface_audit::surface_sources_have_bounded_work(
@@ -356,11 +468,20 @@ impl Executor {
         }
 
         let mut unique_indices: DetHashMap<TermId, Option<usize>> = DetHashMap::default();
-        for (index, &original) in originals.iter().enumerate() {
+        let mut all_native_identity: DetHashMap<TermId, bool> = DetHashMap::default();
+        for (index, (&original, source)) in originals.iter().zip(parsed).enumerate() {
             unique_indices
                 .entry(original)
                 .and_modify(|entry| *entry = None)
                 .or_insert(Some(index));
+            let source_is_native_identity = matches!(
+                proof_surface_syntax::strip_frontend_annotations(source),
+                FrontendTerm::Symbol(name) if name == NATIVE_API_ASSERTION_PLACEHOLDER
+            );
+            all_native_identity
+                .entry(original)
+                .and_modify(|all_native| *all_native &= source_is_native_identity)
+                .or_insert(source_is_native_identity);
         }
         let rebuild_authority: DetHashSet<TermId> =
             self.last_proof_rebuild_originals.iter().copied().collect();
@@ -369,6 +490,26 @@ impl Executor {
             .iter()
             .copied()
             .collect();
+        // Exactly the set `proof_export_scope_assertions` folds in as authored
+        // premises for the current query; nothing derived reaches it.
+        //
+        // Materializing it costs one pass over the ledger, so it carries the
+        // same row cap every other ledger this function folds into a set does
+        // -- but the cap scopes THE ARM, never the document. Capping the whole
+        // function would make an over-cap assumption ledger suppress a document
+        // whose roots the SOURCE ledger already accounts for: a brand-new
+        // certified-but-unpublished path, which is the exact defect this pass
+        // is being repaired for. Over the cap the arm simply holds nothing, so
+        // a root only it could have admitted still fails closed below, just as
+        // it did before the arm existed. Both directions are pinned by
+        // `an_over_cap_assumption_ledger_still_publishes_a_source_owned_document`
+        // and `an_over_cap_assumption_ledger_withholds_the_assumption_arm`.
+        let query_assumptions: DetHashSet<TermId> = match self.last_assumptions.as_deref() {
+            Some(assumptions) if assumptions.len() <= MAX_AUTHORED_ORIGINAL_INDEX_ROWS => {
+                assumptions.iter().copied().collect()
+            }
+            _ => DetHashSet::default(),
+        };
 
         let mut sources = Vec::with_capacity(roots.len());
         for &root in roots {
@@ -377,9 +518,24 @@ impl Executor {
                     sources.push(ReachableAuthoredSource::Identity(root));
                     continue;
                 }
+                if query_assumptions.contains(&root) {
+                    sources.push(ReachableAuthoredSource::Untouched);
+                    continue;
+                }
                 return None;
             };
             let &Some(index) = index else {
+                // Repeated parsed rows are ambiguous because the same
+                // canonical root may have different authored spellings. A
+                // native-API sentinel carries no spelling at all, however:
+                // every such row denotes the root's identity rendering. Any
+                // number of identical identity-only rows therefore has one
+                // unambiguous presentation and grants no additional proof
+                // authority.
+                if all_native_identity.get(&root).copied() == Some(true) {
+                    sources.push(ReachableAuthoredSource::Identity(root));
+                    continue;
+                }
                 return None;
             };
             let source = &parsed[index];
@@ -388,8 +544,10 @@ impl Executor {
                 FrontendTerm::Symbol(name) if name == NATIVE_API_ASSERTION_PLACEHOLDER
             ) {
                 sources.push(ReachableAuthoredSource::Identity(root));
-            } else {
+            } else if authored_surface_is_assume_confinable(&self.ctx.terms, root, source) {
                 sources.push(ReachableAuthoredSource::Parsed(root, source.clone()));
+            } else {
+                sources.push(ReachableAuthoredSource::Untouched);
             }
         }
         Some(sources)
@@ -413,6 +571,7 @@ impl Executor {
                     changed |= overrides.remove(&root).is_some();
                     continue;
                 }
+                ReachableAuthoredSource::Untouched => continue,
                 ReachableAuthoredSource::Parsed(root, source) => (root, source),
             };
             let mut root_override = DetHashMap::default();
@@ -451,10 +610,11 @@ impl Executor {
     /// present in both `last_proof_rebuild_originals` (proof authority) and
     /// `last_proof_raw_original_assertions` (exact top-level source
     /// provenance), whose identity text is itself the authored spelling.
-    /// Duplicate canonical roots are
-    /// ambiguous and make the whole restoration decline atomically,
-    /// suppressing external proof publication; no first-match heuristic is
-    /// used.
+    /// Duplicate canonical roots with parsed text are ambiguous and make the
+    /// whole restoration decline atomically, suppressing external proof
+    /// publication; no first-match heuristic is used. Repeated native-API
+    /// sentinels are the narrow exception: they all request the same identity
+    /// rendering and carry no source spelling to choose between.
     pub(in crate::executor::proof) fn restore_reachable_authored_assume_surface_overrides(
         &mut self,
         proof: &Proof,

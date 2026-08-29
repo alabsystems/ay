@@ -105,6 +105,7 @@ impl AlethePrinter<'_> {
     ) -> Option<Vec<String>> {
         if surface.len() > MAX_EQUIVALENCE_BYTES
             || !canonical_term_is_bounded_for_authored_assume(self.terms, canonical_term)
+                .is_bounded()
         {
             return None;
         }

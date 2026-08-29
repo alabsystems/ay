@@ -2548,7 +2548,7 @@ impl Executor {
             }
             let neg_t = self.ctx.terms.mk_not_raw(eq_t);
 
-            self.record_rebuilt_authored_proof_premise(neg_t);
+            self.record_raw_authored_problem_assertion(neg_t);
             proof.steps.clear();
             proof.named_steps.clear();
             let assume_id = proof.add_assume(neg_t, None);
@@ -4244,6 +4244,61 @@ impl Executor {
     pub(super) fn record_rebuilt_authored_proof_premise(&mut self, premise: TermId) {
         if !self.last_proof_rebuild_originals.contains(&premise) {
             self.last_proof_rebuild_originals.push(premise);
+        }
+    }
+
+    /// Admit one raw re-intern of a PARSED TOP-LEVEL assertion as both proof
+    /// authority and exact raw problem provenance.
+    ///
+    /// Strictly narrower than [`Self::record_rebuilt_authored_proof_premise`]:
+    /// that grant covers every term a repair may legitimately assume, while
+    /// `last_proof_raw_original_assertions` is the separate ledger
+    /// `resolve_reachable_authored_sources` intersects with proof authority
+    /// before it will accept a reachable `assume` that owns no
+    /// `original_problem_assertions` index of its own.
+    /// `derived_rebuild_authority_is_not_exact_raw_problem_provenance` pins
+    /// that the wider grant alone must NOT authenticate an `assume` as a
+    /// problem-file premise, and nothing here changes that: this exists for
+    /// the callers that genuinely hold the narrower fact and today mint no row
+    /// for it.
+    ///
+    /// `rebuild_trust_leaf_proof_from_original_assertions` mints that row for
+    /// every parsed assertion `raw_intern_surface` can rebuild whole. It fails
+    /// closed on exactly the shapes the collapse promoters exist for: an
+    /// elaboration-FOLDED application (`(fst (mk a b))` interns as `a`) leaves
+    /// `authenticated_surface_application_symbol` a live declaration with no
+    /// selected identity, so the re-intern declines and the promoter's own
+    /// rebuild is the only raw form of that assertion in the arena. Recording
+    /// just proof authority there drifts the two ledgers apart, and the
+    /// authored-assume restore pass then suppresses external publication of a
+    /// refutation the strict checker has already accepted.
+    ///
+    /// Callers must have matched the term against a PARSED assertion of the
+    /// problem and finished their exact recognizer gate before recording it.
+    /// `promote_dt_selector_collapse`, the one caller today, holds exactly that
+    /// fact for the raw negation it records: the shape came from
+    /// `match_dt_selector_negation(asrt)` over a PARSED assertion, every member
+    /// was resolved through the exact constructor->selector registry with full
+    /// signatures (ambiguity rejected), and
+    /// `ay_proof::recognize_datatype_selector_project` -- the strict checker's
+    /// OWN recognizer -- accepted the lemma before the negation was interned.
+    /// Scoped to `crate::executor::proof` because the only callers are
+    /// `promote_dt_selector_collapse` and this tree's own regression tests --
+    /// NOT because the module owns the ledgers. Both ledgers it appends to are
+    /// shared executor state: `last_proof_raw_original_assertions` is taken,
+    /// restored or cleared by `theories/combined`, `commands`,
+    /// `theories/euf/dt/lazy_proof_state`, `check_sat`, `check_sat_assuming`,
+    /// `lifecycle` and `quantifier_loop/result_mapping`, and the premise ledger
+    /// behind `record_rebuilt_authored_proof_premise` has five further writers
+    /// under `proof_original_rebuild` and `proof_trust_surgery`. The narrow
+    /// visibility records where this FACT may be minted, not who may read it.
+    pub(in crate::executor::proof) fn record_raw_authored_problem_assertion(
+        &mut self,
+        assertion: TermId,
+    ) {
+        self.record_rebuilt_authored_proof_premise(assertion);
+        if !self.last_proof_raw_original_assertions.contains(&assertion) {
+            self.last_proof_raw_original_assertions.push(assertion);
         }
     }
 

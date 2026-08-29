@@ -305,7 +305,15 @@ impl<'a> InvariantParser<'a> {
         Ok(self.input[start..self.pos].to_string())
     }
 
-    fn parse_numeral(&mut self) -> ChcResult<i64> {
+    // i128 deliberately (not i64): a `u64`-range bound such as
+    // `18446744073709551615` is an ordinary constant in invariants over
+    // machine-integer programs — model-checker-consumer's PostconditionGoal systems carry it
+    // in every unsigned 64-bit range fact — and the i64 parse made the strict
+    // QF invariant-model artifact fail its own producer-side re-parse
+    // ("model_parse_failed: Invalid numeral"), silently downgrading a proved
+    // PDR run to metadata-only evidence. `ChcExpr::Int` is i128-lockstep
+    // already; this parser was the lagging edge.
+    fn parse_numeral(&mut self) -> ChcResult<i128> {
         self.skip_whitespace_and_comments();
 
         let start = self.pos;

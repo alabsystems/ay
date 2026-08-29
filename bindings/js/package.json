@@ -1,6 +1,6 @@
 {
   "name": "ayz3",
-  "version": "0.1.0",
+  "version": "0.19.0",
   "description": "Z3-shaped and declarative finite-domain Node APIs backed by the AY solver.",
   "type": "module",
   "main": "ayz3.mjs",

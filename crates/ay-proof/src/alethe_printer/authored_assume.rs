@@ -22,6 +22,7 @@ mod equivalence;
 use bounds::{
     account_authored_assume_emission, account_authored_assume_planning_input,
     canonical_term_is_bounded_for_authored_assume, invalid_authored_assume_plan,
+    CanonicalRenderBound,
 };
 
 const MAX_AUTHORED_ASSUME_BRIDGES: usize = 8_192;
@@ -233,11 +234,22 @@ impl AlethePrinter<'_> {
                 "an authored assume bridge root is not Boolean",
             ));
         }
-        if !canonical_term_is_bounded_for_authored_assume(self.terms, term) {
-            return Err(invalid_authored_assume_plan(
-                id,
-                "authored assume canonical term exceeds the structural rendering bound",
-            ));
+        match canonical_term_is_bounded_for_authored_assume(self.terms, term) {
+            CanonicalRenderBound::Bounded => {}
+            // A binder, a `let` or an internal constant array is a schema this
+            // lane never renders. Decline the bridge exactly the way every
+            // other unsupported schema does (`plan_authored_assume_use` ->
+            // `Ok(false)` -> `planner.unsupported`): the assume keeps printing
+            // through the ordinary override channel and stays subject to the
+            // fail-closed surface validators. Escalating it killed the whole
+            // document over one quantified assertion.
+            CanonicalRenderBound::UnsupportedShape => return Ok(None),
+            CanonicalRenderBound::ExceedsBound => {
+                return Err(invalid_authored_assume_plan(
+                    id,
+                    "authored assume canonical term exceeds the structural rendering bound",
+                ))
+            }
         }
         let canonical = crate::render_term_canonical(self.terms, term);
         let Some(input_bytes) = surface.len().checked_add(canonical.len()) else {

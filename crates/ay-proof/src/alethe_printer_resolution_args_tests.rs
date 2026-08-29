@@ -154,44 +154,119 @@ fn generic_resolution_export_rejects_surface_changed_pivot_depth() {
     }
 }
 
-/// An `(or p p ... p)` of `arity` arguments, both polarities mapped to a tiny
-/// surface spelling, resolved against each other. The canonical rendering of
-/// the root is ~2 bytes per argument, so the term is cheap to BUILD and
+/// What the expensive `or` is wrapped in before it is assumed.
+///
+/// The pre-flight is allowed to answer QUIETLY (decline just the bridge) about
+/// two schemas it cannot render — a binder and AY's internal `const-array` —
+/// and every wrapper here puts one of them around a term whose RENDER is the
+/// thing the bound exists to prevent. A pre-flight that answers on the schema
+/// it met first never measures the wrapped term, so it degrades into the
+/// printer, and its answer depends on which child the stack popped first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WideShape {
+    /// The bare `(or p ... p)`.
+    Plain,
+    /// `(forall ((z Int)) (or p ... p))`: an unrenderable SHAPE wrapped around
+    /// an unaffordable SIZE. The size has to win.
+    UnderBinder,
+    /// `(and (or p ... p) (= (select (const-array #x00) k) #x00))`, in both
+    /// operand orders. Two orders because a pre-flight that stops at the first
+    /// unrenderable symbol answers one way when the wide conjunct is popped
+    /// first and the other way when it is popped second — the verdict must not
+    /// depend on traversal order.
+    ConstArrayConjunct { wide_first: bool },
+}
+
+/// An `(or p p ... p)` of `arity` arguments — optionally wrapped per
+/// [`WideShape`] — with both polarities of the root mapped to a tiny surface
+/// spelling and resolved against each other. The canonical rendering of the
+/// wide `or` is ~2 bytes per argument, so the term is cheap to BUILD and
 /// expensive to RENDER — which is the whole point: it separates a gate that
 /// inspects structure from one that formats it.
 struct WideOverrideCase {
     terms: TermStore,
+    /// The expensive `or` itself, whatever the root is wrapped in. This is the
+    /// render the pre-flight exists to prevent, so it is what the timing
+    /// comparison is calibrated against.
     wide: TermId,
-    not_wide: TermId,
+    root: TermId,
+    not_root: TermId,
     proof: Proof,
+    /// The same refutation with a PLAIN resolution step, so the
+    /// annotated-resolution override gate never fires and the authored-assume
+    /// pre-flight is the only gate on the path. Without it that second gate
+    /// masks a pre-flight that let the term through: the leak shows up as
+    /// `Err` either way and the difference is invisible.
+    unannotated_proof: Proof,
     overrides: DetHashMap<TermId, String>,
 }
 
 impl WideOverrideCase {
-    fn new(arity: usize) -> Self {
+    fn new(arity: usize, shape: WideShape) -> Self {
         let mut terms = TermStore::new();
         let p = terms.mk_var("p", Sort::Bool);
         let wide = terms.mk_app(Symbol::Named("or".to_string()), vec![p; arity], Sort::Bool);
-        let not_wide = terms.mk_not_raw(wide);
+        let (root, surface) = match shape {
+            WideShape::Plain => (wide, "p".to_string()),
+            WideShape::UnderBinder => (
+                terms.mk_forall(vec![("z".to_string(), Sort::Int)], wide),
+                "(forall ((z Int)) p)".to_string(),
+            ),
+            WideShape::ConstArrayConjunct { wide_first } => {
+                let byte = Sort::bitvec(8);
+                let fill = terms.mk_bitvec(0u32.into(), 8);
+                let const_array = terms.mk_app(
+                    Symbol::named("const-array"),
+                    [fill],
+                    Sort::array(byte.clone(), byte.clone()),
+                );
+                let key = terms.mk_var("k", byte.clone());
+                let read = terms.mk_app(Symbol::named("select"), [const_array, key], byte);
+                let read_is_fill = terms.mk_app(Symbol::named("="), [read, fill], Sort::Bool);
+                let conjuncts = if wide_first {
+                    vec![wide, read_is_fill]
+                } else {
+                    vec![read_is_fill, wide]
+                };
+                let read_surface =
+                    "(= (select ((as const (Array (_ BitVec 8) (_ BitVec 8))) #x00) k) #x00)";
+                let surface = if wide_first {
+                    format!("(and p {read_surface})")
+                } else {
+                    format!("(and {read_surface} p)")
+                };
+                (
+                    terms.mk_app(Symbol::Named("and".to_string()), conjuncts, Sort::Bool),
+                    surface,
+                )
+            }
+        };
+        let not_root = terms.mk_not_raw(root);
         let yes = terms.mk_bool(true);
         let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
-        overrides.insert(wide, "p".to_string());
-        overrides.insert(not_wide, "(not p)".to_string());
+        overrides.insert(root, surface.clone());
+        overrides.insert(not_root, format!("(not {surface})"));
 
         let mut proof = Proof::new();
-        let h1 = proof.add_assume(wide, None);
-        let h2 = proof.add_assume(not_wide, None);
+        let h1 = proof.add_assume(root, None);
+        let h2 = proof.add_assume(not_root, None);
         proof.add_rule_step(
             AletheRule::Resolution,
             Vec::new(),
             vec![h1, h2],
-            vec![wide, yes],
+            vec![root, yes],
         );
+        let mut unannotated_proof = Proof::new();
+        let u1 = unannotated_proof.add_assume(root, None);
+        let u2 = unannotated_proof.add_assume(not_root, None);
+        unannotated_proof.add_resolution(Vec::new(), root, u1, u2);
         Self {
             terms,
             wide,
-            not_wide,
+            root,
+            not_root,
             proof,
+            unannotated_proof,
             overrides,
         }
     }
@@ -200,9 +275,19 @@ impl WideOverrideCase {
         try_export_alethe_with_problem_scope_overrides_and_budget(
             &self.proof,
             &self.terms,
-            &[self.wide, self.not_wide],
+            &[self.root, self.not_root],
             Some(&self.overrides),
             work_budget,
+        )
+    }
+
+    fn export_unannotated(&self) -> Result<String, AlethePrintError> {
+        try_export_alethe_with_problem_scope_overrides_and_budget(
+            &self.unannotated_proof,
+            &self.terms,
+            &[self.root, self.not_root],
+            Some(&self.overrides),
+            None,
         )
     }
 }
@@ -291,7 +376,7 @@ fn annotated_resolution_override_gate_does_not_render_huge_canonical_term() {
     /// that walked every argument before refusing lands near 122x.
     const MAX_REJECT_WALL_GROWTH: f64 = 16.0;
 
-    let huge = WideOverrideCase::new(HUGE_ARITY);
+    let huge = WideOverrideCase::new(HUGE_ARITY, WideShape::Plain);
 
     // Fail closed, and do so independently of the emission work budget.
     // Budget exhaustion is a REACHABLE outcome on this shape — the same
@@ -329,7 +414,7 @@ fn annotated_resolution_override_gate_does_not_render_huge_canonical_term() {
 
     // ...and the same wall, held flat across a 122x arity increase, so a gate
     // that merely renders CHEAPLY still cannot satisfy this test.
-    let scaled = WideOverrideCase::new(SCALED_ARITY);
+    let scaled = WideOverrideCase::new(SCALED_ARITY, WideShape::Plain);
     let scaled_us = per_rejection_wall_us(&scaled, ceiling_us);
     let growth = per_rejection_us / scaled_us;
     assert!(
@@ -339,13 +424,142 @@ fn annotated_resolution_override_gate_does_not_render_huge_canonical_term() {
     );
 }
 
+/// The same no-huge-render property as above, on the two schemas the
+/// authored-assume pre-flight is allowed to decline QUIETLY.
+///
+/// The pre-flight may answer `UnsupportedShape` — which the planner turns into
+/// "no bridge" rather than "no document" — but it may only do so AFTER it has
+/// finished measuring the term. A pre-flight that answers the instant it meets
+/// a binder or a `const-array` never measures what the schema is wrapped
+/// around, so the caller degrades into the ordinary printer and formats the
+/// very term the bound exists to keep off the wire: measured here, a
+/// `(forall ((z Int)) (or p ... p))` of 1_000_000 arguments was rendered in
+/// 31_979us against 0.5us for the same refusal without the binder, i.e. the
+/// wall tracked arity at 121x for a 122x arity increase. The bare `or` in
+/// `annotated_resolution_override_gate_does_not_render_huge_canonical_term`
+/// carries no binder at all, which is exactly why it did not catch this.
+///
+/// Same two criteria, same constants, applied per shape.
+#[test]
+fn wrapped_unrenderable_shapes_do_not_render_huge_canonical_terms() {
+    const SCALED_ARITY: usize = 8_192;
+    const HUGE_ARITY: usize = 1_000_000;
+    /// Identical to the bare-`or` ratchet: one guarded rejection must be at
+    /// least this many times cheaper than the single canonical render it
+    /// prevents.
+    const MIN_REJECT_SPEEDUP_OVER_ONE_RENDER: f64 = 1_000.0;
+    /// Identical to the bare-`or` ratchet: growing the `or` from 8_192 to
+    /// 1_000_000 arguments multiplies arity by 122, and the per-rejection wall
+    /// may not follow it.
+    const MAX_REJECT_WALL_GROWTH: f64 = 16.0;
+
+    for shape in [
+        WideShape::UnderBinder,
+        WideShape::ConstArrayConjunct { wide_first: true },
+        WideShape::ConstArrayConjunct { wide_first: false },
+    ] {
+        let huge = WideOverrideCase::new(HUGE_ARITY, shape);
+
+        // Fail closed. A term that is BOTH unrenderable and oversized is a
+        // size failure: the size verdict outranks the shape verdict, so the
+        // quiet `Ok(None)` decline is not available here.
+        for work_budget in [Some(64u64), Some(1_000_000u64), None] {
+            let error = match huge.export(work_budget) {
+                Err(error) => error,
+                Ok(document) => panic!(
+                    "{shape:?} at {HUGE_ARITY} arguments, budget {work_budget:?}: an \
+                     unrenderable schema wrapped around an unaffordable term must still fail \
+                     closed, got a {}-byte document",
+                    document.len()
+                ),
+            };
+            assert!(
+                matches!(
+                    error,
+                    AlethePrintError::InvalidSurfaceStep { ref reason, .. }
+                        if is_bounded_gate_rejection(reason)
+                ),
+                "{shape:?}, budget {work_budget:?}: {error}"
+            );
+        }
+
+        // NO HUGE RENDER: one rejection has to be orders of magnitude cheaper
+        // than one render of the wide `or` it refused.
+        let one_render_us = one_canonical_render_wall_us(&huge);
+        let ceiling_us = one_render_us / MIN_REJECT_SPEEDUP_OVER_ONE_RENDER;
+        let per_rejection_us = per_rejection_wall_us(&huge, ceiling_us);
+        let speedup = one_render_us / per_rejection_us;
+        assert!(
+            speedup >= MIN_REJECT_SPEEDUP_OVER_ONE_RENDER,
+            "{shape:?}: rejecting a {HUGE_ARITY}-argument term cost {per_rejection_us:.4}us \
+             against a {one_render_us:.1}us canonical render of the same term ({speedup:.1}x); a \
+             gate that refuses without rendering must be at least \
+             {MIN_REJECT_SPEEDUP_OVER_ONE_RENDER:.0}x cheaper"
+        );
+
+        // ...and the wall stays flat across a 122x arity increase, so a gate
+        // that walked the wrapped term before refusing cannot satisfy this.
+        let scaled = WideOverrideCase::new(SCALED_ARITY, shape);
+        let scaled_us = per_rejection_wall_us(&scaled, ceiling_us);
+        let growth = per_rejection_us / scaled_us;
+        assert!(
+            growth <= MAX_REJECT_WALL_GROWTH,
+            "{shape:?}: the rejection wall tracked arity: {scaled_us:.4}us at {SCALED_ARITY} \
+             arguments vs {per_rejection_us:.4}us at {HUGE_ARITY} ({growth:.1}x for a 122x \
+             arity increase)"
+        );
+    }
+}
+
+/// The pre-flight's answer may not depend on which child its stack pops first.
+///
+/// `(and WIDE CONST_ARRAY_READ)` and `(and CONST_ARRAY_READ WIDE)` are the same
+/// term with its conjuncts swapped. A pre-flight that returns at the first
+/// unrenderable symbol answers them differently — measured on the rejected
+/// revision, `wide_first = true` refused in 0.4us while `wide_first = false`
+/// returned a 240-byte document in 7_710us — which makes a fail-closed bound
+/// depend on an internal ordering no caller controls.
+///
+/// Deliberately on the UNANNOTATED refutation. With an annotated resolution the
+/// override gate refuses both orders for its own reason and the leak is
+/// invisible; here the authored-assume pre-flight is the only gate on the path,
+/// so a leak shows up as the document it actually produces.
+///
+/// Both directions are pinned: an affordable conjunction must still EXPORT (the
+/// quiet decline is what keeps one constant-array assertion from costing the
+/// whole proof), and an unaffordable one must FAIL CLOSED — whichever operand
+/// the walk happens to reach first.
+#[test]
+fn const_array_conjunct_verdict_does_not_depend_on_operand_order() {
+    for (arity, must_fail_closed) in [(2usize, false), (8_192, true), (1_000_000, true)] {
+        let wide_first =
+            WideOverrideCase::new(arity, WideShape::ConstArrayConjunct { wide_first: true })
+                .export_unannotated();
+        let wide_second =
+            WideOverrideCase::new(arity, WideShape::ConstArrayConjunct { wide_first: false })
+                .export_unannotated();
+        assert_eq!(
+            wide_first.is_ok(),
+            wide_second.is_ok(),
+            "at {arity} arguments the same conjunction answered differently with its operands \
+             swapped: wide-first {wide_first:?} vs wide-second {wide_second:?}"
+        );
+        assert_eq!(
+            wide_first.is_err(),
+            must_fail_closed,
+            "at {arity} arguments the conjunction should {} closed: {wide_first:?}",
+            if must_fail_closed { "fail" } else { "NOT fail" }
+        );
+    }
+}
+
 /// Companion to the huge-term case above, which now lands on the structural
 /// pre-flight and so no longer reaches the override gate at all. Without this,
 /// widening that test's reason to accept either gate would silently retire the
 /// only coverage the annotated-resolution override gate had.
 #[test]
 fn annotated_resolution_override_gate_rejects_a_small_surface_override() {
-    let case = WideOverrideCase::new(2);
+    let case = WideOverrideCase::new(2, WideShape::Plain);
     let error = case
         .export(None)
         .expect_err("an annotated resolution under active surface overrides must fail closed");

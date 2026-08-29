@@ -568,3 +568,23 @@ fn malformed_or_unbounded_bitvector_indices_fail_closed() {
         );
     }
 }
+
+/// A `u64`-range bound (`18446744073709551615 > i64::MAX`) is an ordinary
+/// constant in invariants over machine-integer programs — model-checker-consumer's
+/// PostconditionGoal systems put it in every unsigned 64-bit range fact — and
+/// the parser's i64 numeral made the strict QF invariant-model artifact fail
+/// its own producer-side re-parse, downgrading a PROVED PDR run to
+/// metadata-only evidence. `ChcExpr::Int` is i128; the parser must be too.
+#[test]
+fn numerals_beyond_i64_parse_to_i128_constants() {
+    let mut problem = ChcProblem::new();
+    problem.declare_predicate("Inv", vec![ChcSort::Int]);
+    let source = "(define-fun Inv ((x Int)) Bool (and (>= x 0) (<= x 18446744073709551615)))";
+    let model = InvariantModel::parse_smtlib(source, &problem)
+        .expect("a u64::MAX bound is a legal Int numeral");
+    let rendered = format!("{model:?}");
+    assert!(
+        rendered.contains("18446744073709551615"),
+        "the constant must survive exactly: {rendered}"
+    );
+}

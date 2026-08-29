@@ -10,7 +10,7 @@
 //! malformed/under-specified input — every such case returns `Err`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ay_core::term::{Constant, Symbol, TermData};
 use ay_core::{Sort, TermId, TermStore};
@@ -106,12 +106,47 @@ const MAX_TYPED_VALUE_WORK: usize = 8192;
 /// Maximum typed value-pair comparisons performed by one equality decision.
 ///
 /// Array equality searches ordered override lists and deduplicates semantic
-/// keys, both of which are quadratic without a trusted hash representation.
-/// Nested aggregate keys multiply that work further. Meter every recursive
-/// pair comparison under one shared budget so an authenticated 8192-node value
-/// still cannot trigger unbounded CPU. Exhaustion is unevaluable and therefore
-/// becomes `CannotConfirm`.
+/// keys, both of which are quadratic for an index sort that
+/// [`Evaluator::encode_canonical_index_key`] cannot canonically encode. Nested
+/// aggregate keys multiply that work further. Meter every recursive pair
+/// comparison under one shared budget so an authenticated 8192-node value still
+/// cannot trigger unbounded CPU. Exhaustion is unevaluable and therefore becomes
+/// `CannotConfirm`.
+///
+/// The budget is deliberately NOT the knob for large arrays. A total model
+/// interpretation over a `(_ BitVec w)` index carries `2^w` store entries, so
+/// the rescan grows as `4 * (2^w)^2` and no constant survives the next width;
+/// canonical keys make that shape linear instead.
 const MAX_TYPED_EQUALITY_COMPARISONS: usize = 65_536;
+
+/// Semantic-key tables for one array-equality decision, built only when the
+/// index sort is canonically encodable.
+///
+/// `visit_order` reproduces the exact sequence the ordered union loop walks --
+/// every left store key in store order, then every right one, duplicates and
+/// all -- so the fast lane reports the same first unevaluable element
+/// comparison as the rescan it replaces.
+struct CanonicalIndexTables {
+    /// Encoded key of every store entry of the left operand then the right one,
+    /// in store order.
+    visit_order: Vec<String>,
+    /// Encoded key -> position in `left.store` of the LAST entry holding it.
+    left: HashMap<String, usize>,
+    /// Encoded key -> position in `right.store` of the LAST entry holding it.
+    right: HashMap<String, usize>,
+}
+
+/// The prefix every sequence-class carrier minted for `sort` must carry.
+///
+/// Mirrors `ay_dpll::executor::model::independent_gate::sequence_euf_class_value`,
+/// which is the sole producer of these tokens. The dependency points the wrong
+/// way for a shared constant (`ay-model-check` cannot depend on `ay-dpll`), so
+/// the coupling is pinned from both sides instead: a producer-side format
+/// change stops matching here, which fails closed rather than admitting an
+/// unauthenticated value.
+fn sequence_euf_class_prefix(sort: &Sort) -> String {
+    format!("@ay-seq-euf-class:{sort:?}:")
+}
 
 /// Restores the local lambda-binding stack on every exit, including unwinding.
 ///
@@ -1374,6 +1409,28 @@ impl<'a> Evaluator<'a> {
                 Ok(())
             }
 
+            // AY's own sequence carrier for an EUF-provided class identity.
+            //
+            // `ay_dpll`'s independent gate reifies a sequence whose model
+            // payload is nothing but an EUF equivalence class as the opaque
+            // token `@ay-seq-euf-class:{sort:?}:{len}:{class}`. The token embeds
+            // the debug rendering of the COMPLETE sequence sort, so this arm
+            // re-derives that rendering and admits the value only at the exact
+            // sort it was minted for: class `e0` in `(Seq Int)` never inhabits
+            // `(Seq Bool)`, and an ad-hoc uninterpreted value inhabits no
+            // sequence sort at all.
+            //
+            // This admits a CARRIER, it does not loosen any comparison. Two
+            // such tokens are decided by `value_eq`'s exact string identity;
+            // a token against a concrete `ModelValue::Seq` stays incomparable
+            // and therefore fail-closed, because the class name is evidence of
+            // an equivalence class and never of a sequence's elements.
+            (ModelValue::Uninterpreted(token), Sort::Seq(_))
+                if token.starts_with(&sequence_euf_class_prefix(sort)) =>
+            {
+                Ok(())
+            }
+
             (ModelValue::Seq(elements), Sort::Seq(element_sort)) => {
                 for element in elements {
                     self.ensure_value_inhabits_sort_bounded(
@@ -1530,6 +1587,33 @@ impl<'a> Evaluator<'a> {
             return Ok(false);
         }
 
+        // Fast lane: when the index sort admits a canonical encoding, the two
+        // ordered rescans per union key collapse into two table lookups. The
+        // visit order, the selected values and the distinct-key count are
+        // identical to the rescan below, so only the CHARGED work differs --
+        // and it only ever decreases. See `canonical_index_tables`.
+        if let Some(tables) =
+            self.canonical_index_tables(left, right, &sort.index_sort, comparison_work)
+        {
+            for encoded in &tables.visit_order {
+                if !self.value_eq_for_typed_values(
+                    Self::table_select(&tables.left, encoded, left),
+                    Self::table_select(&tables.right, encoded, right),
+                    &sort.element_sort,
+                    comparison_work,
+                )? {
+                    return Ok(false);
+                }
+            }
+            if defaults_equal {
+                return Ok(true);
+            }
+            let mut distinct: HashSet<&str> = HashSet::new();
+            distinct.extend(tables.left.keys().map(String::as_str));
+            distinct.extend(tables.right.keys().map(String::as_str));
+            return self.decide_differing_defaults(&sort.index_sort, distinct.len());
+        }
+
         for (key, _) in left.store.iter().chain(&right.store) {
             let left_value =
                 self.array_select_at_sort(left, key, &sort.index_sort, comparison_work)?;
@@ -1549,7 +1633,18 @@ impl<'a> Evaluator<'a> {
         }
 
         let keys = self.distinct_array_keys(left, right, &sort.index_sort, comparison_work)?;
-        match self.known_finite_index_is_covered(&sort.index_sort, keys.len()) {
+        self.decide_differing_defaults(&sort.index_sort, keys.len())
+    }
+
+    /// Decide two arrays whose DEFAULTS differ but whose explicit reads agree:
+    /// they are equal exactly when the stored keys cover the whole index
+    /// carrier, making both defaults unreachable.
+    fn decide_differing_defaults(
+        &self,
+        index_sort: &Sort,
+        distinct_keys: usize,
+    ) -> Result<bool, String> {
+        match self.known_finite_index_is_covered(index_sort, distinct_keys) {
             Some(covered) => Ok(covered),
             None => Err(
                 "array equality with differing defaults needs index-domain coverage evidence"
@@ -1558,6 +1653,144 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    /// The value `array` reads at the semantic key `encoded`.
+    ///
+    /// Exactly [`Self::array_select_at_sort`] for an index sort that
+    /// [`Self::encode_canonical_index_key`] admits: the table holds the LAST
+    /// store position for each semantic key, which is the entry that function's
+    /// reverse scan stops at, and a key absent from the table is one no store
+    /// entry matches, i.e. a read of the default.
+    fn table_select<'b>(
+        table: &HashMap<String, usize>,
+        encoded: &str,
+        array: &'b ArrayValue,
+    ) -> &'b ModelValue {
+        table
+            .get(encoded)
+            .map_or(&array.default, |&position| &array.store[position].1)
+    }
+
+    /// Build semantic-key tables for both operands of an array comparison, or
+    /// `None` when the index sort is outside the canonically encodable
+    /// fragment.
+    ///
+    /// Encoding work is metered on a LOCAL counter and folded into the shared
+    /// `comparison_work` only when every key encoded. A decline therefore
+    /// leaves the caller's charge byte-identical to the ordered-rescan path it
+    /// falls back to, so admitting this lane can never make a comparison the
+    /// meter previously decided become unevaluable.
+    fn canonical_index_tables(
+        &self,
+        left: &ArrayValue,
+        right: &ArrayValue,
+        index_sort: &Sort,
+        comparison_work: &mut usize,
+    ) -> Option<CanonicalIndexTables> {
+        let mut encode_work = 0usize;
+        let mut visit_order = Vec::with_capacity(left.store.len() + right.store.len());
+        let mut left_table = HashMap::with_capacity(left.store.len());
+        let mut right_table = HashMap::with_capacity(right.store.len());
+        for (table, array) in [(&mut left_table, left), (&mut right_table, right)] {
+            for (position, (key, _)) in array.store.iter().enumerate() {
+                let mut encoded = String::new();
+                self.encode_canonical_index_key(key, index_sort, &mut encoded, &mut encode_work)?;
+                // Later stores win, matching the reverse scan in
+                // `array_select_at_sort`.
+                table.insert(encoded.clone(), position);
+                visit_order.push(encoded);
+            }
+        }
+        *comparison_work = comparison_work.checked_add(encode_work)?;
+        Some(CanonicalIndexTables {
+            visit_order,
+            left: left_table,
+            right: right_table,
+        })
+    }
+
+    /// Append a canonical, collision-free encoding of one authenticated index
+    /// value to `out`, or return `None` to decline the whole fast lane.
+    ///
+    /// The lane is only sound because on every ADMITTED sort
+    /// [`Self::value_eq_for_typed_values`] coincides exactly with structural
+    /// equality of the encoded payload:
+    ///
+    /// * each admitted sort has a SINGLE inhabiting `ModelValue` shape, fixed
+    ///   by [`Self::ensure_value_inhabits_sort`], so one element is never
+    ///   representable in two encodings. That is precisely why `Real` (which
+    ///   admits `Int`, `Real` and `Algebraic` payloads for one number),
+    ///   `FloatingPoint` (whose `=` is `fp::same_element`, not field identity),
+    ///   `Array` (extensional, and itself three-valued) and the sequence-class
+    ///   carrier arm of `ensure_value_inhabits_sort` are all declined;
+    /// * `value_eq` decides every admitted shape with `==` on that payload and
+    ///   never returns `Err`, so a table lookup cannot silently swallow an
+    ///   unevaluable key comparison the rescan would have reported;
+    /// * every variant is self-delimiting -- a leading tag, then either a
+    ///   `;`-terminated numeral, a byte-length-prefixed string, or a
+    ///   parenthesised count-prefixed sequence -- so concatenation is
+    ///   injective and two distinct values cannot encode alike.
+    ///
+    /// The `dt_of_sort` guard is defence in depth, not a live filter: a
+    /// datatype can hide behind an uninterpreted NAME, but
+    /// `ensure_value_inhabits_sort` already requires a `ModelValue::Datatype`
+    /// at any sort that resolves to one, and no arm below matches that shape.
+    /// Removing the guard is therefore currently unobservable -- it is kept so
+    /// that adding a constructor-aware arm, or relaxing that inhabitance rule,
+    /// cannot silently start encoding a constructor value as an opaque token.
+    fn encode_canonical_index_key(
+        &self,
+        value: &ModelValue,
+        sort: &Sort,
+        out: &mut String,
+        encode_work: &mut usize,
+    ) -> Option<()> {
+        use std::fmt::Write as _;
+
+        *encode_work = encode_work.checked_add(1)?;
+        if *encode_work > MAX_TYPED_EQUALITY_COMPARISONS {
+            return None;
+        }
+        if self.dt_of_sort(sort).is_some() {
+            return None;
+        }
+        match (sort, value) {
+            (Sort::Bool, ModelValue::Bool(flag)) => out.push(if *flag { 'T' } else { 'F' }),
+            (Sort::Int, ModelValue::Int(element)) => {
+                let _ = write!(out, "i{element};");
+            }
+            (Sort::Char, ModelValue::Int(element)) => {
+                let _ = write!(out, "c{element};");
+            }
+            (Sort::FiniteDomain(_, _), ModelValue::Int(element)) => {
+                let _ = write!(out, "d{element};");
+            }
+            // Widths are equal on every authenticated pair, and `value_eq`
+            // requires that equality anyway; carrying the width keeps the
+            // encoding total rather than relying on that invariant.
+            (Sort::BitVec(_), ModelValue::BitVec { width, value }) => {
+                let _ = write!(out, "v{width}#{value};");
+            }
+            (Sort::String, ModelValue::Str(text)) => {
+                let _ = write!(out, "s{}:{text}", text.len());
+            }
+            (Sort::Uninterpreted(_) | Sort::TypeVar(_), ModelValue::Uninterpreted(token)) => {
+                let _ = write!(out, "u{}:{token}", token.len());
+            }
+            (Sort::Seq(element_sort), ModelValue::Seq(elements)) => {
+                let _ = write!(out, "q{}(", elements.len());
+                for element in elements {
+                    self.encode_canonical_index_key(element, element_sort, out, encode_work)?;
+                }
+                out.push(')');
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    /// Fallback lane: read `array` at `index` by rescanning the override list
+    /// newest-first with full semantic key comparison. Used when the index sort
+    /// has no canonical encoding; [`Self::table_select`] replaces it otherwise.
     fn array_select_at_sort(
         &self,
         array: &ArrayValue,
@@ -1573,6 +1806,9 @@ impl<'a> Evaluator<'a> {
         Ok(array.default.clone())
     }
 
+    /// Fallback lane: the semantically distinct union keys, deduplicated by
+    /// pairwise comparison. Used when the index sort has no canonical encoding;
+    /// otherwise the encoded key tables already carry the distinct count.
     fn distinct_array_keys<'b>(
         &self,
         left: &'b ArrayValue,

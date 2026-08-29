@@ -61,7 +61,14 @@ impl LiaModelEvalBudget {
     }
 
     fn leave(&mut self, term: TermId) {
-        debug_assert!(self.active.remove(&term));
+        // The removal must happen OUTSIDE `debug_assert!`. `debug_assert!`
+        // expands to `if cfg!(debug_assertions) { assert!(..) }`, so with the
+        // release profile's `debug-assertions = false` its argument is never
+        // evaluated and the entry would never be released — turning the
+        // active-path cycle guard into a global visited set exactly in the
+        // profile that ships.
+        let was_active = self.active.remove(&term);
+        debug_assert!(was_active, "leave without a matching enter");
         self.depth = self.depth.saturating_sub(1);
     }
 }
@@ -1851,6 +1858,61 @@ mod tests {
         budget.leave(term);
         assert!(budget.enter(term), "leaving restores the active-path guard");
         budget.leave(term);
+        assert_eq!(budget.depth, 0);
+        assert!(budget.active.is_empty());
+    }
+
+    #[test]
+    fn shared_subterms_evaluate_at_every_dag_occurrence() {
+        // `active` is an ACTIVE-PATH (cycle) guard, not a visited set. Terms
+        // are hash-consed, so a subterm that legitimately occurs twice in one
+        // DAG must evaluate at BOTH occurrences; only a term still on the
+        // current recursion path is a cycle. Releasing the entry anywhere the
+        // release profile can elide — `debug_assert!(active.remove(..))` did
+        // exactly that, since `debug_assert!` never evaluates its argument
+        // with `debug_assertions` off — degrades the guard into a global
+        // visited set and makes every shared subterm a phantom cycle. The
+        // recovery then declines a value it can compute, the eliminated
+        // variable falls through to model completion, and the published model
+        // contradicts its own definition. This test is the production-facing
+        // statement of the property; the budget-internal tests pin the
+        // bookkeeping.
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let one = terms.mk_int(num_bigint::BigInt::from(1));
+        let shared = terms.mk_add(vec![x, one]);
+        let doubled = terms.mk_add(vec![shared, shared]);
+        let values = HashMap::from_iter([(x, num_bigint::BigInt::from(3))]);
+
+        assert_eq!(
+            eval_lia_int_under_values(&terms, doubled, &values),
+            Some(num_bigint::BigInt::from(8))
+        );
+
+        // The same property across the Int<->BV bridge, which is where the
+        // substitution recovery this budget protects actually runs.
+        let as_bv = terms.mk_int2bv(8, shared);
+        let sum_bv = terms.mk_app(
+            ay_core::Symbol::named("bvadd"),
+            [as_bv, as_bv],
+            Sort::bitvec(8),
+        );
+        let round_trip = terms.mk_bv2nat(sum_bv);
+        assert_eq!(
+            eval_lia_int_under_values(&terms, round_trip, &values),
+            Some(num_bigint::BigInt::from(8))
+        );
+
+        // A genuine cycle — the same term re-entered while still on the path —
+        // must still be refused, and the refusal must not depend on
+        // `debug_assertions` either.
+        let mut budget = LiaModelEvalBudget::new();
+        assert!(budget.enter(shared));
+        assert!(
+            eval_lia_int_under_values_inner(&terms, shared, &values, &mut budget).is_none(),
+            "a term already on the active path must not re-enter"
+        );
+        budget.leave(shared);
         assert_eq!(budget.depth, 0);
         assert!(budget.active.is_empty());
     }

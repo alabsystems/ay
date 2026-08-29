@@ -445,3 +445,90 @@ fn test_authored_nested_multiplication_assume_uses_aci_and_congruence() {
         "{output}"
     );
 }
+
+/// A binder is a SHAPE the authored-assume bridge lane cannot render, and no
+/// size makes it renderable. The preflight must therefore DECLINE THE BRIDGE —
+/// the way every other unsupported schema declines, into
+/// `AuthoredAssumePlanner::unsupported` — rather than fail the export. The
+/// escalation propagated out of `plan_equivalent_authored_assumes`, and
+/// `Solver::export_last_unsat_artifact` maps any `Err` to `None`, so ONE
+/// quantified assertion left a certified UNSAT with no publishable proof.
+#[test]
+fn quantified_authored_assume_declines_its_bridge_without_failing_the_document() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::Symbol;
+
+    let mut terms = TermStore::new();
+    let bound = terms.mk_var("q", Sort::Int);
+    let zero = terms.mk_int(0.into());
+    let body = terms.mk_app(Symbol::named("<="), [zero, bound], Sort::Bool);
+    let quantified = terms.mk_forall(vec![("q".to_string(), Sort::Int)], body);
+    let negated = terms.mk_not_raw(quantified);
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(quantified, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), quantified, positive, negative);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(quantified, "(forall ((q Int)) (>= q 0))".to_string());
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &[quantified, negated],
+        Some(&overrides),
+    )
+    .expect("a binder must decline its authored bridge, not the whole document");
+    assert!(
+        output.contains("(forall ((q Int)) (>= q 0))"),
+        "the authored spelling must still reach the document:\n{output}"
+    );
+    assert!(
+        !output.contains(":rule cong") && !output.contains(":rule comp_simplify"),
+        "a shape this lane cannot render must get no equivalence bridge:\n{output}"
+    );
+}
+
+/// AY's internal `(const-array v)` application declines for the same reason:
+/// the canonical renderer would recursively format a sort this preflight does
+/// not meter, so the bridge is impossible at ANY size. Same requirement as the
+/// binder case — no bridge, but still a document.
+#[test]
+fn const_array_authored_assume_declines_its_bridge_without_failing_the_document() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::Symbol;
+
+    let mut terms = TermStore::new();
+    let byte = Sort::bitvec(8);
+    let array_sort = Sort::array(byte.clone(), byte.clone());
+    let fill = terms.mk_bitvec(0u32.into(), 8);
+    let const_array = terms.mk_app(Symbol::named("const-array"), [fill], array_sort);
+    let key = terms.mk_var("k", byte.clone());
+    let read = terms.mk_app(Symbol::named("select"), [const_array, key], byte);
+    let equality = terms.mk_app(Symbol::named("="), [read, fill], Sort::Bool);
+    let negated = terms.mk_not_raw(equality);
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(equality, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), equality, positive, negative);
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(
+        equality,
+        "(= (select ((as const (Array (_ BitVec 8) (_ BitVec 8))) #x00) k) #x00)".to_string(),
+    );
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &[equality, negated],
+        Some(&overrides),
+    )
+    .expect("a constant array must decline its authored bridge, not the whole document");
+    assert!(
+        output.contains("(as const (Array (_ BitVec 8) (_ BitVec 8)))"),
+        "the authored spelling must still reach the document:\n{output}"
+    );
+    assert!(
+        !output.contains("(const-array"),
+        "AY's internal constant-array spelling must never reach the wire:\n{output}"
+    );
+}

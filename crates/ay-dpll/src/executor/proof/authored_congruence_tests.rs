@@ -210,6 +210,39 @@ fn duplicate_authored_root_indices_decline_assume_surface_restoration() {
 }
 
 #[test]
+fn duplicate_native_identity_rows_keep_assume_surface_authority() {
+    let mut executor = Executor::new();
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    let native_source =
+        || FrontendTerm::Symbol(crate::executor::NATIVE_API_ASSERTION_PLACEHOLDER.to_string());
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, native_source());
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, native_source());
+    executor
+        .ctx
+        .add_assertion_with_parsed(negated, native_source());
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(canonical, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), canonical, positive, negative);
+    executor.last_proof_term_overrides = None;
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        executor.last_proof_term_overrides.is_none(),
+        "native identity rows must not invent a surface override"
+    );
+    assert!(
+        !executor.last_unsat_proof_reconstruction_suppressed,
+        "repeated identity-only rows are presentation-equivalent, not ambiguous"
+    );
+}
+
+#[test]
 fn derived_rebuild_authority_is_not_exact_raw_problem_provenance() {
     let mut executor = Executor::new();
     let (canonical, negated) = comparison_surface_fixture(&mut executor);
@@ -237,6 +270,334 @@ fn derived_rebuild_authority_is_not_exact_raw_problem_provenance() {
     assert!(
         executor.last_unsat_proof_reconstruction_suppressed,
         "general rebuild authority must not masquerade as a top-level problem-file premise"
+    );
+}
+
+/// An assumption-only query authors no `(assert ...)`, so the source ledger
+/// this pass aligns against is EMPTY BY CONSTRUCTION. Nothing to restore is
+/// not a failure to restore something: `proof_export_scope_assertions`
+/// already folds `last_assumptions` into the authored premise scope, and
+/// `unsat_query_has_literal_false_assumption_source` still reports exact
+/// source authority for `(check-sat-assuming (false))`. This pass must agree,
+/// or a certified assumption-only refutation publishes no proof at all.
+#[test]
+fn current_query_assumption_roots_need_no_authored_assertion_row() {
+    let mut executor = Executor::new();
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    executor.last_assumptions = Some(vec![canonical, negated]);
+    assert!(executor.ctx.assertions_parsed().is_empty());
+    assert!(executor.ctx.assertions.is_empty());
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(canonical, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), canonical, positive, negative);
+    executor.last_proof_term_overrides = None;
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        !executor.last_unsat_proof_reconstruction_suppressed,
+        "an authored query assumption is a premise, not a missing source row"
+    );
+    assert!(
+        executor.last_proof_term_overrides.is_none(),
+        "an assumption literal has no `(assert ...)` text, so this pass must \
+         neither invent a spelling for it nor remove one"
+    );
+}
+
+/// The assumption arm admits exactly the terms the CURRENT query bound, and
+/// nothing else. A reachable `assume` that no source row, no paired ledger and
+/// no bound assumption accounts for still fails closed.
+#[test]
+fn an_assumption_ledger_admits_only_the_roots_it_actually_holds() {
+    let mut executor = Executor::new();
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    executor.last_assumptions = Some(vec![canonical]);
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(canonical, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), canonical, positive, negative);
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        executor.last_unsat_proof_reconstruction_suppressed,
+        "an unaccounted reachable assume must still suppress publication"
+    );
+}
+
+/// A surface override re-spells ONE `TermId` for the WHOLE document. The
+/// printer confines an authored assume spelling to its own step only when it
+/// can DERIVE `source = canonical` — a comparison reversal, a numeric
+/// multiplication reorder, or `cong` under the canonical root's own operator.
+/// `(distinct i j)` over the canonical `(not (= i j))` reaches none of those:
+/// the entry would leak into every printed occurrence, printing one side of a
+/// resolution as an opaque `distinct` atom and the other as `(= i j)`.
+///
+/// Withholding is the correct answer, not suppression: the root keeps the
+/// canonical spelling the strict checker validated, and a confinable sibling
+/// root in the same document still gets its authored text.
+#[test]
+fn an_unconfinable_authored_spelling_is_withheld_not_suppressed() {
+    let mut executor = Executor::new();
+    let i = executor.ctx.terms.mk_var("i", Sort::Int);
+    let j = executor.ctx.terms.mk_var("j", Sort::Int);
+    let equality = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("="), [i, j], Sort::Bool);
+    let disequality = executor.ctx.terms.mk_not_raw(equality);
+    executor
+        .ctx
+        .add_assertion_with_parsed(equality, parsed_assertion("(assert (= i j))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(disequality, parsed_assertion("(assert (distinct i j))"));
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(equality, None);
+    let negative = proof.add_assume(disequality, None);
+    proof.add_resolution(Vec::new(), equality, positive, negative);
+    executor.last_proof_term_overrides = None;
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        !executor.last_unsat_proof_reconstruction_suppressed,
+        "a spelling this pass declines to install is not a publication failure"
+    );
+    let overrides = executor
+        .last_proof_term_overrides
+        .as_ref()
+        .expect("the confinable sibling root still records its authored text");
+    assert_eq!(
+        overrides.get(&equality).map(String::as_str),
+        Some("(= i j)"),
+        "a root whose authored head matches the canonical head still restores"
+    );
+    assert_eq!(
+        overrides.get(&disequality),
+        None,
+        "`distinct` over a negated-equality root cannot be confined to its assume"
+    );
+}
+
+/// The counterpart of `derived_rebuild_authority_is_not_exact_raw_problem_provenance`:
+/// a promoter that rebuilds a parsed top-level assertion itself must record
+/// BOTH ledgers, because `raw_intern_surface` fails closed on the shapes those
+/// promoters exist for (an elaboration-folded datatype selector application
+/// has no live identity to authenticate) and so mints no row of its own.
+/// Recording only proof authority is the drift that silently suppresses a
+/// certified refutation.
+#[test]
+fn a_promoted_raw_problem_assertion_is_admitted_by_both_ledgers() {
+    let mut executor = Executor::new();
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (>= (f b) 0))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(negated, parsed_assertion("(assert (not (<= 0 (f b))))"));
+
+    let promoted = executor
+        .ctx
+        .terms
+        .mk_var("promoted_raw_problem_assertion", Sort::Bool);
+    let not_promoted = executor.ctx.terms.mk_not_raw(promoted);
+    executor.record_raw_authored_problem_assertion(promoted);
+    executor.record_raw_authored_problem_assertion(not_promoted);
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(promoted, None);
+    let negative = proof.add_assume(not_promoted, None);
+    proof.add_resolution(Vec::new(), promoted, positive, negative);
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        !executor.last_unsat_proof_reconstruction_suppressed,
+        "a raw re-intern of a parsed problem assertion carries exact provenance"
+    );
+}
+
+/// A COMPOSITE fold result is NOT the atom arm's business, and withholding it
+/// must remove nothing.
+///
+/// `authored_surface_is_assume_confinable` answers `true` unconditionally for a
+/// root with no top-level operator. The justification for that arm used to
+/// claim `collect_root_surface_term_override` "already owns" the folded
+/// `(and p ...)` -> `p` case; it owns the ATOM case only, because
+/// `authored_conjunction_folded_onto_variable` exempts a VARIABLE fold result
+/// and nothing else. `(and (not p) (= x x))` interns as the composite
+/// `(not p)`, whose canonical head `not` differs from the authored `and`, so
+/// this pass withholds where it used to re-install.
+///
+/// Withholding means exactly that: nothing installed AND nothing removed. The
+/// authored conjunction an EARLIER pass recorded for that root is what
+/// `--test group_proofs`
+/// `folded_authored_conjunction_assume_is_the_problem_assertion` reads back out
+/// of the published document, so clearing it here would print the bare folded
+/// term as an `assume` that is no assertion of the problem.
+#[test]
+fn a_composite_fold_root_keeps_the_spelling_an_earlier_pass_installed() {
+    let mut executor = Executor::new();
+    let p = executor.ctx.terms.mk_var("p", Sort::Bool);
+    let not_p = executor.ctx.terms.mk_not_raw(p);
+    executor
+        .ctx
+        .add_assertion_with_parsed(not_p, parsed_assertion("(assert (and (not p) (= x x)))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(p, parsed_assertion("(assert p)"));
+
+    let mut overrides = DetHashMap::default();
+    overrides.insert(not_p, "(and (not p) (= x x))".to_string());
+    executor.last_proof_term_overrides = Some(overrides);
+
+    let mut proof = Proof::new();
+    let negative = proof.add_assume(not_p, None);
+    let positive = proof.add_assume(p, None);
+    proof.add_resolution(Vec::new(), p, positive, negative);
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        !executor.last_unsat_proof_reconstruction_suppressed,
+        "a composite fold result is a presentation decision, not a provenance failure"
+    );
+    assert_eq!(
+        executor
+            .last_proof_term_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&not_p))
+            .map(String::as_str),
+        Some("(and (not p) (= x x))"),
+        "the authored conjunction an earlier pass installed must survive untouched"
+    );
+}
+
+/// The other half of the same fact: with no earlier entry to preserve, a
+/// composite fold root gets NOTHING from this pass. It is withheld, never
+/// installed and never a suppression, and a confinable sibling root in the
+/// same document still restores its authored text.
+///
+/// Measured end to end on `(assert (and (= a b) (= x x)))` +
+/// `(assert (not (= a b)))`: the published document is
+/// `(assume t0 (= a b))` ... `(cl)`, strictly Verified with trust=0 and
+/// hole=0, and the exported problem transport carries `(assert (= a b))` as an
+/// assertion of its own.
+#[test]
+fn a_composite_fold_root_installs_nothing_when_no_earlier_pass_did() {
+    let mut executor = Executor::new();
+    let a = executor.ctx.terms.mk_var("a", Sort::Int);
+    let b = executor.ctx.terms.mk_var("b", Sort::Int);
+    let equality = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("="), [a, b], Sort::Bool);
+    let disequality = executor.ctx.terms.mk_not_raw(equality);
+    executor
+        .ctx
+        .add_assertion_with_parsed(equality, parsed_assertion("(assert (and (= a b) (= x x)))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(disequality, parsed_assertion("(assert (not (= a b)))"));
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(equality, None);
+    let negative = proof.add_assume(disequality, None);
+    proof.add_resolution(Vec::new(), equality, positive, negative);
+    executor.last_proof_term_overrides = None;
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        !executor.last_unsat_proof_reconstruction_suppressed,
+        "a spelling this pass declines to install is not a publication failure"
+    );
+    let overrides = executor
+        .last_proof_term_overrides
+        .as_ref()
+        .expect("the confinable sibling root still records its authored text");
+    assert_eq!(
+        overrides.get(&equality),
+        None,
+        "an authored `and` over a folded `=` root is not installed by this pass"
+    );
+    assert_eq!(
+        overrides.get(&disequality).map(String::as_str),
+        Some("(not (= a b))"),
+        "a root whose authored head matches the canonical head still restores"
+    );
+}
+
+/// The current query's assumption ledger is folded into a set, so it carries
+/// the same row cap every other ledger this pass materializes does — and that
+/// cap scopes THE ARM, never the document. A query with more assumptions than
+/// the cap whose reachable roots all resolve through the SOURCE ledger keeps
+/// publishing, exactly as it did before the assumption arm existed. A cap that
+/// suppressed here would be a brand-new certified-but-unpublished path, which
+/// is the defect this whole pass is being repaired for.
+#[test]
+fn an_over_cap_assumption_ledger_still_publishes_a_source_owned_document() {
+    let mut executor = Executor::new();
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (>= (f b) 0))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(negated, parsed_assertion("(assert (not (<= 0 (f b))))"));
+    executor.last_assumptions = Some(vec![
+        canonical;
+        support::MAX_AUTHORED_ORIGINAL_INDEX_ROWS + 1
+    ]);
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(canonical, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), canonical, positive, negative);
+    executor.last_proof_term_overrides = None;
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        !executor.last_unsat_proof_reconstruction_suppressed,
+        "an unmeterable assumption ledger must not suppress a document whose \
+         roots the source ledger already accounts for"
+    );
+    assert_eq!(
+        executor
+            .last_proof_term_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&canonical))
+            .map(String::as_str),
+        Some("(>= (f b) 0)"),
+        "the authored spelling is still restored"
+    );
+}
+
+/// ...and over the cap the ARM is genuinely unavailable: the same two roots
+/// `current_query_assumption_roots_need_no_authored_assertion_row` admits from
+/// a small ledger fail closed once the ledger is too large to meter. The bound
+/// is pinned in both directions, so neither dropping it nor widening it to the
+/// whole function is silently equivalent.
+#[test]
+fn an_over_cap_assumption_ledger_withholds_the_assumption_arm() {
+    let mut executor = Executor::new();
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    let mut assumptions = vec![canonical; support::MAX_AUTHORED_ORIGINAL_INDEX_ROWS];
+    assumptions.push(negated);
+    executor.last_assumptions = Some(assumptions);
+    assert!(executor.ctx.assertions_parsed().is_empty());
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(canonical, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), canonical, positive, negative);
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        executor.last_unsat_proof_reconstruction_suppressed,
+        "over the cap the assumption arm has no members, so a root only it \
+         could have accounted for must still fail closed"
     );
 }
 
