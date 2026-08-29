@@ -93,9 +93,12 @@
 //! with deterministic containers, and the work meter's budget limbs are
 //! compile-time constants.
 //!
-//! The replayed WORK figure is the original walk's metered aggregate, so
-//! consumers that price the verdict (the `EqDiffVar` commit gate's
-//! `REPEATABLE_CHECK_WORK` comparison) make byte-identical decisions.
+//! The replayed WORK figure is the original walk's metered aggregate, so any
+//! consumer that prices the verdict by cost makes byte-identical decisions on
+//! a hit and on a walk. (This memo is also what RETIRED the one such consumer
+//! the campaign had: the `EqDiffVar` commit gate's 125M second price existed
+//! to bound repetition, and repetition is what this memo removed — see
+//! #eqdv-second-price-retired.)
 //!
 //! ## The checker-read TermStore surface is a CONTRACT, not an inference
 //! (#strict-memo-term-metadata-contract)

@@ -33,7 +33,7 @@ use self::strict_check_progress::{
 };
 
 pub(in crate::executor) use self::strict_check_progress::{
-    check_proof_gate_under_controls, check_proof_gate_with_executor_progress, REPEATABLE_CHECK_WORK,
+    check_proof_gate_under_controls, check_proof_gate_with_executor_progress,
 };
 
 /// What a metered resolution-chain check concluded about a proof's empty

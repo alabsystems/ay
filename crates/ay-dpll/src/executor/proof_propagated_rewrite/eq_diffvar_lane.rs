@@ -197,29 +197,24 @@ impl Executor {
     }
 
     /// Ask the exact publication gate whether the spliced proof is worth
-    /// keeping, pricing in that the pipeline will RE-RUN that gate on every
-    /// assembly.
+    /// keeping.
     ///
     /// The decision is made by `check_proof_strict_with_datatypes` — the same
     /// call `mint_unsat_certificate`'s presentation makes — so the lane and
-    /// the mint cannot disagree about what fits the envelope. Three tiers:
+    /// the mint cannot disagree about what fits the envelope. THREE tiers,
+    /// and the envelope is the only price:
     ///
-    ///  * `Ok` COMMITS at any cost: the proof now strict-certifies outright —
-    ///    the best outcome this lane can produce, and the mint then takes
+    ///  * `Ok` COMMITS: the proof now strict-certifies outright — the best
+    ///    outcome this lane can produce, and the mint then takes
     ///    `StrictProof` with no discharge lane and no re-solve. Measured
     ///    (QF_IDL 900-file paired sample, 2026-08-27): every such commit was
     ///    wall-safe and `job_shop/jobshop12-2-6-6-4-4-11` got FASTER
     ///    (7.55 s -> 5.42 s) because the discharge machinery disappeared.
-    ///  * a TYPED rejection commits only when the walk's metered work fits
-    ///    [`crate::executor::proof::REPEATABLE_CHECK_WORK`]. A typed
-    ///    rejection is the same rescuable trust-family class the pre-splice
-    ///    proof was in, so the mint outcome is unchanged either way — but the
-    ///    walk itself is re-run ~60 times across assemblies, and a
-    ///    near-envelope walk multiplies into seconds: measured on
-    ///    `sal/bakery/inf-bakery-mutex-18`, 60 walks at 287-295M work each
-    ///    added 6.4 s of wall and pushed a correct `unsat` over `-T:10` with
-    ///    no envelope refusal anywhere. Reverting restores the pre-splice
-    ///    fail-fast presentation those walks cost milliseconds on.
+    ///  * a TYPED rejection COMMITS. The checker walked the WHOLE document
+    ///    and objected to a named step, which it can only do inside the
+    ///    envelope; the rejection is the same rescuable trust-family class
+    ///    the pre-splice proof was in, so the mint outcome is unchanged
+    ///    either way, and the splice's derived leaves are pure gain.
     ///  * `ResourceLimit` REVERTS: at mint time this exact outcome reaches
     ///    `discharge_trust_steps_for_certification` with nothing collected
     ///    and falls through to a whole-problem re-solve — the measured
@@ -229,6 +224,44 @@ impl Executor {
     ///    NOT remembered, so a transient interrupt cannot disable the lane
     ///    for the rest of the executor's life.
     ///
+    /// # The retired second price (#eqdv-second-price-retired)
+    ///
+    /// A typed rejection used to commit only when the walk's metered work fit
+    /// `REPEATABLE_CHECK_WORK` (125M, half the ordinary reserve), because the
+    /// pipeline re-walked a committed document ~60 times per solve and a
+    /// near-envelope walk multiplied into seconds. #strict-walk-memo removed
+    /// the repetition: an admitted document walks ONCE and every later ask
+    /// replays a stored verdict keyed on literal document equality.
+    ///
+    /// RE-MEASURED on the 900-file QF_IDL sample the price was set on
+    /// (seed 20260824, `AY_CENSUS=1 ay solve --no-proof -T:10`, gate-level
+    /// instrumentation, 189 asks over 117 files):
+    ///
+    ///  * this gate is asked **1 or 2 times per solve, never more** (45 files
+    ///    once, 72 twice). The repetition factor is 2, not 60;
+    ///  * **27 of the 29** asks the 125M price refused were MEMO HITS — the
+    ///    walk had already been paid by another consumer, so the refusal
+    ///    saved nothing on the ask it refused;
+    ///  * the same three-second constraint the old price was derived from
+    ///    (`price * repetitions ~= 7.5G`) re-derives to `7.5G / 2 = 3.75G`,
+    ///    which is **10.7x the whole 350M envelope**. The derived price is
+    ///    above the ceiling, so the ceiling binds;
+    ///  * the population has no boundary at 125M either: admitted costs run
+    ///    continuously 1.2M -> 120.5M and refused ones 127.5M -> 334.7M, the
+    ///    cheapest refusal being 2.0% over the price.
+    ///
+    /// What the retirement admits, measured on the reverted class: the
+    /// `sal/bakery` mutex-9..19 ladder, `mathsat/post_office` PO3/PO4,
+    /// `RTCL/b13_tf_10`, `qlock` and `planning/plan-19..21`. Per file the
+    /// eqdv premiseless-`trust` leaf count collapses — `inf-bakery-mutex-18`
+    /// 18 -> 1, `inf-bakery-mutex-14` 14 -> 1, `plan-19` 18 -> 0 — for a
+    /// per-solve metered-work rise well inside the re-derived headroom
+    /// (mutex-18 0.77G -> 1.24G, mutex-14 0.51G -> 0.89G).
+    ///
+    /// What it still REFUSES is unchanged and is the whole point: a document
+    /// the envelope genuinely refuses (`ResourceLimit`) still reverts —
+    /// 58 of the 189 asks — and so does a cancellation.
+    ///
     /// Both deterministic reverts are REMEMBERED, size-scoped, in
     /// `eqdv_retention_off_declined_at_steps`: rebuilds of a similar-sized
     /// document share the answer, and a much smaller later document re-asks
@@ -237,8 +270,7 @@ impl Executor {
         &self,
         proof: &Proof,
     ) -> EqDiffVarCommitDecision {
-        let (outcome, consumed_work) = self.check_proof_strict_with_datatypes_reporting_work(proof);
-        match outcome {
+        match self.check_proof_strict_with_datatypes(proof) {
             Ok(_) => EqDiffVarCommitDecision::Commit,
             Err(ay_proof::ProofCheckError::ResourceLimit) => {
                 EqDiffVarCommitDecision::Revert { remember: true }
@@ -246,10 +278,7 @@ impl Executor {
             Err(ay_proof::ProofCheckError::Cancelled) => {
                 EqDiffVarCommitDecision::Revert { remember: false }
             }
-            Err(_) if consumed_work <= crate::executor::proof::REPEATABLE_CHECK_WORK => {
-                EqDiffVarCommitDecision::Commit
-            }
-            Err(_) => EqDiffVarCommitDecision::Revert { remember: true },
+            Err(_) => EqDiffVarCommitDecision::Commit,
         }
     }
 

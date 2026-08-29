@@ -94,8 +94,9 @@ fn a_repeat_identical_walk_replays_the_stored_verdict() {
     assert_eq!(first, second, "a replay must be the checker's own verdict");
     assert_eq!(
         first_work, second_work,
-        "a replay must report the original walk's metered work — consumers \
-         price verdicts against REPEATABLE_CHECK_WORK with it"
+        "a replay must report the original walk's metered work — it is the \
+         campaign's deterministic cost figure and a hit must not report a \
+         cheaper walk than the one it replays"
     );
     // The invocation counters keep counting ENTRIES (M0(a) semantics are
     // unchanged); the hit counter is what separates walks from replays.

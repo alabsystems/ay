@@ -39,10 +39,10 @@
 //! | # | guard | mutation | result |
 //! |---|---|---|---|
 //! | 1 | the `derive_eq_diffvar_rewritten_assertions` call in the retention-off subset | delete it | **RED**, 2 tests: `a_rewritten_assertion_is_derived_with_the_parsed_prefix_dropped`, `the_retention_off_derivation_cites_its_definition` (measured at the bound-era wiring; the call is now also load-bearing for the commit-gate tests) |
-//! | A | `eq_diffvar_presentation_commit_decision` | always `Commit` | **RED x2** — `the_commit_gate_decides_all_four_tiers_against_the_real_walk`, `a_refused_subset_run_equals_the_never_spliced_run_and_latches` |
-//! | B | the decision | always `Revert` | **RED x3** — the four-tiers test and BOTH solve-level capability tests (`a_rewritten_assertion_is_derived_with_the_parsed_prefix_dropped`, `the_retention_off_derivation_cites_its_definition`): a gate that always reverts undoes the lane |
+//! | A | `eq_diffvar_presentation_commit_decision` | always `Commit` | **RED x2** — `the_commit_gate_decides_every_tier_against_the_real_walk`, `a_refused_subset_run_equals_the_never_spliced_run_and_latches` |
+//! | B | the decision | always `Revert` | **RED x3** — the tier test and BOTH solve-level capability tests (`a_rewritten_assertion_is_derived_with_the_parsed_prefix_dropped`, `the_retention_off_derivation_cites_its_definition`): a gate that always reverts undoes the lane |
 //! | C | the decision | revert on ANY `Err` (cheap typed included) | **RED x3** — the same three: the real solve's finished document is a cheap typed rejection, which must COMMIT |
-//! | D | the `REPEATABLE_CHECK_WORK` comparison | dropped (every typed verdict commits) | **RED** — the four-tiers test's budget tier |
+//! | D | the typed arm | REINTRODUCE a second price (`Err(_) if work <= 125_000_000 => Commit`, else revert) | **RED** — the tier test's retirement guard (#eqdv-second-price-retired): `repeat_budget_exceeded_fixture` reaches a typed verdict at >125M and must COMMIT |
 //! | E | `remember` | never latch | **RED x2** — the four-tiers test (both remembered tiers) and the wiring test's latch assertion |
 //! | F | `remember` | latch on `Cancelled` too | **RED** — the four-tiers test's cancellation tier |
 //! | G | the tail RE-RUN after a revert | deleted | **RED** — `a_refused_subset_run_equals_the_never_spliced_run_and_latches`: the authored-conjunct leaf its fixture carries is the TAIL's work, and skipping the re-run leaves it a premiseless `trust` step |
@@ -50,8 +50,23 @@
 //!
 //! (The pre-gate ledger row for the former 4,096-step call-site size bound is
 //! superseded: the charge-accuracy fix in `ay-proof` and the commit gate above
-//! replace the bound, and `the_commit_gate_decides_all_four_tiers_against_the_real_walk`
+//! replace the bound, and `the_commit_gate_decides_every_tier_against_the_real_walk`
 //! documents why a size bound cannot express the criterion.)
+//!
+//! # #eqdv-second-price-retired
+//!
+//! Row D used to read the other way round — dropping the
+//! `REPEATABLE_CHECK_WORK` comparison was the mutation and the four-tiers
+//! test's budget tier was the RED. That price bounded REPETITION: the
+//! pipeline re-walked a committed document ~60 times per solve. #strict-walk-memo
+//! removed the repetition, and the gate is now measured at 1-2 asks per solve
+//! (189 asks over 117 files of the 900-file QF_IDL sample, seed 20260824),
+//! with 27 of the 29 asks the price refused answered from the memo. The same
+//! three-second constraint the price was derived from re-derives to 3.75G —
+//! 10.7x the whole 350M envelope — so the envelope binds and the second price
+//! is gone. The row is inverted, not deleted: the mutation is now
+//! REINTRODUCING a price, and the same expensive real-walk fixture is the
+//! guard.
 //!
 //! The retention-ON row of `a_rewritten_assertion_is_derived_with_the_parsed_prefix_dropped`
 //! is the CONTROL: it passed before the call was added and must keep passing,
@@ -249,7 +264,11 @@ fn the_retention_off_promotion_never_produces_a_rejected_fresh_definition() {
 /// whose General/Farkas precharge is cubic in its tree-unfolded payload (a
 /// ~1,500-node chain unfolds past 3,000 nodes and precharges >= 2.7e10 — two
 /// orders of magnitude over the 350M envelope), then the foreign closer.
-fn envelope_refused_fixture(exec: &mut Executor, rewritten: TermId) -> Proof {
+fn envelope_refused_fixture(
+    exec: &mut Executor,
+    rewritten: TermId,
+    extra_leaves: &[TermId],
+) -> Proof {
     let mut proof = Proof::new();
     proof.add_rule_step(AletheRule::Trust, vec![rewritten], Vec::new(), Vec::new());
     let zero = exec.ctx.terms.mk_int(0.into());
@@ -274,6 +293,12 @@ fn envelope_refused_fixture(exec: &mut Executor, rewritten: TermId) -> Proof {
     );
     let negated = exec.ctx.terms.mk_not_raw(rewritten);
     proof.add_rule_step(AletheRule::Trust, vec![negated], Vec::new(), Vec::new());
+    // Extra premiseless leaves sit BEFORE the closer so the proof keeps its
+    // terminal empty clause — the whole-proof gates every tail lane runs
+    // reject a non-terminal document outright.
+    for &leaf in extra_leaves {
+        proof.add_rule_step(AletheRule::Trust, vec![leaf], Vec::new(), Vec::new());
+    }
     proof.add_rule_step(
         AletheRule::Resolution,
         Vec::new(),
@@ -284,10 +309,14 @@ fn envelope_refused_fixture(exec: &mut Executor, rewritten: TermId) -> Proof {
 }
 
 /// A crafted proof whose strict walk reaches a TYPED verdict (the trailing
-/// foreign leaf) but only after consuming more metered work than
-/// `REPEATABLE_CHECK_WORK`: valid `eq_reflexive` steps over a large unshared
-/// term chain accumulate their linearithmic `ClauseIdentityRoute` charges
-/// past the repeatable budget while staying inside the full envelope.
+/// foreign leaf) but only after consuming more than HALF the envelope: valid
+/// `eq_reflexive` steps over a large unshared term chain accumulate their
+/// linearithmic `ClauseIdentityRoute` charges past 125M — the exact figure the
+/// retired second price used — while staying inside the full envelope.
+///
+/// The expense is the point, not incidental: this is the fixture that pins
+/// #eqdv-second-price-retired. A gate that reintroduces ANY price below the
+/// envelope reverts this document, and the tier test below goes RED.
 fn repeat_budget_exceeded_fixture(
     exec: &mut Executor,
     rewritten: TermId,
@@ -335,7 +364,7 @@ fn repeat_budget_exceeded_fixture(
     proof
 }
 
-/// The COMMIT-GATE DECISION, all four tiers, against the real strict walk.
+/// The COMMIT-GATE DECISION, every tier, against the real strict walk.
 ///
 /// The decision is `Executor::eq_diffvar_presentation_commit_decision`, which
 /// the retention-off subset consults on its FINISHED output (see
@@ -346,17 +375,22 @@ fn repeat_budget_exceeded_fixture(
 ///    outcome reaches `discharge_trust_steps_for_certification` with nothing
 ///    collected and falls through to a whole-problem re-solve (the measured
 ///    `planning/plan-8..14` degradation);
-///  * a typed verdict past `REPEATABLE_CHECK_WORK` reverts AND is remembered —
-///    the walk is re-run ~60 times across assemblies, and a near-envelope walk
-///    multiplies into seconds (`inf-bakery-mutex-18`: 60 x 287-295M = +6.4s,
-///    crossing `-T:10` with no refusal anywhere);
-///  * a CHEAP typed verdict commits — same rescuable trust-family class as
-///    pre-splice, affordable to re-check;
+///  * a TYPED verdict COMMITS — at ANY cost the envelope admitted. Two
+///    fixtures pin both ends of that claim, and the expensive one is the
+///    #eqdv-second-price-retired guard: it consumes more than HALF the
+///    envelope (the retired 125M price) and must STILL commit. Any
+///    reintroduced price below the envelope turns this assertion RED;
 ///  * a cancellation reverts WITHOUT being remembered — it is load-dependent,
 ///    and letting it latch would make WHICH leaves get derived depend on
 ///    machine load.
+///
+/// The envelope refusal and the expensive typed verdict are deliberately kept
+/// as SEPARATE fixtures: they are the two sides of the retirement, and a
+/// mutant that collapses `ResourceLimit` into the typed arm (commit
+/// everything) fails the first while a mutant that reintroduces a price fails
+/// the second.
 #[test]
-fn the_commit_gate_decides_all_four_tiers_against_the_real_walk() {
+fn the_commit_gate_decides_every_tier_against_the_real_walk() {
     use super::EqDiffVarCommitDecision;
 
     // Tier 1: envelope refusal -> revert, remembered. The decision is made
@@ -364,7 +398,7 @@ fn the_commit_gate_decides_all_four_tiers_against_the_real_walk() {
     // leading leaf first; the walk then gets past it and meets the envelope.
     let (mut exec, rewritten) = retention_off_fixture();
     let scope = exec.complete_problem_assertions_for_strict_proof();
-    let mut refused = envelope_refused_fixture(&mut exec, rewritten);
+    let mut refused = envelope_refused_fixture(&mut exec, rewritten, &[]);
     assert!(
         exec.derive_eq_diffvar_rewritten_assertions(&mut refused, &scope),
         "the lane must splice the leading leaf, or the tier is not exercised"
@@ -379,7 +413,12 @@ fn the_commit_gate_decides_all_four_tiers_against_the_real_walk() {
         EqDiffVarCommitDecision::Revert { remember: true },
     );
 
-    // Tier 2: typed verdict past the repeatable budget -> revert, remembered.
+    // Tier 2, the RETIREMENT guard: a typed verdict that cost MORE THAN HALF
+    // the envelope must COMMIT. The 125M figure is the retired second price,
+    // named literally so the guard cannot silently follow a constant that
+    // moves; `HALF_ENVELOPE_WORK` is asserted below to be under the envelope
+    // so the fixture stays a typed verdict rather than a refusal.
+    const HALF_ENVELOPE_WORK: usize = 125_000_000;
     let mut expensive = repeat_budget_exceeded_fixture(&mut exec, rewritten, &[]);
     assert!(
         exec.derive_eq_diffvar_rewritten_assertions(&mut expensive, &scope),
@@ -395,19 +434,27 @@ fn the_commit_gate_decides_all_four_tiers_against_the_real_walk() {
         "the fixture must reach a TYPED verdict, not an envelope refusal: {error}"
     );
     assert!(
-        consumed > crate::executor::proof::REPEATABLE_CHECK_WORK,
-        "the fixture must genuinely exceed the repeatable budget: {consumed}"
+        consumed > HALF_ENVELOPE_WORK,
+        "the fixture must genuinely cost more than the retired 125M price, or \
+         it does not guard the retirement: {consumed}"
     );
     assert_eq!(
         exec.eq_diffvar_presentation_commit_decision(&expensive),
-        EqDiffVarCommitDecision::Revert { remember: true },
+        EqDiffVarCommitDecision::Commit,
+        "#eqdv-second-price-retired: a typed verdict commits at any cost the \
+         envelope admitted — the repetition the 125M price bounded is gone \
+         (#strict-walk-memo), and the re-derived price is 10.7x the envelope"
     );
 
-    // Tier 3: cheap typed verdict -> commit.
+    // Tier 3: cheap typed verdict -> commit, unchanged.
     let cheap = leaf_proof(&mut exec, rewritten);
     let (outcome, consumed) = exec.check_proof_strict_with_datatypes_reporting_work(&cheap);
     assert!(outcome.is_err(), "the two trust leaves keep it rejected");
-    assert!(consumed <= crate::executor::proof::REPEATABLE_CHECK_WORK);
+    assert!(
+        consumed <= HALF_ENVELOPE_WORK,
+        "the cheap fixture must stay on the other side of the retired price, \
+         so the two typed tiers really are the two ends of the claim"
+    );
     assert_eq!(
         exec.eq_diffvar_presentation_commit_decision(&cheap),
         EqDiffVarCommitDecision::Commit,
@@ -457,14 +504,16 @@ fn authored_conjunct(exec: &Executor) -> TermId {
 
 #[test]
 fn a_refused_subset_run_equals_the_never_spliced_run_and_latches() {
-    // The arm under test: lane eligible, gate must revert on the envelope.
+    // The arm under test: lane eligible, gate must revert on the ENVELOPE —
+    // the one deterministic revert that survives #eqdv-second-price-retired,
+    // and therefore the only fixture that can still drive this contract.
     // The extra premiseless leaf over the authored `(and h1 h2)` conjunct is
     // the TAIL's work — `derive_authored_conjunct_leaves` derives it — so a
     // mutant that skips the tail re-run after the revert leaves it a bare
     // `trust` step and diverges from the control.
     let (mut exec, rewritten) = retention_off_fixture();
     let conjunct = authored_conjunct(&exec);
-    let mut proof = repeat_budget_exceeded_fixture(&mut exec, rewritten, &[conjunct]);
+    let mut proof = envelope_refused_fixture(&mut exec, rewritten, &[conjunct]);
     exec.run_assumption_authority_passes_without_parsed_syntax(&mut proof);
     assert!(
         exec.eqdv_retention_off_declined_at_steps.get() != 0,
@@ -490,7 +539,7 @@ fn a_refused_subset_run_equals_the_never_spliced_run_and_latches() {
     let (mut control, control_rewritten) = retention_off_fixture();
     let control_conjunct = authored_conjunct(&control);
     let mut control_proof =
-        repeat_budget_exceeded_fixture(&mut control, control_rewritten, &[control_conjunct]);
+        envelope_refused_fixture(&mut control, control_rewritten, &[control_conjunct]);
     control.eqdv_retention_off_declined_at_steps.set(usize::MAX);
     control.run_assumption_authority_passes_without_parsed_syntax(&mut control_proof);
 

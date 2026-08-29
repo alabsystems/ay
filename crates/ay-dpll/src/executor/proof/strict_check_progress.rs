@@ -85,38 +85,33 @@ pub(in crate::executor) fn executor_stop_signals_asserted(executor: &Executor) -
     executor_stopped(executor, &should_stop)
 }
 
-/// The metered WORK a strict check may consume and still be considered cheap
-/// enough to RE-RUN many times over.
+/// WHY THERE IS NO SECOND, TIGHTER PRICE (#eqdv-second-price-retired).
 ///
-/// The envelope above bounds ONE check. The certification pipeline does not
-/// run one: every proof assembly re-runs the surgery revert gates and the
-/// mint's presentation over the whole document — measured 30 assemblies and
-/// ~60 whole-proof walks on `QF_IDL/sal/bakery` solves — so a proof whose
-/// single walk consumes a large fraction of the envelope multiplies into
-/// seconds of wall even when every walk SUCCEEDS. Measured on
-/// `inf-bakery-mutex-18` (`--no-proof -T:10`): 60 walks at 287-295M work each
-/// = 17.5G metered units ≈ 6.4s of added wall, which crossed `-T:10` and
-/// published `unknown` over a correct `unsat` with no envelope refusal
-/// anywhere.
+/// [`MAX_CHECK_WORK`] prices ONE strict walk. A tighter second price used to
+/// sit beside it — `REPEATABLE_CHECK_WORK = GENERAL_CHECK_WORK / 2` (125M) —
+/// because the pipeline did not run one walk: every assembly re-ran the
+/// surgery revert gates and the mint's presentation over the whole document.
+/// Its derivation was explicit: "~60 repetitions of a walk at this bound cost
+/// under three seconds", i.e. `price * 60 ~= 7.5G` metered units.
 ///
-/// HALF of [`GENERAL_CHECK_WORK`]. Each assembly's FINISHED document is
-/// priced fresh by its consumer (today: the `EqDiffVar` retention-off commit
-/// gate), and the size-scoped decline latch stops the pricing walks once a
-/// document past this bound has been declined, so the figure needs to cover
-/// repetition of an ADMITTED document only: ~60 repetitions of a walk at this
-/// bound cost under three seconds on the machines the calibration was
-/// measured on, and every corpus file observed to cross `-T:10` through
-/// repeated walks consumed 2.3x-2.6x more than this per walk
-/// (`inf-bakery-mutex-18`: 60 walks x 287-295M = +6.4s). The bound must not
-/// be tighter than the documents whose committed splices downstream surgery
-/// then SHRINKS into outright strict certifications: measured on
-/// `queens_bench/super_queen5-1`, the subset's finished documents walk at
-/// 2,547-2,565 steps mid-pipeline and the mint's final document is 7 steps
-/// and `strict=ok` — an eighth-envelope bound deterministically reverted that
-/// splice and LOST the strict certification, 3/3 reps. Consumers treat a
-/// TYPED verdict that consumed more than this as "true but too expensive to
-/// keep re-deriving" and fall back to the cheaper pre-splice presentation.
-pub(in crate::executor) const REPEATABLE_CHECK_WORK: usize = GENERAL_CHECK_WORK / 2;
+/// #strict-walk-memo removed the repetition. RE-MEASURED on the same 900-file
+/// QF_IDL sample the price was set on (seed 20260824, `AY_CENSUS=1 ay solve
+/// --no-proof -T:10`, gate-level instrumentation, 189 asks over 117 files):
+/// the gate is asked **1 or 2 times per solve, never more** (45 files once,
+/// 72 twice), and **27 of the 29** asks the 125M price refused were memo
+/// HITS — the walk was already paid by another consumer, so the refusal saved
+/// nothing on the ask it refused. Re-deriving at the same three-second
+/// constraint gives `7.5G / 2 = 3.75G`, **10.7x [`MAX_CHECK_WORK`]**: the
+/// derived price is above the ceiling, so the ceiling binds.
+///
+/// The population agrees. Admitted costs run continuously 1.2M -> 120.5M and
+/// refused ones 127.5M -> 334.7M, with no gap at 125M (the cheapest refusal
+/// was 2.0% over the price). The only structural boundary there is the
+/// envelope itself: a TYPED verdict means the checker walked the whole
+/// document and objected to a named step, which it can only do inside
+/// [`MAX_CHECK_WORK`]. So the `EqDiffVar` commit gate now prices a typed
+/// verdict against nothing but the envelope that produced it, and what still
+/// reverts is unchanged: `ResourceLimit` and `Cancelled`.
 
 /// Run one strict check under the executor's active solve controls and one
 /// aggregate, checked-arithmetic resource envelope.
@@ -140,9 +135,21 @@ pub(super) fn check_with_executor_progress(
 }
 
 /// As [`check_with_executor_progress`], additionally reporting the aggregate
-/// WORK the meter recorded for the walk — the deterministic figure
-/// [`REPEATABLE_CHECK_WORK`] is compared against. Reporting only: the check's
-/// outcome, envelope and cancellation behaviour are byte-identical.
+/// WORK the meter recorded for the walk.
+///
+/// DETERMINISTIC by construction, and that is the property the figure exists
+/// for: every charge the meter sums is a structural count of the document and
+/// the term universe (`.len()`s, step counts, and the flat per-lemma
+/// precharges in `ay_proof::checker::bv_bitblast`), never a clock, a load
+/// sample, a thread count or an allocator capacity — the byte limb takes the
+/// `.capacity()`s, the work limb never does. So the same document on the same
+/// store reports the same figure on any machine at any load. VERIFIED, not
+/// asserted: `inf-bakery-mutex-18` reports the identical ten-walk work trace
+/// unloaded and under an 8-way sweep, 3/3 reps each.
+///
+/// Reporting only: the check's outcome, envelope and cancellation behaviour
+/// are byte-identical. #strict-walk-memo replays the ORIGINAL walk's figure
+/// for a memo hit, so a replayed verdict carries a replayed cost.
 pub(super) fn check_with_executor_progress_reporting_work(
     executor: &Executor,
     proof: &Proof,

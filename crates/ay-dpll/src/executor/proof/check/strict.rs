@@ -32,8 +32,9 @@ impl Executor {
     }
 
     /// As [`Self::check_proof_strict_with_datatypes`], additionally reporting
-    /// the aggregate metered WORK the walk consumed — the deterministic figure
-    /// [`REPEATABLE_CHECK_WORK`] is defined against. The finite-enum
+    /// the aggregate metered WORK the walk consumed — the deterministic,
+    /// machine-independent cost figure (see
+    /// `check_with_executor_progress_reporting_work`). The finite-enum
     /// capability route reports 0: it is separately bounded by its own
     /// capability budget and never enters the aggregate meter.
     pub(in crate::executor) fn check_proof_strict_with_datatypes_reporting_work(

@@ -6742,7 +6742,6 @@ fn build_bool_pterm(terms: &mut TermStore, pt: &FrontendTerm) -> Option<TermId> 
 }
 
 pub(in crate::executor) use check::StrictWalkMemo;
-pub(in crate::executor) use check::REPEATABLE_CHECK_WORK;
 #[cfg(all(test, feature = "proof-checker"))]
 use check::*;
 #[cfg(test)]

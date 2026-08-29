@@ -229,6 +229,67 @@ fn distinct_arrays_card1_ctor_infinite_field_is_sat() {
     assert_eq!(result, vec!["sat"]);
 }
 
+/// A single-constructor datatype whose one field is `Int` is not a singleton,
+/// so array distinctness over it is SAT — and AY must SAY so.
+///
+/// (#dt-array-element-ext) The element literal
+/// `¬(= (select v3 k) (select v5 k))` the extensionality witness produces
+/// lives at the datatype sort, where the array/EUF route used to stop: EUF was
+/// satisfied by keeping the two selects in different classes, nothing related
+/// the difference to the constructor's FIELD, and the verdict degraded to
+/// `unknown`. The constructor exhaustiveness+injectivity bridge pushes it to
+/// `¬(= (v (select v3 k)) (v (select v5 k)))`, which LIA witnesses directly.
+#[test]
+#[timeout(10_000)]
+fn distinct_arrays_single_ctor_int_field_is_sat() {
+    let result = run_smt(
+        "(set-logic ALL)\
+         (declare-datatype B1 ((mk (v Int))))\
+         (declare-const v3 (Array Int B1))\
+         (declare-const v5 (Array Int B1))\
+         (assert (distinct v3 v5))\
+         (check-sat)",
+    );
+    assert_eq!(
+        result,
+        vec!["sat"],
+        "an Int field makes the element sort non-singleton, so the arrays can differ"
+    );
+}
+
+/// Same bridge, `Bool` field: the element sort has exactly two inhabitants,
+/// which is already enough for two arrays to differ.
+#[test]
+#[timeout(10_000)]
+fn distinct_arrays_single_ctor_bool_field_is_sat() {
+    let result = run_smt(
+        "(set-logic ALL)\
+         (declare-datatype B2 ((mk (b Bool))))\
+         (declare-const v3 (Array Int B2))\
+         (declare-const v5 (Array Int B2))\
+         (assert (distinct v3 v5))\
+         (check-sat)",
+    );
+    assert_eq!(result, vec!["sat"]);
+}
+
+/// The bridge must not over-refute a NESTED single-constructor record whose
+/// innermost field is genuinely variable: still SAT.
+#[test]
+#[timeout(10_000)]
+fn distinct_arrays_nested_single_ctor_int_field_is_sat() {
+    let result = run_smt(
+        "(set-logic ALL)\
+         (declare-datatype Inner2 ((ic2 (n Int))))\
+         (declare-datatype Outer2 ((oc2 (f Inner2))))\
+         (declare-const v3 (Array Int Outer2))\
+         (declare-const v5 (Array Int Outer2))\
+         (assert (distinct v3 v5))\
+         (check-sat)",
+    );
+    assert_eq!(result, vec!["sat"]);
+}
+
 /// Distinctness over a genuinely uninterpreted (non-datatype) element sort
 /// must stay SAT: cardinality is unknown, so we must not refute.
 #[test]

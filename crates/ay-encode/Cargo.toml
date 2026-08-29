@@ -1,0 +1,37 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+# Author: Andrew Yates
+
+[package]
+name = "ay-encode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Shared AY encoding/invocation surface for model-checker-consumer and ty: sort/term builders, a single invocation config, a frontend-neutral verdict, and a proof-certificate hook."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The typed builder surface (Sort/Expr/AYProgram, Horn + BMC presets).
+ay-bindings.workspace = true
+# The CHC/PDR portfolio + verdict + proof-transcript types.
+ay-chc.workspace = true
+# Core sorts + symbol quoting (also re-exported through ay-bindings).
+ay-core.workspace = true
+# Needed to name `serde_json::Value` in the proof-run metadata accessors
+# (`Certificate::metadata_json`), which surface `ay-chc`'s JSON evidence.
+serde_json.workspace = true
+
+# Optional: Alethe (SAT-level) proof export. Off by default so the leaf
+# crate stays minimal; model-checker-consumer/ty opt in when they want re-checkable
+# SAT-level certificates in addition to CHC proof transcripts.
+ay-proof = { workspace = true, optional = true }
+
+[features]
+default = []
+## Pull in `ay-proof` so [`proof`] can export/recheck Alethe certificates.
+alethe = ["dep:ay-proof"]

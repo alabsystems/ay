@@ -934,15 +934,54 @@ pub(crate) fn encode_model_equality(
                     third_before,
                 )
             {
-                negations.note_theory_authority(
-                    original_id,
-                    ay_core::TheoryLemmaProof {
-                        clause: vec![not_le, not_ge, eq_atom],
-                        kind: ay_core::TheoryLemmaKind::ArithEqTriangle,
-                        farkas: None,
-                        lia: None,
-                    },
-                );
+                // NEVER ASSERT A KIND ITS RECOGNIZER REFUSES.
+                //
+                // `recognize_arith_eq_triangle` IS `validate_arith_eq_triangle`
+                // run on the recorded clause, and that schema is deliberately
+                // ORDER- AND ORIENTATION-SENSITIVE: it demands exactly
+                // `(not (<= a b)) (not (<= b a)) (= a b)` with the equality's
+                // own operands. This site built the clause and asserted the
+                // kind WITHOUT consulting the recognizer, so any clause whose
+                // atoms did not land in that exact shape was recorded as a
+                // triangle the checker then refuted.
+                //
+                // That is not a lost certificate, it is a POISONED PROOF: the
+                // step fails as "invalid theory lemma", the deferred-trust
+                // discharge rejects a NON-trust step, and the mandatory funnel
+                // withdraws an otherwise correct UNSAT to
+                // `unknown (self-check-rejected)`. Measured: on a 639-file
+                // diverse corpus sweep this was the ONLY self-check-rejected
+                // instance (benchmarks/smt/QF_ALIA/smtlib_regression/
+                // pointer-safe-5.smt2, whose declared status is unsat), and it
+                // was timing-dependent — the same query answered `interrupted`
+                // or `self-check-rejected` run to run.
+                //
+                // Gating on the recognizer is strictly fail-closed. When it
+                // accepts, the recorded step is exactly what the strict checker
+                // will re-derive. When it refuses, we record NO theory
+                // authority: the clause still reaches the solver, and is simply
+                // an unauthenticated original — which declines certification
+                // cleanly instead of poisoning the surrounding proof.
+                //
+                // (`theory_inference/funnel.rs` handles the same schema by
+                // REORDERING through `infer_arith_eq_triangle_permutation`
+                // before assigning the kind. Doing that here too would recover
+                // the merely-misordered cases rather than dropping them; it is
+                // deliberately not done in this minimal fix because that helper
+                // is private to the funnel and duplicating its ordering rule is
+                // exactly how a producer and a checker drift apart.)
+                let triangle = vec![not_le, not_ge, eq_atom];
+                if ay_proof::recognize_arith_eq_triangle(terms, &triangle) {
+                    negations.note_theory_authority(
+                        original_id,
+                        ay_core::TheoryLemmaProof {
+                            clause: triangle,
+                            kind: ay_core::TheoryLemmaKind::ArithEqTriangle,
+                            farkas: None,
+                            lia: None,
+                        },
+                    );
+                }
             }
         }
 

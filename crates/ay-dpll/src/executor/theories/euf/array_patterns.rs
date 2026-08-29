@@ -17,6 +17,12 @@ use ay_core::{Sort, Symbol, TermData, TermId};
 
 const SINGLETON_CLOSURE_RESOURCE_POLL_INTERVAL: usize = 1024;
 
+/// Descent cap for [`Executor::bridge_datatype_element_extensionality`]. Each
+/// level is one datatype-field projection or one array `select`, so 8 covers
+/// a record-of-record-of-array element sort with room to spare; deeper nesting
+/// falls back to the (fail-closed) behaviour that existed before the bridge.
+const DT_ELEMENT_EXT_MAX_DEPTH: usize = 8;
+
 pub(in crate::executor) mod finite_array_closure;
 
 /// Whether singleton-sort closure finished emitting its complete spanning set.
@@ -3495,6 +3501,11 @@ impl Executor {
             // only — the eager emission above stays authoritative.
             self.array_ext_shadow.record(eq_term, lhs, rhs, not_sel_eq);
 
+            // #dt-array-element-ext: an element literal at a SINGLE-CONSTRUCTOR
+            // datatype sort is unwitnessable on its own — push it into the
+            // constructor's fields. No-op for every other element sort.
+            self.bridge_datatype_element_extensionality(sel_a, sel_b);
+
             // #qfax-ext-row-seed: eagerly materialize the ROW unrolling of the
             // extensionality witness down BOTH store chains. The lazy Row2Down
             // machinery blocks forever when the inner select(base, diff) term
@@ -3547,6 +3558,159 @@ impl Executor {
                         depth += 1;
                     }
                 }
+            }
+        }
+    }
+
+    /// (#dt-array-element-ext) Carry an array-extensionality ELEMENT
+    /// disequality through a SINGLE-CONSTRUCTOR datatype element sort, down to
+    /// a sort the model builder can actually give two different values.
+    ///
+    /// `add_array_extensionality_axioms_up_to` mints the witness `k` and the
+    /// element literal `¬(= (select a k) (select b k))`. When the element sort
+    /// is a datatype with exactly ONE constructor `C{f_1..f_n}`, that literal
+    /// is unwitnessable on its own: every inhabitant IS a `C(…)`, so the two
+    /// elements can only differ inside a FIELD, and nothing on the array/EUF
+    /// route relates the element disequality to those fields. The EUF solver is
+    /// satisfied by simply keeping the two `select` terms in different classes
+    /// (measured: `[EUF CHECK] Diseq: term 7 != term 8`, no further work), the
+    /// model builder then materializes BOTH as the same concrete
+    /// `mk((as const (Array Int Bool)) false)`, and the independent model gate
+    /// rejects the result — a SAT instance fail-closed to `unknown`:
+    ///
+    /// ```smt
+    /// (declare-datatype U1 ((mk (g (Array Int Bool)))))
+    /// (declare-const v3 (Array Int U1))
+    /// (declare-const v5 (Array Int U1))
+    /// (assert (distinct v3 v5))   ; sat: U1's field sort is INFINITE
+    /// ```
+    ///
+    /// This emits the clauses that push the difference down to a sort the
+    /// search and the model builder can split:
+    ///
+    ///  1. Exhaustiveness + injectivity of the unique constructor:
+    ///     `(= x y) ∨ ¬(= f_1(x) f_1(y)) ∨ … ∨ ¬(= f_n(x) f_n(y))`.
+    ///     Valid because every value of the sort is `C(…)` and `C` is
+    ///     injective, so `x ≠ y` forces SOME field to differ. The whole
+    ///     disjunction is required — a per-field clause would be plain WRONG
+    ///     for `n ≥ 2` (two records may agree on `f_1` and differ on `f_2`).
+    ///  2. For each ARRAY-sorted field pair, the ordinary fresh-Skolem
+    ///     extensionality clause `(= p q) ∨ ¬(= (select p j) (select q j))` —
+    ///     the same conservative, equisatisfiable extension the caller emits
+    ///     for a top-level array pair — so the field disequality itself gets a
+    ///     difference witness.
+    ///
+    /// and recurses (bounded by [`DT_ELEMENT_EXT_MAX_DEPTH`], with a visited
+    /// set that also terminates recursive datatypes) so a nested
+    /// record/array chain ends at a scalar disequality.
+    ///
+    /// MULTI-CONSTRUCTOR datatypes are deliberately SKIPPED: two of their
+    /// values can already differ by CONSTRUCTOR, which the DT theory and the
+    /// model builder handle today (`(Array Int D2)` with `D2 = a2 | b2` is
+    /// answered `sat`), and clause (1) is not available for them without the
+    /// tester machinery `dt_datatype_value_equality_congruence_axioms` already
+    /// owns. A constructor with ZERO fields is also skipped: that sort is a
+    /// singleton and `x ≠ y` is UNSAT, which
+    /// `add_ground_singleton_sort_equalities` refutes.
+    ///
+    /// SOUNDNESS. Every emitted clause is either a datatype tautology (1) or a
+    /// fresh-witness conservative extension (2), so the pass can only PRUNE
+    /// spurious models — it can never refute a satisfiable problem, and it
+    /// leaves the caller's own extensionality clause untouched.
+    fn bridge_datatype_element_extensionality(&mut self, elem_a: TermId, elem_b: TermId) {
+        let mut queue: Vec<(TermId, TermId, usize)> = vec![(elem_a, elem_b, 0)];
+        let mut seen: HashSet<(TermId, TermId)> = HashSet::default();
+        while let Some((a, b, depth)) = queue.pop() {
+            if a == b || depth >= DT_ELEMENT_EXT_MAX_DEPTH {
+                continue;
+            }
+            if !seen.insert(Self::ordered_term_pair(a, b)) {
+                continue;
+            }
+            let sort = self.ctx.terms.sort(a).clone();
+            if sort != *self.ctx.terms.sort(b) {
+                continue;
+            }
+
+            if matches!(sort, Sort::Array(_)) {
+                // Field-level array disequality: give it its own difference
+                // witness, exactly as the caller does for a top-level pair.
+                let Some(diff_var) = array_extensionality_witness(
+                    &mut self.ctx.terms,
+                    &mut self.array_ext_witness_cache,
+                    a,
+                    b,
+                ) else {
+                    continue;
+                };
+                let sel_a = self.ctx.terms.mk_select(a, diff_var);
+                let sel_b = self.ctx.terms.mk_select(b, diff_var);
+                let eq_ab = self.ctx.terms.mk_eq(a, b);
+                let sel_eq = self.ctx.terms.mk_eq(sel_a, sel_b);
+                let not_sel_eq = self.ctx.terms.mk_not(sel_eq);
+                let ext_clause = self.ctx.terms.mk_or(vec![eq_ab, not_sel_eq]);
+                self.array_ext_witness_cache.record_generated_clause(
+                    &self.ctx.terms,
+                    ext_clause,
+                    vec![ArrayExtWitnessBinding {
+                        witness: diff_var,
+                        array_a: a,
+                        array_b: b,
+                    }],
+                );
+                self.push_array_axiom_assertion_site(ext_clause, "dt_element_ext_axiom");
+                queue.push((sel_a, sel_b, depth + 1));
+                continue;
+            }
+
+            // Datatype sorts reach here either as `Sort::Datatype` or, after
+            // the eager uninterpreted lowering, as `Sort::Uninterpreted(name)`
+            // naming a declared datatype.
+            let dt_name = match &sort {
+                Sort::Datatype(dt) => dt.name.clone(),
+                Sort::Uninterpreted(name) => name.clone(),
+                _ => continue,
+            };
+            let ctors: Vec<String> = self
+                .ctx
+                .datatype_iter()
+                .find(|(name, _)| *name == dt_name.as_str())
+                .map(|(_, ctors)| ctors.to_vec())
+                .unwrap_or_default();
+            if ctors.len() != 1 {
+                continue; // multi-constructor (or not a datatype at all)
+            }
+            let Some(fields) = self.ctx.constructor_selector_info_in(&dt_name, &ctors[0]) else {
+                continue;
+            };
+            if fields.is_empty() {
+                continue; // singleton sort: the disequality is UNSAT, not witnessable
+            }
+
+            let eq_ab = self.ctx.terms.mk_eq(a, b);
+            let mut literals: Vec<TermId> = Vec::with_capacity(fields.len() + 1);
+            literals.push(eq_ab);
+            let mut children: Vec<(TermId, TermId)> = Vec::with_capacity(fields.len());
+            for (sel_name, sel_sort) in &fields {
+                let field_a = self.ctx.terms.mk_app(
+                    Symbol::named(sel_name.as_str()),
+                    vec![a],
+                    sel_sort.clone(),
+                );
+                let field_b = self.ctx.terms.mk_app(
+                    Symbol::named(sel_name.as_str()),
+                    vec![b],
+                    sel_sort.clone(),
+                );
+                let field_eq = self.ctx.terms.mk_eq(field_a, field_b);
+                let not_field_eq = self.ctx.terms.mk_not(field_eq);
+                literals.push(not_field_eq);
+                children.push((field_a, field_b));
+            }
+            let clause = self.ctx.terms.mk_or(literals);
+            self.push_array_axiom_assertion_site(clause, "dt_element_ext_injectivity");
+            for (field_a, field_b) in children {
+                queue.push((field_a, field_b, depth + 1));
             }
         }
     }
