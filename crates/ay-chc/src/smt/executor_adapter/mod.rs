@@ -15,6 +15,7 @@
 
 mod logic_detection;
 mod model_parsing;
+mod strict_unsat;
 
 // Re-export for sibling modules (persistent.rs) and crate-level re-export (smt/mod.rs #7983).
 pub(crate) use logic_detection::{
@@ -22,6 +23,7 @@ pub(crate) use logic_detection::{
     quote_symbol, sort_to_smtlib,
 };
 pub(crate) use model_parsing::parse_model_into;
+pub(crate) use strict_unsat::{smtlib_strict_unsat_cert_via_executor, StrictUnsatCert};
 
 // Re-export test-visible helpers (tests.rs uses super::*).
 #[cfg(test)]
@@ -191,123 +193,9 @@ pub(crate) fn smtlib_first_verdict_via_executor(
     }
 }
 
-/// A native strict UNSAT certificate plus bound Alethe diagnostic text for one
-/// CHC replay obligation.
-///
-/// Produced by [`smtlib_strict_unsat_cert_via_executor`] on a proof-enabled
-/// `ay-dpll` `Solver`. No external process (z3 or carcara) is invoked:
-/// `strict_verdict` is AY's in-process native proof-IR verdict, while `bundle`
-/// and `alethe` are retained for diagnostic hashing. A verdict that uses the
-/// sound deferred-trust theory rescue can accompany a bundle rejected by the
-/// narrower plain `ay_dpll::api::re_check_bundle_strict`; neither diagnostic
-/// payload is therefore a universal standalone offline certificate.
-pub(crate) struct StrictUnsatCert {
-    /// Serialized proof-bundle diagnostic bound by the checked-replay row.
-    pub bundle: ay_dpll::api::SerializableProofBundle,
-    /// Rendered Alethe proof text (the human/tool-visible certificate).
-    pub alethe: String,
-    /// In-process strict verdict from `export_last_unsat_artifact()`.
-    pub strict_verdict: ay_dpll::api::StrictProofVerdict,
-}
-
-/// Discharge one UNSAT replay obligation with AY's native strict proof check.
-///
-/// This is the proof-emitting sibling of [`smtlib_first_verdict_via_executor`]:
-/// rather than merely returning a trusted `unsat`/`sat`/`unknown` verdict, it
-/// builds a proof-enabled `ay-dpll` [`Solver`](ay_dpll::api::Solver), executes
-/// the obligation, and — only when the obligation is genuinely `unsat` and a
-/// proof was produced — returns an in-process
-/// [`StrictProofVerdict`](ay_dpll::api::StrictProofVerdict) plus its serialized
-/// [`SerializableProofBundle`](ay_dpll::api::SerializableProofBundle)
-/// diagnostic. The in-process verdict is authoritative here; deferred-trust
-/// theory rescue is not reproduced by the narrower plain offline bundle
-/// checker. No z3 or external checker is invoked.
-///
-/// The proof machinery is enabled by prepending
-/// `(set-option :produce-proofs true)`; the obligation carries its own
-/// `(set-logic …)`, declarations, and assertions, which `parse_smtlib2`
-/// executes while skipping its `(check-sat)` (we drive the solve ourselves so
-/// we can capture the proof artifact).
-///
-/// Fail-closed like [`smtlib_first_verdict_via_executor`]: any parse error,
-/// executor error, ay panic, a non-`unsat` verdict, or a missing proof returns
-/// `None`. A `None` return must be treated by the caller as "not strictly
-/// discharged" (fail-close to metadata-only / unknown), never as a pass.
 /// Re-export of the shared splitter that lives with the `Solver` API it
 /// exists to serve; see [`ay_dpll::api::split_leading_set_logic`].
 pub(crate) use ay_dpll::api::split_leading_set_logic;
-
-pub(crate) fn smtlib_strict_unsat_cert_via_executor(
-    smt: &str,
-    timeout: Option<std::time::Duration>,
-) -> Option<StrictUnsatCert> {
-    use ay_dpll::api::{Solver, SolverConfig};
-
-    ay_core::catch_ay_panics(
-        AssertUnwindSafe(|| {
-            let config = match timeout {
-                Some(timeout) if !timeout.is_zero() => {
-                    SolverConfig::default().with_timeout(timeout)
-                }
-                _ => SolverConfig::default(),
-            };
-            // Take the obligation's OWN `(set-logic …)` and build the solver
-            // with it, rather than opening at `Logic::All` and letting the
-            // script re-select.
-            //
-            // `Solver::try_new_with_config` dispatches a `set-logic` of its
-            // own, so a `set-logic` left in the script is the SECOND one — and
-            // since `118630ef6` ("z3 exit-code contract … reject a second
-            // set-logic") the elaborator rejects that, exactly as z3 does.
-            // `parse_smtlib2` would then fail and `.ok()?` would swallow it as
-            // a bare `None`, which every caller must read as "not strictly
-            // discharged". The visible symptom was checked replay reporting
-            // "did not produce a native strict UNSAT certificate;
-            // staying metadata-only" for obligations that are perfectly
-            // provable.
-            //
-            // Constructing with the declared logic keeps the obligation's own
-            // semantics instead of silently widening it to `ALL`; an
-            // unrecognized or absent declaration falls back to `ALL`, which is
-            // what this path used before.
-            let (logic, body) = split_leading_set_logic(smt, ay_dpll::api::Logic::All);
-            let mut solver = Solver::try_new_with_config(logic, config).ok()?;
-
-            // Enable proof production BEFORE any assertion is installed so the
-            // executor retains parsed assertions for proof rebuild. The
-            // obligation text's `(check-sat)` is skipped by `parse_smtlib2`; we
-            // run the solve ourselves below to capture the proof artifact.
-            let script = format!("(set-option :produce-proofs true)\n{body}");
-            solver.parse_smtlib2(&script).ok()?;
-
-            let result = solver.check_sat_internal_query();
-            if !result.is_unsat() {
-                tracing::debug!(
-                    "executor_adapter: strict-unsat-cert obligation was not unsat; failing closed"
-                );
-                return None;
-            }
-
-            // `export_last_unsat_artifact().strict_verdict` is AY's own
-            // in-process native proof-IR check; the bundle is the offline-
-            // recheckable twin. The Alethe text is bound diagnostic output and
-            // can be honestly holey. All three are required — a missing proof
-            // (e.g. the executor decided unsat on a path that produced no
-            // proof) fails closed.
-            let artifact = solver.export_last_unsat_artifact()?;
-            let bundle = solver.export_last_unsat_bundle()?;
-            Some(StrictUnsatCert {
-                bundle,
-                alethe: artifact.alethe,
-                strict_verdict: artifact.strict_verdict,
-            })
-        }),
-        |reason| {
-            tracing::debug!("executor_adapter: strict-unsat-cert ay panic: {reason}");
-            None
-        },
-    )
-}
 
 fn needs_strict_reparsed_validation(exprs: &[&ChcExpr]) -> bool {
     exprs

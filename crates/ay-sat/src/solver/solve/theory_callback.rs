@@ -429,6 +429,24 @@ impl TheoryCallback for ExtensionCallback<'_> {
         if clause.is_empty() {
             // Empty conflict clause = derivation of the empty clause = UNSAT.
             // The extension proved a genuine contradiction (e.g., XOR: 0 = 1).
+            //
+            // #cert-level0-theory-conflict: the extension hands over NO
+            // explanation here, so the clause trace holds no derivation and
+            // `finalize_unsat_proof` still stamps `mark_empty()` onto it
+            // (finalize_unsat.rs) — the certificate consumer's
+            // `EmptyMarkerWithoutDerivedEmpty` decline.
+            //
+            // MEASURED: stamping `mark_proof_work_exhausted()` here to make
+            // that decline honest is NOT safe. The stamp is consumed by
+            // `sat_proof_manager/mod.rs` ("skipping best-effort default
+            // certificate"), which abandons SAT proof reconstruction outright;
+            // the SMT proof then degenerates to a `TheoryLemma { Generic }`
+            // that mandatory strict certification rejects, and published UNSAT
+            // verdicts turn into `unknown`
+            // (`test_interpolation_spike_mini_conservation`,
+            // `test_interpolation_builtin_repro_all_strengths_verify`). The
+            // decline stays imprecise rather than losing correct answers; no
+            // certificate is minted from this shape either way.
             return Some(solver.declare_unsat());
         }
         solver.tla_trace_step(

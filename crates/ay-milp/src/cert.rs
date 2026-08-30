@@ -407,6 +407,49 @@ impl OptimalityCertificate {
         col_ub: &[Option<BigRational>],
         z_star: &BigRational,
     ) -> Result<(), CertificateError> {
+        let bound = Self::bound_leaf_value(multipliers, model, col_lb, col_ub)?;
+        // (e) INEQUALITY, NOT EQUALITY. A leaf that proves MORE than required
+        // must still pass. `z_star` is converted INTO the combination's type
+        // (`From<BigRational> for Rational`) so the comparison is exact on both
+        // sides -- never through f64.
+        let target = Rational::from(z_star.clone());
+        let dominates = match model.sense() {
+            Sense::Minimize => bound >= target,
+            Sense::Maximize => bound <= target,
+        };
+        if dominates {
+            Ok(())
+        } else {
+            Err(CertificateError::ConstantMismatch)
+        }
+    }
+
+    /// The EXACT bound `multipliers` prove over the box `col_lb`/`col_ub`, in
+    /// the model's own frame with the objective offset already applied — the
+    /// number [`Self::verify_bound_leaf`] compares against its `z_star`.
+    ///
+    /// Split out from that function rather than duplicated because a second
+    /// implementation of this algebra is a second place for the frame to be
+    /// wrong, and the two callers disagreeing about the frame is exactly the
+    /// defect neither could detect on its own. Every soundness property
+    /// documented on [`Self::verify_bound_leaf`] lives HERE: the box is a
+    /// parameter and never recorded, and the objective is read from `model`.
+    ///
+    /// `Ok(bound)` means: no point of `model` inside the box has objective
+    /// better than `bound`. It carries NO claim that `bound` is attained, so a
+    /// caller that reports it as an optimum rather than a bound is making a
+    /// claim this function did not licence.
+    ///
+    /// # Errors
+    /// [`CertificateError::CoefficientMismatch`] when the multipliers do not
+    /// combine to the model's own objective, plus every error
+    /// [`combine_bounded`] raises for a malformed multiplier list.
+    pub(crate) fn bound_leaf_value(
+        multipliers: &[Multiplier],
+        model: &Model,
+        col_lb: &[Option<BigRational>],
+        col_ub: &[Option<BigRational>],
+    ) -> Result<Rational, CertificateError> {
         let combo = combine_bounded(multipliers, model, Some((col_lb, col_ub)))?;
         let sense = model.sense();
 
@@ -435,23 +478,16 @@ impl OptimalityCertificate {
         // `want` is its negation, so the objective is bounded ABOVE by
         // `combo.constant`.
         //
-        // (d) THE OFFSET IS APPLIED so the comparison happens in the same frame
-        // as `Outcome::Optimal.value` and the primal witness.
+        // (d) THE OFFSET IS APPLIED so the value is in the same frame as
+        // `Outcome::Optimal.value` and the primal witness.
         // `combine_bounded` works in `ay_lra::rational::Rational`; the model's
-        // offset and the caller's `z_star` are `BigRational`. Convert INTO the
-        // combination's type (`From<BigRational> for Rational`, rational.rs:665)
-        // so the comparison is exact on both sides -- never through f64.
+        // offset is a `BigRational`. Convert INTO the combination's type
+        // (`From<BigRational> for Rational`, rational.rs:665).
         let offset = Rational::from(model.obj_offset_exact());
-        let target = Rational::from(z_star.clone());
-        let dominates = match sense {
-            Sense::Minimize => (-combo.constant.clone()) + offset >= target,
-            Sense::Maximize => combo.constant.clone() + offset <= target,
-        };
-        if dominates {
-            Ok(())
-        } else {
-            Err(CertificateError::ConstantMismatch)
-        }
+        Ok(match sense {
+            Sense::Minimize => (-combo.constant) + offset,
+            Sense::Maximize => combo.constant + offset,
+        })
     }
 
     /// Re-express this optimality bound as a [`CertifiedRow`] containing the

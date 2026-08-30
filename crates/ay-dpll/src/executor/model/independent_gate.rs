@@ -3200,7 +3200,44 @@ impl Executor {
         }
         let text = sx.render();
         let ev = self.parse_model_value_string(&text, &Some(sort.clone()));
-        super::dt_construct::eval_to_mv(&ev, sort)
+        if let Some(mv) = super::dt_construct::eval_to_mv(&ev, sort) {
+            return Some(mv);
+        }
+        // #dt-uninterpreted-field-carrier — an UNINTERPRETED-sorted constructor
+        // field carries an EUF element token, and `eval_to_mv` (the scalar
+        // converter shared with total-DT construction) has no carrier for one.
+        // Dropping it here made the WHOLE enclosing constructor tree unparseable,
+        // so a datatype leaf whose printed value the printer had already
+        // rendered in full — verification-consumer's self-carrier `Mapping (mapping_entries:
+        // FMap, mapping_default: Int)`, measured 40706/40706 renderings
+        // `(Mapping (as @FMap!N FMap) 0)` — fell through to the opaque
+        // `@Mapping!N` token, which `datatype_eq_at_sort` then correctly refused
+        // even reflexively (Sat -> Unknown).
+        //
+        // This RESTORES a value that already existed; it relaxes nothing.
+        // `eval_value_to_model_value` performs exactly this `Element -> Uninterpreted`
+        // mapping for a TOP-LEVEL uninterpreted leaf, and
+        // `ensure_value_inhabits_sort` already admits `Uninterpreted` at an
+        // uninterpreted sort. The asymmetry was that the same value was
+        // representable at depth 0 and discarded at depth 1.
+        //
+        // SCOPE — why this cannot become opaque authority over a datatype
+        // (the invariant `parse_rendered_dt_value_cached`'s entry guard exists
+        // to hold): the arm is reachable only BELOW an early return that already
+        // routed every guard-REGISTERED sort to `sexp_to_dt_value_guarded`, and
+        // an INVALID (oversized/duplicate) registry makes `datatype_name` `None`
+        // for every sort, which fails the top-level entry guard before any field
+        // is read. So the sort here is a genuinely non-datatype carrier under a
+        // valid registry, where an EUF token is the only faithful value.
+        // Constructor identity and arity stay decisive: a token still fails
+        // `datatype_eq_at_sort` and `ensure_value_inhabits_sort` at any sort the
+        // guard does register.
+        if matches!(sort, Sort::Uninterpreted(_)) && guard.datatype_name(sort).is_none() {
+            if let EvalValue::Element(token) = &ev {
+                return Some(ModelValue::Uninterpreted(token.clone()));
+            }
+        }
+        None
     }
 
     /// Interpret a parsed S-expression as a datatype [`ModelValue`] of `sort`.

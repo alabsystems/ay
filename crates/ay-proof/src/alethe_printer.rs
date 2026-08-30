@@ -5655,7 +5655,7 @@ impl<'a> AlethePrinter<'a> {
             let mut out = String::from("(cl");
             for &lit in clause {
                 out.push(' ');
-                self.write_term_into(&mut out, lit);
+                self.write_derived_literal_into(&mut out, lit);
             }
             out.push(')');
             out

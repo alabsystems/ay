@@ -44,6 +44,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 mod checked_run;
+mod strict_bundle;
 
 /// Cap on clause instantiations while expanding an acyclic clause system into
 /// one quantifier-free error-reachability query. Prevents pathological DAG
@@ -92,6 +93,19 @@ pub struct ChcCheckedReplayRun {
 
 fn verification_error(message: impl Into<String>) -> ChcError {
     ChcError::Verification(message.into())
+}
+
+fn dump_failed_obligation(obligation: &ChcReplayObligation) {
+    let Some(dir) = ay_core::misc_cli_flags()
+        .chc_dump_failed_replay_obligation
+        .as_deref()
+    else {
+        return;
+    };
+    let path = format!("{dir}/{}.smt2", obligation.name);
+    if std::fs::write(&path, &obligation.smtlib).is_ok() {
+        eprintln!("[ay-chc] wrote failing replay obligation to {path}");
+    }
 }
 
 /// Expected executor verdict for one replay obligation kind.
@@ -208,86 +222,14 @@ impl ChcPdrProofRun {
             }
             let expected = expected_verdict(obligation.kind);
 
-            // UNSAT obligations (initiation/consecution/safety and synthesized
-            // acyclic-exhaustion/ghost-pair discharges) are discharged with a
-            // NATIVE STRICT ALETHE self-check — self-contained, no z3, no
-            // external checker. AY's in-process strict verdict must be
-            // Verified. No certificate, or a Rejected verdict, fails closed
-            // to metadata-only; a trusted re-run verdict is insufficient.
-            // The serialized bundle is digest-bound for downstream checking,
-            // but the stricter plain `re_check_bundle_strict` is deliberately
-            // not this admission gate, as explained below.
-            //
-            // SAT (trace-validity) obligations have no UNSAT proof: a witness
-            // is checked by verdict (ground-eval), exactly as before.
             let checker_command;
             let strict_cert = if expected == "unsat" {
-                let Some(cert) =
-                    crate::smt::executor_adapter::smtlib_strict_unsat_cert_via_executor(
-                        &obligation.smtlib,
-                        Some(remaining),
-                    )
-                else {
-                    // Env-gated dump so the failing obligation is a runnable
-                    // reproducer instead of just a name in an error string.
-                    if let Some(dir) = ay_core::misc_cli_flags()
-                        .chc_dump_failed_replay_obligation
-                        .as_deref()
-                    {
-                        let path = format!("{dir}/{}.smt2", obligation.name);
-                        if std::fs::write(&path, &obligation.smtlib).is_ok() {
-                            eprintln!("[ay-chc] wrote failing replay obligation to {path}");
-                        }
-                    }
-                    return Err(verification_error(format!(
-                        "checked replay obligation {} did not produce a native strict \
-                         UNSAT certificate; staying metadata-only",
-                        obligation.name
-                    )));
-                };
-                if !matches!(
-                    cert.strict_verdict,
-                    ay_dpll::api::StrictProofVerdict::Verified(_)
-                ) {
-                    return Err(verification_error(format!(
-                        "checked replay obligation {} native strict proof verdict is not \
-                         Verified; staying metadata-only",
-                        obligation.name
-                    )));
-                }
-                // The gate above is AY's authoritative native proof-IR strict
-                // self-check (`export_last_unsat_artifact().strict_verdict`),
-                // which includes the sound deferred-trust rescue: any trust
-                // step demoted from genuine BV/array theory reasoning is
-                // independently re-discharged as a theory tautology (¬clause
-                // UNSAT) on AY's OWN executor — self-contained, no z3, no
-                // external checker. The proof bundle and Alethe text are
-                // serialized only to bind diagnostic hashes below; their bytes
-                // are not retained in the checked-replay row, so that row is
-                // not standalone offline proof evidence. The Alethe text may
-                // honestly contain `hole`; note the plain
-                // offline `re_check_bundle_strict` is STRICTER than this gate (it
-                // rejects deferred-trust-rescued proofs), so it is not used as
-                // the admission gate here — doing so would fail-close legitimate
-                // BV/array-lemma LIA proofs the strict verdict soundly accepts.
-                let bundle_bytes = serde_json::to_vec(&cert.bundle).map_err(|error| {
-                    verification_error(format!(
-                        "checked replay bundle serialization for obligation {}: {error}",
-                        obligation.name
-                    ))
-                })?;
-                let alethe_sha256 = super::sha256_hex(cert.alethe.as_bytes());
-                let bundle_sha256 = super::sha256_hex(&bundle_bytes);
-                checker_command = format!(
-                    "{CHC_IN_PROCESS_REPLAY_CHECKER_NAME} --strict-alethe --expect {expected} {}",
-                    obligation.name
-                );
-                Some(ChcObligationStrictCert::new(
-                    alethe_sha256,
-                    bundle_sha256,
-                    "verified",
-                ))
+                let (cert, command) = strict_bundle::discharge(obligation, remaining, expected)?;
+                checker_command = command;
+                Some(cert)
             } else {
+                // SAT trace-validity obligations have no UNSAT proof. The
+                // executor checks their concrete witness by verdict.
                 let verdict = crate::smt::executor_adapter::smtlib_first_verdict_via_executor(
                     &obligation.smtlib,
                     Some(remaining),
@@ -317,7 +259,10 @@ impl ChcPdrProofRun {
                 "expected": expected,
                 "verdict": expected,
                 "status": "pass",
-                "strict_alethe": strict_cert.is_some(),
+                "strict_bundle": strict_cert.is_some(),
+                "strict_alethe": strict_cert
+                    .as_ref()
+                    .is_some_and(|cert| cert.alethe_sha256.is_some()),
                 "strict_cert": strict_cert.as_ref().map(ChcObligationStrictCert::to_json_value),
             }));
             let mut row = ChcCheckedReplayObligation::new(

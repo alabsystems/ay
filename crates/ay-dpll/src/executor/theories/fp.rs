@@ -123,6 +123,42 @@ impl Executor {
         // state has not opted out. Everything below this point is the original
         // stateless pipeline, byte-for-byte, and remains the behaviour for
         // every single-shot solve and every declined incremental one.
+        //
+        // The lane is SOUND — 1,820 check-sat indices compared against bitwuzla
+        // 0.9.1 AND cvc5 1.3.0 with zero conflicts, plus 3,260 more by the
+        // implementer, and ten mutations each from a pristine snapshot. Nothing
+        // below questions that.
+        //
+        // It was parked after proving 14x SLOWER on a real division file, which
+        // no corpus average revealed. Measured on
+        // `incremental/ABVFPLRA/.../image_filter_true-unreach-call.c.smt2`, same
+        // binary, back-to-back, `-T:600 -memory:4096`:
+        //
+        //     lane ON    real 546.71 s   user 295.29 s
+        //     lane OFF   real  39.60 s   user  17.05 s
+        //
+        // The file finishes in 40 s disarmed and blows a 600 s budget armed. The
+        // cost is throughput, not correctness: the armed run emits 453 of 463
+        // check-sats — it simply STOPS 10 EARLY — plus one boundary flip. That is
+        // -11 definite answers on `image_filter` and -3 on `inv_Newton`, i.e. -14
+        // on Inc Equality_MachineArith, the one incremental-FP division there is.
+        //
+        // The branch's own 1.84x general / 3.59x repro-shaped speedups are real
+        // and not in dispute. The lane's effect is simply SHAPE-DEPENDENT with a
+        // very wide spread in both directions, and a corpus mean hid the tail.
+        //
+        // One hypothesis is already REFUTED, recorded so it is not re-tried:
+        // clause accumulation. `:num-clauses` / `:num-vars` are IDENTICAL armed
+        // and disarmed (1,097,324 / 364,799), so the lane is not growing the
+        // database.
+        //
+        // The admission gate now excludes that exact shape without a tuned
+        // threshold: no persistent encoding or SAT solver exists until every
+        // current FP-relevant authored TermId was previously observed or
+        // encoded (pop/reassert counts). A stable tiny anchor cannot admit a
+        // disjoint large batch. Any novel root restarts statelessly; an exact
+        // repeat may rebuild persistence on the following query.
+
         if persistent_authorized
             && self.incremental_mode
             && !ay_core::misc_cli_flags().no_fp_incremental

@@ -50,6 +50,12 @@ const OPT_CERT_CERTIFY_RESERVE_DIV: u32 = 8;
 const OPT_CERT_CERTIFY_RESERVE_MIN_MS: u64 = 10_000;
 const OPT_CERT_CERTIFY_RESERVE_MAX_MS: u64 = 300_000;
 const OPT_CERT_NATIVE_TAIL_MIN_MS: u64 = 2_000;
+// The certificate chain's per-route budget is NOT configured here. It moved
+// into the chain itself (`ay_pb::proof::certify_opt_lin_any_interruptible`),
+// where every caller inherits it: this file used to hold both the ladder and
+// its `CertRouteBudget`, and when the ladder was factored into the library the
+// budget stayed behind, so the library chain's three search rungs went back to
+// sharing one deadline for every other caller.
 const OPT_CERT_HUGE_MIN_VARS: u32 = 900_000;
 const OPT_CERT_HUGE_MIN_CONSTRAINTS: usize = 1_000_000;
 
@@ -531,7 +537,8 @@ fn apply_memory_limit() {
 fn usage() -> String {
     concat!(
         "usage:\n",
-        "  ay-pb pb solve  [--timeout MS] [--proof FILE] [--stats] [--stats-json] FILE\n",
+        "  ay-pb pb solve  [--timeout MS] [--proof FILE] [--stats] [--stats-json]\n",
+        "                  [--cert-debug] FILE\n",
         "  ay-pb pb verify [--z3|--no-z3|--require-z3] [--z3-timeout SEC] INSTANCE.opb [SOLUTION]\n",
         "                  (SOLUTION is a solver-output file; omit to read it from stdin)"
     )
@@ -2604,51 +2611,24 @@ fn try_opt_lin_cert_fallback(
             || ay_sys::process_memory_exceeded()
     };
 
-    // Compact lower bound first (broad coverage: augmented refutations needing
-    // Sinz aux registers); fall back to the aux-free lift. Both are re-checked
-    // by the competition's VeriPB checker.
-    // Try the FAST direct CG-aggregation floor first (instant, no SAT refutation):
-    // it certifies covering-tight optima whose augmented refutation the two routes
-    // below cannot find in budget. Falls through when it does not apply.
-    let pbp = ay_pb::proof::certify_opt_lin_trivial_zero_floor(instance, &incumbent, optimum)
-        .or_else(|| {
-            ay_pb::proof::certify_opt_lin_knapsack_cardinality(instance, &incumbent, optimum)
-        })
-        .or_else(|| {
-            ay_pb::proof::certify_opt_lin_direct_aggregation_floor(instance, &incumbent, optimum)
-        })
-        .or_else(|| ay_pb::proof::certify_opt_lin_lp_dual_floor(instance, &incumbent, optimum))
-        .or_else(|| {
-            ay_pb::proof::certify_opt_lin_bounds_compact_interruptible(
-                instance,
-                &incumbent,
-                optimum,
-                &should_stop,
-            )
-        })
-        .or_else(|| {
-            ay_pb::proof::certify_opt_lin_bounds_interruptible(
-                instance,
-                &incumbent,
-                optimum,
-                &should_stop,
-            )
-        })
-        .or_else(|| {
-            // PB-NATIVE lower bound (aux-heavy gap): refute the augmented
-            // instance with the proof-logging PB CDCL — no CNF encoding, so no
-            // Sinz aux budget and no adder/BDD aux in the refutation. Last so
-            // it can only ADD certificates the CNF routes decline.
-            ay_pb::proof::certify_opt_lin_bounds_pb_interruptible(
-                instance,
-                &incumbent,
-                optimum,
-                &should_stop,
-            )
-        });
-    let Some(pbp) = pbp else {
+    // THE WHOLE CHAIN, cheapest-first, from the ONE library definition shared
+    // with the CLI (`crates/ay/src/cmd_pb.rs`). This site used to be a
+    // hand-written `.or_else(...)` ladder plus its own `CertRouteBudget`, and
+    // the CLI's copy of the same ladder is what drifted to two rungs while this
+    // one grew to eight. The per-route budget now lives WITH the chain, so a
+    // caller cannot get one without the other.
+    let Some((pbp, route)) = ay_pb::proof::certify_opt_lin_any_interruptible(
+        instance,
+        &incumbent,
+        optimum,
+        timeout_dur.map(|timeout| start + timeout),
+        &should_stop,
+    ) else {
         return Ok(OptCertFallbackOutcome::Declined(timings));
     };
+    if ay_core::misc_cli_flags().cert_debug {
+        eprintln!("c opt-lin-cert route: {} (fallback)", route.as_str());
+    }
 
     fs::write(temp_proof_path, pbp.as_bytes())
         .map_err(|e| format!("failed to write proof '{}': {e}", temp_proof_path.display()))?;
@@ -2717,45 +2697,23 @@ fn commit_certified_known_optimum(
             || ay_sys::process_memory_exceeded()
     };
 
-    let pbp = ay_pb::proof::certify_opt_lin_trivial_zero_floor(instance, incumbent, optimum)
-        .or_else(|| {
-            ay_pb::proof::certify_opt_lin_knapsack_cardinality(instance, incumbent, optimum)
-        })
-        .or_else(|| {
-            ay_pb::proof::certify_opt_lin_direct_aggregation_floor(instance, incumbent, optimum)
-        })
-        .or_else(|| ay_pb::proof::certify_opt_lin_lp_dual_floor(instance, incumbent, optimum))
-        .or_else(|| {
-            ay_pb::proof::certify_opt_lin_bounds_compact_interruptible(
-                instance,
-                incumbent,
-                optimum,
-                &should_stop,
-            )
-        })
-        .or_else(|| {
-            ay_pb::proof::certify_opt_lin_bounds_interruptible(
-                instance,
-                incumbent,
-                optimum,
-                &should_stop,
-            )
-        })
-        .or_else(|| {
-            // PB-NATIVE lower bound (aux-heavy gap): refute the augmented
-            // instance with the proof-logging PB CDCL — no CNF encoding, so no
-            // Sinz aux budget and no adder/BDD aux in the refutation. Last so
-            // it can only ADD certificates the CNF routes decline.
-            ay_pb::proof::certify_opt_lin_bounds_pb_interruptible(
-                instance,
-                incumbent,
-                optimum,
-                &should_stop,
-            )
-        });
-    let Some(pbp) = pbp else {
+    // THE WHOLE CHAIN, same single library definition as the sibling site above
+    // and as the CLI. Routes 1-5 are pure arithmetic and never consult
+    // `should_stop`, so this site still certifies with a fully-consumed
+    // deadline; only the three search rungs decline early, and each of those
+    // gets a slice of its own.
+    let Some((pbp, route)) = ay_pb::proof::certify_opt_lin_any_interruptible(
+        instance,
+        incumbent,
+        optimum,
+        timeout_dur.map(|timeout| start + timeout),
+        &should_stop,
+    ) else {
         return Ok(false);
     };
+    if ay_core::misc_cli_flags().cert_debug {
+        eprintln!("c opt-lin-cert route: {} (known-optimum)", route.as_str());
+    }
 
     fs::write(temp_proof_path, pbp.as_bytes())
         .map_err(|e| format!("failed to write proof '{}': {e}", temp_proof_path.display()))?;

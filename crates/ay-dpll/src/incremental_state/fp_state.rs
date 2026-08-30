@@ -11,11 +11,19 @@
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::{TermId, TseitinState};
+use ay_core::{Sort, TermId, TermStore, TseitinState};
 use ay_fp::FpEncodingCache;
 use ay_sat::Solver as SatSolver;
 
 use super::IncrementalSubsystem;
+
+/// Result of observing the current authored assertion set for persistence.
+pub(crate) enum FpIncrementalAdmission {
+    /// Every current FP-relevant root has an exact reusable identity.
+    Admit,
+    /// The full current set has not been observed; answer statelessly.
+    Defer,
+}
 
 /// Persistent state for the incremental FP lane.
 ///
@@ -74,6 +82,17 @@ pub(crate) struct IncrementalFpState {
     /// refreshing `term_to_cnf` alone does not fix it.
     pub(crate) linked_bool_inputs: HashSet<TermId>,
 
+    /// Assertions observed at incremental entry or on the last deferred query.
+    ///
+    /// An entry probe is captured before a `TermStore` borrow is available and
+    /// may temporarily include Bool-only roots; only current FP-relevant roots
+    /// are ever looked up in it. Later probes contain only roots whose DAG
+    /// mentions FP. This metadata retains no SAT state or encoding.
+    reuse_probe: Option<HashSet<TermId>>,
+    /// Memoized "this term's DAG mentions an FP-sorted term" predicate.
+    /// Term data is immutable, so both positive and negative entries are stable.
+    fp_relevance_cache: Vec<Option<bool>>,
+
     /// Number of check-sats this lane has served in the current session.
     ///
     /// Published as `fp_incremental.solves`. Diagnostic, but load-bearing for
@@ -105,6 +124,8 @@ impl IncrementalFpState {
             next_fp_var: 1,
             linked_predicate_vars: HashSet::default(),
             linked_bool_inputs: HashSet::default(),
+            reuse_probe: None,
+            fp_relevance_cache: Vec::new(),
             solves: 0,
             disabled: false,
         }
@@ -163,12 +184,124 @@ impl IncrementalFpState {
         self.fp_cache.next_var = self.fp_cache.next_var.max(self.next_fp_var);
     }
 
+    /// Capture the assertions outside the first incremental scope.
+    ///
+    /// They are guaranteed to remain live after the corresponding push. FP
+    /// relevance is filtered lazily at check-sat, avoiding a DAG walk on push.
+    pub(crate) fn record_incremental_entry(&mut self, assertions: &[TermId]) {
+        if !self.disabled && self.scope_depth == 0 && self.solves == 0 && self.reuse_probe.is_none()
+        {
+            self.reuse_probe = Some(assertions.iter().copied().collect());
+        }
+    }
+
+    /// Whether `root` transitively mentions an FP-sorted term.
+    ///
+    /// Iterative post-order keeps this safe for deep authored DAGs. The cache
+    /// makes a disjoint batch linear in newly seen terms across the session,
+    /// rather than re-walking shared prefixes at every check-sat.
+    fn term_mentions_fp(&mut self, terms: &TermStore, root: TermId) -> bool {
+        if let Some(relevant) = self.cached_fp_relevance(root) {
+            return relevant;
+        }
+
+        let mut stack = vec![(root, false)];
+        while let Some((term, expanded)) = stack.pop() {
+            if self.cached_fp_relevance(term).is_some() {
+                continue;
+            }
+            if matches!(terms.sort(term), Sort::FloatingPoint(..)) {
+                self.cache_fp_relevance(term, true);
+                continue;
+            }
+            let children = terms.children(term);
+            if expanded {
+                let relevant = children
+                    .iter()
+                    .any(|&child| self.cached_fp_relevance(child) == Some(true));
+                self.cache_fp_relevance(term, relevant);
+            } else {
+                stack.push((term, true));
+                stack.extend(children.into_iter().map(|child| (child, false)));
+            }
+        }
+        self.cached_fp_relevance(root) == Some(true)
+    }
+
+    fn cached_fp_relevance(&self, term: TermId) -> Option<bool> {
+        self.fp_relevance_cache
+            .get(term.0 as usize)
+            .copied()
+            .flatten()
+    }
+
+    fn cache_fp_relevance(&mut self, term: TermId, relevant: bool) {
+        let index = term.0 as usize;
+        if self.fp_relevance_cache.len() <= index {
+            self.fp_relevance_cache.resize(index + 1, None);
+        }
+        self.fp_relevance_cache[index] = Some(relevant);
+    }
+
+    fn fp_relevant_assertions(
+        &mut self,
+        terms: &TermStore,
+        assertions: &[TermId],
+    ) -> HashSet<TermId> {
+        assertions
+            .iter()
+            .copied()
+            .filter(|&term| self.term_mentions_fp(terms, term))
+            .collect()
+    }
+
+    /// Admit only when every current FP-relevant root was already observed.
+    ///
+    /// Roots may survive continuously or be popped and reasserted: immutable
+    /// `TermId` identity makes either reusable. Subsets/removals are therefore
+    /// admitted immediately. Any novel root tears an active SAT state down but
+    /// does not disable the lane: this query is the new full-set observation,
+    /// and an identical repeat may rebuild persistence on the next check.
+    pub(crate) fn observe_live_assertion_reuse(
+        &mut self,
+        terms: &TermStore,
+        assertions: &[TermId],
+    ) -> FpIncrementalAdmission {
+        let relevant = self.fp_relevant_assertions(terms, assertions);
+        if self.solves > 0 {
+            if !relevant.is_empty()
+                && relevant
+                    .iter()
+                    .all(|term| self.encoded_assertions.contains_key(term))
+            {
+                return FpIncrementalAdmission::Admit;
+            }
+            self.reset_sat_encoding_for_rebuild();
+            self.reuse_probe = Some(relevant);
+            return FpIncrementalAdmission::Defer;
+        }
+
+        let fully_observed = !relevant.is_empty()
+            && self
+                .reuse_probe
+                .as_ref()
+                .is_some_and(|previous| relevant.iter().all(|term| previous.contains(term)));
+        self.reuse_probe = Some(relevant);
+        if fully_observed {
+            self.reuse_probe = None;
+            FpIncrementalAdmission::Admit
+        } else {
+            FpIncrementalAdmission::Defer
+        }
+    }
+
     /// FULL teardown: drop the solver and every cache, keeping only the
     /// frontend scope depth so the next check-sat can rebuild the scope stack.
     ///
-    /// Reserved for `reset()` / `(reset-assertions)` and for the sticky
-    /// [`Self::disabled`] opt-out. Deliberately NOT the `pop()` path — see
-    /// `IncrementalBvState::pop` for why a scope retraction needs no teardown.
+    /// Used by `reset()` / `(reset-assertions)`, the sticky [`Self::disabled`]
+    /// opt-out, and a non-sticky restart when admission sees a novel FP root.
+    /// Deliberately NOT the ordinary `pop()` path — see
+    /// `IncrementalBvState::pop` for why scope retraction needs no teardown.
     ///
     /// `FpSolver::reset` (`ay-fp`'s `TheorySolver` impl) is NOT usable here: it
     /// restarts `next_var` at 1 while leaving `bool_input_lits`,
@@ -191,6 +324,8 @@ impl IncrementalFpState {
             next_fp_var,
             linked_predicate_vars,
             linked_bool_inputs,
+            reuse_probe,
+            fp_relevance_cache,
             solves,
             disabled: _,
         } = self;
@@ -204,6 +339,8 @@ impl IncrementalFpState {
         *next_fp_var = 1;
         linked_predicate_vars.clear();
         linked_bool_inputs.clear();
+        *reuse_probe = None;
+        fp_relevance_cache.clear();
         *solves = 0;
     }
 

@@ -88,10 +88,17 @@ pub(super) fn parse_mults_mode(
     })
 }
 
-pub(super) fn parse_optcert(
+/// Parse a `rootdual` block: an [`OptimalityCertificate`] used as a BOUND,
+/// plus the residual the emitter recorded.
+///
+/// The `gap` field is parsed but NOT believed: [`check`] re-derives it from
+/// `bound` and the verdict line and refuses a block whose two records disagree.
+/// Parsing it here rather than skipping it is what makes that comparison
+/// possible at all.
+pub(super) fn parse_root_dual(
     lines: &[&str],
     start: usize,
-) -> Result<(OptimalityCertificate, bool, usize), CertIoError> {
+) -> Result<(RootDualBoundRecord, usize), CertIoError> {
     let head: Vec<&str> = lines[start].split_whitespace().collect();
     let bad = |msg: &str| CertIoError::Malformed {
         line: start + 1,
@@ -99,13 +106,36 @@ pub(super) fn parse_optcert(
     };
     let sense = kv(&head, "sense")
         .and_then(parse_sense)
-        .ok_or_else(|| bad("optcert sense"))?;
+        .ok_or_else(|| bad("rootdual sense"))?;
     let bound = kv(&head, "bound")
         .and_then(parse_rat)
-        .ok_or_else(|| bad("optcert bound"))?;
-    let trivial = kv(&head, "trivial") == Some("1");
+        .ok_or_else(|| bad("rootdual bound"))?;
+    let gap = kv(&head, "gap")
+        .and_then(parse_rat)
+        .ok_or_else(|| bad("rootdual gap"))?;
+    let (objective, i) = parse_objective_records(lines, start + 1)?;
+    let (multipliers, next) = parse_mults(lines, i, "end")?;
+    Ok((
+        RootDualBoundRecord {
+            certificate: OptimalityCertificate {
+                sense,
+                objective,
+                bound,
+                multipliers,
+            },
+            gap,
+        },
+        next,
+    ))
+}
+
+/// The `obj <col> <coeff>` run shared by `optcert` and `rootdual`.
+fn parse_objective_records(
+    lines: &[&str],
+    start: usize,
+) -> Result<(Vec<(u32, BigRational)>, usize), CertIoError> {
     let mut objective = Vec::new();
-    let mut i = start + 1;
+    let mut i = start;
     while i < lines.len() {
         let l = lines[i].trim();
         let f: Vec<&str> = l.split_whitespace().collect();
@@ -129,6 +159,26 @@ pub(super) fn parse_optcert(
         objective.push((c, a));
         i += 1;
     }
+    Ok((objective, i))
+}
+
+pub(super) fn parse_optcert(
+    lines: &[&str],
+    start: usize,
+) -> Result<(OptimalityCertificate, bool, usize), CertIoError> {
+    let head: Vec<&str> = lines[start].split_whitespace().collect();
+    let bad = |msg: &str| CertIoError::Malformed {
+        line: start + 1,
+        msg: msg.to_string(),
+    };
+    let sense = kv(&head, "sense")
+        .and_then(parse_sense)
+        .ok_or_else(|| bad("optcert sense"))?;
+    let bound = kv(&head, "bound")
+        .and_then(parse_rat)
+        .ok_or_else(|| bad("optcert bound"))?;
+    let trivial = kv(&head, "trivial") == Some("1");
+    let (objective, i) = parse_objective_records(lines, start + 1)?;
     let (multipliers, next) = parse_mults(lines, i, "end")?;
     Ok((
         OptimalityCertificate {

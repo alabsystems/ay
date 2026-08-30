@@ -248,6 +248,11 @@ pub use scheduling_route::{
     SingleMachineSchedulingOptimalityCertificate,
 };
 mod opt_cert;
+mod root_dual;
+pub use root_dual::{
+    derive_root_dual_bound, model_objective_exact, root_dual_bound_in_model_frame, root_dual_gap,
+    RootDualBudget, RootDualDecline, RootDualLane, RootDualReport,
+};
 pub mod sepstat;
 mod session;
 mod simplex;

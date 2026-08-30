@@ -36,6 +36,7 @@ impl ReplayFixture {
             network_design_optimality_certificate: None,
             block_angular_optimality_certificate: None,
             milp_optimality_tree_certificate: None,
+            root_dual_bound_certificate: None,
             single_machine_scheduling_optimality_certificate: None,
             single_row_dp_infeasibility_certificate: None,
             multi_row_bdd_infeasibility_certificate: None,

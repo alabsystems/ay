@@ -44,7 +44,7 @@ mod bv_state;
 pub(crate) use bv_state::IncrementalBvState;
 
 mod fp_state;
-pub(crate) use fp_state::IncrementalFpState;
+pub(crate) use fp_state::{FpIncrementalAdmission, IncrementalFpState};
 
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{Sort, TermData, TermId, TermStore, TseitinState};

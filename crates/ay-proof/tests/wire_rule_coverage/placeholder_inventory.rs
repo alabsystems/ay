@@ -21,8 +21,23 @@ pub(super) fn assert_expected(placeholders: &BTreeMap<String, BTreeSet<String>>)
     // positional `{}` sites likewise print this exact constant: the two fresh
     // definitional lowerings `format_fresh_def_bound` / `format_fresh_def_eq`,
     // which have no Alethe rule to claim, and the promoted-LIA evaluation
-    // fallback taken when the ground formatter declines. The remaining
+    // fallback taken when the ground formatter declines. The fourth
     // positional site prints the already-inventoried promoted Farkas rule.
+    //
+    // The FIFTH positional site is NOT a constant. `707ac89b43 proof(bv):
+    // certify bounded E5 shift contradictions` added
+    // `alethe_printer/bv_mul_zero/shift_monotonicity.rs`, which prints one
+    // Alethe step per Tseitin clause of its Boolean circuit and takes each
+    // step's rule from `CnfStep::rule`. That name set is closed and
+    // enumerable: `CnfStep` has one private constructor,
+    // `BoolCircuit::add_clause`, called only from `BoolCircuit::build_cnf`,
+    // whose arms spell exactly ten `&'static str` rules -- `true`, `false`,
+    // `and_pos`, `and_neg`, `or_pos`, `or_neg`, `equiv_pos1`, `equiv_pos2`,
+    // `equiv_neg1`, `equiv_neg2`. Bumping this count on its own would have
+    // been a rubber stamp, so `dynamic_printer_rule_candidates` now reads
+    // those ten literals straight out of that production table and feeds them
+    // to the external probe. carcara 1.1.0 (git 9a352ee) implements all ten,
+    // and the probe -- not this comment -- is what re-proves that every run.
     //
     // The two `rule` sites are bounded selectors: `sko_forall`/`sko_ex` after
     // strict Skolem-step validation, and the shared promoted Farkas wire rule.
@@ -30,6 +45,19 @@ pub(super) fn assert_expected(placeholders: &BTreeMap<String, BTreeSet<String>>)
     // from the fixed decoder table. The counts below make every such producer
     // addition fail closed until this census and the candidate inventory are
     // reviewed together.
+    //
+    // The `rule` count stays at TWO even though `707ac89b43` looked like it
+    // added a third. That commit also put its test module INLINE in
+    // `shift_monotonicity.rs`, and a filename suffix (`*_tests.rs`) is the
+    // ONLY exclusion this scan has for test code. The inline module therefore
+    // entered the scan as production and contributed both a phantom `:rule
+    // {rule}` site (a loop over eight expected names) and -- worse -- a
+    // literal `:rule trust` taken from a NEGATIVE assertion. `trust` is the
+    // fallback AY deliberately refuses to emit (#8821) and is a name the
+    // installed carcara answers `unknown rule` for, so accepting the site
+    // would have failed the external probe over a rule AY never writes. Those
+    // tests now live in `shift_monotonicity_tests.rs`, beside the sibling
+    // `bv_mul_zero_tests.rs`, so the scan sees only what the printer emits.
     //
     // `blast_rule` and `simplify_rule` each have TWO sites, and both pairs are
     // fed by the SAME production table: `decode_idempotent_bv_gate`, whose arms
@@ -51,7 +79,7 @@ pub(super) fn assert_expected(placeholders: &BTreeMap<String, BTreeSet<String>>)
          checker-implemented unproved marker"
     );
     let expected = BTreeMap::from([
-        ("", 4),
+        ("", 5),
         ("UNPROVED_STEP_RULE", 1),
         ("blast_rule", 2),
         ("non_strict_rule", 1),

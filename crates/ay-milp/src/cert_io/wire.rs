@@ -17,6 +17,21 @@ pub(super) fn fmt_rat(r: &BigRational) -> String {
     }
 }
 
+/// A rational as an APPROXIMATE decimal, for a human reading a check report.
+///
+/// Never written to a certificate and never compared against anything: an
+/// exactified `f64` dual can carry a denominator around `2^90`, and a reader
+/// handed `105177991209283667304698998625037/4951760157141521099596496896`
+/// cannot tell at a glance whether the bound is close to the claimed optimum
+/// or nowhere near it. The exact value is always printed beside this, and the
+/// `~` prefix says which of the two is the certificate's.
+pub(super) fn approx_decimal(r: &BigRational) -> String {
+    use num_traits::ToPrimitive as _;
+    r.to_f64()
+        .filter(|value| value.is_finite())
+        .map_or_else(|| "~?".to_owned(), |value| format!("~{value}"))
+}
+
 /// Parse a wire rational. Rejects a zero/negative denominator and a
 /// non-reduced fraction: the wire form is CANONICAL, so `2/4` is malformed
 /// rather than silently normalised. That keeps the `%END` digest a function of

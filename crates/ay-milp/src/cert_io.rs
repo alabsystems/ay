@@ -216,6 +216,7 @@ pub(crate) mod ledger {
 
 mod check_claims;
 mod check_dual;
+mod check_dual_bound;
 mod check_infeasible;
 mod check_policy;
 mod check_primal;
@@ -246,6 +247,7 @@ mod wire;
 
 use check_claims::*;
 use check_dual::*;
+use check_dual_bound::*;
 use check_infeasible::*;
 use check_policy::*;
 use check_primal::*;
@@ -278,7 +280,7 @@ pub(crate) use digest::canonical_digest_bytes_bounded;
 pub use digest::{canonical_digest, canonical_model_v1, sha256_hex};
 pub use emission::EmitCtx;
 pub use emission_main::emit;
-pub use parsing::{CertIoError, Certificate, Header, ParsedClaim};
+pub use parsing::{CertIoError, Certificate, Header, ParsedClaim, RootDualBoundRecord};
 pub use parsing_main::parse;
 
 #[cfg(test)]

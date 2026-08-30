@@ -392,6 +392,7 @@ fn add_dynamic_candidate(
 fn dynamic_printer_rule_candidates(
     main_source: &str,
     symm_source: &str,
+    shift_source: &str,
 ) -> BTreeMap<String, BTreeSet<String>> {
     let mut candidates = BTreeMap::<String, BTreeSet<String>>::new();
 
@@ -446,6 +447,31 @@ fn dynamic_printer_rule_candidates(
     for mut literal in selector_rules {
         literal.line += selector_line;
         add_dynamic_candidate(&mut candidates, &literal, "surface symmetry rule");
+    }
+
+    // The bounded E5 shift lowering prints one Alethe step per Tseitin clause
+    // of its Boolean circuit and takes the rule from `CnfStep::rule`, a
+    // `&'static str`. That name set is closed and readable from production:
+    // every `CnfStep` is built by the single private constructor
+    // `BoolCircuit::add_clause`, so reading the rule argument of each
+    // `self.add_clause(...)` call enumerates it exactly, the same way the
+    // idempotent BV decoder table above is read field-by-field. The rule is
+    // the first string literal of the call; a call that spells it any other
+    // way yields no literal and fails the count assertion below rather than
+    // silently dropping a name out of the external probe.
+    let add_clause_calls = shift_source.matches("self.add_clause(").count();
+    assert!(
+        add_clause_calls > 0,
+        "bounded shift lowering has no CNF clause rules"
+    );
+    let shift_rules = first_string_before_semicolon_after(shift_source, "self.add_clause(");
+    assert_eq!(
+        shift_rules.len(),
+        add_clause_calls,
+        "every bounded-shift CNF clause must spell its Alethe rule as a literal"
+    );
+    for literal in shift_rules {
+        add_dynamic_candidate(&mut candidates, &literal, "printer shift CNF rule");
     }
 
     candidates
@@ -584,6 +610,7 @@ fn rule_inventory() -> RuleInventory {
     let mut dynamic_placeholders = BTreeMap::<String, BTreeSet<String>>::new();
     let mut main_printer_source = None;
     let mut surface_symm_source = None;
+    let mut shift_monotonicity_source = None;
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     for path in printer_source_paths() {
         let relative = path.strip_prefix(manifest).unwrap_or(&path);
@@ -591,6 +618,9 @@ fn rule_inventory() -> RuleInventory {
         match relative.to_string_lossy().as_ref() {
             "src/alethe_printer.rs" => main_printer_source = Some(source.clone()),
             "src/alethe_printer/surface_symm.rs" => surface_symm_source = Some(source.clone()),
+            "src/alethe_printer/bv_mul_zero/shift_monotonicity.rs" => {
+                shift_monotonicity_source = Some(source.clone());
+            }
             _ => {}
         }
         for literal in rust_string_literals(&source) {
@@ -622,6 +652,9 @@ fn rule_inventory() -> RuleInventory {
         surface_symm_source
             .as_deref()
             .expect("surface symmetry printer source was scanned"),
+        shift_monotonicity_source
+            .as_deref()
+            .expect("bounded shift-monotonicity printer source was scanned"),
     );
     for (candidate, sources) in printer_candidates {
         if !inventory.sources.contains_key(&candidate) {

@@ -71,10 +71,10 @@ export PATH="$PWD/target/release:$PATH"
 ```
 
 > AY builds with plain stable Rust. The ALab
-> Trust (development-only integration) compiler — a
-> verification-oriented Rust toolchain — machine-checks selected kernels today
-> through an explicit fail-closed lane, and will become the recommended way to
-> build AY when it is published.
+> [Trust](https://github.com/alabsystems/trust) compiler — a
+> verification-oriented Rust toolchain, now published — machine-checks selected
+> kernels today through an explicit fail-closed lane; its public check builds
+> on a stock nightly, and its INSTALL.md documents the self-hosted fork lane.
 
 Solve a small integer problem from stdin:
 
@@ -179,7 +179,7 @@ checker rejects are disabled rather than emitted. The older `--competition`,
 
 Beyond external checkers, [`verification/lean`](verification/lean) states
 soundness theorems for selected solver kernels in Lean 4, the ALab
-Clean (development-only integration) proof kernel reconstructs
+[Clean](https://github.com/alabsystems/clean) proof kernel reconstructs
 supported SAT, SMT, arithmetic, and Farkas evidence in a minimal auditable
 kernel, and `ay check <drat|lrat|dpr|sr|model>` re-checks artifacts in-tree.
 
@@ -367,7 +367,7 @@ contributions, not claims that the techniques began here.
   See the [selector](crates/ay-chc/src/portfolio/selector.rs) and
   [acceptance gate](crates/ay-chc/src/portfolio/accept.rs).
 - **Checked code without a shadow implementation.** The
-  Trust (development-only integration) toolchain machine-checks
+  [Trust](https://github.com/alabsystems/trust) toolchain machine-checks
   selected bounded kernels over the same source bytes Rust compiles, removing
   the drift between an executable function and a proof model — for example
   [`ay-sat-congruence-core`](crates/ay-sat-congruence-core/src/lib.rs).
@@ -390,21 +390,21 @@ contributions, not claims that the techniques began here.
 ## AY in ALab Systems
 
 AY is exercised as infrastructure by the other ALab Systems projects.
-Trust VC (development-only integration) /
-Trust WP (development-only integration) lower Rust contracts and
+[Trust VC](https://github.com/alabsystems/trust-vc) /
+[Trust WP](https://github.com/alabsystems/trust-wp) lower Rust contracts and
 verification conditions to SMT and retain AY's evidence for proof
 reconstruction, over typed compiler facts from
-Trust IR (development-only integration).
-Trust MC (development-only integration) /
-Ty (development-only integration) drive bounded and symbolic model
+[Trust IR](https://github.com/alabsystems/trust-ir).
+[Trust MC](https://github.com/alabsystems/trust-mc) /
+[Ty](https://github.com/alabsystems/ty) drive bounded and symbolic model
 checking with SAT, CHC/PDR, k-induction, counterexample validation, and
-LRAT-backed hardware checks. Clean (development-only integration)
+LRAT-backed hardware checks. [Clean](https://github.com/alabsystems/clean)
 discharges theorem goals with AY-backed tactics and reconstructs SAT, SMT,
 arithmetic, and Farkas evidence in its proof kernel.
-NY (development-only integration) uses AY's in-process MILP and SMT
+[NY](https://github.com/alabsystems/ny) uses AY's in-process MILP and SMT
 escalation paths for neural-network properties, returning validated
 counterexamples and supported certificates, and
-NN (development-only integration) exposes partial NY/AY hooks.
+[NN](https://github.com/alabsystems/nn) exposes partial NY/AY hooks.
 
 ## Similar programs
 

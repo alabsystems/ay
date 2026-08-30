@@ -76,6 +76,24 @@ pub struct ParsedClaim {
     pub source: Option<String>,
 }
 
+/// A parsed `rootdual` block: a bound on the model's optimum, together with
+/// the residual the emitter says it leaves unproved.
+///
+/// Both fields are ASSERTIONS. The certificate is re-verified against the
+/// model and `gap` is RE-DERIVED from `certificate.bound` and the verdict
+/// line; a record whose two numbers disagree is refused rather than believed,
+/// which is what stops an emitter understating how much of its own optimum is
+/// unproved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootDualBoundRecord {
+    /// The bound object: positive multipliers whose oriented combination is
+    /// the model's own objective, priced at the model's own bounds.
+    pub certificate: OptimalityCertificate,
+    /// The residual to the claimed optimum, in the model's frame, as the
+    /// emitter recorded it.
+    pub gap: BigRational,
+}
+
 /// A parsed `.ayc` file. NOTHING here is trusted: it is a set of assertions
 /// for [`check`] to re-derive.
 #[derive(Debug, Clone)]
@@ -97,6 +115,13 @@ pub struct Certificate {
     pub farkas: Option<FarkasCertificate>,
     /// The optimality certificate, when present.
     pub optcert: Option<OptimalityCertificate>,
+    /// The ROOT DUAL BOUND, when present. A SEPARATE field from `optcert` on
+    /// purpose: an `optcert` under the `dual` claim asserts that its bound IS
+    /// the optimum, while this one asserts only that the optimum is no better
+    /// than its bound. Reading one as the other would turn a partial
+    /// certificate into a complete-looking one, which is the single failure
+    /// this whole lane exists to prevent.
+    pub root_dual_bound: Option<RootDualBoundRecord>,
     /// Whether the optimality certificate was marked trivial by the emitter
     /// (re-derived by [`check`], never trusted).
     pub optcert_trivial: bool,
@@ -154,6 +179,7 @@ pub(super) const SUCCINCT_SOURCES: &[&str] = &[
     "witness",
     "farkas",
     "optcert",
+    "root-dual-bound",
     "tree",
     "optimality-tree",
     "sat-relu-rup",

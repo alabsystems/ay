@@ -58,11 +58,29 @@ pub(crate) struct PbAbSwitchesCli {
     /// Two-club frontier dump (B74).
     #[arg(long, hide = true, hide_short_help = true, hide_long_help = true)]
     pb_two_club_dump_frontier: bool,
+    /// PB certificate diagnostics: which OPT-LIN rung ran, what slice of the
+    /// certification budget it was given, and how long it took.
+    ///
+    /// THE CARRIER GAP THIS CLOSES. `MiscCliFlags::cert_debug` has existed for
+    /// a while and `crates/ay/src/cmd_pb.rs` and
+    /// `crates/ay-pb-core/src/proof/cert.rs` are full of `if
+    /// misc_cli_flags().cert_debug` diagnostics — but the flag was only ever
+    /// parsed by `ay solve`, never by `ay pb solve`. So on the PB path every
+    /// one of those sites was dead code and the certificate chain's own
+    /// scheduling could not be observed from the shipped binary at all. That is
+    /// exactly the observation this track needed: the per-route budget defect
+    /// is invisible to code review and only a measured slice settles it.
+    #[arg(long, hide = true, hide_short_help = true, hide_long_help = true)]
+    cert_debug: bool,
 }
 
 impl PbAbSwitchesCli {
     pub(super) fn proof_tap_legacy(&self) -> bool {
         self.proof_tap_legacy
+    }
+
+    fn cert_debug(&self) -> bool {
+        self.cert_debug
     }
 
     fn requested(&self) -> PbAbSwitches {
@@ -138,8 +156,27 @@ impl PbCommand {
         }
     }
 
+    fn cert_debug(&self) -> bool {
+        match self {
+            Self::Solve { ab_switches, .. } => ab_switches.cert_debug(),
+        }
+    }
+
     /// Install this command's process-constant A/B switches before solving.
     pub(super) fn install_ab_switches(&self) -> Result<()> {
+        // Diagnostics carrier, not an engine switch. INSTALL WITHOUT READING
+        // FIRST: `misc_cli_flags()` initialises the set-once global as a side
+        // effect of reading it, so an `if !misc_cli_flags().cert_debug` guard
+        // burns the cell with the default and makes the install that follows a
+        // silent no-op. (Measured: the first cut of this flag parsed fine and
+        // printed nothing.) A failed set — another command already installed
+        // flags in-process — is not an error here; the flag only decides
+        // whether comments are printed.
+        if self.cert_debug() {
+            let _ = ay_core::set_global_misc_cli_flags_with(|flags| {
+                flags.cert_debug = true;
+            });
+        }
         // A thread-scoped test override IS the resolution: reads route
         // through it, and the set-once global must not be burned (or
         // compared) on a per-test request.

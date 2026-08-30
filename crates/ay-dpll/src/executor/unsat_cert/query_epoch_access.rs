@@ -5,6 +5,39 @@
 use super::*;
 
 impl Executor {
+    /// Authenticate the source-closed proof premise inventory for one exact
+    /// plain public query.
+    ///
+    /// `exact_roots` and `source_context` originate from an opaque API binding
+    /// minted immediately after parsing on this same solver. Raw rebuilt-source
+    /// term ids need not equal folded canonical roots; they enter the returned
+    /// closure only through the proof provenance installed for this exact query
+    /// epoch. Callers must still narrow to the actually checked `Assume` set and
+    /// independently recheck the resulting bundle.
+    pub(crate) fn exact_plain_query_source_closure(
+        &self,
+        exact_roots: &[TermId],
+        source_context: &SourceContextStamp,
+    ) -> Option<Vec<TermId>> {
+        let epoch = self.checked_sat_refutation_query_epoch()?;
+        if epoch.assertions.as_slice() != exact_roots
+            || epoch.assumptions.as_deref() != Some(&[])
+            || &epoch.source_context_stamp != source_context
+            || self.ctx.assertions.as_slice() != exact_roots
+            || self.ctx.source_context_stamp() != *source_context
+        {
+            return None;
+        }
+        let provenance = self.proof_problem_assertion_provenance.as_ref()?;
+        if provenance.original_problem_assertions.as_slice() != exact_roots {
+            return None;
+        }
+        let mut closure = self.proof_export_scope_assertions();
+        let mut seen = HashSet::default();
+        closure.retain(|term| seen.insert(*term));
+        (!closure.is_empty()).then_some(closure)
+    }
+
     /// Whether the active solve is a public exact-query epoch whose eventual
     /// UNSAT publication must carry authored-scope certification.
     ///

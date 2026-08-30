@@ -34,6 +34,12 @@ pub struct EmitCtx<'a> {
     /// the general dual half of an `Optimal`, applicable to any branched MILP
     /// rather than to a recognised structure.
     pub milp_optimality_tree_certificate: Option<&'a MilpOptimalityCertificate>,
+    /// A ROOT-ONLY dual bound: exact evidence that nothing feasible beats some
+    /// value WEAKER than the claimed optimum. Offered only where the dual claim
+    /// would otherwise be `NONE`, and emitted under its own `objbound` claim --
+    /// a name that neither IS nor EXTENDS `dual` -- so it can never stand in
+    /// for, or be grepped as, the dual half it does not prove.
+    pub root_dual_bound_certificate: Option<&'a OptimalityCertificate>,
     /// Model-bound exact optimum of a recognized single-machine scheduling model.
     pub single_machine_scheduling_optimality_certificate:
         Option<&'a SingleMachineSchedulingOptimalityCertificate>,

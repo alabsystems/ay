@@ -3981,7 +3981,7 @@ impl Executor {
         match self.last_result {
             Some(SolveResult::Unsat(_)) => {
                 // Export the stored proof in Alethe format
-                match self.last_proof() {
+                match self.last_proof_with_authenticated_alethe_surface() {
                     Some(proof) => {
                         let Some(scope) = self.proof_export_scope_assertions_for(proof) else {
                             return "(error \"finite-enum proof authority is stale\")".to_string();
@@ -4043,7 +4043,7 @@ impl Executor {
         if self.last_unsat_proof_reconstruction_suppressed {
             return None;
         }
-        let proof = self.last_proof()?;
+        let proof = self.last_proof_with_authenticated_alethe_surface()?;
         // #A2b: `proof_reconstruction_step_budget` is set ONLY for the
         // synthesized-default certificate (never for explicit `--proof`,
         // `--strict-proofs`, `--self-check`, or `:produce-proofs`). Extend
@@ -4105,7 +4105,7 @@ impl Executor {
         if self.last_unsat_proof_reconstruction_suppressed {
             return None;
         }
-        let proof = self.last_proof()?;
+        let proof = self.last_proof_with_authenticated_alethe_surface()?;
         let scope = self.proof_export_scope_assertions_for(proof)?;
         let overrides = if self.last_proof_has_finite_enum_sidecar() {
             Some(self.finite_enum_surface_overrides_for_proof(proof)?.clone())
@@ -4130,7 +4130,7 @@ impl Executor {
         if self.last_unsat_proof_reconstruction_suppressed {
             return None;
         }
-        let proof = self.last_proof()?;
+        let proof = self.last_proof_with_authenticated_alethe_surface()?;
         // #A2b: same emission-budget contract as the String variant above.
         if self.last_proof_has_finite_enum_sidecar() {
             let Some(overrides) = self.finite_enum_surface_overrides_for_proof(proof) else {

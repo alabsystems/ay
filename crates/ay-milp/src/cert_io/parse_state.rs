@@ -32,6 +32,7 @@ impl ParseState {
                 farkas: None,
                 optcert: None,
                 optcert_trivial: false,
+                root_dual_bound: None,
                 tree: None,
                 opt_tree: None,
                 affine_aggregation: None,

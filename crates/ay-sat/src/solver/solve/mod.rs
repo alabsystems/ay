@@ -36,7 +36,7 @@ mod preprocessing_extension_transaction;
 #[cfg(test)]
 mod tests;
 mod theory_backend;
-mod theory_callback;
+pub(in crate::solver) mod theory_callback;
 mod theory_entry;
 
 use super::config_preprocess_cleanup::PreprocessOutcome;

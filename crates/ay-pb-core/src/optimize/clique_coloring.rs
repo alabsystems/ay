@@ -85,7 +85,7 @@ use crate::types::{PbConstraint, PbInstance, PbObjective, PbRel};
 /// A detected clique-coloring instance: the recovered family parameters and the
 /// positional variable layout. All offsets are 0-based into the `[0, num_vars)`
 /// assignment vector (i.e. `var_id - 1`).
-struct CliqueColoringShape {
+pub(crate) struct CliqueColoringShape {
     /// Number of nodes / first-grouping slots / objective indicators.
     n: usize,
     /// Number of second-grouping colours.
@@ -118,6 +118,38 @@ impl CliqueColoringShape {
     /// 1-indexed variable id of `g2(b,k)` (`b` in `1..=n`, `k` in `1..=t`).
     fn g2_var(&self, b: usize, k: usize) -> usize {
         self.base_g2 + self.t * (b - 1) + k
+    }
+
+    // --- Accessors for the OPT-LIN certificate emitter -------------------
+    //
+    // The certifier in `proof::cert::clique_coloring` reuses THIS recognizer
+    // rather than carrying a second one, so the certificate and the solver's
+    // answer can never disagree about what the instance is. These are the same
+    // positional formulas above, published under names the emitter reads in.
+
+    /// Number of nodes / slots / objective indicators.
+    pub(crate) fn n(&self) -> usize {
+        self.n
+    }
+    /// Number of second-stage colours.
+    pub(crate) fn t(&self) -> usize {
+        self.t
+    }
+    /// 1-indexed id of the objective indicator for slot `i` (`1..=n`).
+    pub(crate) fn obj(&self, i: usize) -> usize {
+        self.obj_var(i)
+    }
+    /// 1-indexed id of "vertex `b` occupies slot `s`" (`b, s` in `1..=n`).
+    pub(crate) fn g1(&self, b: usize, s: usize) -> usize {
+        self.g1_var(b, s)
+    }
+    /// 1-indexed id of "vertex `b` takes colour `k`" (`b` in `1..=n`, `k` in `1..=t`).
+    pub(crate) fn g2(&self, b: usize, k: usize) -> usize {
+        self.g2_var(b, k)
+    }
+    /// 1-indexed id of the edge between vertices `a < b` (both in `1..=n`).
+    pub(crate) fn edge(&self, a: usize, b: usize) -> usize {
+        self.edge_var(a, b)
     }
 }
 
@@ -163,6 +195,13 @@ fn key_of(rel: u8, rhs: i128, mut pairs: Vec<(i128, u32)>) -> ConstraintKey {
 /// canonical family EXACTLY. Returns `None` for anything that is not precisely
 /// this shape (detection is intentionally strict — a mismatch costs only the scan
 /// and falls through to the portfolio).
+pub(crate) fn detect_shape(
+    instance: &PbInstance,
+    objective: &PbObjective,
+) -> Option<CliqueColoringShape> {
+    detect(instance, objective)
+}
+
 fn detect(instance: &PbInstance, objective: &PbObjective) -> Option<CliqueColoringShape> {
     let num_vars = instance.num_vars as usize;
     let n = objective.terms.len();

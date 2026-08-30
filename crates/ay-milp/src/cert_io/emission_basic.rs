@@ -148,6 +148,40 @@ pub(super) fn optcert_block(oc: &OptimalityCertificate, trivial: bool) -> String
     s
 }
 
+/// The `rootdual` block: a bound on the model's optimum that is NOT a proof of
+/// it, written so that the part it leaves unproved is a field of the record.
+///
+/// Same shape as [`optcert_block`] — a bound, the objective it bounds, and the
+/// multipliers — plus one field `optcert` does not have and must not have:
+/// `gap`, the residual between this bound and the value the verdict line
+/// claims. `optcert` under the `dual` claim asserts that its bound IS the
+/// optimum, so a residual there would be a contradiction; a `rootdual` asserts
+/// only that the optimum is no better than `bound`, so the distance still to be
+/// closed is the single most important thing a reader needs and it is written
+/// down rather than left to be inferred.
+///
+/// `gap` is REDUNDANT BY CONSTRUCTION — it is a function of `bound`, the
+/// model's offset and the verdict line — and that is exactly why it is safe to
+/// write: the checker RE-DERIVES it and refuses the block if the two disagree,
+/// so an emitter cannot understate its own residual. Everything load-bearing
+/// still has exactly one source.
+pub(super) fn root_dual_block(oc: &OptimalityCertificate, gap: &BigRational) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "rootdual sense={} bound={} gap={} frame=model",
+        sense_token(oc.sense),
+        fmt_rat(&oc.bound),
+        fmt_rat(gap)
+    );
+    for (c, a) in &oc.objective {
+        let _ = writeln!(s, "obj {c} {}", fmt_rat(a));
+    }
+    write_multipliers(&mut s, &oc.multipliers);
+    let _ = writeln!(s, "end");
+    s
+}
+
 /// The `opttree` block: a whole-tree OPTIMALITY certificate's DUAL half.
 ///
 /// The witness rides in the certificate's own `witness` block (the `primal`

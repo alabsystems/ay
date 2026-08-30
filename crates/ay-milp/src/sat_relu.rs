@@ -2304,6 +2304,7 @@ mod tests {
             network_design_optimality_certificate: session.network_design_optimality_certificate(),
             block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
             milp_optimality_tree_certificate: None,
+            root_dual_bound_certificate: None,
             single_machine_scheduling_optimality_certificate: session
                 .single_machine_scheduling_optimality_certificate(),
             single_row_dp_infeasibility_certificate: session
@@ -3223,6 +3224,7 @@ mod tests {
             network_design_optimality_certificate: session.network_design_optimality_certificate(),
             block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
             milp_optimality_tree_certificate: None,
+            root_dual_bound_certificate: None,
             single_machine_scheduling_optimality_certificate: session
                 .single_machine_scheduling_optimality_certificate(),
             single_row_dp_infeasibility_certificate: session

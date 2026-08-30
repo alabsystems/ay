@@ -467,6 +467,14 @@ const HARNESS_FLAGS: &[(&str, &str, &str)] = &[
     ),
     (
         "src/bin/ay-milp.rs",
+        "no-root-dual",
+        "WIRED. Read in `cmd_solve` (`flags.has(\"no-root-dual\")`) to skip the ROOT DUAL \
+         BOUND derivation — the partial dual evidence offered where the whole-tree proof \
+         declined. Its two value siblings `--root-dual-rim` and `--root-dual-secs` are in \
+         `VALUE_FLAGS` and read in the same block.",
+    ),
+    (
+        "src/bin/ay-milp.rs",
         "deterministic",
         "WIRED, in the `ay_milp` bin SUBMODULE (`solve_options.rs`), which is why a \
          grep of `ay-milp.rs` alone finds no reader and must not be trusted: it calls \

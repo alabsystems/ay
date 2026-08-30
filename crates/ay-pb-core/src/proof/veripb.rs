@@ -12,7 +12,7 @@ use std::{
 use thiserror::Error;
 
 use crate::cutting_planes::CpConstraint;
-use crate::types::{PbInstance, PbLit, PbRel};
+use crate::types::{PbConstraint, PbInstance, PbLit, PbRel};
 
 use super::steps::{ConstraintId, ProofStep};
 
@@ -389,6 +389,20 @@ pub(crate) fn write_opt_conclusion_hinted<W: Write>(
     Ok(())
 }
 
+/// How many VeriPB `f` constraint ids a single input row occupies.
+///
+/// VeriPB's OPB loader expands `=` into the `>=` half followed by the `<=`
+/// half, so an equality owns TWO consecutive ids and everything after it is
+/// shifted. This is the ONE place that fact is encoded; both the header count
+/// and the index->id map below are derived from it so they cannot drift apart.
+fn veripb_row_id_width(constraint: &PbConstraint) -> u64 {
+    if constraint.rel == PbRel::Eq {
+        2
+    } else {
+        1
+    }
+}
+
 /// Returns the number of input constraints in VeriPB's imported formula.
 ///
 /// VeriPB expands equality rows into two `>=` constraints, so proof headers
@@ -398,10 +412,35 @@ pub fn veripb_input_constraint_count(instance: &PbInstance) -> Result<u64> {
         .constraints
         .iter()
         .try_fold(0u64, |count, constraint| {
-            let contribution = if constraint.rel == PbRel::Eq { 2 } else { 1 };
-            count.checked_add(contribution)
+            count.checked_add(veripb_row_id_width(constraint))
         })
         .ok_or(ProofError::ConstraintIdOverflow)
+}
+
+/// Maps every `instance.constraints[i]` to the VeriPB `f` id of its FIRST
+/// imported half, so `result[i]` is the id a `pol` step must cite to use row
+/// `i`. For a `Ge` row that is the only half; for an `Eq` row the `<=` half
+/// lives at `result[i] + 1`.
+///
+/// WHY THIS EXISTS. `result[i] == i + 1` holds only while no `=` row precedes
+/// `i`. `certify_opt_lin_direct_aggregation_floor` assumed it unconditionally
+/// and, on `normalized-fx57.opb` (3,286 rows, 57 of them `=`), cited id 3286
+/// for the row VeriPB had imported as 3343 — a real, unrelated row. Every `pol`
+/// step still parsed, so the defect surfaced only at the very last line, as
+/// `conclusion BOUNDS`'s hint failing to imply the bound. The header count of
+/// the same proof was already correct, because it came from
+/// [`veripb_input_constraint_count`], which does account for the split: one
+/// file, two mappings, one of them wrong. There is now one mapping.
+pub fn veripb_input_row_ids(instance: &PbInstance) -> Result<Vec<ConstraintId>> {
+    let mut ids = Vec::with_capacity(instance.constraints.len());
+    let mut next: u64 = 1;
+    for constraint in &instance.constraints {
+        ids.push(ConstraintId::new(next).ok_or(ProofError::ConstraintIdOverflow)?);
+        next = next
+            .checked_add(veripb_row_id_width(constraint))
+            .ok_or(ProofError::ConstraintIdOverflow)?;
+    }
+    Ok(ids)
 }
 
 /// Formats a pseudo-Boolean literal in VeriPB / OPB notation.

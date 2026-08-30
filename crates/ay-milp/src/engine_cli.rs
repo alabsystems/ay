@@ -354,6 +354,8 @@ pub const VALUE_FLAGS: &[&str] = &[
     "opt-tree-leaves",
     "opt-tree-work",
     "opt-tree-grid",
+    "root-dual-rim",
+    "root-dual-secs",
     "emit-witness",
     "witness-format",
     "format",

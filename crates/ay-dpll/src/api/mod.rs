@@ -90,8 +90,8 @@ pub use rec_defs::{
 // Re-export all public types for backwards compatibility
 pub use introspect::TermKind;
 pub use proofs::{
-    FarkasCertificate, ProofAcceptanceError, ProofAcceptanceMode, StrictProofVerdict,
-    UnsatProofArtifact,
+    ExactSmtlibQueryBinding, FarkasCertificate, ProofAcceptanceError, ProofAcceptanceMode,
+    StrictProofVerdict, UnsatProofArtifact,
 };
 pub use solving::{
     ApplyResult, Goal, ParsedPublicFormulaMetadata, ParsedPublicTermMetadata, ParsedSmtlib2Batch,

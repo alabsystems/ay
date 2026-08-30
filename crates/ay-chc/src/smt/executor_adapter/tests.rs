@@ -8,7 +8,6 @@ use super::*;
 use crate::expr::eval_array_select;
 use crate::{ChcDtConstructor, ChcDtSelector, ChcSort, ChcVar};
 use std::sync::Arc;
-
 /// Test helper: call term_body_to_smt_value with empty DT ctor set.
 fn tv(term: &ay_frontend::Term) -> Option<SmtValue> {
     term_body_to_smt_value(term, &FxHashSet::default())
@@ -1866,6 +1865,7 @@ fn split_leading_set_logic_falls_back_and_leaves_unrecognized_input_alone() {
         assert_eq!(body, odd, "must be untouched: {odd:?}");
     }
 }
+mod strict_unsat;
 
 /// #cert-accounting item 3/6: the declared query role reaches ay-dpll and is
 /// attributed there, and declaring it changes no verdict.

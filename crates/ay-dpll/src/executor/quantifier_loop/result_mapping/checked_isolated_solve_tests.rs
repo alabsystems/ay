@@ -267,3 +267,175 @@ fn a_digit_free_internal_symbol_does_not_veto_the_prune() {
         probe_ctx.terms.len()
     );
 }
+
+/// The RoundingMode branch image the finite-domain expansion hands this probe,
+/// with the RM-literal equality left UNFOLDED — the shape a producer that
+/// forgets `rm_literal_atom_folds` (or any other substituting pass) yields.
+///
+/// It is a regression pin for the probe/top-level ASYMMETRY that was reported
+/// and does not exist: measured at c8a7afd54, the probe and a fresh top-level
+/// `check_sat` return the SAME verdict on this exact root vector, and both
+/// returned `Unknown`. The cause was never a probe environment that loses the
+/// Pass-B axioms — `rm_domain_axioms` produces the identical distinct-5 axiom
+/// on both sides — but that neither side's axiom NAMED the substitution-built
+/// atom. See `executor::rm_domain::RmLiteralAtoms`.
+///
+/// # Why an unconstrained RM atom could not publish a wrong `sat`
+///
+/// The residual this closes was a RELAXATION (an atom no axiom names), so the
+/// lane's `unsat` stayed sound and only its `sat` could be wrong. That a wrong
+/// probe `sat` cannot cross [`Executor::checked_isolated_solve`] is a claim
+/// about SAT-certificate MINTING, and `GroundDecision` accepts a certificate
+/// from ANY lane — `SatCertificate::confirms_sat_emission` is exhaustive over
+/// all three kinds — so naming only the ordinary funnel is not a proof. There
+/// are FOUR minting sites in non-test code, all in `model/sat_emit.rs`
+/// (`last_sat_certificate = Some(..)`; the other two occurrences in that file
+/// are `#[cfg(test)]`), and each needs its own permit:
+///
+/// 1. `emit_sat_verdict`, VACUOUS arm — guarded by
+///    `self.ctx.assertions.is_empty() && roots.is_empty()`. With no assertions
+///    and no roots there is no RM atom in the DAG at all, so `rm_domain_axioms`
+///    returns `NoMention` and this pass contributes nothing to reach it.
+/// 2. `emit_sat_verdict`, TERMINAL arm — mints only when `gated == Sat`, i.e.
+///    after `apply_independent_model_gate` returns `ConfirmedSat` over
+///    `independent_gate_query_roots`. Those are the probe's own installed
+///    roots: the Pass-B axioms are scope-transient and restored before
+///    emission, so the gate judges the query, not the axiom set. A model that
+///    violates a free RM atom fails there — MEASURED twice, as
+///    `MODEL-UNCONFIRMED ... Assertion N violated`, both times degrading to
+///    `unknown` rather than publishing.
+/// 3. `emit_checked_projection_sat` and
+/// 4. `emit_checked_exact_exists_sat` — both live inside
+///    `check_sat_guarded`'s `if let Some(permit) = projection_authority`
+///    block. A probe enters through `Executor::check_sat`, which passes `None`
+///    and, by its own contract, "cannot infer authority from call depth or
+///    assertion shape". So neither lane is reachable from a probe at all, which
+///    `a_probe_route_solve_carries_no_projection_authority` pins.
+///
+/// A fifth minting site added later would NOT inherit any of these permits.
+mod rm_literal_atom_probe {
+    use super::*;
+
+    const RM_BRANCH_SCRIPT: &str = "(declare-const rm RoundingMode) \
+         (assert (= (fp.roundToIntegral rm ((_ to_fp 8 24) RNE 2.5)) ((_ to_fp 8 24) RNE 2.0))) \
+         (assert (= rm roundTowardPositive))";
+
+    fn branch_image(executor: &mut Executor) -> Vec<TermId> {
+        let roots = executor.ctx.assertions.clone();
+        let rtn = crate::executor::rm_domain::rm_literal_term(
+            &mut executor.ctx.terms,
+            ay_fp::RoundingMode::RTN,
+        );
+        let variable = (0..executor.ctx.terms.len())
+            .map(|index| TermId(u32::try_from(index).expect("arena index fits u32")))
+            .find(
+                |&id| matches!(executor.ctx.terms.get(id), TermData::Var(name, _) if name == "rm"),
+            )
+            .expect("the fixture declares `rm`");
+        let mut map = ay_core::kani_compat::DetHashMap::default();
+        map.insert(variable, rtn);
+        roots
+            .iter()
+            .map(|&root| executor.ctx.terms.substitute_terms(root, &map))
+            .collect()
+    }
+
+    fn branch_executor() -> (Executor, Vec<TermId>) {
+        let commands = parse(RM_BRANCH_SCRIPT).expect("RM branch fixture parses");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("RM branch fixture executes");
+        let image = branch_image(&mut executor);
+        (executor, image)
+    }
+
+    /// The UNSAT-only probe decides the branch.
+    #[test]
+    fn exact_unsat_probe_refutes_the_substituted_rm_branch() {
+        let (mut executor, image) = branch_executor();
+        executor.begin_public_solve(false);
+        executor.bind_unsat_query_assumptions(&[]);
+        let outcome = executor
+            .checked_isolated_solve(image.clone(), CheckedIsolatedMode::ExactUnsat, 5_000)
+            .map(|(_, kind)| kind);
+        assert!(
+            matches!(outcome, Some(CheckedGroundKind::Unsat)),
+            "the exact-UNSAT probe must refute the branch, got {outcome:?}"
+        );
+    }
+
+    /// ...and so does the ground-decision probe, which is the one whose `Sat`
+    /// arm carries authority.
+    #[test]
+    fn ground_decision_probe_refutes_the_substituted_rm_branch() {
+        let (mut executor, image) = branch_executor();
+        executor.begin_public_solve(false);
+        executor.bind_unsat_query_assumptions(&[]);
+        let outcome = executor
+            .checked_isolated_solve(image.clone(), CheckedIsolatedMode::GroundDecision, 5_000)
+            .map(|(_, kind)| kind);
+        assert!(
+            matches!(outcome, Some(CheckedGroundKind::Unsat)),
+            "the ground-decision probe must refute the branch, got {outcome:?}"
+        );
+    }
+
+    /// The permit half of the four-site argument in this module's docs: the
+    /// route a probe takes into `check_sat_guarded` carries NO
+    /// `AuthoredPlainHardQueryPermit`, so `emit_checked_projection_sat` and
+    /// `emit_checked_exact_exists_sat` — the two SAT-certificate lanes that do
+    /// not run the independent model gate — are unreachable behind it.
+    #[test]
+    fn a_probe_route_solve_carries_no_projection_authority() {
+        let (executor, image) = branch_executor();
+        let mut top = Executor::new();
+        top.ctx = executor.ctx.clone();
+        top.ctx
+            .process_command(&ay_frontend::Command::ResetAssertions)
+            .expect("the derived query resets the outer assertions");
+        for &root in &image {
+            top.ctx.add_assertion_with_parsed(
+                root,
+                ay_frontend::command::Term::Symbol(NATIVE_API_ASSERTION_PLACEHOLDER.to_string()),
+            );
+        }
+        top.begin_public_solve(false);
+        top.bind_unsat_query_assumptions(&[]);
+        let _ = top.check_sat().expect("the solve completes");
+        assert!(
+            !top.last_authored_query_authority_seen,
+            "`Executor::check_sat` must reach the solve with no projection permit"
+        );
+    }
+
+    /// THE ASYMMETRY CLAIM, PINNED. A fresh top-level `check_sat` over exactly
+    /// the probe's root vector must agree with the probe. This is what makes
+    /// "the probe environment loses something the top level has" a falsifiable
+    /// statement rather than a diagnosis: if a future change gives the probe a
+    /// weaker environment than the top level, these two verdicts diverge here.
+    #[test]
+    fn the_probe_and_a_fresh_top_level_solve_agree_on_the_branch() {
+        let (executor, image) = branch_executor();
+
+        let mut top = Executor::new();
+        top.ctx = executor.ctx.clone();
+        top.ctx
+            .process_command(&ay_frontend::Command::ResetAssertions)
+            .expect("the derived query resets the outer assertions");
+        for &root in &image {
+            top.ctx.add_assertion_with_parsed(
+                root,
+                ay_frontend::command::Term::Symbol(NATIVE_API_ASSERTION_PLACEHOLDER.to_string()),
+            );
+        }
+        top.begin_public_solve(false);
+        top.bind_unsat_query_assumptions(&[]);
+        let verdict = top.check_sat().expect("the top-level solve completes");
+        assert!(
+            verdict.is_unsat(),
+            "a fresh top-level solve over the probe's own roots must reach the \
+             same verdict the probe does, got {verdict:?}"
+        );
+    }
+}

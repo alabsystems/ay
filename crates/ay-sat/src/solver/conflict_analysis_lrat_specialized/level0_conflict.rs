@@ -6,6 +6,7 @@
 
 use super::super::*;
 use crate::kani_compat::det_hash_set_new;
+use crate::solver::solve::theory_callback::TheoryCallback;
 
 impl Solver {
     /// Record the BCP resolution chain for a level-0 conflict (#4176).
@@ -89,6 +90,59 @@ impl Solver {
                 self.min.lrat_to_clear.push(var_idx);
             }
         }
+    }
+
+    /// Record a level-0 theory model conflict, then declare UNSAT
+    /// (#cert-level0-theory-conflict).
+    ///
+    /// The `TheoryModelCheck::Conflict` arm of the unified CDCL loop used to
+    /// DISCARD the theory's conflict clause and call `declare_unsat()`
+    /// directly. `finalize_unsat_proof` then stamps `trace.mark_empty()`
+    /// (`solve/finalize_unsat.rs`) onto a clause trace holding NO derivation,
+    /// producing a trace that CLAIMS UNSAT and cannot back it — the
+    /// certificate consumer's `EmptyMarkerWithoutDerivedEmpty` decline.
+    ///
+    /// Recording the T-lemma confers NO authority. It lands as an
+    /// `is_original` trace entry — the same shape a successful mint already
+    /// has — and the exact fragment independently re-derives authority for
+    /// EVERY original entry (`sat_proof_manager/exact_fragment/build_steps.rs`
+    /// gates a theory annotation on `clauses_equivalent` plus
+    /// `rebind_theory_annotation`) and never trusts the flag. A T-lemma with
+    /// no registered proof therefore still declines, now naming the real
+    /// reason: `UnauthenticatedOriginalClause`.
+    ///
+    /// When there is nothing to record — the theory asserted UNSAT with no
+    /// explanation at all, or the lemma is not a usable level-0 conflict
+    /// (`add_theory_lemma_scoped` may attach an unassigned scope selector, and
+    /// `add_theory_conflict_lemma` then leaves no terminal chain) — the trace
+    /// keeps today's imprecise decline. MEASURED: stamping
+    /// `mark_proof_work_exhausted()` to make that decline honest is NOT safe.
+    /// The stamp is consumed by `sat_proof_manager` ("skipping best-effort
+    /// default certificate"), which abandons SAT proof reconstruction
+    /// outright; the SMT proof then degenerates to a `TheoryLemma { Generic }`
+    /// that mandatory strict certification rejects, turning published UNSAT
+    /// verdicts into `unknown`. Nothing mints from that shape either way, so
+    /// the imprecise decline is strictly better than losing correct answers.
+    pub(in crate::solver) fn declare_level0_theory_conflict_unsat<C: TheoryCallback>(
+        &mut self,
+        callback: &mut C,
+        clause: Vec<Literal>,
+    ) -> SatResult {
+        if !clause.is_empty() {
+            // #8467: materialize before the lemma is added (lazy table
+            // indexes are not arena offsets).
+            //
+            // `add_theory_conflict_lemma` does the whole job: it writes the
+            // `is_original` trace entry and, on detecting the all-false lemma
+            // at level 0, emits the terminal chain itself. Driving
+            // `record_level0_conflict_chain` afterwards appends a DUPLICATE
+            // empty clause and trades this decline for
+            // `EntryAfterTerminalEmpty` — measured on every reproducing
+            // instance.
+            callback.materialize_lazy_reasons(self);
+            self.add_theory_conflict_lemma(clause);
+        }
+        self.declare_unsat()
     }
 
     fn materialize_level0_conflict_clause_id(

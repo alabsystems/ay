@@ -1065,7 +1065,7 @@ impl Solver {
                     }
                     TheoryModelCheck::Conflict(clause) => {
                         if self.decision_level == 0 {
-                            return self.declare_unsat();
+                            return self.declare_level0_theory_conflict_unsat(callback, clause);
                         }
                         if let Some(result) = callback.handle_conflict_clause(self, clause) {
                             return result;

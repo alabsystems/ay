@@ -179,7 +179,7 @@ fn reachable_authored_assume_restores_its_exact_unique_source_index() {
 }
 
 #[test]
-fn duplicate_authored_root_indices_decline_assume_surface_restoration() {
+fn duplicate_root_with_identity_row_uses_exact_canonical_surface() {
     let mut executor = Executor::new();
     let (canonical, negated) = comparison_surface_fixture(&mut executor);
     executor
@@ -201,11 +201,11 @@ fn duplicate_authored_root_indices_decline_assume_surface_restoration() {
 
     assert!(
         executor.last_proof_term_overrides.is_none(),
-        "an ambiguous canonical root must not pick one authored spelling"
+        "an exact canonical row needs no authored override"
     );
     assert!(
-        executor.last_unsat_proof_reconstruction_suppressed,
-        "ambiguous source provenance must suppress external proof publication"
+        !executor.last_unsat_proof_reconstruction_suppressed,
+        "a canonical source row authenticates the identity presentation"
     );
 }
 

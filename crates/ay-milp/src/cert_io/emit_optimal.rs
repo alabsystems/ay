@@ -30,11 +30,54 @@ pub(super) fn emit_optimal(emission: &mut Emission<'_, '_>, outcome: &Outcome) -
     } else {
         emit_special_optimality(emission)
     };
+    // SUBORDINATE, AND ONLY WHERE THERE IS NOTHING TO BE SUBORDINATE TO. A root
+    // bound proves strictly less than the dual claim it sits beside, so it is
+    // offered only where that claim came out unbacked. Where an artifact already
+    // proves the optimum, adding a weaker statement about the same model would
+    // be noise at best and, at worst, an invitation to read the pair as one
+    // hedged claim.
+    let dual_is_backed = dual.kind == EvidenceKind::Succinct;
     emission.claims.push(dual);
+    if !dual_is_backed {
+        if let Some(claim) = emit_root_dual_bound(emission, value) {
+            emission.claims.push(claim);
+        }
+    }
     format!(
         "verdict optimal value={} frame=file",
         fmt_rat(&(value / emission.ctx.obj_scale))
     )
+}
+
+/// The `objbound` claim: a checkable bound that is NOT the optimum, with the
+/// residual it leaves unproved written into the block.
+///
+/// The name does not contain `dual` ON PURPOSE. It is checked by a separate
+/// arm, reported under a separate standing and refused by a separate policy,
+/// and none of that survives contact with a reader if the token it is printed
+/// under has `dual` as a prefix -- see `CLAIM_NAMES` for the measured failure
+/// that costs.
+///
+/// Returns `None` — emitting nothing at all — when the derived bound is not
+/// consistent with the verdict being certified. That is the fail-closed
+/// direction: a bound BETTER than the claimed optimum would mean the verdict is
+/// wrong, and dressing that contradiction up as evidence is the one thing this
+/// lane must never do.
+fn emit_root_dual_bound(
+    emission: &mut Emission<'_, '_>,
+    value: &BigRational,
+) -> Option<EmittedClaim> {
+    let certificate = emission.ctx.root_dual_bound_certificate?;
+    // The RESIDUAL is derived here from the certificate and the verdict value,
+    // by the same function the checker re-runs. There is no separate emitter
+    // arithmetic for it to drift from.
+    let gap = crate::root_dual::root_dual_gap(certificate, emission.ctx.model, value).ok()?;
+    Some(emission.block_claim(
+        "objbound",
+        root_dual_block(certificate, &gap),
+        "root-dual-bound",
+        "root-dual-bound",
+    ))
 }
 
 fn emit_special_optimality(emission: &mut Emission<'_, '_>) -> EmittedClaim {

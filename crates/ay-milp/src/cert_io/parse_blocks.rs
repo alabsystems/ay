@@ -26,6 +26,14 @@ pub(super) fn parse_core_block(
             state.certificate.optcert_trivial = trivial;
             *line = next;
         }
+        "rootdual" => {
+            if state.certificate.root_dual_bound.is_some() {
+                return Err(malformed(*line, "duplicate rootdual block"));
+            }
+            let (record, next) = parse_root_dual(lines, *line)?;
+            state.certificate.root_dual_bound = Some(record);
+            *line = next;
+        }
         "tree" => {
             let (root, next) = parse_tree(lines, *line + 1)?;
             state.certificate.tree = Some(MilpInfeasibilityCertificate { root });

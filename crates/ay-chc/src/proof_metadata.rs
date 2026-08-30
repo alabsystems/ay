@@ -85,14 +85,8 @@ pub(crate) const CHC_REPLAY_CHECKER_IDENTITY_SCHEMA: &str = "ay.chc-replay-check
 /// Schema tag for checked replay command result rows.
 pub(crate) const CHC_REPLAY_CHECK_RESULT_SCHEMA: &str = "ay.chc-replay-check-result/v1";
 
-/// Stable schema tag for a native strict certificate plus bound Alethe
-/// diagnostic recorded alongside an UNSAT replay obligation.
-///
-/// The string retains its historical `strict-alethe` spelling for wire
-/// compatibility; the `verdict` authenticates the native bundle, not an
-/// external checker verdict for the Alethe text.
-pub(crate) const CHC_OBLIGATION_STRICT_CERT_SCHEMA: &str =
-    "ay.chc-obligation-strict-alethe-cert/v1";
+mod strict_cert;
+pub use strict_cert::ChcObligationStrictCert;
 
 /// Schema tag for binding a checked replay summary to one evidence manifest.
 pub const CHC_CHECKED_REPLAY_MANIFEST_BINDING_SCHEMA: &str =
@@ -956,112 +950,6 @@ impl ChcReplayCheckResult {
     }
 }
 
-/// Native strict-verdict commitments for one UNSAT replay obligation.
-///
-/// This row records that AY's in-process, no-z3 checker verified the
-/// obligation. It retains hashes of the rendered Alethe diagnostic and the
-/// serialized bundle, not their bytes, so it is not standalone/offline proof
-/// evidence. The Alethe text may honestly contain a hole, and deferred-trust
-/// rescue may accept theory steps that the narrower plain
-/// `ay_dpll::api::re_check_bundle_strict` rejects. `verdict` is always
-/// `"verified"`; a rejected or absent in-process verdict fails closed before a
-/// row is recorded.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ChcObligationStrictCert {
-    /// SHA-256 over the rendered Alethe proof text.
-    pub alethe_sha256: String,
-    /// SHA-256 commitment to the serialized proof-bundle diagnostic.
-    pub bundle_sha256: String,
-    /// AY-native strict verdict — `"verified"` for any recorded cert.
-    pub verdict: String,
-}
-
-impl ChcObligationStrictCert {
-    /// Build a native strict-certificate record from the bound digests.
-    pub(crate) fn new(
-        alethe_sha256: impl Into<String>,
-        bundle_sha256: impl Into<String>,
-        verdict: impl Into<String>,
-    ) -> Self {
-        Self {
-            alethe_sha256: alethe_sha256.into(),
-            bundle_sha256: bundle_sha256.into(),
-            verdict: verdict.into(),
-        }
-    }
-
-    /// Render the certificate record as JSON.
-    pub fn to_json_value(&self) -> serde_json::Value {
-        serde_json::json!({
-            "schema": CHC_OBLIGATION_STRICT_CERT_SCHEMA,
-            "schema_version": 1,
-            "alethe_sha256": self.alethe_sha256,
-            "bundle_sha256": self.bundle_sha256,
-            "verdict": self.verdict,
-        })
-    }
-
-    /// Parse an OPTIONAL strict-cert record. Absence returns `None` with no
-    /// reason (backward compatible); a present-but-malformed record pushes a
-    /// reason and returns `None`.
-    fn from_json_value_opt(
-        object: &serde_json::Map<String, serde_json::Value>,
-        key: &str,
-        label: &str,
-        reasons: &mut Vec<String>,
-    ) -> Option<Self> {
-        match object.get(key) {
-            None | Some(serde_json::Value::Null) => None,
-            Some(value) => {
-                let Some(object) = value.as_object() else {
-                    reasons.push(format!("{label} is not an object"));
-                    return None;
-                };
-                expect_json_string(
-                    object,
-                    "schema",
-                    CHC_OBLIGATION_STRICT_CERT_SCHEMA,
-                    &format!("{label}.schema"),
-                    reasons,
-                );
-                expect_json_u64(
-                    object,
-                    "schema_version",
-                    1,
-                    &format!("{label}.schema_version"),
-                    reasons,
-                );
-                let alethe_sha256 = string_field(
-                    object,
-                    "alethe_sha256",
-                    &format!("{label}.alethe_sha256"),
-                    reasons,
-                )?;
-                let bundle_sha256 = string_field(
-                    object,
-                    "bundle_sha256",
-                    &format!("{label}.bundle_sha256"),
-                    reasons,
-                )?;
-                let verdict =
-                    string_field(object, "verdict", &format!("{label}.verdict"), reasons)?;
-                Some(Self::new(alethe_sha256, bundle_sha256, verdict))
-            }
-        }
-    }
-
-    fn identity_input(&self) -> String {
-        format!(
-            "{}\nalethe_sha256={}\nbundle_sha256={}\nverdict={}\n",
-            CHC_OBLIGATION_STRICT_CERT_SCHEMA,
-            self.alethe_sha256,
-            self.bundle_sha256,
-            json_string(&self.verdict),
-        )
-    }
-}
-
 /// One checked CHC replay obligation query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1103,14 +991,13 @@ impl ChcCheckedReplayObligation {
         }
     }
 
-    /// Attach native strict-verdict commitments to this obligation row.
+    /// Attach native strict proof-bundle commitments to this obligation row.
     ///
     /// Used for UNSAT obligations discharged via
     /// `smtlib_strict_unsat_cert_via_executor`: the row records that AY's
-    /// in-process, no-z3 checker verified the obligation rather than merely
-    /// trusting a re-run verdict. It stores only diagnostic hashes, not a
-    /// standalone certificate; the Alethe diagnostic may disclose unsupported
-    /// wire rules as `hole`.
+    /// in-process, no-z3 offline checker verified the exact-bound bundle rather
+    /// than merely trusting a re-run verdict. It stores only commitments, not
+    /// the standalone bundle bytes; Alethe presentation is optional.
     #[must_use]
     pub(crate) fn with_strict_cert(mut self, cert: ChcObligationStrictCert) -> Self {
         self.strict_cert = Some(cert);
@@ -1200,7 +1087,8 @@ impl ChcCheckedReplayObligation {
         // Include the strict cert in identity only when present, so obligations
         // recorded before this evidence existed keep their prior identity
         // (backward compatible), while a cert-bearing obligation binds its
-        // Alethe/bundle digests into the obligation identity.
+        // bundle checker/schema, bundle digest, and explicit Alethe-presence
+        // state into the obligation identity.
         if let Some(cert) = &self.strict_cert {
             out.push_str(&cert.identity_input());
         }

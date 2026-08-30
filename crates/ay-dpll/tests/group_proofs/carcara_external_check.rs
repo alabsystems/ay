@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+#[path = "carcara_external_check/duplicate_authored_root.rs"]
+mod duplicate_authored_root;
 #[path = "carcara_external_check/folded_atom_assumptions.rs"]
 mod folded_atom_assumptions;
 #[path = "carcara_external_check/folded_conjunction_assumptions.rs"]

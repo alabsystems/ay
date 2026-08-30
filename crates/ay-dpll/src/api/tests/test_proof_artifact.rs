@@ -10,7 +10,7 @@
 use crate::api::proofs::strict_verdict_from_result;
 use crate::api::*;
 use ay_core::{AletheRule, FarkasAnnotation, ProofStep, Symbol, TheoryLemmaKind};
-
+mod duplicate_authored_root;
 #[test]
 fn finite_enum_artifact_is_native_strict_and_explicitly_holey_on_alethe_wire() {
     #[allow(deprecated)]

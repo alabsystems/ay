@@ -110,6 +110,58 @@ impl Solver {
             .collect())
     }
 
+    /// Parse one fresh plain-hard SMT-LIB query and mint its opaque proof binding.
+    ///
+    /// The solver must have no pre-existing hard assertions, soft constraints,
+    /// or objectives. The parse itself must add at least one hard assertion and
+    /// no soft/objective state. Declarations and definitions are included in the
+    /// captured source-context identity. Any later declaration, definition,
+    /// assertion, reset, or sibling-solver use makes proof export with this
+    /// binding fail closed.
+    ///
+    /// Query commands are skipped exactly as in [`Self::parse_smtlib2`]; callers
+    /// that accept only one command shape must validate that shape separately.
+    pub fn parse_smtlib2_with_exact_query_binding(
+        &mut self,
+        input: &str,
+    ) -> Result<crate::api::proofs::ExactSmtlibQueryBinding, SolverError> {
+        let context = self.executor.context();
+        if !context.assertions.is_empty()
+            || !context.soft_constraints().is_empty()
+            || !context.objectives().is_empty()
+        {
+            return Err(SolverError::InvalidArgument {
+                operation: "parse_smtlib2_with_exact_query_binding",
+                message: "exact-query binding requires an empty formula state".to_string(),
+            });
+        }
+
+        let assertions = self.parse_smtlib2(input)?;
+        let context = self.executor.context();
+        if assertions.is_empty()
+            || !context.soft_constraints().is_empty()
+            || !context.objectives().is_empty()
+            || context.assertions.len() != assertions.len()
+            || context
+                .assertions
+                .iter()
+                .copied()
+                .ne(assertions.iter().map(|term| term.id()))
+        {
+            return Err(SolverError::InvalidArgument {
+                operation: "parse_smtlib2_with_exact_query_binding",
+                message: "parse did not produce one exact non-empty hard-assertion delta"
+                    .to_string(),
+            });
+        }
+
+        Ok(crate::api::proofs::ExactSmtlibQueryBinding {
+            solver: self.cache_token.clone(),
+            source_context: context.source_context_stamp().clone(),
+            assertions,
+        })
+    }
+
     /// Parse with Z3 5.0.0's strict public collection typing and return every
     /// formula delta plus occurrence-level public metadata.
     ///

@@ -133,3 +133,8 @@ fn uncontaminated_refutation_still_mints_its_certificate() {
          cone holds no CEGQI counterexample premise must still mint its certificate"
     );
 }
+
+// Chained from here rather than from `checked_sat_refutation.rs` so the parent
+// file, which sits exactly on its `.code_quality_file_size_baseline.toml`
+// ceiling, does not grow. Same `tests` module, same `super::*` scope.
+include!("level0_theory_conflict_tests.rs");

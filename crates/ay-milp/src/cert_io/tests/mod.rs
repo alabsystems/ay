@@ -122,6 +122,7 @@ fn emit_affine_fixture_with(
             affine_aggregation_certificate: certificate,
             block_angular_optimality_certificate: None,
             milp_optimality_tree_certificate: None,
+            root_dual_bound_certificate: None,
             sat_relu_infeasibility_certificate: None,
             parity_infeasibility_certificate: None,
             network_design_infeasibility_certificate: None,

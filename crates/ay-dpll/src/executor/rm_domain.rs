@@ -23,10 +23,13 @@
 //!    distinct, and
 //! 2. per non-literal RoundingMode-sorted ground term `t`:
 //!    `(or (= t RNE) (= t RNA) (= t RTP) (= t RTN) (= t RTZ))` — domain
-//!    coverage.
+//!    coverage;
+//! 3. `not (= m_i m_j)` for each different-mode literal equality that is IN THE
+//!    DAG but is not one of the ten atoms item 1 canonicalizes to — a
+//!    substitution-built operand order, say. See [`literal_pins`].
 //!
-//! Both are VALID in every model of the FP theory (the RoundingMode domain is
-//! exactly the five modes), so adding them removes no models and can never
+//! All three are VALID in every model of the FP theory (the RoundingMode domain
+//! is exactly the five modes), so adding them removes no models and can never
 //! turn `sat` into `unsat`; they only stop EUF from inventing out-of-domain
 //! elements or merging distinct modes. This mirrors
 //! `add_finite_enum_domain_coverage` (the all-nullary-datatype precedent) with
@@ -50,6 +53,17 @@
 //! CNF. Callers place the returned axioms scope-transiently (check_sat's
 //! in-place preprocessing with `scope_tracked_assertions` restore; the
 //! check-sat-assuming wrapper's truncate) so nothing persists across solves.
+//!
+//! PRODUCER/CHECKER PARITY. Every axiom this pass emits is one
+//! [`ay_proof::recognize_rounding_mode_domain`] — AY's own strict RoundingMode
+//! checker — re-derives from scratch: item 1 as its exact pairwise-distinctness
+//! conjunction, item 2 as its exact five-mode coverage disjunction, item 3 as
+//! its `recognize_pairwise_unit`. `check_sat` hands each axiom to
+//! `push_array_axiom_assertion_site`, and `promote_rounding_mode_domain_lemmas`
+//! can only label the ones that checker accepts, so an axiom outside its
+//! language would be one AY asserts and then refuses to check.
+//! `rm_domain_tests.rs::every_emitted_axiom_is_re_derived_by_the_strict_rm_checker`
+//! holds that as a whole-axiom-list invariant.
 
 use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::term::{Symbol, TermData};
@@ -57,6 +71,9 @@ use ay_core::{Sort, TermId, TermStore};
 use ay_fp::RoundingMode;
 
 use super::Executor;
+
+mod literal_pins;
+use literal_pins::RmLiteralAtoms;
 
 /// The five IEEE 754 / SMT-LIB rounding modes, in canonical order.
 pub(in crate::executor) const RM_MODES: [RoundingMode; 5] = [
@@ -162,6 +179,10 @@ impl Executor {
         // (equality/distinct/ite/UF argument…): the distinct-5 axiom is then
         // load-bearing even with no non-literal term (`(= RTP RTZ)`).
         let mut literal_domain_mention = false;
+        // The different-mode literal equalities present in the DAG. See
+        // `RmLiteralAtoms`: distinct-5 constrains only the atoms `mk_eq`
+        // canonicalizes to, so an atom interned any other way needs its own pin.
+        let mut literal_atoms = RmLiteralAtoms::default();
 
         let mut stack: Vec<TermId> = roots.to_vec();
         // Roots are formulas (Bool-sorted); an RM literal can only be *seen*
@@ -179,6 +200,7 @@ impl Executor {
             }
             match terms.get(t) {
                 TermData::App(sym, args) => {
+                    literal_atoms.record(terms, t, sym, args);
                     let mode_slot = fp_rounding_mode_operand(sym.name(), args);
                     for (i, &a) in args.iter().enumerate() {
                         // A literal in the rounding-op mode slot (arg 0) is the
@@ -228,6 +250,7 @@ impl Executor {
                             &mut needs_coverage,
                             &mut coverage_set,
                             &mut literal_domain_mention,
+                            &mut literal_atoms,
                         )
                     {
                         return RmDomainAxioms::FailClose;
@@ -255,6 +278,15 @@ impl Executor {
         // `mk_distinct` expands ≥3-ary distinct to pairwise disequalities, so
         // every theory lane sees plain `not (= …)` atoms.
         axioms.push(terms.mk_distinct(lits.clone()));
+
+        // Pins for the different-mode literal equalities distinct-5 does not
+        // already name. `None` means the scan may not proceed (see
+        // `RmLiteralAtoms::pins`).
+        let Some(pins) = literal_atoms.pins(terms, &lits) else {
+            return RmDomainAxioms::FailClose;
+        };
+        axioms.extend(pins);
+
         for t in needs_coverage {
             let eqs: Vec<TermId> = lits.iter().map(|&l| terms.mk_eq(t, l)).collect();
             axioms.push(terms.mk_or(eqs));
@@ -269,7 +301,10 @@ impl Executor {
 /// * an RM literal in an FP rounding-op mode slot — benign, ignored (this is
 ///   the standard quantified-FP pattern, e.g. `forall i. … (fp.add RNE …)`);
 /// * an RM literal in a domain position — sets `literal_domain_mention` so
-///   the distinct-5 axiom (ground, valid) constrains every instantiation;
+///   the distinct-5 axiom (ground, valid) constrains every instantiation, and
+///   collects any different-mode literal equality into `literal_atoms`: the
+///   atom is GROUND (both operands are mode literals), so instantiation leaves
+///   it untouched and a top-level pin on it is both valid and effective;
 /// * a plain RM-sorted `Var` that is NOT a bound variable of any enclosing
 ///   binder — a GLOBAL constant (bound-variable-carrying terms are never
 ///   plain global Vars), so the ground coverage disjunction reaches it:
@@ -288,6 +323,7 @@ fn walk_quantifier_body(
     needs_coverage: &mut Vec<TermId>,
     coverage_set: &mut HashSet<TermId>,
     literal_domain_mention: &mut bool,
+    literal_atoms: &mut RmLiteralAtoms,
 ) -> bool {
     // No cross-call seen-set: the binder-name context matters, and quantifier
     // bodies are small relative to the ground DAG.
@@ -307,6 +343,7 @@ fn walk_quantifier_body(
     }
     match data {
         TermData::App(sym, args) => {
+            literal_atoms.record(terms, body, &sym, &args);
             let mode_slot = fp_rounding_mode_operand(sym.name(), &args);
             for (i, &a) in args.iter().enumerate() {
                 let in_mode_slot = i == 0 && mode_slot == Some(a);
@@ -323,6 +360,7 @@ fn walk_quantifier_body(
                     needs_coverage,
                     coverage_set,
                     literal_domain_mention,
+                    literal_atoms,
                 ) {
                     return false;
                 }
@@ -336,6 +374,7 @@ fn walk_quantifier_body(
             needs_coverage,
             coverage_set,
             literal_domain_mention,
+            literal_atoms,
         ),
         TermData::Ite(c, th, el) => [c, th, el].into_iter().all(|x| {
             if is_rm_literal(terms, x) {
@@ -349,6 +388,7 @@ fn walk_quantifier_body(
                 needs_coverage,
                 coverage_set,
                 literal_domain_mention,
+                literal_atoms,
             )
         }),
         // `let` under a binder: fail closed iff its subtree mentions RM at
@@ -367,6 +407,7 @@ fn walk_quantifier_body(
                 needs_coverage,
                 coverage_set,
                 literal_domain_mention,
+                literal_atoms,
             );
             binder_names.truncate(binder_names.len() - added);
             ok
@@ -413,3 +454,7 @@ fn subtree_mentions_rm_sort(terms: &TermStore, root: TermId) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+#[path = "rm_domain_tests.rs"]
+mod tests;

@@ -869,7 +869,7 @@ const MAX_DEPTH: usize = 512;
 /// ```
 ///
 /// See the development design notes.
-const DEFAULT_DUAL_GRID_BITS: Option<u32> = Some(12);
+pub(crate) const DEFAULT_DUAL_GRID_BITS: Option<u32> = Some(12);
 
 /// Snap `v` to the nearest multiple of `2^-bits`, exactly.
 ///
@@ -930,7 +930,7 @@ pub(crate) fn snap_dyadic(v: f64, bits: u32) -> Option<BigRational> {
 /// exactly the work it always did — a duplicated rung would re-price and
 /// re-verify every leaf the lane declines, which would show up as derivation
 /// cost in the very comparison the grid is being measured by.
-fn grid_ladder(bits: Option<u32>) -> impl Iterator<Item = Option<u32>> {
+pub(crate) fn grid_ladder(bits: Option<u32>) -> impl Iterator<Item = Option<u32>> {
     [bits, None]
         .into_iter()
         .take(if bits.is_some() { 2 } else { 1 })
@@ -1101,7 +1101,7 @@ pub fn derive_optimality_tree_reported(
 /// Maximize model, exactly as `LpSession` does before calling
 /// [`ExactLp::minimize`]. Coefficients come from the exact side-store, so a
 /// column whose `f64` advice underflowed to zero still carries its true value.
-fn minimize_frame_objective(model: &Model) -> Vec<(u32, Rational)> {
+pub(crate) fn minimize_frame_objective(model: &Model) -> Vec<(u32, Rational)> {
     let sense = model.sense();
     let mut out = Vec::new();
     for (j, spec) in model.cols.iter().enumerate() {
@@ -1122,7 +1122,7 @@ fn minimize_frame_objective(model: &Model) -> Vec<(u32, Rational)> {
 /// The same objective as [`minimize_frame_objective`], DENSE and exact: one
 /// entry per column, which is the shape [`bound_multipliers_from_duals`] needs
 /// to accumulate residuals into.
-fn minimize_frame_objective_dense(model: &Model) -> Vec<BigRational> {
+pub(crate) fn minimize_frame_objective_dense(model: &Model) -> Vec<BigRational> {
     let sense = model.sense();
     let mut out = vec![BigRational::zero(); model.num_cols()];
     for (j, spec) in model.cols.iter().enumerate() {
@@ -1141,7 +1141,7 @@ fn minimize_frame_objective_dense(model: &Model) -> Vec<BigRational> {
 /// here is harmless by construction: it can only make the float lane's duals a
 /// worse guess, and every proposal built from them is re-verified against the
 /// EXACT objective before it becomes evidence.
-fn float_objective(model: &Model) -> Vec<(u32, f64)> {
+pub(crate) fn float_objective(model: &Model) -> Vec<(u32, f64)> {
     let sense = model.sense();
     let mut out = Vec::new();
     for (j, spec) in model.cols.iter().enumerate() {
@@ -1165,7 +1165,7 @@ fn float_objective(model: &Model) -> Vec<(u32, f64)> {
 /// The exact effective box of `work`'s current column bounds, in the shape
 /// [`OptimalityCertificate::verify_bound_leaf`] and
 /// [`FarkasCertificate::verify_with_col_bounds`] want.
-fn exact_box(work: &Model) -> (Vec<Option<BigRational>>, Vec<Option<BigRational>>) {
+pub(crate) fn exact_box(work: &Model) -> (Vec<Option<BigRational>>, Vec<Option<BigRational>>) {
     let n = work.num_cols();
     let lb = (0..n)
         .map(|j| exact(work.col_bounds(Col(j as u32)).0))
@@ -1404,7 +1404,7 @@ fn float_leaf(
 /// Every other `f64` here converts to a rational LOSSLESSLY, so nothing else is
 /// rounded; the floats' inaccuracy costs tightness (a leaf that fails to close
 /// and is split instead) and never validity.
-fn bound_multipliers_from_duals(
+pub(crate) fn bound_multipliers_from_duals(
     work: &Model,
     obj_min: &[BigRational],
     duals: &[f64],

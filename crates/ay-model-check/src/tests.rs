@@ -346,6 +346,48 @@ fn typed_equality_rejects_identical_malformed_nested_values() {
                 args: vec![ModelValue::Bool(true)],
             },
         ),
+        // #dt-uninterpreted-field-carrier — ay-dpll's rendered-value parser
+        // preserves an EUF element token at a NON-datatype constructor field
+        // (it is the only faithful value there, and the top-level leaf path
+        // always did the same). That carrier must never acquire authority over
+        // a DATATYPE sort: constructor identity is required, and an identical
+        // opaque token is not evidence of it — not even reflexively. These two
+        // cases fail if a future change teaches the checker to accept
+        // `Uninterpreted` where a constructor is declared.
+        (
+            "opaque carrier at a datatype sort",
+            Sort::Datatype(DatatypeSort::new(
+                "TokenBox",
+                vec![DatatypeConstructor::new(
+                    "TokenBox_mk",
+                    vec![DatatypeField::new("payload", Sort::Int)],
+                )],
+            )),
+            ModelValue::Uninterpreted("@TokenBox!0".to_string()),
+        ),
+        (
+            "opaque carrier at a datatype FIELD sort",
+            Sort::Datatype(DatatypeSort::new(
+                "OuterBox",
+                vec![DatatypeConstructor::new(
+                    "OuterBox_mk",
+                    vec![DatatypeField::new(
+                        "inner",
+                        Sort::Datatype(DatatypeSort::new(
+                            "InnerBox",
+                            vec![DatatypeConstructor::new(
+                                "InnerBox_mk",
+                                vec![DatatypeField::new("payload", Sort::Int)],
+                            )],
+                        )),
+                    )],
+                )],
+            )),
+            ModelValue::Datatype {
+                ctor: "OuterBox_mk".to_string(),
+                args: vec![ModelValue::Uninterpreted("@InnerBox!0".to_string())],
+            },
+        ),
     ];
 
     for (description, sort, value) in cases {

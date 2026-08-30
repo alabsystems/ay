@@ -32,11 +32,16 @@
 //!
 //! ## What is NOT handled here (it declines instead)
 //!
-//! Uninterpreted structure needing Ackermann congruence, unsupported FP
-//! predicates, and base encoding gaps all take the sticky opt-out: the session
-//! state is torn down, the lane is disabled, and every later check-sat runs the
-//! untouched stateless pipeline. Declining is always safe — "disabled" is
-//! exactly the pre-existing behaviour.
+//! Disjoint FP-relevant query batches are never admitted. Uninterpreted
+//! structure needing Ackermann congruence, unsupported FP predicates, and base
+//! encoding gaps take the sticky opt-out. Declining is always safe: "disabled"
+//! is the pre-existing stateless behaviour.
+//!
+//! ## Admission
+//! Persistence is never seeded speculatively. Every current FP-relevant
+//! authored [`TermId`] must have appeared in the prior observation or active
+//! encoding; pop/reassert counts because identity is immutable. A novel root
+//! restarts statelessly and may re-admit only after the full set recurs.
 
 use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::{CnfClause, TermId, Tseitin, TseitinResult};
@@ -44,7 +49,7 @@ use ay_fp::FpSolver;
 use ay_sat::{SatResult, Solver as SatSolver};
 
 use crate::executor_types::{Result, SolveResult, UnknownReason};
-use crate::incremental_state::IncrementalFpState;
+use crate::incremental_state::{FpIncrementalAdmission, IncrementalFpState};
 
 use super::super::super::Executor;
 use super::support::FpPredicateResult;
@@ -68,31 +73,30 @@ const PERSISTENT_FP_SAT_PREPROCESS: bool = false;
 const REORDER_DISABLE_VARS: usize = 50_000;
 
 impl Executor {
-    /// Attempt the persistent FP lane.
-    ///
-    /// `Ok(None)` means "declined; run the stateless pipeline" and is only
-    /// returned BEFORE any persistent state is mutated. Declines discovered
-    /// after encoding has begun tear the session state down and publish
-    /// `Unknown` — which is what the stateless path publishes for the same
-    /// cause anyway.
+    /// Attempt persistence. Novel active roots tear the solver down before
+    /// `Ok(None)`; no discarded clause can reach the stateless fallback.
     pub(super) fn try_solve_fp_incremental(&mut self) -> Result<Option<SolveResult>> {
-        // ---- Pre-flight, strictly before any state is touched ----
-        //
-        // Congruence is the one clause family whose GENERATOR reads the
-        // assertion set (`scan_foreign(&terms, &ctx.assertions)`). What it
-        // emits is a guarded Ackermann instance, hence a scope-independent
-        // tautology — but keeping it correct incrementally needs an append-only
-        // emitted-pair set AND a re-scan whenever the foreign application set
-        // grows. Getting that wrong drops a pair a NEW assertion introduced,
-        // which is a wrong `sat`. Decline the whole shape instead.
-        // `is_empty()` also covers the `unencodable` sort flag.
+        // The complete FP-relevant root set is the admission proof.
+        // There is no speculative seed, and an active novel set restarts
+        // statelessly before its first answer.
+        // Its recorded full set is admission evidence only for a later query;
+        // no encoding or SAT clause survives the deferred answer.
+        let admission = self
+            .incr_fp_state
+            .get_or_insert_with(IncrementalFpState::new)
+            .observe_live_assertion_reuse(&self.ctx.terms, &self.ctx.assertions);
+        match admission {
+            FpIncrementalAdmission::Admit => {}
+            FpIncrementalAdmission::Defer => return Ok(None),
+        }
+
+        // Congruence needs append-only pair tracking and re-scans as foreign
+        // terms grow; a missed pair is a wrong `sat`, so decline this shape.
         if !congruence::scan_foreign(&self.ctx.terms, &self.ctx.assertions).is_empty() {
             self.disable_fp_incremental_lane();
             return Ok(None);
         }
 
-        // ---- The activation-provenance check ----
-        //
         // Authorization (`fp_persistent_armed`) is fail-safe by POLARITY, but
         // it is still an audit: it assumes no route reaches `solve_fp` with a
         // substituted `ctx.assertions` while the flag is live. Six such routes
@@ -125,11 +129,7 @@ impl Executor {
                     .any(|term| !live.contains(term))
             }
         });
-        // Reported through `tracing`, NOT `last_statistics`: this decline hands
-        // the problem to the stateless pipeline, whose own solve repopulates
-        // the statistics map and would erase the counter before anyone read it.
-        // (Measured — the mutation that forces this path showed the counter at
-        // zero while the guard was demonstrably doing its job.)
+        // Stateless fallback repopulates statistics, so report via tracing.
         if provenance_violation {
             tracing::warn!(
                 "persistent FP lane holds an activation for an assertion that is no longer in \

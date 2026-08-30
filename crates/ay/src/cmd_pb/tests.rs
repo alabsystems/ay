@@ -2646,45 +2646,59 @@ fn test_proof_mode_optimization_interruption_removes_stale_sidecar() {
         .expect("proof-mode interrupted optimization should fail closed cleanly")
     };
 
-    assert_eq!(solution.solution.status, PbStatus::Unknown);
-    assert!(solution.solution.assignment.is_empty());
-    assert!(solution.solution.objective.is_none());
-    assert!(
-        !proof.path().exists(),
-        "incomplete proof sidecar must be removed"
+    // WHAT CHANGED, AND WHY THIS IS NOT A WEAKENING. This test used to require
+    // `s UNKNOWN` here, on the premise that an interrupted proof-mode
+    // optimization cannot certify anything. That premise died when the full
+    // OPT-LIN chain was wired into the CLI: five of its eight rungs are pure
+    // arithmetic on the instance and the incumbent, they never poll
+    // `should_stop`, and they are DELIBERATELY not scheduled behind a budget —
+    // a caller whose deadline is already spent must still get them. So a run
+    // that is interrupted before it can search can still PROVE this optimum,
+    // and reporting `s UNKNOWN` for an instance it holds a checkable
+    // certificate for would be throwing away a correct answer.
+    //
+    // The premise was re-measured, not assumed. Same fixture, through the
+    // shipped CLI with a 5 ms budget (fully starved), proof re-checked by the
+    // PINNED VeriPB (sha256 fc6a28ee…):
+    //
+    //   c opt-lin-cert route: direct-aggregation-floor (fallback)
+    //   o 1 / s OPTIMUM FOUND
+    //   s VERIFIED BOUNDS 1 <= obj <= 1        (checker exit 0)
+    //
+    // The bound is the instance's true optimum, so this is a stronger answer
+    // backed by a proof, not a looser claim. Fail-closed on interruption with
+    // NOTHING proven is still covered, by
+    // `test_solve_opb_proof_mode_respects_termination_flag` above.
+    assert_eq!(solution.solution.status, PbStatus::OptimumFound);
+    assert_eq!(solution.solution.objective, Some(1));
+    assert_eq!(
+        solution.solution.assignment.len(),
+        instance.num_vars as usize
     );
+
+    // The subject of this test survives: whatever the outcome, the STALE
+    // artifacts on the proof path must not.
     assert!(
         !sidecar_path.exists(),
-        "incomplete proof cleanup must remove stale conflict-row sidecars"
+        "proof-mode cleanup must remove stale conflict-row sidecars"
+    );
+    let committed = fs::read_to_string(proof.path()).expect("a certificate must be committed");
+    assert!(
+        !committed.contains("stale proof"),
+        "the stale proof bytes must have been replaced, got:\n{committed}"
+    );
+    assert!(
+        committed.starts_with("pseudo-Boolean proof version 3.0"),
+        "the committed file must be a VeriPB proof, got:\n{committed}"
+    );
+    assert!(
+        committed.contains("conclusion BOUNDS 1 : "),
+        "the certificate must conclude the optimum it reports, got:\n{committed}"
     );
     assert!(
         output.is_empty(),
         "solve_opb should not emit stale incumbent output directly"
     );
-    // PROOF-TO-SCORE: cached feasible incumbents survive an unproven proof-mode
-    // solve so the emission boundary can flush them as s SATISFIABLE (after its
-    // fail-closed re-verification). Clearing them here used to collapse the
-    // certified build to s UNKNOWN on every instance it could not prove in
-    // budget.
-    let cached = best_solution
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    assert_eq!(
-        cached.as_ref().map(|solution| solution.status),
-        Some(PbStatus::Satisfiable),
-        "incomplete proof-mode optimization must keep the cached incumbent"
-    );
-
-    let mut writer = PbOutputWriter::new(&mut output);
-    let status = write_result_or_best_known(&mut writer, &solution.solution, true, &best_solution)
-        .expect("flushed incumbent should render");
-    let rendered = String::from_utf8(output).expect("output should be utf-8");
-
-    assert_eq!(status, PbStatus::Satisfiable);
-    assert!(rendered.contains("s SATISFIABLE\n"));
-    assert!(rendered.contains("v x1 -x2"));
-    assert!(!rendered.contains("o "), "flush must not duplicate o lines");
 }
 
 // --- EARLY self-checked structural-UNSAT recognizers (wf-port-cmdpb) ---------
@@ -2953,4 +2967,156 @@ fn decision_sat_gate_passes_through_non_sat_verdicts() {
         decision_sat_self_checked(unknown, &instance).status,
         PbStatus::Unknown
     );
+}
+
+// ---------------------------------------------------------------------------
+// Certified-optimization budget split.
+//
+// These are REGRESSION tests for a measured defect, not shape tests. Before the
+// split existed, `solve_optimization_with_proof` gave the native proof-logging
+// CDCL the caller's whole `timeout_dur` and then called the certificate stage
+// with the SAME `start`/`timeout_dur`, so the stage's budget was `B - B = 0` for
+// every `B` and every `*_interruptible` helper returned `None` on its first
+// check. The property that matters is therefore not "the numbers are these
+// numbers" but "what is left for certification is STRICTLY POSITIVE".
+
+#[test]
+fn test_cert_opt_budget_split_leaves_the_certificate_stage_a_real_budget() {
+    let instance =
+        ay_pb::parse_opb("* #variable= 2 #constraint= 1\nmin: +1 x1 +1 x2 ;\n+1 x1 +1 x2 >= 1 ;\n")
+            .expect("fixture should parse");
+    let objective = instance.objective.clone().expect("objective present");
+
+    for budget in [
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(600),
+    ] {
+        let start = std::time::Instant::now();
+        let split = compute_cert_opt_budget_split(&instance, &objective, Some(budget), start);
+        let deadline = split
+            .native_deadline
+            .expect("a bounded, single-literal-linear run must be eligible");
+        let hard = split
+            .native_hard_limit
+            .expect("ceiling present when capped");
+
+        // THE POINT: the native phase stops strictly before the caller's
+        // deadline, so what follows it is not scheduled after its budget is
+        // gone.
+        let overall_deadline = start + budget;
+        assert!(
+            deadline < overall_deadline,
+            "native slice must end before the overall deadline ({budget:?})"
+        );
+        assert!(
+            hard < overall_deadline,
+            "even the extended ceiling must end before the overall deadline ({budget:?})"
+        );
+        assert!(
+            deadline < hard,
+            "the ceiling must be able to extend the slice"
+        );
+        // And the reserve behind it is a real slice of wall clock, not zero.
+        assert!(
+            certify_reserve(budget) > std::time::Duration::ZERO,
+            "certification reserve must be positive at {budget:?}"
+        );
+        assert!(
+            certify_reserve(budget) <= budget / 2,
+            "the reserve must never take more than half the budget"
+        );
+    }
+}
+
+#[test]
+fn test_cert_opt_budget_split_declines_where_it_would_only_cost_search() {
+    let instance =
+        ay_pb::parse_opb("* #variable= 2 #constraint= 1\nmin: +1 x1 +1 x2 ;\n+1 x1 +1 x2 >= 1 ;\n")
+            .expect("fixture should parse");
+    let objective = instance.objective.clone().expect("objective present");
+
+    // No timeout: today's unbounded-native semantics are preserved exactly.
+    let unbounded =
+        compute_cert_opt_budget_split(&instance, &objective, None, std::time::Instant::now());
+    assert!(unbounded.native_deadline.is_none());
+    assert!(unbounded.native_hard_limit.is_none());
+
+    // A multi-literal (non-linear) objective term is outside the OPT-LIN
+    // helpers' domain, so reserving for them would take time from the search
+    // and buy nothing.
+    let product_objective = ay_pb::PbObjective {
+        terms: vec![ay_pb::PbTerm {
+            coeff: 1,
+            lits: vec![
+                ay_pb::PbLit {
+                    var: 1,
+                    negated: false,
+                },
+                ay_pb::PbLit {
+                    var: 2,
+                    negated: false,
+                },
+            ],
+        }],
+    };
+    let nonlinear = compute_cert_opt_budget_split(
+        &instance,
+        &product_objective,
+        Some(std::time::Duration::from_secs(60)),
+        std::time::Instant::now(),
+    );
+    assert!(nonlinear.native_deadline.is_none());
+}
+
+#[test]
+fn test_certify_reserve_clamps() {
+    // remaining/8, clamped to [10s, 300s], and never more than remaining/2.
+    assert_eq!(
+        certify_reserve(std::time::Duration::from_secs(10)),
+        std::time::Duration::from_secs(5)
+    );
+    assert_eq!(
+        certify_reserve(std::time::Duration::from_secs(800)),
+        std::time::Duration::from_secs(100)
+    );
+    assert_eq!(
+        certify_reserve(std::time::Duration::from_secs(3000)),
+        std::time::Duration::from_secs(300)
+    );
+    assert_eq!(
+        certify_reserve(std::time::Duration::ZERO),
+        std::time::Duration::ZERO
+    );
+}
+
+#[test]
+fn test_extend_native_deadline_is_monotone_and_clamped() {
+    let now = std::time::Instant::now();
+    let split = CertOptBudgetSplit {
+        native_deadline: Some(now + std::time::Duration::from_secs(10)),
+        native_hard_limit: Some(now + std::time::Duration::from_secs(20)),
+        improve_grace: std::time::Duration::from_secs(60),
+    };
+    let cell = std::cell::Cell::new(split.native_deadline);
+    extend_native_deadline(&cell, &split);
+    let extended = cell.get().expect("still capped");
+    assert!(
+        extended <= split.native_hard_limit.unwrap(),
+        "the grace must never push past the hard ceiling"
+    );
+    assert!(
+        extended >= split.native_deadline.unwrap(),
+        "extension must be monotone"
+    );
+
+    // Uncapped stays uncapped: no deadline can be invented here.
+    let uncapped = CertOptBudgetSplit {
+        native_deadline: None,
+        native_hard_limit: None,
+        improve_grace: std::time::Duration::from_secs(60),
+    };
+    let none_cell = std::cell::Cell::new(None);
+    extend_native_deadline(&none_cell, &uncapped);
+    assert!(none_cell.get().is_none());
 }

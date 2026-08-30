@@ -19,12 +19,15 @@
 //!    proxy literal an earlier `ite` decomposition froze into the mux.
 //!
 //! Plus one mechanism barrier proving the session really is one solver, and
-//! one barrier on the decline path.
+//! dedicated barriers on admission and decline paths.
 //!
 //! Every verdict asserted here was independently confirmed with bitwuzla 0.9.1
 //! and cvc5 1.3.0.
 
 use crate::common::solve_authored_vec;
+
+#[path = "fp_persistent_lane/admission.rs"]
+mod admission;
 
 /// Every script in this file, plus the two mechanism scripts, run under BOTH
 /// settings of `--no-fp-incremental`. Used by the equivalence barrier below.
@@ -34,7 +37,7 @@ fn lane_scripts() -> Vec<(&'static str, String)> {
             "scoped contradiction",
             format!(
                 "{DECLS}(assert (fp.lt x y))\n(push 1)\n(assert (fp.gt x y))\n\
-                 (check-sat)\n(pop 1)\n(check-sat)\n(push 1)\n\
+                 (check-sat)\n(check-sat)\n(pop 1)\n(check-sat)\n(push 1)\n\
                  (assert (fp.isNormal x))\n(check-sat)\n"
             ),
         ),
@@ -42,7 +45,7 @@ fn lane_scripts() -> Vec<(&'static str, String)> {
             "reactivation",
             format!(
                 "{DECLS}(assert (fp.lt x y))\n(push 1)\n(assert (fp.gt x y))\n\
-                 (check-sat)\n(pop 1)\n(check-sat)\n(push 1)\n\
+                 (check-sat)\n(check-sat)\n(pop 1)\n(check-sat)\n(push 1)\n\
                  (assert (fp.gt x y))\n(check-sat)\n"
             ),
         ),
@@ -50,24 +53,26 @@ fn lane_scripts() -> Vec<(&'static str, String)> {
             "frontier moved by Boolean structure",
             format!(
                 "{DECLS}(declare-fun p () Bool)\n(declare-fun q () Bool)\n\
-                 (push 1)\n(assert (fp.lt x y))\n(check-sat)\n(push 1)\n\
-                 (assert (and p q))\n(assert (fp.geq x y))\n(check-sat)\n"
+                 (declare-fun r () Bool)\n(push 1)\n(assert (fp.lt x y))\n\
+                 (assert (=> r (fp.geq x y)))\n(check-sat)\n(check-sat)\n\
+                 (push 1)\n(assert (and p q))\n(assert r)\n(check-sat)\n"
             ),
         ),
         (
             "ite bool condition named later",
             format!(
                 "{DECLS}(declare-fun b () Bool)\n(push 1)\n\
-                 (assert (fp.lt (ite b x y) z))\n(check-sat)\n(push 1)\n\
-                 (assert b)\n(assert (fp.geq x z))\n(check-sat)\n"
+                 (assert (fp.lt (ite b x y) z))\n(assert (fp.geq x z))\n\
+                 (check-sat)\n(check-sat)\n(push 1)\n(assert b)\n(check-sat)\n"
             ),
         ),
         (
             "arithmetic across scopes",
             format!(
                 "{DECLS}(assert (fp.lt (fp.add RNE x y) z))\n(push 1)\n\
-                 (assert (fp.gt (fp.mul RNE x y) z))\n(check-sat)\n(pop 1)\n\
-                 (check-sat)\n(push 1)\n(assert (fp.isNegative z))\n(check-sat)\n"
+                 (assert (fp.gt (fp.mul RNE x y) z))\n(check-sat)\n\
+                 (check-sat)\n(pop 1)\n(check-sat)\n(push 1)\n\
+                 (assert (fp.isNegative z))\n(check-sat)\n"
             ),
         ),
     ]
@@ -159,6 +164,7 @@ fn fp_incremental_scoped_contradiction_does_not_survive_pop() {
          (push 1)\n\
          (assert (fp.gt x y))\n\
          (check-sat)\n\
+         (check-sat)\n\
          (pop 1)\n\
          (check-sat)\n\
          (push 1)\n\
@@ -167,7 +173,7 @@ fn fp_incremental_scoped_contradiction_does_not_survive_pop() {
     );
     assert_eq!(
         verdicts(&smt),
-        vec!["unsat", "sat", "sat"],
+        vec!["unsat", "unsat", "sat", "sat"],
         "an FP assertion activated inside a push leaked past its pop"
     );
 }
@@ -188,6 +194,7 @@ fn fp_incremental_reasserted_conflict_is_reactivated_after_pop() {
          (push 1)\n\
          (assert (fp.gt x y))\n\
          (check-sat)\n\
+         (check-sat)\n\
          (pop 1)\n\
          (check-sat)\n\
          (push 1)\n\
@@ -196,20 +203,19 @@ fn fp_incremental_reasserted_conflict_is_reactivated_after_pop() {
     );
     assert_eq!(
         verdicts(&smt),
-        vec!["unsat", "sat", "unsat"],
+        vec!["unsat", "unsat", "sat", "unsat"],
         "an FP assertion re-asserted after a pop was never re-activated"
     );
 }
 
 /// (3) The FP variable offset must be FROZEN for the whole session.
 ///
-/// The second scope adds a purely Boolean assertion, which allocates new
-/// Tseitin variables and so MOVES `tseitin_result.num_vars` — the quantity the
-/// stateless path recomputes `var_offset` from on every call. If the offset is
-/// recomputed rather than frozen, `fp.geq`'s freshly emitted circuit lands on
-/// different SAT variables than the cached bits `fp.lt` already constrained.
-/// The two predicates then talk about disjoint bit sets, nothing contradicts,
-/// and the solve reports a wrong `sat`.
+/// The initial query installs both `fp.lt` and a guarded `fp.geq` in the
+/// persistent encoding. The second scope adds fresh purely Boolean structure,
+/// which allocates Tseitin variables and MOVES `tseitin_result.num_vars` — the
+/// quantity the stateless path derives `var_offset` from on every call. Setting
+/// `r` then activates the cached contradiction after the frontier has moved.
+/// The original FP bits must remain at their frozen SAT positions.
 #[test]
 fn fp_incremental_frozen_offset_keeps_cached_bits_wired() {
     let smt = format!(
@@ -218,17 +224,20 @@ fn fp_incremental_frozen_offset_keeps_cached_bits_wired() {
          (declare-fun y () Float32)\n\
          (declare-fun p () Bool)\n\
          (declare-fun q () Bool)\n\
+         (declare-fun r () Bool)\n\
          (push 1)\n\
          (assert (fp.lt x y))\n\
+         (assert (=> r (fp.geq x y)))\n\
+         (check-sat)\n\
          (check-sat)\n\
          (push 1)\n\
          (assert (and p q))\n\
-         (assert (fp.geq x y))\n\
+         (assert r)\n\
          (check-sat)\n"
     );
     assert_eq!(
         verdicts(&smt),
-        vec!["sat", "unsat"],
+        vec!["sat", "sat", "unsat"],
         "FP bits from an earlier check-sat were re-wired by a moving var_offset"
     );
 }
@@ -236,10 +245,11 @@ fn fp_incremental_frozen_offset_keeps_cached_bits_wired() {
 /// (4) A Bool named only by a LATER assertion must be tied to the FP proxy
 /// literal the earlier `ite` decomposition froze into the mux.
 ///
-/// On the first check-sat `b` occurs only below an FP `ite`, so the Tseitin
-/// walk never names it and `encode_bool_condition` falls to `bool_input_lit` —
-/// an UNCONSTRAINED fresh literal. Sound in isolation. On the second check-sat
-/// `(assert b)` gives `b` a Tseitin variable, but `term_to_fp` has cached the
+/// When the FP assertions are encoded, `b` occurs only below an FP `ite`, so
+/// the Tseitin walk never names it and `encode_bool_condition` falls to
+/// `bool_input_lit` — an UNCONSTRAINED fresh literal. Sound in isolation. On
+/// the later check-sat, `(assert b)` gives `b` a Tseitin variable, but
+/// `term_to_fp` has cached the
 /// `ite` decomposition, so `get_fp` returns immediately and the mux is never
 /// re-encoded: it stays wired to the unlinked literal. Without the repair pass
 /// the SAT solver satisfies `(assert b)` through the Tseitin variable while the
@@ -247,8 +257,9 @@ fn fp_incremental_frozen_offset_keeps_cached_bits_wired() {
 /// that the model gate cannot see, because the published FP value is internally
 /// consistent and the disagreement is between two names for `b`.
 ///
-/// Note the leading `(push 1)`: the first check-sat must run on the
-/// PERSISTENT lane for the stale-cache hazard to exist at all.
+/// The first check observes both FP roots; its identical repeat admits and
+/// caches them before the later Bool-only assertion exposes the stale-cache
+/// bug without changing the FP-relevant assertion-root set.
 #[test]
 fn fp_incremental_ite_bool_condition_is_linked_when_later_named() {
     let smt = format!(
@@ -259,15 +270,16 @@ fn fp_incremental_ite_bool_condition_is_linked_when_later_named() {
          (declare-fun b () Bool)\n\
          (push 1)\n\
          (assert (fp.lt (ite b x y) z))\n\
+         (assert (fp.geq x z))\n\
+         (check-sat)\n\
          (check-sat)\n\
          (push 1)\n\
          (assert b)\n\
-         (assert (fp.geq x z))\n\
          (check-sat)\n"
     );
     assert_eq!(
         verdicts(&smt),
-        vec!["sat", "unsat"],
+        vec!["sat", "sat", "unsat"],
         "an FP `ite` condition stayed wired to an unlinked literal after the \
          same Bool was given a Tseitin variable"
     );
@@ -283,23 +295,24 @@ fn fp_incremental_ite_bool_condition_is_linked_when_later_named() {
 /// pop and check-sat #3 reproduced #1 to the digit — the same search re-run
 /// from scratch on a brand-new solver.
 ///
-/// The first check-sat is deliberately excluded: it runs before any `push`, so
-/// `incremental_mode` is still false and it takes the stateless path.
+/// The base FP assertion captured immediately before `push` is the admission
+/// set. Each scope changes only Bool roots, so all three measured check-sats
+/// reuse the same persistent FP encoding.
 #[test]
 fn fp_incremental_session_uses_one_persistent_sat_solver() {
     let smt = format!(
-        "{DECLS}\
+        "{DECLS}(declare-fun p () Bool)\n\
          (assert (not (= (fp.add RNE (fp.add RNE x y) z)\n\
                          (fp.add RNE x (fp.add RNE y z)))))\n\
          (push 1)\n\
-         (assert (fp.isNormal x))\n\
+         (assert p)\n\
          (check-sat)\n\
          (get-info :all-statistics)\n\
          (pop 1)\n\
          (check-sat)\n\
          (get-info :all-statistics)\n\
          (push 1)\n\
-         (assert (fp.isPositive z))\n\
+         (assert (not p))\n\
          (check-sat)\n\
          (get-info :all-statistics)\n"
     );

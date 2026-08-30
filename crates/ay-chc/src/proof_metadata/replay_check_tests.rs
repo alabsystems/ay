@@ -101,6 +101,10 @@ fn route_b_native_proof_admission(metadata: &serde_json::Value) -> Result<(), &'
 }
 
 include!("replay_check_tests/checked_run_assertions.rs");
+#[path = "replay_check_tests/strict_bundle.rs"]
+mod strict_bundle;
+#[path = "replay_check_tests/strict_cert.rs"]
+mod strict_cert;
 
 #[test]
 fn checked_replay_admits_small_safe_pdr_proof_end_to_end() {
@@ -123,26 +127,7 @@ fn checked_replay_admits_small_safe_pdr_proof_end_to_end() {
         .expect("checked replay should pass on a verified safe proof");
     assert_checked_run_invariants(&checked);
 
-    // Every UNSAT obligation (initiation/consecution/safety) must carry a
-    // native strict-Alethe certificate — the self-contained, no-z3 evidence
-    // that it was discharged by a REAL Alethe-verified proof, not a trusted
-    // re-run verdict.
-    assert!(
-        !checked.summary().obligations.is_empty(),
-        "safe PDR proof should have replay obligations"
-    );
-    for obligation in &checked.summary().obligations {
-        assert_ne!(obligation.kind, ChcReplayObligationKind::TraceValidity);
-        let cert = obligation.strict_cert.as_ref().unwrap_or_else(|| {
-            panic!(
-                "unsat obligation {} must carry a native strict-Alethe cert",
-                obligation.name
-            )
-        });
-        assert_eq!(cert.verdict, "verified");
-        assert_eq!(cert.alethe_sha256.len(), 64);
-        assert_eq!(cert.bundle_sha256.len(), 64);
-    }
+    strict_bundle::assert_strict_bundle_rows(&checked);
 
     // The strict-cert-bearing summary must round-trip through JSON with a
     // stable identity (the strict cert is part of the obligation identity).
@@ -212,12 +197,12 @@ fn checked_replay_admits_bmc_acyclic_exhaustion_safe() {
         "acyclic-exhaustion replay must synthesize Safety obligations"
     );
     // Synthesized safety obligations are UNSAT obligations discharged by the
-    // native strict-Alethe self-check, so each carries a verified strict cert.
+    // native strict bundle checker, so each carries a verified strict cert.
     for obligation in &checked.summary().obligations {
         let cert = obligation
             .strict_cert
             .as_ref()
-            .expect("acyclic-exhaustion safety obligation must carry a strict-Alethe cert");
+            .expect("acyclic-exhaustion safety obligation must carry a strict bundle cert");
         assert_eq!(cert.verdict, "verified");
     }
     let json = checked.proof_run().metadata().to_json_value();
@@ -389,7 +374,7 @@ fn checked_replay_validates_unsafe_trace() {
         ChcReplayObligationKind::TraceValidity
     );
     // A trace-validity (SAT-witness) obligation has no UNSAT proof, so it
-    // carries no strict-Alethe cert — it stays on the trusted ground-eval path.
+    // carries no strict bundle cert — it stays on the trusted ground-eval path.
     assert!(checked.summary().obligations[0].strict_cert.is_none());
 
     // Route B admits SAFE proofs only; a checked unsafe transcript is still
@@ -461,7 +446,7 @@ fn checked_replay_rejects_model_that_does_not_discharge_safety() {
         .run_checked_replay(REPLAY_TEST_BUDGET)
         .expect_err("non-discharging model must fail the checked replay");
     // A safety obligation is an UNSAT obligation now discharged by the native
-    // strict-Alethe self-check. A bogus model makes it replay SAT, so no UNSAT
+    // strict bundle self-check. A bogus model makes it replay SAT, so no UNSAT
     // certificate is produced and the pass fails closed to metadata-only.
     assert!(
         error

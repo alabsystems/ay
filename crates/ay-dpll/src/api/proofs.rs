@@ -21,6 +21,12 @@ use num_rational::BigRational;
 use crate::array_proof_check::{check_array_clause, ArrayStepVerdict};
 use crate::bv_proof_check::{check_bv_assertions_unsat, check_bv_clause, BvStepVerdict};
 
+mod artifact_types;
+pub use artifact_types::{FarkasCertificate, ProofAcceptanceMode};
+
+mod exact_query;
+pub use exact_query::ExactSmtlibQueryBinding;
+
 mod bv_lia_source_replay;
 use bv_lia_source_replay::discharge_source_bv_lia;
 
@@ -59,16 +65,6 @@ pub enum StrictProofVerdict {
     Rejected(String),
 }
 
-/// Consumer-facing acceptance mode for an UNSAT proof artifact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ProofAcceptanceMode {
-    /// Require AY's native strict proof validation to have succeeded.
-    Strict,
-    /// Require strict validation plus the restricted-rule-subset strict subset.
-    RestrictedRuleSubset,
-}
-
 /// Error returned when an UNSAT proof artifact is not acceptable at a
 /// consumer boundary.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -83,20 +79,6 @@ pub enum ProofAcceptanceError {
     /// Strict validation succeeded, but the proof is outside the restricted rule subset.
     #[error("proof is not in the restricted-rule-subset strict subset")]
     NotRestrictedRuleSubset,
-}
-
-/// Structured Farkas payload for a theory lemma in the exported proof.
-///
-/// Coefficients are promoted to [`BigRational`] so downstream consumers can
-/// use the certificate without depending on ay-core's internal `Rational64`
-/// representation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct FarkasCertificate {
-    /// Index of the `TheoryLemma` step in the exported proof DAG.
-    pub proof_step_index: u32,
-    /// Non-negative coefficients for the lemma's input constraints.
-    pub coefficients: Vec<BigRational>,
 }
 
 /// A consumer-facing UNSAT proof artifact for downstream consumers.

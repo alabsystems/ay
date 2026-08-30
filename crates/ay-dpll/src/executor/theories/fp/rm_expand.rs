@@ -251,6 +251,21 @@ impl Executor {
     /// Map every `=`/`distinct` application over ALL-RM-literal operands in
     /// `roots` to its truth constant. (`mk_distinct` expands n-ary distinct at
     /// elaboration, so the `distinct` arm is defensive for embedder terms.)
+    ///
+    /// SORT-GUARDED, and this one is load-bearing rather than decorative.
+    /// [`rm_literal_mode`] recognizes a term by NAME alone, so without the sort
+    /// check a nullary constant that merely BORROWS a mode's spelling at
+    /// another sort is read as a rounding mode and its equality is folded to a
+    /// truth constant. Folding to `false` DELETES models, which is the one
+    /// direction that can publish a wrong `unsat`, and it did: MEASURED on
+    /// `[(= (fp.roundToIntegral rm 2.5) 2.0), (= RNE_Int RTZ_Int)]` with both
+    /// Int constants built through `TermStore::mk_app`, this lane returned
+    /// `unsat` for a satisfiable query. Not reachable from a `.smt2` file or
+    /// from `Solver::declare_*`: both reject the ten mode spellings as reserved
+    /// symbols (measured — the CLI errors "symbol 'RNE' is reserved"). It is
+    /// reachable from raw in-crate term construction, which is exactly the
+    /// class the sibling `unsat_cert/rm_domain_expansion.rs::rm_literal_equality_value`
+    /// already guards, and this now mirrors it.
     fn collect_rm_literal_atom_folds(&self, roots: &[TermId]) -> HashMap<TermId, TermId> {
         let mut folds: HashMap<TermId, TermId> = HashMap::default();
         let mut modes_scratch: Vec<RoundingMode> = Vec::new();
@@ -267,6 +282,10 @@ impl Executor {
                     if (name == "=" || name == "distinct") && args.len() >= 2 {
                         modes_scratch.clear();
                         for &a in args {
+                            if !is_rm_sort(self.ctx.terms.sort(a)) {
+                                modes_scratch.clear();
+                                break;
+                            }
                             match rm_literal_mode(&self.ctx.terms, a) {
                                 Some(m) => modes_scratch.push(m),
                                 None => {
@@ -309,5 +328,64 @@ impl Executor {
             }
         }
         folds
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ay_core::{Sort, Symbol};
+
+    /// A nullary constant that borrows a rounding mode's NAME at another sort
+    /// must not be folded as a rounding mode.
+    ///
+    /// Without the sort guard this lane folded `(= RNE_Int RTZ_Int)` to
+    /// `false` in every branch and published `unsat` for a query whose FP half
+    /// is satisfiable at `rm = RTZ` and whose Int half is satisfiable at
+    /// `RNE = RTZ = 0`. Folding to `false` deletes models, so this is the wrong
+    /// direction of a wrong verdict, not a completeness loss.
+    #[test]
+    fn an_int_sorted_mode_name_is_not_folded_as_a_rounding_mode() {
+        let commands = ay_frontend::parse(
+            "(declare-const rm RoundingMode) \
+             (assert (= (fp.roundToIntegral rm ((_ to_fp 8 24) RNE 2.5)) ((_ to_fp 8 24) RNE 2.0)))",
+        )
+        .expect("the symbolic-RM fixture parses");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("the symbolic-RM fixture executes");
+
+        // `mk_app` is the only way to build these: the frontend and
+        // `Solver::declare_*` both reject the ten mode spellings as reserved.
+        let int_rne = executor
+            .ctx
+            .terms
+            .mk_app(Symbol::named("RNE"), vec![], Sort::Int);
+        let int_rtz = executor
+            .ctx
+            .terms
+            .mk_app(Symbol::named("RTZ"), vec![], Sort::Int);
+        let equality = executor.ctx.terms.mk_eq(int_rne, int_rtz);
+        assert!(
+            !executor
+                .collect_rm_literal_atom_folds(&[equality])
+                .contains_key(&equality),
+            "an Int-sorted equality was folded by the RoundingMode domain fact"
+        );
+
+        executor.ctx.add_assertion_with_parsed(
+            equality,
+            ay_frontend::command::Term::Symbol(
+                crate::executor::NATIVE_API_ASSERTION_PLACEHOLDER.to_string(),
+            ),
+        );
+        executor.begin_public_solve(false);
+        executor.bind_unsat_query_assumptions(&[]);
+        let verdict = executor.check_sat().expect("the solve completes");
+        assert!(
+            !verdict.is_unsat(),
+            "the RM enumeration refuted a satisfiable query, got {verdict:?}"
+        );
     }
 }

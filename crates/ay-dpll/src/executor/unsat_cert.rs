@@ -7403,4 +7403,57 @@ mod tests {
             "the identical query must mint with the switch off"
         );
     }
+
+    /// The whole-problem re-discharge decides the substitution-built
+    /// RoundingMode branch.
+    ///
+    /// Reported as a second, separate "reconfirm environment gap": the lane
+    /// answered `Unknown` on this obligation EVEN WITH all ten pairwise RM
+    /// disequalities supplied as extra roots. Measured at c8a7afd54 — both
+    /// halves of that report reproduce, and both have the same single cause,
+    /// which is not an environment gap at all. `reconfirms_unsat_within` runs
+    /// an ordinary `check_sat` on a fresh executor, so it saw exactly the
+    /// distinct-5 axiom the top level sees; supplying the ten disequalities
+    /// changed nothing because `mk_eq` canonicalizes THEIR operand order too,
+    /// and the obligation's own atom — reinterned by `substitute_terms` — is a
+    /// different term from all ten. See `executor::rm_domain::RmLiteralAtoms`.
+    #[test]
+    fn whole_problem_reconfirmation_decides_a_substituted_rm_branch() {
+        let commands = ay_frontend::parse(
+            "(declare-const rm RoundingMode) \
+             (assert (= (fp.roundToIntegral rm ((_ to_fp 8 24) RNE 2.5)) ((_ to_fp 8 24) RNE 2.0))) \
+             (assert (= rm roundTowardPositive))",
+        )
+        .expect("RM branch fixture parses");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("RM branch fixture executes");
+
+        let roots = executor.ctx.assertions.clone();
+        let rtn = crate::executor::rm_domain::rm_literal_term(
+            &mut executor.ctx.terms,
+            ay_fp::RoundingMode::RTN,
+        );
+        let variable = (0..executor.ctx.terms.len())
+            .map(|index| TermId(u32::try_from(index).expect("arena index fits u32")))
+            .find(|&id| {
+                matches!(
+                    executor.ctx.terms.get(id),
+                    TermData::Var(name, _) if name == "rm"
+                )
+            })
+            .expect("the fixture declares `rm`");
+        let mut map = ay_core::kani_compat::DetHashMap::default();
+        map.insert(variable, rtn);
+        let branch: Vec<TermId> = roots
+            .iter()
+            .map(|&root| executor.ctx.terms.substitute_terms(root, &map))
+            .collect();
+
+        assert!(
+            executor.reconfirms_unsat_within(&branch, WHOLE_PROBLEM_RECONFIRMATION_LIMITS),
+            "the fresh re-solve must refute the branch it is handed"
+        );
+    }
 }

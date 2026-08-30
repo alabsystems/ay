@@ -116,6 +116,7 @@ fn exports_boolean_and_certificate_that_carcara_accepts() {
 }
 
 include!("export_alethe_validation/linear_arithmetic.rs");
+include!("export_alethe_validation/let_bridge_resolution.rs");
 
 const QF_EQ_TRANS_DISTINCT_UNSAT: &str = r#"
 (set-logic QF_UFLIA)

@@ -83,6 +83,14 @@ solve options
                                Not the budget: if this ever binds the run says `deadline` and
                                its evidence was load-dependent.
   --no-opt-tree                opt out of whole-tree optimality derivation
+  --root-dual-rim <n>          exact-rim iteration cap for the ROOT DUAL BOUND — the weaker,
+                               always-cheap fallback offered ONLY where the whole-tree proof
+                               declined. DEFAULT 0: the float lane alone, whose evidence is a
+                               function of the model and never of the clock. A nonzero cap adds
+                               an exact-rim attempt when the float lane finds nothing; measured,
+                               that closes 4 more of 23 corpus instances and costs up to 25 s.
+  --root-dual-secs <secs>      wall-clock SAFETY NET for the same (default 60; 0 = no net)
+  --no-root-dual               opt out of the root dual bound entirely
   --emit-witness <path>        write the witness on ANY verdict that has one
   --witness-format <ay|sol|rational>   default: rational
   --format <line|json>         stdout shape (default line)
@@ -94,6 +102,12 @@ and nothing was refuted, but a claim carries no checkable evidence. It is a
 non-zero exit. `verify` also prints a CLAIMS census line naming every claim by
 standing (verified / refuted / unbacked), so a consumer never has to infer which
 half of an `optimal` was proved from the aggregate word alone.
+An `objbound` claim is a BOUND on the optimum, never the optimum: it verifies
+that nothing feasible beats some value WEAKER than the verdict's, and names the
+residual it leaves unproved. It does not back the `dual` claim and cannot turn
+an exit 11 into an exit 0. Its name deliberately neither is nor extends `dual`,
+so `verified=primal,dual` — the signature of a PROVED optimum — never matches a
+census that carries only a bound.
 ";
 
 /// THE OPTIMALITY-TREE BUDGET, and it is deterministic. In `work` units TIMES
@@ -201,6 +215,29 @@ const OPT_TREE_LEAVES: usize = 20_000;
 /// are deliberately different tags — which is the signal that this run's
 /// evidence was load-dependent after all.
 const OPT_TREE_BACKSTOP_SECS: f64 = 600.0;
+
+/// The ROOT DUAL BOUND's exact-rim iteration cap, and it is ZERO ON PURPOSE.
+///
+/// The float lane needs no cap worth naming — measured over the 23 corpus
+/// instances whose whole-tree proof declines, it produced a verified bound on 18
+/// of them in at most 0.105 s, and its cost is bounded by the float simplex's
+/// own iteration limit rather than by anything this lane chooses. The EXACT rim
+/// is the opposite: it closed 4 of the remaining 5 (`b-ball` 0.007 s, `dcmulti`
+/// 0.74 s, `neos-3610040-iskar` 0.40 s, `gen` 6.1 s, `rout` 25.1 s) and did not
+/// finish on `qiu` in 30 s, and its per-iteration cost varies by four orders of
+/// magnitude across those models, so no iteration cap bounds its WALL.
+///
+/// Defaulting it OFF is what keeps the shipped artifact a pure function of the
+/// model: with the rim disabled, no clock can change which certificate a run
+/// emits. `--root-dual-rim <n>` buys the extra four back for anyone willing to
+/// pay wall for them.
+const ROOT_DUAL_RIM_ITERS: u64 = 0;
+
+/// Wall-clock SAFETY NET for the root dual bound, in seconds. NOT the budget:
+/// with the rim off by default nothing in this lane approaches it, and it exists
+/// only so that a model whose float relaxation is pathological cannot make a
+/// `solve` appear to hang.
+const ROOT_DUAL_BACKSTOP_SECS: f64 = 60.0;
 
 /// Wall clock at the first instruction of `main` in the FINAL (post-`arm`)
 /// process image, for `--phase-ledger`.
@@ -342,6 +379,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
     switches.extend([
         "no-emit-cert",
         "no-opt-tree",
+        "no-root-dual",
         "deterministic",
         "no-deterministic",
         // DIAGNOSTIC ONLY (`--phase-ledger`): one stderr line attributing this
@@ -649,6 +687,70 @@ fn cmd_solve(args: &[String]) -> ExitCode {
         }
     };
 
+    // THE WEAKER HALF-STEP, and it exists only where the step above failed.
+    // A root dual bound proves that nothing feasible beats some value that is
+    // WORSE than the claimed optimum, so it is never a substitute for the tree
+    // and is never derived when the tree succeeded. It rides `.ayc` under its
+    // own `objbound` claim; the `dual` claim stays exactly as unbacked as it
+    // was, and `verify` still exits 11.
+    let mut root_dual_note = String::new();
+    let mut ph_root_dual = Duration::ZERO;
+    let root_dual = if flags.has("no-root-dual") || cert_path.is_none() || opt_tree.is_some() {
+        None
+    } else {
+        let rim = match flags.get("root-dual-rim") {
+            Some(v) => match v.parse::<u64>() {
+                Ok(n) => n,
+                Err(_) => return die("--root-dual-rim needs a non-negative integer"),
+            },
+            None => ROOT_DUAL_RIM_ITERS,
+        };
+        let secs = match flags.get("root-dual-secs") {
+            Some(v) => match v.parse::<f64>() {
+                Ok(x) if x >= 0.0 => x,
+                _ => return die("--root-dual-secs needs a non-negative number"),
+            },
+            None => ROOT_DUAL_BACKSTOP_SECS,
+        };
+        match &outcome {
+            Outcome::Optimal { .. } => {
+                let t = Instant::now();
+                let budget = ay_milp::RootDualBudget::new(s.model())
+                    .with_rim_iters(rim)
+                    .with_deadline(
+                        (secs > 0.0).then(|| Instant::now() + Duration::from_secs_f64(secs)),
+                    );
+                let (derived, report) = ay_milp::derive_root_dual_bound(s.model(), &budget);
+                // NAME THE LANE ON THE SUCCESS LINE. It is the only number here
+                // that says whether this run's evidence was clock-free: `float`
+                // is a pure function of the model, `exact-rim` was reached only
+                // because the float lane found nothing and could in principle
+                // have been stopped by the net instead.
+                root_dual_note = format!(
+                    ", root-dual-bound {} in {:.3} s",
+                    derived.as_ref().map_or_else(
+                        || format!(
+                            "declined ({}; rim {} iters, cap {rim})",
+                            report
+                                .decline
+                                .map_or("unknown", ay_milp::RootDualDecline::tag),
+                            report.rim_iters
+                        ),
+                        |_| format!(
+                            "via {} lane ({} rim iters)",
+                            report.lane.map_or("-", ay_milp::RootDualLane::tag),
+                            report.rim_iters
+                        )
+                    ),
+                    t.elapsed().as_secs_f64()
+                );
+                ph_root_dual = t.elapsed();
+                derived
+            }
+            _ => None,
+        }
+    };
+
     let mut ph_cert = Duration::ZERO;
     if let Some(cp) = &cert_path {
         let t = Instant::now();
@@ -666,6 +768,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
             network_design_optimality_certificate: s.network_design_optimality_certificate(),
             block_angular_optimality_certificate: s.block_angular_optimality_certificate(),
             milp_optimality_tree_certificate: opt_tree.as_ref(),
+            root_dual_bound_certificate: root_dual.as_ref(),
             single_machine_scheduling_optimality_certificate: s
                 .single_machine_scheduling_optimality_certificate(),
             single_row_dp_infeasibility_certificate: s.single_row_dp_infeasibility_certificate(),
@@ -687,7 +790,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
         let bytes = ayc.len();
         match std::fs::write(cp, ayc.as_bytes()) {
             Ok(()) => eprintln!(
-                "certificate: {cp} ({bytes} bytes, {} us){opt_tree_note}",
+                "certificate: {cp} ({bytes} bytes, {} us){opt_tree_note}{root_dual_note}",
                 t.elapsed().as_micros()
             ),
             Err(e) => eprintln!("ay-milp: WARNING: cannot write {cp}: {e}"),
@@ -770,13 +873,14 @@ fn cmd_solve(args: &[String]) -> ExitCode {
             + ph_session
             + Duration::from_secs_f64(dt)
             + ph_opt_tree
+            + ph_root_dual
             + ph_cert
             + ph_require
             + dispatch;
         let us = |d: Duration| d.as_micros();
         eprintln!(
             "phase-ledger: dispatch={} read={} parse={} shape={} session={} solve={} \
-             opt_tree={} cert={} require={} resid={} in_main={} (us)",
+             opt_tree={} root_dual={} cert={} require={} resid={} in_main={} (us)",
             us(dispatch),
             us(ph_read),
             us(ph_parse),
@@ -784,6 +888,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
             us(ph_session),
             (dt * 1e6) as u128,
             us(ph_opt_tree),
+            us(ph_root_dual),
             us(ph_cert),
             us(ph_require),
             us(in_main.saturating_sub(named)),

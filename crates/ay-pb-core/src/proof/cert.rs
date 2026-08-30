@@ -17,7 +17,15 @@
 //! claim). A `None` or a proof that fails to verify must never change the
 //! reported SAT/UNSAT status — certification is strictly additive.
 
+mod clique_coloring;
+mod cp_replay;
+mod frustrated_cycle;
 mod lp_dual_floor;
+
+pub use clique_coloring::certify_opt_lin_clique_coloring;
+pub use frustrated_cycle::certify_opt_lin_frustrated_cycle;
+
+use std::time::Instant;
 
 use ay_sat::{Literal, ProofOutput, SatResult, Solver};
 
@@ -25,9 +33,11 @@ use super::drat_lift::{emit_decision_unsat_proof, parse_aux_free_drat};
 use super::reified_encoding::{
     emit_sinz_introductions_pol_derived_weighted, encode_instance_proof_producing,
 };
+use super::route_budget::CertRouteBudget;
 use super::steps::{ConstraintId, ProofStep};
 use super::veripb::{
-    format_lit, veripb_input_constraint_count, write_opt_conclusion_hinted, VeriPbWriter,
+    format_lit, veripb_input_constraint_count, veripb_input_row_ids, write_opt_conclusion_hinted,
+    VeriPbWriter,
 };
 use crate::encoding::CnfEncoder;
 use crate::types::{PbConstraint, PbInstance, PbLit, PbObjective, PbRel, PbTerm};
@@ -724,7 +734,17 @@ pub fn certify_opt_lin_direct_aggregation_floor(
     }
 
     // Select covering rows (same predicate as build_aggregation_floor_cert),
-    // tracking each row's ORIGINAL 1-based index = its VeriPB `f` constraint id.
+    // citing each row's VeriPB `f` id.
+    //
+    // NOT `idx + 1`. VeriPB imports an `=` row as TWO consecutive constraints
+    // (the `>=` half then the `<=` half), so every equality BEFORE a selected
+    // row shifts that row's id. `veripb_input_row_ids` is the one definition of
+    // that map and shares `veripb_row_id_width` with the `f` header count, so
+    // the header and the hints cannot disagree again. Before this, on
+    // `normalized-fx57.opb` (57 equalities), the emitter cited id 3286 for the
+    // row VeriPB had at 3343: a legal `pol` over the WRONG row, which parsed
+    // fine and then failed the `conclusion BOUNDS` hint check.
+    let row_ids = veripb_input_row_ids(instance).ok()?;
     let mut selected_ids: Vec<ConstraintId> = Vec::new();
     let mut colsum: std::collections::BTreeMap<u32, i128> = std::collections::BTreeMap::new();
     let mut rhs_sum: i128 = 0;
@@ -745,8 +765,7 @@ pub fn certify_opt_lin_direct_aggregation_floor(
             *colsum.entry(v).or_insert(0) =
                 colsum.get(&v).copied().unwrap_or(0).checked_add(t.coeff)?;
         }
-        let vid = u64::try_from(idx.checked_add(1)?).ok()?;
-        selected_ids.push(ConstraintId::new(vid)?);
+        selected_ids.push(*row_ids.get(idx)?);
     }
     if selected_ids.is_empty() || rhs_sum <= 0 || colsum.is_empty() {
         return None;
@@ -773,6 +792,15 @@ pub fn certify_opt_lin_direct_aggregation_floor(
 
     // ---- Emit the VeriPB proof. ----
     let f_count = veripb_input_constraint_count(instance).ok()?;
+    // Fail closed rather than cite a row VeriPB did not import. `row_ids` and
+    // `f_count` come from the same width function, so this can only fire if
+    // that shared definition is edited inconsistently — which is exactly the
+    // class of change that produced the fx57 defect. Emitting nothing costs one
+    // certificate; emitting a hint out of range costs a rejected proof next to
+    // an `s OPTIMUM FOUND`.
+    if selected_ids.iter().any(|id| id.get() > f_count) {
+        return None;
+    }
     let mut writer = VeriPbWriter::new(Vec::<u8>::new(), f_count).ok()?;
 
     // Upper bound: log the incumbent; VeriPB installs `obj <= optimum-1`.
@@ -1378,6 +1406,216 @@ fn format_assignment(assignment: &[bool]) -> String {
     out
 }
 
+/// The name of the OPT-LIN certificate route that produced a proof.
+///
+/// Diagnostics only: which route fired never changes a verdict, an objective or
+/// a byte of stdout. It exists so a miss can be attributed to a route instead of
+/// to "the chain", which is what the coverage census had to reconstruct by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptLinCertRoute {
+    /// `obj >= 0` for a non-negative objective whose optimum is 0.
+    TrivialZeroFloor,
+    /// The knapsack cardinality floor (the knapPI class).
+    KnapsackCardinality,
+    /// The clique-colouring structural floor, whose LP dual is always 0.
+    CliqueColoring,
+    /// A direct Chvátal-Gomory aggregation floor; no refutation needed.
+    DirectAggregationFloor,
+    /// The exact rational LP dual, un-complemented into instance rows.
+    LpDualFloor,
+    /// The signed-graph frustration-index structural floor, whose LP dual is
+    /// always 0 because the half-integral sign point is feasible at cost 0.
+    FrustratedCycle,
+    /// Augmented-instance refutation lifted through the compact Sinz encoding.
+    BoundsCompact,
+    /// Augmented-instance refutation lifted aux-free.
+    Bounds,
+    /// Augmented-instance refutation by the proof-logging PB-native CDCL.
+    BoundsPbNative,
+}
+
+/// SEARCH rungs in the OPT-LIN chain — `bounds_compact`, `bounds` (aux-free)
+/// and `bounds_pb` — i.e. the ones that consult `should_stop` and can therefore
+/// consume a budget. The five floor rungs are pure arithmetic and are NOT
+/// scheduled, so they are not counted here.
+const OPT_LIN_SEARCH_ROUTES: u32 = 3;
+
+impl OptLinCertRoute {
+    /// Stable kebab-case label, for `--cert-debug` output and reports.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TrivialZeroFloor => "trivial-zero-floor",
+            Self::KnapsackCardinality => "knapsack-cardinality",
+            Self::CliqueColoring => "clique-coloring",
+            Self::DirectAggregationFloor => "direct-aggregation-floor",
+            Self::LpDualFloor => "lp-dual-floor",
+            Self::FrustratedCycle => "frustrated-cycle",
+            Self::BoundsCompact => "bounds-compact",
+            Self::Bounds => "bounds-auxfree",
+            Self::BoundsPbNative => "bounds-pb-native",
+        }
+    }
+}
+
+/// THE OPT-LIN certificate chain: every floor/refutation route this crate has,
+/// in the one order that is allowed to exist, tried cheapest-first.
+///
+/// # Why this function exists
+///
+/// Until this was factored out, the chain lived as hand-copied `.or_else(...)`
+/// ladders inside `crates/ay-pb/src/bin/ay.rs` — and only there. Each new
+/// emitter (`trivial_zero_floor`, `knapsack_cardinality`,
+/// `direct_aggregation_floor`, `lp_dual_floor`, `bounds_pb`, `clique_coloring`)
+/// was wired into that binary's two copies and into no other caller, so the
+/// SHIPPED CLI (`crates/ay/src/cmd_pb.rs`), which had forked the ladder back
+/// when it had only two rungs, silently kept a two-route chain while the
+/// competition binary grew to eight. Measured consequence: on the same
+/// instances at the same budget, `ay-pb` certified nine optima the CLI did not,
+/// and none the other way round.
+///
+/// A chain that is copied is a chain that drifts. This is the single definition;
+/// callers get new routes by existing.
+///
+/// # Order
+///
+/// Strictly cheapest-first, so an expensive route can never eat the budget of a
+/// cheap one that would have succeeded:
+///
+/// 1. `trivial_zero_floor` — O(n) syntactic, optimum-0 non-negative objectives.
+/// 2. `knapsack_cardinality` — O(n log n), the knapPI class, ~13 lines of proof.
+/// 3. `clique_coloring` — O(1) header pre-gate; the structural family whose LP
+///    relaxation *and* full level-1 RLT lift are both exactly 0, so no dual
+///    floor can ever fire on it.
+/// 4. `direct_aggregation_floor` — a short Chvátal-Gomory aggregation, no SAT
+///    refutation needed; certifies covering-tight optima the refutations cannot
+///    reach in budget.
+/// 5. `lp_dual_floor` — the exact rational LP dual, un-complemented; the only
+///    route for tight-LP maximisation optima.
+/// 6. `frustrated_cycle` — O(1) header pre-gate; the signed-graph frustration
+///    index, whose LP relaxation is exactly 0 at the half-integral sign point,
+///    so no dual floor can ever fire on it either. LAST of the floor rungs
+///    because it is the only one whose on-family cost is a search rather than a
+///    formula: every cheaper route gets its chance first, and off-family
+///    instances pay three integer comparisons.
+/// 7. `bounds_compact` — augmented refutation with Sinz aux registers (broadest
+///    refutation coverage).
+/// 8. `bounds` — the aux-free lift.
+/// 9. `bounds_pb` — PB-native refutation; last, so it can only ADD certificates
+///    the CNF routes declined.
+///
+/// # Budget
+///
+/// TWO KINDS OF RUNG, AND THEY ARE SCHEDULED DIFFERENTLY.
+///
+/// Routes 1-6 are pure arithmetic on the instance and the incumbent: they do not
+/// consult `should_stop`. They are called DIRECTLY, outside the scheduler, and
+/// that is deliberate and load-bearing — a caller whose deadline has already
+/// passed still gets every floor route. Gating them behind a budget that can be
+/// zero would LOSE certificates the CLI gets today;
+/// `floor_routes_still_fire_with_an_already_expired_deadline` is the regression
+/// test.
+///
+/// Rung 6 (`frustrated_cycle`) is the one whose on-family cost is not a
+/// formula: it separates cycles and solves a packing LP. It is bounded by
+/// deterministic COUNTS (rows, pool, rounds, pivots) rather than by a clock,
+/// precisely so that it can live outside the scheduler without either eating a
+/// budget or making the emitted bytes depend on machine load. Off-family
+/// instances never reach that work: three integer comparisons on the header
+/// decide it.
+///
+/// Routes 7-9 are SEARCH, and they are the ones that can eat a chain. Each gets
+/// a deadline of its own out of `deadline` via [`CertRouteBudget`]: rung `i` of
+/// `n` remaining gets `remaining / n`, and time an earlier rung did not spend
+/// rolls forward. Passing `deadline: None` keeps the uncapped behaviour.
+///
+/// THE BUDGET LIVES HERE, NOT AT THE CALL SITES. It was originally written at
+/// one call site in `crates/ay-pb/src/bin/ay.rs`, and when this chain was
+/// factored into the library the budget stayed behind — so the three search
+/// rungs went back to sharing one deadline for every caller of this function.
+/// Measured on `evencolouring_..._nvert_071` through `ay pb solve --timeout
+/// 120000`, with the shared deadline:
+///
+/// ```text
+///   bounds-compact    slice=shared  elapsed=81914ms -> none
+///   bounds-auxfree    slice=shared  elapsed=0ms     -> none
+///   bounds-pb-native  slice=shared  elapsed=0ms     -> none      s UNKNOWN
+/// ```
+///
+/// `bounds-pb-native` is the rung that certifies that instance. A chain whose
+/// budget is copied is a budget that drifts, exactly as the chain itself did.
+///
+/// # Soundness
+///
+/// This function chooses an order; it derives nothing. Every rung independently
+/// re-verifies that the incumbent is complete, feasible and achieves `optimum`,
+/// and returns `None` rather than a doubtful proof. The returned text is proof
+/// text only — untrusted until the external pinned VeriPB checker accepts it —
+/// and `None` must never change a reported status. Certification is strictly
+/// additive.
+pub fn certify_opt_lin_any_interruptible(
+    instance: &PbInstance,
+    incumbent: &[bool],
+    optimum: i128,
+    deadline: Option<Instant>,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<(String, OptLinCertRoute)> {
+    // RUNGS 1-6: pure arithmetic, NOT scheduled. They never poll `should_stop`,
+    // so they must not be put behind a budget that can be zero — a caller that
+    // reaches certification with its deadline already spent (which is the
+    // normal case for the CLI) still gets every one of them.
+    let floor = certify_opt_lin_trivial_zero_floor(instance, incumbent, optimum)
+        .map(|p| (p, OptLinCertRoute::TrivialZeroFloor))
+        .or_else(|| {
+            certify_opt_lin_knapsack_cardinality(instance, incumbent, optimum)
+                .map(|p| (p, OptLinCertRoute::KnapsackCardinality))
+        })
+        .or_else(|| {
+            certify_opt_lin_clique_coloring(instance, incumbent, optimum)
+                .map(|p| (p, OptLinCertRoute::CliqueColoring))
+        })
+        .or_else(|| {
+            certify_opt_lin_direct_aggregation_floor(instance, incumbent, optimum)
+                .map(|p| (p, OptLinCertRoute::DirectAggregationFloor))
+        })
+        .or_else(|| {
+            certify_opt_lin_lp_dual_floor(instance, incumbent, optimum)
+                .map(|p| (p, OptLinCertRoute::LpDualFloor))
+        })
+        .or_else(|| {
+            certify_opt_lin_frustrated_cycle(instance, incumbent, optimum)
+                .map(|p| (p, OptLinCertRoute::FrustratedCycle))
+        });
+    if floor.is_some() {
+        return floor;
+    }
+
+    // RUNGS 7-9: SEARCH, one deadline each. `bounds_pb_native` is last and is
+    // the rung that closes the most misses, so it is precisely the one a shared
+    // deadline starves.
+    let mut budget = CertRouteBudget::new(deadline, OPT_LIN_SEARCH_ROUTES, should_stop);
+    let mut pbp = budget
+        .run(OptLinCertRoute::BoundsCompact.as_str(), |stop| {
+            certify_opt_lin_bounds_compact_interruptible(instance, incumbent, optimum, stop)
+        })
+        .map(|p| (p, OptLinCertRoute::BoundsCompact));
+    if pbp.is_none() {
+        pbp = budget
+            .run(OptLinCertRoute::Bounds.as_str(), |stop| {
+                certify_opt_lin_bounds_interruptible(instance, incumbent, optimum, stop)
+            })
+            .map(|p| (p, OptLinCertRoute::Bounds));
+    }
+    if pbp.is_none() {
+        pbp = budget
+            .run(OptLinCertRoute::BoundsPbNative.as_str(), |stop| {
+                certify_opt_lin_bounds_pb_interruptible(instance, incumbent, optimum, stop)
+            })
+            .map(|p| (p, OptLinCertRoute::BoundsPbNative));
+    }
+    pbp
+}
+
 #[cfg(test)]
 mod direct_floor_tests {
     use super::*;
@@ -1733,6 +1971,151 @@ mod direct_floor_tests {
         assert!(
             certify_opt_lin_lp_dual_floor(&instance, &incumbent, 2).is_none(),
             "LP-dual floor must decline when LP* = 0 but the optimum is 2"
+        );
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+    use crate::types::{PbConstraint, PbInstance, PbLit, PbObjective, PbRel, PbTerm};
+    use std::time::Duration;
+
+    fn plit(var: u32) -> PbLit {
+        PbLit {
+            var,
+            negated: false,
+        }
+    }
+    fn term(coeff: i128, var: u32) -> PbTerm {
+        PbTerm {
+            coeff,
+            lits: vec![plit(var)],
+        }
+    }
+    fn ge(terms: Vec<PbTerm>, rhs: i128) -> PbConstraint {
+        PbConstraint {
+            terms,
+            rel: PbRel::Ge,
+            rhs,
+        }
+    }
+
+    /// Triangle covering, optimum 2 — the direct-aggregation floor's own
+    /// fixture. The chain must reach it and must SAY which rung reached it.
+    fn triangle_cover() -> PbInstance {
+        PbInstance {
+            num_vars: 3,
+            num_constraints: 3,
+            constraints: vec![
+                ge(vec![term(1, 1), term(1, 2)], 1),
+                ge(vec![term(1, 2), term(1, 3)], 1),
+                ge(vec![term(1, 1), term(1, 3)], 1),
+            ],
+            objective: Some(PbObjective {
+                terms: vec![term(1, 1), term(1, 2), term(1, 3)],
+            }),
+        }
+    }
+
+    #[test]
+    fn chain_reaches_the_floor_routes_and_names_the_rung() {
+        let instance = triangle_cover();
+        let incumbent = vec![true, true, false];
+        let (proof, route) =
+            certify_opt_lin_any_interruptible(&instance, &incumbent, 2, None, &|| false)
+                .expect("the chain must reach the direct-aggregation floor");
+        assert_eq!(route, OptLinCertRoute::DirectAggregationFloor);
+        assert_eq!(route.as_str(), "direct-aggregation-floor");
+        assert!(proof.contains("conclusion BOUNDS 2"), "proof was:\n{proof}");
+    }
+
+    /// THE BUDGET PROPERTY THE SHIPPED CLI DEPENDS ON. The CLI's certificate
+    /// stage is entered after the native proof-logging phase has already spent
+    /// the caller's deadline, so `should_stop()` is routinely true on the first
+    /// poll. The five floor rungs are pure arithmetic and must fire anyway; only
+    /// the three search rungs are allowed to decline early. If this test ever
+    /// fails, wiring the chain into a starved caller stops buying anything and
+    /// the CLI silently returns to its two-route coverage.
+    #[test]
+    fn floor_routes_still_fire_with_an_already_expired_deadline() {
+        let instance = triangle_cover();
+        let incumbent = vec![true, true, false];
+        // BOTH kinds of exhaustion at once: an absolute deadline that expired
+        // a second ago AND a `should_stop` that is already true.
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("a one-second-old instant exists on every supported clock");
+        let (proof, route) =
+            certify_opt_lin_any_interruptible(&instance, &incumbent, 2, Some(expired), &|| true)
+                .expect("floor routes must not consult should_stop");
+        assert_eq!(route, OptLinCertRoute::DirectAggregationFloor);
+        assert!(proof.contains("conclusion BOUNDS 2"), "proof was:\n{proof}");
+    }
+
+    /// FAIL CLOSED. An incumbent that does not achieve the claimed optimum must
+    /// produce NO proof from ANY rung — a certificate for a bound the instance
+    /// does not support is the worst defect this module can have.
+    #[test]
+    fn chain_declines_when_the_incumbent_does_not_achieve_the_claim() {
+        let instance = triangle_cover();
+        // {x1,x2,x3} has value 3, not 2.
+        let incumbent = vec![true, true, true];
+        assert!(
+            certify_opt_lin_any_interruptible(&instance, &incumbent, 2, None, &|| false).is_none(),
+            "the chain must not certify an optimum its incumbent does not reach"
+        );
+    }
+
+    /// THE SCHEDULER MUST BE SIZED FOR EVERY SEARCH RUNG. `CertRouteBudget`
+    /// hands rung `i` of `n` a slice of `remaining / n`; if a search rung is
+    /// added to the chain and `OPT_LIN_SEARCH_ROUTES` is not bumped with it,
+    /// the extra rung runs with `routes_left` already 0 and takes ALL of what
+    /// is left — the starvation defect, reintroduced by addition. The match is
+    /// exhaustive on purpose: a new variant will not compile until it is
+    /// classified.
+    #[test]
+    fn the_scheduler_is_sized_for_every_search_rung() {
+        let mut search = 0u32;
+        for route in [
+            OptLinCertRoute::TrivialZeroFloor,
+            OptLinCertRoute::KnapsackCardinality,
+            OptLinCertRoute::CliqueColoring,
+            OptLinCertRoute::DirectAggregationFloor,
+            OptLinCertRoute::LpDualFloor,
+            OptLinCertRoute::FrustratedCycle,
+            OptLinCertRoute::BoundsCompact,
+            OptLinCertRoute::Bounds,
+            OptLinCertRoute::BoundsPbNative,
+        ] {
+            let consults_should_stop = match route {
+                OptLinCertRoute::TrivialZeroFloor
+                | OptLinCertRoute::KnapsackCardinality
+                | OptLinCertRoute::CliqueColoring
+                | OptLinCertRoute::DirectAggregationFloor
+                | OptLinCertRoute::LpDualFloor
+                | OptLinCertRoute::FrustratedCycle => false,
+                OptLinCertRoute::BoundsCompact
+                | OptLinCertRoute::Bounds
+                | OptLinCertRoute::BoundsPbNative => true,
+            };
+            search += u32::from(consults_should_stop);
+        }
+        assert_eq!(
+            OPT_LIN_SEARCH_ROUTES, search,
+            "the per-route budget must be sized for exactly the search rungs"
+        );
+    }
+
+    /// A claim BELOW the true optimum must also be refused: the floor rungs
+    /// derive the bound themselves and must not be talked into a smaller one.
+    #[test]
+    fn chain_declines_a_claim_below_the_true_optimum() {
+        let instance = triangle_cover();
+        let incumbent = vec![true, true, false];
+        assert!(
+            certify_opt_lin_any_interruptible(&instance, &incumbent, 1, None, &|| false).is_none(),
+            "the chain must not certify a bound below the instance's optimum"
         );
     }
 }

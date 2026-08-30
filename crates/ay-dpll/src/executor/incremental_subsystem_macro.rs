@@ -27,6 +27,7 @@ macro_rules! for_each_incremental_subsystem {
         let fp = $self
             .incr_fp_state
             .get_or_insert_with(IncrementalFpState::new);
+        fp.record_incremental_entry(&$self.ctx.assertions);
         for _ in 0..$n {
             fp.push();
         }

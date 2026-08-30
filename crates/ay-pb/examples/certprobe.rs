@@ -124,6 +124,10 @@ fn main() -> Result<ExitCode, CertprobeError> {
             ay_pb::proof::certify_opt_lin_knapsack_cardinality(&instance, &incumbent, optimum),
         ),
         (
+            "clique_coloring",
+            ay_pb::proof::certify_opt_lin_clique_coloring(&instance, &incumbent, optimum),
+        ),
+        (
             "direct_aggregation_floor",
             ay_pb::proof::certify_opt_lin_direct_aggregation_floor(&instance, &incumbent, optimum),
         ),

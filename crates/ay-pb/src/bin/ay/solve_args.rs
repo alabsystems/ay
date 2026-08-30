@@ -114,6 +114,21 @@ fn parse_solve_args(args: Vec<String>) -> Result<SolveArgs, String> {
             "--stats" => stats = true,
             "--stats-json" => stats_json = true,
             "--native" => native = true,
+            // PB certificate diagnostics: which OPT-LIN rung ran, the slice of
+            // the certification budget it was given, and how long it took.
+            // `MiscCliFlags::cert_debug` gates diagnostics all through
+            // `ay-pb-core`'s certificate module, but nothing on the PB command
+            // line ever set it, so those sites were dead here. Set-once; a
+            // second install (tests) is not an error, the flag only decides
+            // whether comments print.
+            // INSTALL WITHOUT READING FIRST: `misc_cli_flags()` initialises
+            // the set-once global as a side effect of reading it, so guarding
+            // this on its current value makes the install a no-op.
+            "--cert-debug" => {
+                let _ = ay_core::set_global_misc_cli_flags_with(|flags| {
+                    flags.cert_debug = true;
+                });
+            }
             "--help" | "-h" => return Err(usage()),
             arg if arg.starts_with('-') => return Err(format!("unknown argument: {arg}")),
             path => {

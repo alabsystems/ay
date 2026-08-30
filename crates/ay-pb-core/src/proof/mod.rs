@@ -12,17 +12,20 @@ mod koops;
 mod optimum_check;
 mod refutation_check;
 mod reified_encoding;
+mod route_budget;
 mod steps;
 pub(crate) mod tap;
 mod veripb;
 
 pub use self::cert::{
-    certify_decision_unsat, certify_decision_unsat_interruptible, certify_opt_lin_bounds,
-    certify_opt_lin_bounds_compact, certify_opt_lin_bounds_compact_interruptible,
-    certify_opt_lin_bounds_interruptible, certify_opt_lin_bounds_pb,
-    certify_opt_lin_bounds_pb_interruptible, certify_opt_lin_direct_aggregation_floor,
-    certify_opt_lin_knapsack_cardinality, certify_opt_lin_lp_dual_floor,
-    certify_opt_lin_trivial_zero_floor, lp_dual_floor_diagnosis, solution_only_sat_proof,
+    certify_decision_unsat, certify_decision_unsat_interruptible,
+    certify_opt_lin_any_interruptible, certify_opt_lin_bounds, certify_opt_lin_bounds_compact,
+    certify_opt_lin_bounds_compact_interruptible, certify_opt_lin_bounds_interruptible,
+    certify_opt_lin_bounds_pb, certify_opt_lin_bounds_pb_interruptible,
+    certify_opt_lin_clique_coloring, certify_opt_lin_direct_aggregation_floor,
+    certify_opt_lin_frustrated_cycle, certify_opt_lin_knapsack_cardinality,
+    certify_opt_lin_lp_dual_floor, certify_opt_lin_trivial_zero_floor, lp_dual_floor_diagnosis,
+    solution_only_sat_proof, OptLinCertRoute,
 };
 pub use self::drat_lift::{emit_decision_unsat_proof, parse_aux_free_drat};
 #[cfg(test)]
@@ -35,6 +38,7 @@ pub use self::optimum_check::{
 pub use self::refutation_check::{
     pb_eq_halves, pb_ge, LinConstraint, RefError, RefStep, Refutation,
 };
+pub use self::route_budget::CertRouteBudget;
 
 pub use self::context::{
     FailClosedReason, InputRowIds, ObjectiveProofState, ProofConclusionState, ProofContext,
@@ -59,7 +63,7 @@ pub use self::steps::{ConstraintId, ProofStep};
 pub use self::tap::ProofTapStats;
 pub use self::veripb::{
     format_constraint, format_cp_constraint, format_lit, veripb_input_constraint_count,
-    ProofConclusionKind, ProofError, Result, VeriPbWriter,
+    veripb_input_row_ids, ProofConclusionKind, ProofError, Result, VeriPbWriter,
 };
 
 #[cfg(test)]

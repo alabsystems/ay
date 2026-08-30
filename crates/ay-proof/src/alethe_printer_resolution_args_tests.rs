@@ -9,6 +9,9 @@ use crate::{
 use ay_core::kani_compat::DetHashMap;
 use ay_core::{AletheRule, Proof, Sort, Symbol, TermId, TermStore};
 
+#[path = "alethe_printer_resolution_args_let_bridge_tests.rs"]
+mod let_bridge_tests;
+
 #[test]
 fn generic_resolution_export_rejects_malformed_argument_count() {
     let mut terms = TermStore::new();

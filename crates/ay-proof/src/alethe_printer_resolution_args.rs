@@ -9,6 +9,10 @@ use super::AlethePrinter;
 use ay_core::kani_compat::DetHashMap;
 use ay_core::{AletheRule, Constant, ProofId, TermData, TermId, TermStore};
 
+#[cfg(test)]
+#[path = "alethe_printer_resolution_args_precedence_tests.rs"]
+mod precedence_tests;
+
 pub(super) fn is_generic_resolution(rule: &AletheRule) -> bool {
     matches!(rule, AletheRule::ThResolution | AletheRule::Resolution)
 }
@@ -76,6 +80,44 @@ pub(super) fn validate_generic_resolution_surface(
 
     let premise_clauses = printer.proof_clauses.borrow();
     validate_duplicate_free_directed_fold(printer.terms, clause, premises, args, &premise_clauses)
+}
+
+impl AlethePrinter<'_> {
+    /// Print a derived literal after any certified `let` bridge. Assumptions
+    /// bypass this path and remain source-exact.
+    ///
+    /// A certified rendering for the outer literal (a Skolem rewrite or its
+    /// own direct `let` bridge) keeps `write_term_into`'s normal precedence.
+    /// Otherwise, only an explicit `Not(inner)` needs repair: a derived
+    /// positive `inner` already follows the ordinary bridge lookup there. A
+    /// raw outer term override is intentionally bypassed because it is source
+    /// spelling, not an independently certified derived-literal rendering.
+    ///
+    /// De Morgan and other complement-normalized roots are deliberately not
+    /// inferred here. They remain distinct Alethe atoms and must use a
+    /// dedicated checked bridge, or the resolution checker rejects them.
+    pub(super) fn write_derived_literal_into(&self, out: &mut String, term_id: TermId) {
+        if self.work_budget_exhausted() {
+            self.write_term_into(out, term_id);
+            return;
+        }
+        let has_certified_outer_rendering = self.skolem_overrides.borrow().contains_key(&term_id)
+            || self.let_bridge_renderings.borrow().contains_key(&term_id);
+        if has_certified_outer_rendering {
+            self.write_term_into(out, term_id);
+            return;
+        }
+        if let TermData::Not(inner) = self.terms.get(term_id) {
+            if let Some(eliminated) = self.let_bridge_renderings.borrow().get(inner).cloned() {
+                self.charge((eliminated.len() + "(not )".len()) as u64);
+                out.push_str("(not ");
+                out.push_str(&eliminated);
+                out.push(')');
+                return;
+            }
+        }
+        self.write_term_into(out, term_id);
+    }
 }
 
 /// Match the occurrence-sensitive subset accepted by AY's native explicit

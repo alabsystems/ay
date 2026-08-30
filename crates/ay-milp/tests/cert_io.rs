@@ -451,6 +451,7 @@ fn emit_session_certificate_with_tree(
         network_design_optimality_certificate: session.network_design_optimality_certificate(),
         block_angular_optimality_certificate: session.block_angular_optimality_certificate(),
         milp_optimality_tree_certificate: opt_tree,
+        root_dual_bound_certificate: None,
         single_machine_scheduling_optimality_certificate: session
             .single_machine_scheduling_optimality_certificate(),
         single_row_dp_infeasibility_certificate: session.single_row_dp_infeasibility_certificate(),
@@ -1739,6 +1740,7 @@ fn a_size_cap_downgrades_the_claim_it_drops() {
         network_design_optimality_certificate: s.network_design_optimality_certificate(),
         block_angular_optimality_certificate: s.block_angular_optimality_certificate(),
         milp_optimality_tree_certificate: None,
+        root_dual_bound_certificate: None,
         single_machine_scheduling_optimality_certificate: s
             .single_machine_scheduling_optimality_certificate(),
         single_row_dp_infeasibility_certificate: s.single_row_dp_infeasibility_certificate(),

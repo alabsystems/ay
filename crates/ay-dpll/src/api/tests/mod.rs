@@ -19,6 +19,7 @@ mod test_core;
 mod test_counterexample_minimization;
 mod test_declaration_identity;
 mod test_define_fun;
+mod test_exact_query_bundle;
 mod test_explanation_report;
 mod test_fp;
 mod test_fp_bv_bridge;
