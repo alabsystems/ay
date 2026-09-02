@@ -62,6 +62,19 @@ pub enum Logic {
     QfAbv,
     /// Quantifier-free arrays with uninterpreted functions and bitvectors
     QfAufbv,
+    /// Quantifier-free uninterpreted functions with bitvectors and linear integer arithmetic
+    ///
+    /// AY conditionally dispatches this declared upper bound only when the
+    /// live query is in its validated array-free, datatype-free linear
+    /// fragment. Unsupported combinations return `unknown`.
+    QfUfbvlia,
+    /// Quantifier-free arrays, uninterpreted functions, bitvectors, and linear integer arithmetic
+    ///
+    /// AY conditionally dispatches array-free content through the same
+    /// validated scalar subset as [`Self::QfUfbvlia`]. Live array content
+    /// remains fail-closed until AY has a sound array + UF + BV + LIA
+    /// combination procedure.
+    QfAufbvlia,
     /// Quantifier-free uninterpreted functions with non-linear integer arithmetic
     QfUfnia,
     /// Quantifier-free uninterpreted functions with non-linear real arithmetic
@@ -161,6 +174,8 @@ impl Logic {
             Self::QfUfbv => "QF_UFBV",
             Self::QfAbv => "QF_ABV",
             Self::QfAufbv => "QF_AUFBV",
+            Self::QfUfbvlia => "QF_UFBVLIA",
+            Self::QfAufbvlia => "QF_AUFBVLIA",
             Self::QfUfnia => "QF_UFNIA",
             Self::QfUfnra => "QF_UFNRA",
             Self::QfUfnira => "QF_UFNIRA",
@@ -229,6 +244,8 @@ impl std::str::FromStr for Logic {
             "QF_UFBV" => Ok(Self::QfUfbv),
             "QF_ABV" => Ok(Self::QfAbv),
             "QF_AUFBV" => Ok(Self::QfAufbv),
+            "QF_UFBVLIA" => Ok(Self::QfUfbvlia),
+            "QF_AUFBVLIA" => Ok(Self::QfAufbvlia),
             "QF_UFNIA" | "QF_AUFNIA" => Ok(Self::QfUfnia),
             "QF_UFNRA" | "QF_AUFNRA" => Ok(Self::QfUfnra),
             "QF_UFNIRA" | "QF_AUFNIRA" => Ok(Self::QfUfnira),
@@ -436,6 +453,20 @@ mod split_leading_set_logic_tests {
             let (logic, body) = split_leading_set_logic(odd, Logic::QfLia);
             assert_eq!(logic, Logic::QfLia, "must fall back on {odd:?}");
             assert_eq!(body, odd, "must be untouched: {odd:?}");
+        }
+    }
+
+    #[test]
+    fn preserves_named_bv_lia_combination_logics() {
+        for (name, expected) in [
+            ("QF_UFBVLIA", Logic::QfUfbvlia),
+            ("QF_AUFBVLIA", Logic::QfAufbvlia),
+        ] {
+            let input = format!("(set-logic {name})\n(check-sat)\n");
+            let (logic, body) = split_leading_set_logic(&input, Logic::All);
+            assert_eq!(logic, expected);
+            assert_eq!(logic.as_str(), name);
+            assert_eq!(body, "\n(check-sat)\n");
         }
     }
 }

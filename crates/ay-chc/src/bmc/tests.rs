@@ -5,10 +5,36 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 use super::*;
 use crate::ab_switches::{ChcAbSwitches, TestOverride};
+use crate::parser::ChcParser;
 use crate::pdr::counterexample::{DerivationWitness, DerivationWitnessEntry};
 use crate::pdr::{CexVerificationResult, PdrConfig, PdrSolver};
 use crate::{ClauseBody, ClauseHead, HornClause};
 use ntest::timeout;
+
+#[test]
+fn incremental_bmc_script_declares_problem_ufs_under_compatible_logic() {
+    let problem = ChcParser::parse(
+        r#"(set-logic HORN)
+(declare-fun f (Int) Int)
+(declare-fun Inv (Int) Bool)
+(assert (Inv 0))
+(assert (forall ((x Int) (xp Int))
+  (=> (and (Inv x) (= xp (+ x 1)) (= (f x) x)) (Inv xp))))
+(assert (forall ((x Int)) (=> (and (Inv x) (> x 10)) false)))
+(check-sat)
+"#,
+    )
+    .expect("scalar-UF transition fixture should parse");
+
+    let segments = BmcSolver::ts_incremental_script_segments_for_test(problem, 0)
+        .expect("fixture should lower to an incremental transition system");
+    assert!(segments[0].starts_with("(set-logic ALL)\n"));
+    assert!(
+        segments[0].contains("(declare-fun f (Int) Int)"),
+        "the persistent session must declare source UFs before any unrolled assertion: {}",
+        segments[0]
+    );
+}
 
 fn create_large_acyclic_int_chain_for_exact_first_9004(pred_count: usize) -> ChcProblem {
     let mut problem = ChcProblem::new();
@@ -103,6 +129,59 @@ fn test_large_acyclic_bmc_prefers_exact_executor_before_concrete_prepass_9004() 
         !adaptive_solver.prefer_exact_acyclic_executor_first(),
         "adaptive stepping keeps its existing route"
     );
+}
+
+/// Exact streaming-path Unsafe evidence must retain the fully-ground
+/// derivation it used on the BMC problem.  Enclosing transform lanes cannot
+/// soundly reconstruct dropped parameter values from the legacy trace alone.
+#[test]
+#[timeout(30_000)]
+fn exact_acyclic_streaming_unsafe_carries_validated_ground_derivation() {
+    let mut problem = ChcProblem::new();
+    let p0 = problem.declare_predicate("GroundPath0", vec![ChcSort::Int]);
+    let p1 = problem.declare_predicate("GroundPath1", vec![ChcSort::Int]);
+    let x = ChcVar::new("x", ChcSort::Int);
+
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(p0, vec![ChcExpr::int(0)]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::predicates_only(vec![(p0, vec![ChcExpr::var(x.clone())])]),
+        ClauseHead::Predicate(
+            p1,
+            vec![ChcExpr::add(ChcExpr::var(x.clone()), ChcExpr::int(1))],
+        ),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(p1, vec![ChcExpr::var(x.clone())])],
+            Some(ChcExpr::eq(ChcExpr::var(x), ChcExpr::int(1))),
+        ),
+        ClauseHead::False,
+    ));
+
+    let solver = BmcSolver::new(
+        problem.clone(),
+        BmcConfig {
+            max_depth: 2,
+            acyclic_safe: true,
+            prefer_exact_acyclic_first: true,
+            time_budget: Some(std::time::Duration::from_secs(5)),
+            enable_k_induction: false,
+            enable_adaptive_stepping: false,
+            ..BmcConfig::default()
+        },
+    );
+    let ChcEngineResult::Unsafe(cex) = solver.solve() else {
+        panic!("reachable exact acyclic branch must produce Unsafe");
+    };
+    let derivation = cex
+        .ground_derivation
+        .as_ref()
+        .expect("exact acyclic Unsafe must carry its ground derivation");
+    crate::ground_derivation::validate_ground_derivation(&problem, derivation)
+        .expect("attached derivation must validate against the BMC problem");
 }
 
 #[test]
@@ -3160,7 +3239,9 @@ fn trace_get_value_keeps_exact_neighbors_of_unavailable_array_read_9185() {
     ];
 
     let mut model = FxHashMap::default();
-    BmcSolver::parse_trace_get_value_outputs_into_model(&mut model, &values, &outputs);
+    assert!(BmcSolver::parse_trace_get_value_outputs_into_model(
+        &mut model, &values, &outputs,
+    ));
 
     assert_eq!(model.get("Init#0"), Some(&SmtValue::Bool(true)));
     assert_eq!(model.get("Bad#1"), Some(&SmtValue::Bool(true)));
@@ -3175,6 +3256,93 @@ fn trace_get_value_keeps_exact_neighbors_of_unavailable_array_read_9185() {
     let mut commands = String::new();
     BmcSolver::append_trace_get_value_commands(&mut commands, &values);
     assert_eq!(commands.matches("(get-value (").count(), values.len());
+}
+
+#[test]
+fn trace_get_value_installs_exact_uf_applications_and_checks_congruence() {
+    let x = ChcVar::new("x_uf_trace", ChcSort::Int);
+    let f_x = ChcExpr::FuncApp(
+        "f_uf_trace".to_string(),
+        ChcSort::Int,
+        vec![ChcExpr::var(x.clone()).into()],
+    );
+    let f_zero = ChcExpr::FuncApp(
+        "f_uf_trace".to_string(),
+        ChcSort::Int,
+        vec![ChcExpr::Int(0).into()],
+    );
+    let values = vec![
+        BmcTraceValue::Var(x),
+        BmcTraceValue::UfApplication {
+            application: f_x.clone(),
+            return_sort: ChcSort::Int,
+        },
+        BmcTraceValue::UfApplication {
+            application: f_zero.clone(),
+            return_sort: ChcSort::Int,
+        },
+    ];
+    let consistent_outputs = vec![
+        "((x_uf_trace 0))".to_string(),
+        "(((f_uf_trace x_uf_trace) 7))".to_string(),
+        "(((f_uf_trace 0) 7))".to_string(),
+    ];
+    let mut model = FxHashMap::default();
+    assert!(BmcSolver::parse_trace_get_value_outputs_into_model(
+        &mut model,
+        &values,
+        &consistent_outputs,
+    ));
+    assert_eq!(evaluate_expr(&f_x, &model), Some(SmtValue::Int(7)));
+    assert_eq!(evaluate_expr(&f_zero, &model), Some(SmtValue::Int(7)));
+    let f_equivalent_unobserved_syntax = ChcExpr::FuncApp(
+        "f_uf_trace".to_string(),
+        ChcSort::Int,
+        vec![ChcExpr::add(ChcExpr::Int(0), ChcExpr::Int(0)).into()],
+    );
+    assert_eq!(
+        evaluate_expr(&f_equivalent_unobserved_syntax, &model),
+        Some(SmtValue::Int(7)),
+        "ground replay must resolve a renamed/rebuilt application by its concrete arguments"
+    );
+
+    let inconsistent_outputs = vec![
+        "((x_uf_trace 0))".to_string(),
+        "(((f_uf_trace x_uf_trace) 7))".to_string(),
+        "(((f_uf_trace 0) 8))".to_string(),
+    ];
+    assert!(
+        !BmcSolver::parse_trace_get_value_outputs_into_model(
+            &mut FxHashMap::default(),
+            &values,
+            &inconsistent_outputs,
+        ),
+        "equal concrete arguments with unequal results must fail closed"
+    );
+    assert!(
+        !BmcSolver::parse_trace_get_value_outputs_into_model(
+            &mut FxHashMap::default(),
+            &values,
+            &consistent_outputs[..2],
+        ),
+        "a missing UF application observation must never receive a default"
+    );
+}
+
+#[test]
+fn trace_get_value_parses_exact_real_uf_results() {
+    use num_bigint::BigInt;
+    use num_rational::BigRational;
+
+    let value =
+        ay_frontend::sexp::parse_sexp("(- (/ 3.0 2.0))").expect("exact Real get-value fixture");
+    assert_eq!(
+        BmcSolver::trace_get_value_smt_value(&value, &ChcSort::Real),
+        Some(SmtValue::Real(BigRational::new(
+            BigInt::from(-3),
+            BigInt::from(2),
+        )))
+    );
 }
 
 #[test]
@@ -3227,7 +3395,9 @@ fn trace_get_value_reconstructs_nested_array_reads_with_collided_array_keys() {
         "(((select (select F P) 0) 1))".to_string(),
         "(((select (select F E) 0) 2))".to_string(),
     ];
-    BmcSolver::parse_trace_get_value_outputs_into_model(&mut model, &values, &outputs);
+    assert!(BmcSolver::parse_trace_get_value_outputs_into_model(
+        &mut model, &values, &outputs,
+    ));
 
     assert_ne!(
         model.get("P"),
@@ -3270,7 +3440,9 @@ fn trace_get_value_reconstruction_reaches_array_key_dependency_fixpoint() {
         "(((select (select F E) 0) 7))".to_string(),
         "(((select E 5) 9))".to_string(),
     ];
-    BmcSolver::parse_trace_get_value_outputs_into_model(&mut model, &values, &outputs);
+    assert!(BmcSolver::parse_trace_get_value_outputs_into_model(
+        &mut model, &values, &outputs,
+    ));
 
     assert_eq!(evaluate_expr(&key_read, &model), Some(SmtValue::Int(9)));
     assert_eq!(
@@ -4637,6 +4809,67 @@ fn test_model_root_selection_retries_past_unextractable_lane() {
 ///
 /// `BmcSolver::solve` now fails closed to `Unknown` on any such problem.
 #[test]
+fn repeated_body_predicate_scan_distinguishes_duplicate_and_distinct() {
+    let build_problem = |repeat: bool| {
+        let mut problem = ChcProblem::new();
+        let p = problem.declare_predicate("P", Vec::new());
+        let q = problem.declare_predicate("Q", Vec::new());
+        problem.add_clause(HornClause::new(
+            ClauseBody::predicates_only(vec![
+                (p, Vec::new()),
+                (if repeat { p } else { q }, Vec::new()),
+            ]),
+            ClauseHead::False,
+        ));
+        problem
+    };
+
+    let repeated = BmcSolver::new(build_problem(true), BmcConfig::default());
+    assert_eq!(repeated.has_repeated_body_predicate(), Some(true));
+
+    let distinct = BmcSolver::new(build_problem(false), BmcConfig::default());
+    assert_eq!(distinct.has_repeated_body_predicate(), Some(false));
+}
+
+#[test]
+fn repeated_body_predicate_scan_stops_fail_closed() {
+    let build_problem = || {
+        let mut problem = ChcProblem::new();
+        let p = problem.declare_predicate("P", Vec::new());
+        let q = problem.declare_predicate("Q", Vec::new());
+        problem.add_clause(HornClause::new(
+            ClauseBody::predicates_only(vec![(p, Vec::new()), (q, Vec::new())]),
+            ClauseHead::False,
+        ));
+        problem
+    };
+
+    let expired = BmcSolver::new(build_problem(), BmcConfig::default());
+    expired
+        .solve_deadline
+        .set(Some(ay_core::time::Instant::now()));
+    assert_eq!(expired.has_repeated_body_predicate(), None);
+    assert!(matches!(
+        expired.resolve_unrepresentable_safe(ChcEngineResult::Safe(InvariantModel::default())),
+        ChcEngineResult::Unknown
+    ));
+    assert!(expired.stats().budget_exhausted);
+
+    let cancellation = crate::CancellationToken::new();
+    let cancelled = BmcSolver::new(
+        build_problem(),
+        BmcConfig::default().with_cancellation(cancellation.clone()),
+    );
+    cancellation.cancel();
+    assert_eq!(cancelled.has_repeated_body_predicate(), None);
+    assert!(matches!(
+        cancelled.resolve_unrepresentable_safe(ChcEngineResult::Safe(InvariantModel::default())),
+        ChcEngineResult::Unknown
+    ));
+    assert!(!cancelled.stats().budget_exhausted);
+}
+
+#[test]
 fn repeated_body_predicate_never_reports_safe() {
     let smt = r#"
 (set-logic HORN)
@@ -4757,4 +4990,19 @@ fn tree_refutation_handles_multi_premise_query() {
         matches!(result, ChcEngineResult::Unsafe(_)),
         "the derivation-tree lane must refute a multi-premise query, got {result:?}"
     );
+}
+
+#[test]
+fn bmc_normalizes_beyond_i128_abstract_values_to_bv129() {
+    let bits = (num_bigint::BigInt::from(1_u8) << 128) + 9_u8;
+    let abstract_value = SmtValue::int_from_bigint(bits);
+    let concrete = BmcSolver::model_smt_value_for_sort(&abstract_value, &ChcSort::BitVec(129))
+        .expect("BV-to-Int witness should concretize");
+    assert_eq!(
+        concrete.bitvec_to_biguint(),
+        Some(((num_bigint::BigUint::from(1_u8) << 128) + 9_u8, 129))
+    );
+    let expr = BmcSolver::smt_value_expr_for_sort(&abstract_value, &ChcSort::BitVec(129))
+        .expect("concrete witness literal should reconstruct");
+    assert_eq!(expr.sort(), ChcSort::BitVec(129));
 }

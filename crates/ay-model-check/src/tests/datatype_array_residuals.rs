@@ -29,6 +29,105 @@ fn residual_free_dt_array_alias_with_consistent_reads_confirms() {
 }
 
 #[test]
+fn residual_free_dt_array_bv64_alias_with_consistent_reads_confirms() {
+    // MODEL_CHECKER_CONSUMER models Rust memory/Vec indices as BV64. Exercise that exact
+    // carrier (including the high-bit range) rather than relying on the Int
+    // control above: a = b and matching field requirements at one BV64 cell
+    // admit a concrete finite-store witness and residual-disabled replay.
+    let mut ts = TermStore::new();
+    let asort = Sort::array(Sort::bitvec(64), struct_sort());
+    let a = ts.mk_var("a", asort.clone());
+    let b = ts.mk_var("b", asort);
+    let index = ts.mk_bitvec(BigInt::from(0x8000_0000_0000_0001u64), 64);
+    let c5 = ts.mk_int(int(5));
+    let c7 = ts.mk_int(int(7));
+    let alias = app(&mut ts, "=", &[a, b], Sort::Bool);
+    let r1 = field_read_eq(&mut ts, "f", a, index, c5);
+    let r2 = field_read_eq(&mut ts, "f", b, index, c5);
+    let r3 = field_read_eq(&mut ts, "g", b, index, c7);
+    assert_confirmed(&verdict(&ts, &StubModel::new(), &[alias, r1, r2, r3]));
+}
+
+#[test]
+fn residual_free_dt_array_alias_only_materializes_and_replays() {
+    // Even with no explicit store cells, the residual proof must construct a
+    // real array value for the class and replay the alias equality. Both leaves
+    // receive the SAME canonical default array, so the equality confirms.
+    let mut ts = TermStore::new();
+    let asort = Sort::array(Sort::Int, struct_sort());
+    let a = ts.mk_var("a", asort.clone());
+    let b = ts.mk_var("b", asort);
+    let alias = app(&mut ts, "=", &[a, b], Sort::Bool);
+    assert_confirmed(&verdict(&ts, &StubModel::new(), &[alias]));
+}
+
+#[test]
+fn residual_field_witness_selects_a_fitting_constructor() {
+    // The canonical DEFAULT may use `empty`, but the explicit cell constrained
+    // through selector `f` must use `full` and synthesize only its unconstrained
+    // `g` field. The fresh replay projects `f(full(5, 0))` and confirms it.
+    let mut ts = TermStore::new();
+    let datatype = Sort::Datatype(DatatypeSort::new(
+        "Choice",
+        vec![
+            DatatypeConstructor::unit("empty"),
+            DatatypeConstructor::new(
+                "full",
+                vec![
+                    DatatypeField::new("f", Sort::Int),
+                    DatatypeField::new("g", Sort::Int),
+                ],
+            ),
+        ],
+    ));
+    let array = ts.mk_var("a", Sort::array(Sort::Int, datatype.clone()));
+    let index = ts.mk_int(int(0));
+    let five = ts.mk_int(int(5));
+    let select = app(&mut ts, "select", &[array, index], datatype);
+    let field = app(&mut ts, "f", &[select], Sort::Int);
+    let assertion = app(&mut ts, "=", &[field, five], Sort::Bool);
+    assert_confirmed(&verdict(&ts, &StubModel::new(), &[assertion]));
+}
+
+#[test]
+fn residual_witness_replay_rejects_malformed_whole_element() {
+    // The residual consistency map alone sees one unopposed whole-element
+    // requirement. It is NOT enough: the model value names `mk` with the wrong
+    // arity. Materialization followed by the ordinary typed replay must refuse
+    // it instead of turning this malformed commitment into ConfirmedSat.
+    let mut ts = TermStore::new();
+    let datatype = struct_sort();
+    let array = ts.mk_var("a", Sort::array(Sort::Int, datatype.clone()));
+    let bad = ts.mk_var("bad", datatype.clone());
+    let index = ts.mk_int(int(0));
+    let select = app(&mut ts, "select", &[array, index], datatype);
+    let assertion = app(&mut ts, "=", &[select, bad], Sort::Bool);
+    let model = StubModel::new().with(
+        bad,
+        ModelValue::Datatype {
+            ctor: "mk".to_string(),
+            args: vec![ModelValue::Int(int(1))],
+        },
+    );
+    assert_cannot(&verdict(&ts, &model, &[assertion]));
+}
+
+#[test]
+fn residual_witness_entry_budget_fails_closed() {
+    // A satisfiable family just beyond the documented hard entry cap must be
+    // rejected wholesale, never truncated to a partial finite-store witness.
+    let mut ts = TermStore::new();
+    let array = ts.mk_var("a", Sort::array(Sort::Int, struct_sort()));
+    let five = ts.mk_int(int(5));
+    let mut assertions = Vec::new();
+    for offset in 0..=residual::MAX_WITNESS_ENTRIES {
+        let index = ts.mk_int(BigInt::from(offset));
+        assertions.push(field_read_eq(&mut ts, "f", array, index, five));
+    }
+    assert_cannot(&verdict(&ts, &StubModel::new(), &assertions));
+}
+
+#[test]
 fn residual_free_dt_array_conflicting_reads_stay_unknown() {
     // Same shape but f(a[0]) = 5 vs f(b[0]) = 6 with a = b: two constraints
     // force different values at ONE (class, index, field) slot — the residue
@@ -45,6 +144,24 @@ fn residual_free_dt_array_conflicting_reads_stay_unknown() {
     let r2 = field_read_eq(&mut ts, "f", b, i0, c6);
     let m = StubModel::new();
     assert_cannot(&verdict(&ts, &m, &[alias, r1, r2]));
+}
+
+#[test]
+fn residual_free_dt_array_bv64_alias_with_conflicting_reads_stays_unknown() {
+    // The positive BV64 case must not widen the fragment: aliased arrays
+    // still identify the same high-bit index, so contradictory requirements
+    // at that cell cannot produce a witness or ConfirmedSat.
+    let mut ts = TermStore::new();
+    let asort = Sort::array(Sort::bitvec(64), struct_sort());
+    let a = ts.mk_var("a", asort.clone());
+    let b = ts.mk_var("b", asort);
+    let index = ts.mk_bitvec(BigInt::from(0x8000_0000_0000_0001u64), 64);
+    let c5 = ts.mk_int(int(5));
+    let c6 = ts.mk_int(int(6));
+    let alias = app(&mut ts, "=", &[a, b], Sort::Bool);
+    let r1 = field_read_eq(&mut ts, "f", a, index, c5);
+    let r2 = field_read_eq(&mut ts, "f", b, index, c6);
+    assert_cannot(&verdict(&ts, &StubModel::new(), &[alias, r1, r2]));
 }
 
 #[test]

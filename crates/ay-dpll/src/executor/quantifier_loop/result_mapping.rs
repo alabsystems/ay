@@ -5364,6 +5364,7 @@ impl Executor {
         self.last_negations = None;
         self.last_proof_rebuild_originals.clear();
         self.last_proof_raw_original_assertions.clear();
+        self.last_proof_expanded_let_sources.clear();
         self.quant_expansion_records.clear();
         if self.proof_problem_assertion_provenance.is_some() {
             crate::executor::unsat_cert::probe_cert_reject(|| {
@@ -7617,6 +7618,7 @@ impl Executor {
     /// already have crossed the process ceiling.
     fn qpf_probe_preflight(&self) -> bool {
         if self.external_stop_reason().is_some()
+            || self.term_memory_exceeded()
             || ay_core::TermStore::global_memory_exceeded()
             || ay_sys::process_memory_exceeded_at_percent(50)
             || crate::memory::memory_exceeded(self.memory_limit())
@@ -7767,6 +7769,7 @@ impl Executor {
         probe.set_decision_limit(self.decision_limit());
         probe.set_ground_budget_enabled(self.ground_budget_enabled());
         probe.set_memory_limit(self.memory_limit());
+        probe.set_term_memory_limit(self.term_memory_limit());
         let tight = ay_core::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
         let bounded = match self.solve_deadline.get() {
             Some(d) if d < tight => Some(d),

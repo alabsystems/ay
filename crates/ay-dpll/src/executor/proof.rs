@@ -6,6 +6,7 @@
 
 mod authored_array_row1;
 mod authored_array_row_value;
+mod authored_bv_high_zero_refutation;
 mod authored_bv_lia_refutation;
 mod authored_cascade;
 mod authored_collection_subset;
@@ -25,6 +26,7 @@ mod authored_guarded_linear;
 mod authored_helpers;
 mod authored_linear;
 mod authored_linear_subset;
+mod authored_negated_conjunct_bridge;
 mod authored_negated_exists;
 mod authored_negated_exists_ground_inst;
 mod authored_nested_forall;
@@ -55,6 +57,7 @@ mod exact_authored_affine_euf_refutation;
 mod exact_authored_bv_refutation;
 mod exact_authored_conjunct_refutation;
 mod exact_authored_false_refutation;
+mod exact_authored_poly_refutation;
 mod extensionality_surface;
 mod false_source;
 mod finite_enum;

@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use crate::{engines, BmcConfig, SmtContext, SmtResult};
 
 // ========== Regression tests for #352 ==========
 
@@ -29,26 +30,279 @@ fn test_regression_352_unknown_function_errors() {
     );
 }
 
+fn solve_only_constraint(input: &str) -> SmtResult {
+    let problem = ChcParser::parse(input).expect("UF fixture should parse");
+    assert_eq!(problem.clauses().len(), 1, "fixture must have one rule");
+    let constraint = problem.clauses()[0]
+        .body
+        .constraint
+        .as_ref()
+        .expect("fixture rule must have a background-theory constraint");
+    SmtContext::new().check_sat(constraint)
+}
+
 #[test]
-fn test_regression_352_non_bool_declare_fun_errors() {
-    // #352: Non-Bool declare-fun should produce parse error
+fn test_scalar_return_declare_fun_has_euf_congruence() {
+    for input in [
+        r#"
+                (set-logic HORN)
+                (declare-fun f (Int) Int)
+                (declare-fun g (Int) Int)
+                (declare-var x Int)
+                (declare-var y Int)
+                (rule (=> (and (= x y) (distinct (f (g x)) (f (g y)))) false))
+            "#,
+        r#"
+                (set-logic HORN)
+                (declare-fun f ((_ BitVec 8)) (_ BitVec 16))
+                (declare-var x (_ BitVec 8))
+                (declare-var y (_ BitVec 8))
+                (rule (=> (and (= x y) (distinct (f x) (f y))) false))
+            "#,
+    ] {
+        let result = solve_only_constraint(input);
+        assert!(
+            result.is_unsat(),
+            "x = y must imply f(x) = f(y), got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn test_scalar_return_declare_fun_keeps_distinct_applications_independent() {
     let input = r#"
             (set-logic HORN)
             (declare-fun f (Int) Int)
-            (declare-fun Inv (Int) Bool)
-            (check-sat)
+            (declare-var x Int)
+            (declare-var y Int)
+            (rule (=> (and (distinct x y) (distinct (f x) (f y))) false))
         "#;
 
-    let result = ChcParser::parse(input);
+    let result = solve_only_constraint(input);
     assert!(
-        result.is_err(),
-        "Non-Bool declare-fun 'f' should cause parse error"
+        result.is_sat(),
+        "different UF arguments may have different results, got {result:?}"
     );
-    let err_msg = result.expect_err("test should fail").to_string();
+}
+
+#[test]
+fn test_scalar_return_nullary_declare_fun_parses_as_stable_constant() {
+    let input = r#"
+            (set-logic HORN)
+            (declare-fun c () Int)
+            (declare-var x Int)
+            (rule (=> (and (= x c) (distinct x c)) false))
+        "#;
+
+    let result = solve_only_constraint(input);
     assert!(
-        err_msg.contains("Non-predicate function declaration"),
-        "Error should mention 'Non-predicate function declaration': {err_msg}"
+        result.is_unsat(),
+        "two occurrences of one nullary UF must denote the same value, got {result:?}"
     );
+}
+
+#[test]
+fn test_local_binding_shadows_scalar_nullary_uf() {
+    for local_formula in ["(= (let ((c 0)) c) 0)", "(exists ((c Int)) (= c 0))"] {
+        let input = format!(
+            "(set-logic HORN)\n\
+             (declare-fun c () Int)\n\
+             (rule (=> (and (= c 1) {local_formula}) false))"
+        );
+        let result = solve_only_constraint(&input);
+        assert!(
+            result.is_sat(),
+            "the local c must shadow global c; otherwise c=1 and c=0 become contradictory: \
+             {local_formula}, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn test_non_horn_nested_relation_fails_validation_before_query_slicing() {
+    let problem = ChcParser::parse(
+        r#"
+            (set-logic HORN)
+            (declare-rel P ())
+            (declare-var x Int)
+            (rule P)
+            (query (or P (= x 0)))
+        "#,
+    )
+    .expect("the surface parser retains the non-Horn Boolean shape for validation");
+
+    assert!(
+        matches!(problem.validate(), Err(crate::ChcError::Verification(_))),
+        "a relation nested in a background constraint must not reach dependency slicing"
+    );
+}
+
+#[test]
+fn test_scalar_return_uf_congruence_is_shared_across_horn_rules() {
+    let input = r#"
+            (set-logic HORN)
+            (declare-fun f (Int) Int)
+            (declare-rel P (Int))
+            (declare-var x Int)
+            (rule (P (f 0)))
+            (rule (=> (and (P x) (distinct x (f 0))) false))
+        "#;
+    let problem = ChcParser::parse(input).expect("cross-rule UF fixture should parse");
+    let result = engines::solve_bmc_only(
+        problem,
+        BmcConfig {
+            max_depth: 4,
+            acyclic_safe: true,
+            prefer_exact_acyclic_first: true,
+            ..BmcConfig::default()
+        },
+    );
+    assert!(
+        result.is_safe(),
+        "one UF symbol must keep its interpretation across a derivation: got {result:?}"
+    );
+}
+
+#[test]
+fn test_parameterized_int_uf_reaches_end_to_end_unsafe() {
+    let problem = ChcParser::parse(
+        r#"
+            (set-logic HORN)
+            (declare-fun f (Int) Int)
+            (declare-rel P (Int))
+            (declare-var x Int)
+            (rule (P (f 0)))
+            (rule (=> (and (P x) (= (f 0) 7)) false))
+        "#,
+    )
+    .expect("Int UF unsafe fixture should parse");
+    let result = engines::solve_bmc_only(
+        problem,
+        BmcConfig {
+            max_depth: 4,
+            ..BmcConfig::default()
+        },
+    );
+    assert!(
+        result.is_unsafe(),
+        "a concrete finite interpretation f(0)=7 witnesses Unsafe: {result:?}"
+    );
+}
+
+#[test]
+fn test_parameterized_bv_uf_reaches_end_to_end_unsafe() {
+    let problem = ChcParser::parse(
+        r#"
+            (set-logic HORN)
+            (declare-fun f ((_ BitVec 8)) (_ BitVec 16))
+            (declare-rel P ((_ BitVec 16)))
+            (declare-var x (_ BitVec 16))
+            (rule (P (f #x03)))
+            (rule (=> (and (P x) (= (f #x03) #x1234)) false))
+        "#,
+    )
+    .expect("BV UF unsafe fixture should parse");
+    let result = engines::solve_bmc_only(
+        problem,
+        BmcConfig {
+            max_depth: 4,
+            ..BmcConfig::default()
+        },
+    );
+    assert!(
+        result.is_unsafe(),
+        "a concrete finite interpretation f(#x03)=#x1234 witnesses Unsafe: {result:?}"
+    );
+}
+
+#[test]
+fn test_parameterized_uf_multi_premise_query_ground_replays_unsafe() {
+    let problem = ChcParser::parse(
+        r#"
+            (set-logic HORN)
+            (declare-fun f (Int) Int)
+            (declare-rel P (Int))
+            (declare-rel Q (Int))
+            (declare-var x Int)
+            (declare-var y Int)
+            (rule (P (f 0)))
+            (rule (Q (f 0)))
+            (rule (=> (and (P x) (Q y) (= x y) (= (f 0) 7)) false))
+        "#,
+    )
+    .expect("multi-premise UF unsafe fixture should parse");
+    let result = engines::solve_bmc_only(
+        problem,
+        BmcConfig {
+            max_depth: 4,
+            ..BmcConfig::default()
+        },
+    );
+    assert!(
+        result.is_unsafe(),
+        "finite UF observations must survive pure multi-premise ground replay: {result:?}"
+    );
+}
+
+#[test]
+fn test_scalar_return_declare_fun_checks_application_signature() {
+    for (application, expected) in [
+        ("(f x x)", "expects 1 arguments, got 2"),
+        ("(f b)", "expected argument sort Int, got Bool"),
+    ] {
+        let input = format!(
+            "(set-logic HORN)\n\
+             (declare-fun f (Int) Int)\n\
+             (declare-var x Int)\n\
+             (declare-var b Bool)\n\
+             (rule (=> (= {application} 0) false))"
+        );
+        let error = ChcParser::parse(&input).expect_err("invalid UF call must fail closed");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} in error, got {error}"
+        );
+    }
+}
+
+#[test]
+fn test_scalar_return_declare_fun_rejects_symbol_collisions() {
+    for input in [
+        "(declare-fun f (Int) Int) (declare-fun f (Int) Int)",
+        "(declare-fun f (Int) Int) (declare-fun f (Bool) Int)",
+        "(declare-fun f (Int) Int) (declare-rel f (Int))",
+        "(declare-rel f (Int)) (declare-fun f (Int) Int)",
+        "(declare-fun f (Int) Int) (declare-var f Int)",
+        "(declare-var f Int) (declare-fun f (Int) Int)",
+        "(declare-fun f (Int) Int) (declare-datatype T ((f)))",
+        "(declare-datatype T ((f))) (declare-fun f (Int) Int)",
+    ] {
+        let error = ChcParser::parse(input).expect_err("symbol collision must fail closed");
+        assert!(
+            error.to_string().contains("already declared"),
+            "collision error should identify the existing declaration: {error}"
+        );
+    }
+}
+
+#[test]
+fn test_scalar_return_declare_fun_rejects_non_scalar_boundary() {
+    for input in [
+        "(declare-fun f (Int) (Array Int Int))",
+        "(declare-fun f ((Array Int Int)) Int)",
+        "(declare-fun select (Int) Int)",
+        "(declare-fun as (Int) Int)",
+        "(declare-fun const (Int) Int)",
+        "(declare-fun let (Int) Int)",
+        "(declare-datatype T ((as)))",
+    ] {
+        let error = ChcParser::parse(input).expect_err("out-of-scope UF must fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("non-scalar") || message.contains("active logic"),
+            "error should describe the bounded UF boundary: {message}"
+        );
+    }
 }
 
 // ========== N-ary equality tests ==========

@@ -28,6 +28,13 @@ impl Default for Executor {
 }
 
 impl Executor {
+    /// Revoke caches and root windows whose authority ends with one query.
+    pub(super) fn clear_query_scoped_authority(&mut self) {
+        self.lemma_cache.clear();
+        self.self_check_authored_assertions = None;
+        self.independent_gate_authored_assertions = None;
+    }
+
     /// Execute a native-API declaration outside SMT-LIB assertion scoping.
     ///
     /// Native declaration handles belong to the solver context rather than an
@@ -173,6 +180,7 @@ impl Executor {
         self.clear_preprocessing_proof_records();
         self.last_proof_rebuild_originals.clear();
         self.last_proof_raw_original_assertions.clear();
+        self.last_proof_expanded_let_sources.clear();
         self.last_proof_decline = None;
         self.last_proof_quality = None;
         self.last_unknown_reason = None;
@@ -943,6 +951,27 @@ impl Executor {
         self.memory_limit
     }
 
+    /// Set this executor's `TermStore` ceiling in bytes.
+    ///
+    /// This limit is per executor and does not inspect process RSS. When the
+    /// store's capacity-aware instance accounting crosses the ceiling, the
+    /// active check-sat stops with [`UnknownReason::MemoryLimit`].
+    pub fn set_term_memory_limit(&mut self, limit: Option<usize>) {
+        self.term_memory_limit = limit;
+    }
+
+    /// Get this executor's per-instance `TermStore` ceiling in bytes.
+    pub fn term_memory_limit(&self) -> Option<usize> {
+        self.term_memory_limit
+    }
+
+    /// Whether this executor's `TermStore` has crossed its configured ceiling.
+    #[must_use]
+    pub fn term_memory_exceeded(&self) -> bool {
+        self.term_memory_limit
+            .is_some_and(|limit| self.ctx.terms.instance_memory_exceeded(limit))
+    }
+
     /// Whether the caller's interrupt flag is currently raised.
     ///
     /// Diagnostics only. `make_should_stop` folds the interrupt and the deadline
@@ -1201,7 +1230,7 @@ impl Executor {
         self.quantifier_deadline_policy = QuantifierDeadlinePolicy::RelaxToBackstop;
         self.quantifier_deadline_backstop_opt_in = false;
         self.quantifier_pipeline_engaged = false;
-        self.lemma_cache.clear();
+        self.clear_query_scoped_authority();
         for_each_incremental_subsystem!(reset self);
     }
 }

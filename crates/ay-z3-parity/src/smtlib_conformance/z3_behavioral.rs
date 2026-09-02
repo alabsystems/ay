@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Exact, executable Z3 5.0.0 CLI transcript differential.
+//! Exact, executable Z3 5.1.0 CLI transcript differential.
 //!
 //! This validator intentionally records mismatches.  The catalog is closed in
 //! code and a receipt cannot pass by dropping a case, changing its comparator,
@@ -20,10 +20,10 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Instant;
 
-pub(super) const VALIDATOR_ID: &str = "builtin.z3-behavioral-transcripts-5.0.0.v1";
+pub(super) const VALIDATOR_ID: &str = "builtin.z3-behavioral-transcripts-5.1.0.v1";
 
-const DIMENSION_ID: &str = "overlay.z3-5.0.0";
-const REQUIREMENT_ID: &str = "overlay.z3-5.0.0.behavioral-transcripts";
+const DIMENSION_ID: &str = "overlay.z3-5.1.0";
+const REQUIREMENT_ID: &str = "overlay.z3-5.1.0.behavioral-transcripts";
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 const FILE_PLACEHOLDER: &str = "{INPUT_FILE}";
 const STREAM_PHASE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -276,7 +276,7 @@ impl SourceOwner {
 }
 
 fn source_proven_no_effect_reason(_owner: &SourceOwner) -> Option<&'static str> {
-    // No Z3 5.0.0 CLI owner currently receives no-effect credit. A future
+    // No Z3 5.1.0 CLI owner currently receives no-effect credit. A future
     // claim must first retain every relevant source blob and add executable
     // occurrence and call-site predicates to the source snapshot validator.
     None
@@ -365,7 +365,7 @@ impl CaseSpec {
 
     fn expected(&self) -> String {
         format!(
-            "source-owner={};effect={};artifact-policy={};source-effect-reason={};pinned Z3 5.0.0 and manifest-bound AY agree under {}; oracle-args={:?}; subject-args={:?}; stdin-sha256={}; both guarded, complete, untruncated, UTF-8",
+            "source-owner={};effect={};artifact-policy={};source-effect-reason={};pinned Z3 5.1.0 and manifest-bound AY agree under {}; oracle-args={:?}; subject-args={:?}; stdin-sha256={}; both guarded, complete, untruncated, UTF-8",
             self.source_owner
                 .as_ref()
                 .map_or_else(|| "none".to_string(), SourceOwner::display),
@@ -733,7 +733,7 @@ fn validate_receipt_rows(receipt: &ValidatorReceipt) -> Result<(), String> {
             })?;
         let (source_effect_reason, _) =
             reason_and_rest
-                .split_once(";pinned Z3 5.0.0")
+                .split_once(";pinned Z3 5.1.0")
                 .ok_or_else(|| {
                     format!(
                         "{VALIDATOR_ID} case has no bounded source-effect reason: {}",
@@ -1036,7 +1036,7 @@ fn execute(
     let z3_profile = &contract.profile.z3_overlay.reference_executable;
     let staged_ay = stage_authenticated_executable(ay_source, &subject.sha256, "AY executable")?;
     let staged_z3 =
-        stage_authenticated_executable(z3_source, &z3_profile.sha256, "Z3 5.0.0 executable")?;
+        stage_authenticated_executable(z3_source, &z3_profile.sha256, "Z3 5.1.0 executable")?;
     let repo_root = locate_repo_root()?;
     let resources = PlannedResources::plan(
         &repo_root,
@@ -1117,7 +1117,7 @@ fn execute(
             oracle_directory.as_deref(),
             (isolated && spec.style == RunStyle::File).then_some(relative_input.as_path()),
             timeout,
-            &format!("Z3 5.0.0 behavioral case {}", spec.id),
+            &format!("Z3 5.1.0 behavioral case {}", spec.id),
         )?;
         let ay = run_target(
             &resources,
@@ -1145,7 +1145,7 @@ fn execute(
                 baseline_directory.as_deref(),
                 (isolated && baseline.style == RunStyle::File).then_some(relative_input.as_path()),
                 timeout,
-                &format!("Z3 5.0.0 effect baseline for {}", spec.id),
+                &format!("Z3 5.1.0 effect baseline for {}", spec.id),
             )?)
         } else {
             None
@@ -1196,7 +1196,7 @@ fn discover_observable_items(
                 args.iter().copied(),
                 input,
                 timeout,
-                &format!("Z3 5.0.0 behavioral ownership discovery: {id}"),
+                &format!("Z3 5.1.0 behavioral ownership discovery: {id}"),
             )
             .map_err(|error| error.to_string())?;
         let exit_code = output.status.and_then(|status| status.code());
@@ -1615,10 +1615,10 @@ fn row_from_pair(
         expected: spec.expected(),
         observed,
         stdout: Some(format!(
-            "--- pinned-z3-5.0.0 stdout ---\n{recorded_oracle_stdout}--- manifest-ay stdout ---\n{recorded_subject_stdout}--- pinned-z3-5.0.0 effect-baseline stdout ---\n{recorded_baseline_stdout}--- pinned-z3-5.0.0 artifacts ---\n{oracle_artifacts}--- manifest-ay artifacts ---\n{subject_artifacts}--- pinned-z3-5.0.0 effect-baseline artifacts ---\n{baseline_artifacts}"
+            "--- pinned-z3-5.1.0 stdout ---\n{recorded_oracle_stdout}--- manifest-ay stdout ---\n{recorded_subject_stdout}--- pinned-z3-5.1.0 effect-baseline stdout ---\n{recorded_baseline_stdout}--- pinned-z3-5.1.0 artifacts ---\n{oracle_artifacts}--- manifest-ay artifacts ---\n{subject_artifacts}--- pinned-z3-5.1.0 effect-baseline artifacts ---\n{baseline_artifacts}"
         )),
         stderr: Some(format!(
-            "--- pinned-z3-5.0.0 stderr ---\n{recorded_oracle_stderr}--- manifest-ay stderr ---\n{recorded_subject_stderr}--- pinned-z3-5.0.0 effect-baseline stderr ---\n{recorded_baseline_stderr}"
+            "--- pinned-z3-5.1.0 stderr ---\n{recorded_oracle_stderr}--- manifest-ay stderr ---\n{recorded_subject_stderr}--- pinned-z3-5.1.0 effect-baseline stderr ---\n{recorded_baseline_stderr}"
         )),
         exit_code: subject.exit_code,
         process: Some(ProcessObservation {
@@ -1771,7 +1771,7 @@ fn overlay_dimension(contract: &Contract) -> Result<&Dimension, String> {
         .dimensions
         .iter()
         .find(|dimension| dimension.id == DIMENSION_ID)
-        .ok_or("contract has no overlay.z3-5.0.0 dimension".to_string())
+        .ok_or("contract has no overlay.z3-5.1.0 dimension".to_string())
 }
 
 fn batch_case(id: impl Into<String>, input: &str) -> CaseSpec {
@@ -1969,7 +1969,7 @@ fn source_info_key_case(name: &str) -> Option<CaseSpec> {
         case,
         BaselineSpec {
             args: vec!["-in".to_string()],
-            // Z3 5.0.0 exits zero for an unknown query while deliberately
+            // Z3 5.1.0 exits zero for an unknown query while deliberately
             // emitting its positioned diagnostic. That makes this a complete,
             // observable negative control rather than an interrupted invocation.
             input: b"(get-info :ay-no-such-info)\n(exit)\n".to_vec(),
@@ -2865,7 +2865,7 @@ fn input_for_extension(extension: &str) -> &'static str {
         "drat" => "a arith 1 0\n",
         // This is a complete Z3 API-replay log: version header plus a user-log
         // message. It exercises replay dispatch without calling an ABI entry.
-        "log" => "V \"5.0.0.0\"\nM \"ay-z3-log-dispatch\"\n",
+        "log" => "V \"5.1.0.0\"\nM \"ay-z3-log-dispatch\"\n",
         _ => "(check-sat)\n(exit)\n",
     }
 }
@@ -2898,7 +2898,7 @@ fn source_filename_extension_case(extension: &str) -> CaseSpec {
         },
     );
     if extension == "drat" {
-        // Z3 5.0.0 stores a `.drat` argument separately from `g_input_file`
+        // Z3 5.1.0 stores a `.drat` argument separately from `g_input_file`
         // but still applies the generic "input file was not specified" guard.
         // `-in` satisfies that guard; the DRAT reader still consumes the file.
         case.oracle_args.push("-in".to_string());
@@ -4075,8 +4075,8 @@ mod tests {
             + PROBE_NAMES.len()
             + 1;
         assert_eq!(base_count, BASE_CASE_COUNT);
-        assert_eq!(EXPECTED_SOURCE_OWNER_COUNT, 1_508);
-        assert_eq!(EXPECTED_CASE_COUNT, 1_846);
+        assert_eq!(EXPECTED_SOURCE_OWNER_COUNT, 1_518);
+        assert_eq!(EXPECTED_CASE_COUNT, 1_856);
         assert_eq!(EXPECTED_UNRESOLVED_COMMAND_OWNERS, 57);
         assert_eq!(EXPECTED_AUDITED_COMMAND_GAP_UNIVERSE_OWNERS, 63);
         assert_eq!(EXPECTED_UNRESOLVED_SOURCE_OWNERS, 301);
@@ -4217,7 +4217,7 @@ mod tests {
             assert_eq!(case.subject_args, ["--z3-mode", FILE_PLACEHOLDER], "{name}");
             assert!(
                 !String::from_utf8_lossy(&case.input).contains("(query ("),
-                "Z3 5.0.0 query expects a registered predicate name: {name}"
+                "Z3 5.1.0 query expects a registered predicate name: {name}"
             );
         }
     }

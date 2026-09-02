@@ -75,6 +75,7 @@ macro_rules! new_stack_guarded_expr {
             propagated_value_provenance: Default::default(),
             last_proof_rebuild_originals: Vec::new(),
             last_proof_raw_original_assertions: Vec::new(),
+            last_proof_expanded_let_sources: Vec::new(),
             last_proof_decline: None,
             last_proof_quality: None,
             strict_check_invocations: Cell::new(0),
@@ -121,6 +122,7 @@ macro_rules! new_stack_guarded_expr {
             decision_limit: None,
             ground_budget_enabled: true,
             memory_limit: None,
+            term_memory_limit: None,
             solve_interrupt: None,
             #[cfg(test)]
             test_force_non_bv_congruence_bail: false,

@@ -141,17 +141,12 @@ pub(crate) mod pin {
 
     /// SHA-256 of the patch applied on top of [`commit`]. The patch is part of
     /// the pin: it is what turns an unsound upstream build into the checker AY
-    /// validated against.
+    /// validated against. It is the private fork's `alab-main` delta over the
+    /// shared upstream base, carrying the fix for every one of the twenty-one
+    /// defects. (This repo previously carried a second, locally written patch;
+    /// those fixes now live in the fork — see the prose in `ci/veripb.pin`.)
     pub(crate) fn patch_sha256() -> &'static str {
         require("VERIPB_PATCH_SHA256")
-    }
-
-    /// SHA-256 of the SECOND patch, applied on top of the first. It closes the
-    /// ninth wrong-verdict defect (`pol` addition wrapping the cancellation
-    /// subtraction), which the first patch does not, so it is as much a part of
-    /// the checker's identity as the first one.
-    pub(crate) fn patch2_sha256() -> &'static str {
-        require("VERIPB_PATCH2_SHA256")
     }
 }
 
@@ -164,16 +159,68 @@ const CHECKER_ENV_VARS: [&str; 3] = ["VERIPB_BIN", "AY_PB26_VERIPB_BIN", "VERIPB
 /// locations. Set it to a nonexistent path to model a machine with no checker.
 const SEARCH_PATH_ENV: &str = "AY_VERIPB_SEARCH_PATH";
 
-/// Cache-key contract shared with `scripts/ci/pb_certified_gate.sh` and
-/// `ay-test-support`: EVERY patch is part of the checker identity, so a changed
-/// or added patch must not silently reuse a binary built from the same upstream
-/// commit. Both prefixes are in the key for that reason.
+/// Cache-key contract shared with `scripts/lib/veripb_build_id.sh` (the ONE
+/// shell-side authority, sourced by both `scripts/ci/pb_certified_gate.sh` and
+/// `scripts/cert_ci.sh`) and with `ay-test-support`.
+///
+/// This is the checker's IDENTITY: the pinned commit plus the patch-sha prefix,
+/// so a changed patch must not silently reuse a binary built from the same
+/// upstream commit. It is both the whole name of a legacy (pre-2026-08-30)
+/// cache directory and the prefix of a keyed one — the shell side appends
+/// [`RUSTC_KEY_INFIX`] plus a compiler fingerprint when it BUILDS, because
+/// compiling twice in one target dir with two compilers breaks (E0514, commit
+/// 8499748c6). This resolver never builds, and a finished binary runs the same
+/// under any of today's compilers, so resolution accepts every directory
+/// matching the identity, keyed or legacy. `ay-test-support` is a
+/// dev-dependency here, so this lane carries its own copy of the contract;
+/// `pin_reader_agrees_with_ay_test_support` pins the two together and the
+/// shell format itself is pinned by test-support's executable
+/// `shell_and_rust_agree_on_the_cache_key`.
 fn pinned_build_id() -> String {
     let patch_sha = pin::patch_sha256();
     let patch_prefix = patch_sha.get(..12).unwrap_or(patch_sha);
-    let patch2_sha = pin::patch2_sha256();
-    let patch2_prefix = patch2_sha.get(..12).unwrap_or(patch2_sha);
-    format!("{}-{patch_prefix}-{patch2_prefix}", pin::commit())
+    format!("{}-{patch_prefix}", pin::commit())
+}
+
+/// Separator between the identity prefix and the compiler fingerprint in a
+/// keyed cache-directory name. Mirrors `ay_test_support::veripb::RUSTC_KEY_INFIX`.
+const RUSTC_KEY_INFIX: &str = "-rustc";
+
+/// Whether a `~/.cache/ay-veripb` entry name denotes a build of the pinned
+/// checker: exactly the identity (legacy layout) or the identity plus a
+/// compiler fingerprint (keyed layout).
+fn is_pinned_cache_dir(name: &str, pinned_id: &str) -> bool {
+    name == pinned_id
+        || name
+            .strip_prefix(pinned_id)
+            .is_some_and(|rest| rest.starts_with(RUSTC_KEY_INFIX))
+}
+
+/// Candidate checker binaries under the shared build cache, keyed builds
+/// before the legacy unkeyed one and lexically-later fingerprints first (the
+/// order is about determinism, not preference: every match is the same pinned
+/// source, and the self-test re-proves whichever binary wins). When nothing
+/// matching exists the legacy path is still named, so a "searched:" error
+/// message points at where a build would land.
+fn pinned_cache_candidates(cache: &Path) -> Vec<PathBuf> {
+    let pinned_id = pinned_build_id();
+    let mut names: Vec<String> = std::fs::read_dir(cache)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| is_pinned_cache_dir(name, &pinned_id))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort_by(|a, b| b.cmp(a));
+    if names.is_empty() {
+        names.push(pinned_id);
+    }
+    names
+        .iter()
+        .map(|name| cache.join(name).join("target/release/veripb"))
+        .collect()
 }
 
 /// Every path a checker could be resolved from, in resolution order.
@@ -229,10 +276,10 @@ pub(crate) fn candidate_paths(
         .or_else(|| env_get("HOME").map(|home| PathBuf::from(home).join(".cache")));
     if let Some(cache) = cache {
         let cache = cache.join("ay-veripb");
-        candidates.push(cache.join(pinned_build_id()).join("target/release/veripb"));
-        // Compatibility with the original unkeyed cache populated by
-        // scripts/cert_ci.sh. The pinned path above comes first: its directory
-        // identity covers both the upstream commit and the reviewed patch.
+        candidates.extend(pinned_cache_candidates(&cache));
+        // Compatibility with the original pre-pin cache layout populated by an
+        // early scripts/cert_ci.sh. The pinned paths above come first: their
+        // directory identity covers the upstream commit and the reviewed patch.
         candidates.push(cache.join("VeriPB/target/release/veripb"));
     }
     if let Some(home) = env_get("HOME") {
@@ -2435,11 +2482,28 @@ mod tests {
             pin::patch_sha256(),
             ay_test_support::veripb::pin::patch_sha256()
         );
-        assert_eq!(
-            pin::patch2_sha256(),
-            ay_test_support::veripb::pin::patch2_sha256()
-        );
         assert_eq!(pin::commit().len(), 40);
+        // The cache-key contract is one identity too: this lane's copy must
+        // resolve exactly the directories the shared resolver resolves (the
+        // shell-side format is pinned against test-support's copy by the
+        // executable `shell_and_rust_agree_on_the_cache_key`).
+        assert_eq!(
+            pinned_build_id(),
+            ay_test_support::veripb::pinned_build_id()
+        );
+        assert_eq!(RUSTC_KEY_INFIX, ay_test_support::veripb::RUSTC_KEY_INFIX);
+        for name in [
+            pinned_build_id(),
+            format!("{}-rustc1.99.0-dev-acb08e7616", pinned_build_id()),
+            format!("{}-other", pinned_build_id()),
+            format!("{}x", pinned_build_id()),
+        ] {
+            assert_eq!(
+                is_pinned_cache_dir(&name, &pinned_build_id()),
+                ay_test_support::veripb::is_pinned_cache_dir(&name, &pinned_build_id()),
+                "the two resolvers disagree on `{name}`"
+            );
+        }
     }
 
     /// End to end against the REAL pinned checker: emit a certificate the way

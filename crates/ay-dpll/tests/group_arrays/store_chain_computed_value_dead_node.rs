@@ -195,3 +195,89 @@ fn test_simd_div_harness_query_is_sat() -> Result<()> {
     );
     Ok(())
 }
+
+/// The minimized `model-checker-consumer` `simd_insert` shape from model-checker-consumer commit
+/// `3bb5d0e53`: the result constructor wraps a two-deep store chain, and both
+/// store values are selects through a constructor-equated source array.  The
+/// out-of-bounds check is independently forced true, so the base query is SAT.
+///
+/// Before #store-chain-dead-node, AY read cached bit-blast values for the two
+/// compound `select` store operands.  Those nodes were not authoritative model
+/// leaves, so the fabricated result cells conflicted with definitional array
+/// completion and the independent gate degraded this query to `unknown
+/// (:reason-unknown incomplete)`.
+fn simd_insert_store_chain_query(extra_assertion: &str) -> String {
+    format!(
+        r"
+        (set-logic ALL)
+        (declare-datatype i64x2
+          ((i64x2_mk (fld_0 (Array (_ BitVec 64) (_ BitVec 64))))))
+
+        (declare-const source_arr (Array (_ BitVec 64) (_ BitVec 64)))
+        (assert (= (select source_arr #x0000000000000000) #x000000000000000a))
+        (assert (= (select source_arr #x0000000000000001) #x0000000000000014))
+        (declare-const source i64x2)
+        (assert (= source (i64x2_mk source_arr)))
+
+        (declare-const simd_arr (Array (_ BitVec 64) (_ BitVec 64)))
+        (declare-const result i64x2)
+        (assert
+          (= result
+             (i64x2_mk
+               (store
+                 (store simd_arr
+                        #x0000000000000000
+                        (select (fld_0 source) #x0000000000000000))
+                 #x0000000000000001
+                 (select (fld_0 source) #x0000000000000001)))))
+
+        (declare-const ay_violation_simd_insert_0 Bool)
+        (assert
+          (= ay_violation_simd_insert_0
+             (not (bvult #x00000002 #x00000002))))
+        (assert ay_violation_simd_insert_0)
+        {extra_assertion}
+        (check-sat)
+        "
+    )
+}
+
+#[test]
+#[ntest::timeout(120_000)]
+fn test_trust_simd_insert_constructor_store_of_selects_is_decided() -> Result<()> {
+    for (extra, expected, description) in [
+        (
+            "",
+            SolverOutcome::Sat,
+            "the forced out-of-bounds violation makes the base query SAT",
+        ),
+        (
+            r"(assert
+                 (and
+                   (= (select (fld_0 result) #x0000000000000000)
+                      #x000000000000000a)
+                   (= (select (fld_0 result) #x0000000000000001)
+                      #x0000000000000014)))",
+            SolverOutcome::Sat,
+            "both result lanes must read back the constructor-equated source lanes",
+        ),
+        (
+            r"(assert
+                 (not (= (select (fld_0 result) #x0000000000000000)
+                         #x000000000000000a)))",
+            SolverOutcome::Unsat,
+            "ROW at lane zero must refute a contradictory result cell",
+        ),
+        (
+            r"(assert
+                 (not (= (select (fld_0 result) #x0000000000000001)
+                         #x0000000000000014)))",
+            SolverOutcome::Unsat,
+            "ROW at lane one must refute a contradictory result cell",
+        ),
+    ] {
+        let outcome = run_executor_smt_with_timeout(&simd_insert_store_chain_query(extra), 20)?;
+        assert_eq!(outcome, expected, "{description}; got {outcome:?}");
+    }
+    Ok(())
+}

@@ -180,8 +180,9 @@ fn test_executor_rlimit_huge_budget_preserves_fp_unsat() {
     assert_eq!(outputs, vec!["unsat"]);
 
     // Proof lane twin: the verdict must stay `unsat` under `:produce-proofs`
-    // and the proof must actually be produced (`get-proof` returns a proof
-    // term, not an error).
+    // and the native proof must remain strict. Pinned Carcara has no FP sort
+    // grammar, so `get-proof` must visibly decline the Alethe transport rather
+    // than emit a document its parser cannot authenticate.
     let smt_proof = "(set-logic QF_FP)\n\
                      (set-option :produce-proofs true)\n\
                      (set-option :rlimit 1000000)\n\
@@ -195,10 +196,15 @@ fn test_executor_rlimit_huge_budget_preserves_fp_unsat() {
     let outputs = exec.execute_all(&commands).unwrap();
     assert_eq!(outputs[0], "unsat");
     assert!(
-        !outputs[1].contains("error") && !outputs[1].is_empty(),
-        "huge budget must not suppress the FP UNSAT proof: {}",
+        outputs[1].contains("UNVERIFIABLE PROOF")
+            && outputs[1].contains("unsupported by pinned Carcara"),
+        "the FP proof must fail closed only at the unsupported Alethe surface: {}",
         &outputs[1][..outputs[1].len().min(200)]
     );
+    let proof = exec.last_proof().expect("native FP proof after UNSAT");
+    let quality = ay_proof::check_proof_strict(proof, &exec.ctx.terms)
+        .expect("the generous rlimit must preserve the strict native FP proof");
+    assert!(quality.is_complete(), "{quality}");
 }
 
 #[test]

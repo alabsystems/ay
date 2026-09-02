@@ -20,6 +20,8 @@ mod duplicate_authored_root;
 mod folded_atom_assumptions;
 #[path = "carcara_external_check/folded_conjunction_assumptions.rs"]
 mod folded_conjunction_assumptions;
+#[path = "carcara_external_check/nia_negated_conjunct.rs"]
+mod nia_negated_conjunct;
 include!("carcara_external_check/fixtures.rs");
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -100,17 +102,6 @@ fn require_carcara_or_skip() -> Option<PathBuf> {
     None
 }
 
-fn required_cargo_home_carcara() -> PathBuf {
-    let home = std::env::var_os("HOME").expect("HOME must be set for the production proof gate");
-    let path = PathBuf::from(home).join(".cargo/bin/carcara");
-    assert!(
-        path.is_file(),
-        "the production E5 proof gate requires the real checker at {}",
-        path.display()
-    );
-    path
-}
-
 fn exact_carcara_verdict(carcara: &Path, problem: &str, proof: &str) -> (bool, String) {
     let directory = tempfile::tempdir().expect("temporary Carcara directory");
     let problem_path = directory.path().join("problem.smt2");
@@ -155,7 +146,7 @@ include!("carcara_external_check/normalized_bv.rs");
 #[test]
 #[timeout(60_000)]
 fn test_e5_shift_exact_artifact_is_native_strict_and_carcara_valid() {
-    let carcara = required_cargo_home_carcara();
+    let carcara = required_carcara_for_corpus();
     let mut solver = Solver::try_new(Logic::QfBv).expect("QF_BV solver");
     solver.set_produce_proofs(true);
     let x = solver.declare_const("x", Sort::bitvec(8));
@@ -262,6 +253,46 @@ fn test_carcara_trust_free_guarded_self_equality_division() {
     assert!(
         run_carcara_trust_free(&carcara, "guarded_self_eq_division", problem, &proof),
         "guarded self-equality proof must be trust-free verifiable by carcara"
+    );
+}
+
+/// A folded `let` assertion must remain source-exact at the assumption
+/// boundary, then use the certified Alethe `let` bridge before `and_pos` sees
+/// the expanded conjunction. AY's internal checker does not compare assumes
+/// to the original SMT-LIB syntax, so only pinned Carcara catches this scope
+/// mismatch.
+#[test]
+#[timeout(60_000)]
+fn test_carcara_trust_free_let_linear_conjunction_collapse() {
+    let problem = r#"
+(set-logic QF_LIA)
+(declare-fun x0 () Int)
+(declare-fun x1 () Int)
+(assert (let ((?v_0 (* 1 x0)) (?v_1 (* (- 1) x0)))
+  (and (<= (+ ?v_0 ?v_1) (- 1)) (<= (+ (* 1 x1) (* 0 x0)) 0))))
+(check-sat)
+"#;
+    let proof = solve_unsat_and_get_proof(problem, "let_linear_conjunction_collapse");
+    assert!(
+        !proof.contains(":rule hole") && !proof.contains(":rule trust"),
+        "let conjunction collapse must remain fully proved:\n{proof}"
+    );
+    assert!(
+        proof.contains(":rule let") && proof.contains(":rule and_pos"),
+        "the proof must bridge the source let before extracting its conjunct:\n{proof}"
+    );
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    // This is specifically a proof of let elimination. The corpus helper uses
+    // `--expand-let-bindings`, which erases the `let` term from the proof
+    // before Carcara can apply `:rule let`; run the pinned checker in its
+    // ordinary parser mode so both the source premise and certified rule stay
+    // present.
+    let (valid, diagnostic) = exact_carcara_verdict(&carcara, problem, &proof);
+    assert!(
+        valid,
+        "pinned Carcara must accept the source-exact let proof: {diagnostic}"
     );
 }
 

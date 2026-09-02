@@ -101,6 +101,11 @@ impl SmallModel {
                         int_assignments.insert(name.clone(), int_val);
                     }
                 }
+                SmtValue::BigBitVec(n, _width) => {
+                    if let Some(int_val) = num_traits::ToPrimitive::to_i128(n.as_ref()) {
+                        int_assignments.insert(name.clone(), int_val);
+                    }
+                }
                 // Beyond-i128 witnesses: skip (i128 cache boundary; the
                 // evaluator abstains on the missing var — fail-closed).
                 // Array/DT values have no scalar representation.

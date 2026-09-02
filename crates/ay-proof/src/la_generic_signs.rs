@@ -115,46 +115,51 @@ impl Lin {
 /// Split the top-level whitespace-separated s-expression tokens/subforms of
 /// `s` (an already-trimmed expression). `(f a b)` yields `["f", "a", "b"]`,
 /// respecting nested parentheses; a bare atom yields the atom itself.
-fn split_sexpr(s: &str) -> Option<Vec<String>> {
-    let s = s.trim();
-    if !s.starts_with('(') {
-        return Some(vec![s.to_string()]);
+pub(crate) fn carcara_quoted_symbols_are_lexically_supported(s: &str) -> bool {
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Mode {
+        Normal,
+        QuotedSymbol,
+        String,
     }
-    if !s.ends_with(')') {
-        return None;
-    }
-    let inner = &s[1..s.len() - 1];
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut cur = String::new();
-    for ch in inner.chars() {
-        match ch {
-            '(' => {
-                depth += 1;
-                cur.push(ch);
-            }
-            ')' => {
-                depth -= 1;
-                if depth < 0 {
-                    return None;
-                }
-                cur.push(ch);
-            }
-            c if c.is_whitespace() && depth == 0 => {
-                if !cur.is_empty() {
-                    parts.push(std::mem::take(&mut cur));
-                }
-            }
-            c => cur.push(c),
+
+    let bytes = s.as_bytes();
+    let mut mode = Mode::Normal;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match (mode, bytes[index]) {
+            (Mode::Normal, b'|') => mode = Mode::QuotedSymbol,
+            (Mode::Normal, b'"') => mode = Mode::String,
+            (Mode::Normal, b'\\') => return false,
+            // Pinned Carcara follows SMT-LIB's quoted-symbol grammar and
+            // rejects backslash outright; AY/Z3's `\|` / `\\` extension must
+            // never be granted wire-rule authority.
+            (Mode::QuotedSymbol, b'\\') => return false,
+            (Mode::QuotedSymbol, b'|') => mode = Mode::Normal,
+            (Mode::String, b'"') if bytes.get(index + 1) == Some(&b'"') => index += 1,
+            (Mode::String, b'"') => mode = Mode::Normal,
+            _ => {}
         }
+        index += 1;
     }
-    if depth != 0 {
+    mode == Mode::Normal
+}
+
+fn split_sexpr(s: &str) -> Option<Vec<String>> {
+    const MAX_FIELDS: usize = 100_000;
+    const MAX_BYTES: usize = 1024 * 1024;
+    let s = s.trim();
+    if !carcara_quoted_symbols_are_lexically_supported(s) {
         return None;
     }
-    if !cur.is_empty() {
-        parts.push(cur);
+    if !s.starts_with('(') {
+        let fields = crate::alethe_printer::split_smt_term_slices_bounded(s, 1, MAX_BYTES).ok()?;
+        return (fields == [s]).then(|| vec![s.to_string()]);
     }
-    Some(parts)
+    let inner = s.strip_prefix('(')?.strip_suffix(')')?;
+    crate::alethe_printer::split_smt_term_slices_bounded(inner, MAX_FIELDS, MAX_BYTES)
+        .ok()
+        .map(|fields| fields.into_iter().map(str::to_string).collect())
 }
 
 /// Parse a decimal / integer numeral token (`7.0`, `-5`, `45.0`) into a
@@ -164,13 +169,31 @@ fn parse_numeral(tok: &str) -> Option<BigRational> {
         Some(rest) => (true, rest),
         None => (false, tok),
     };
-    if body.is_empty() {
+    if body.is_empty() || !body.as_bytes().first().is_some_and(u8::is_ascii_digit) {
         return None;
     }
-    let val = if let Some(dot) = body.find('.') {
+    let val = if let Some(slash) = body.find('/') {
+        let numerator = &body[..slash];
+        let denominator = &body[slash + 1..];
+        if numerator.len() > 1 && numerator.starts_with('0')
+            || denominator.is_empty()
+            || !numerator.bytes().all(|byte| byte.is_ascii_digit())
+            || !denominator.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        let numerator = numerator.parse::<BigInt>().ok()?;
+        let denominator = denominator.parse::<BigInt>().ok()?;
+        if denominator.is_zero() {
+            return None;
+        }
+        BigRational::new(numerator, denominator)
+    } else if let Some(dot) = body.find('.') {
         let int_part = &body[..dot];
         let frac_part = &body[dot + 1..];
-        if !int_part.chars().all(|c| c.is_ascii_digit())
+        if int_part.is_empty()
+            || int_part.len() > 1 && int_part.starts_with('0')
+            || !int_part.chars().all(|c| c.is_ascii_digit())
             || !frac_part.chars().all(|c| c.is_ascii_digit())
         {
             return None;
@@ -180,7 +203,7 @@ fn parse_numeral(tok: &str) -> Option<BigRational> {
         let denom = BigInt::from(10u32).pow(frac_part.len() as u32);
         BigRational::new(numer, denom)
     } else {
-        if !body.chars().all(|c| c.is_ascii_digit()) {
+        if body.len() > 1 && body.starts_with('0') || !body.chars().all(|c| c.is_ascii_digit()) {
             return None;
         }
         BigRational::from(body.parse::<BigInt>().ok()?)
@@ -195,10 +218,12 @@ fn parse_numeral(tok: &str) -> Option<BigRational> {
 fn parse_lin(s: &str) -> Option<Lin> {
     let s = s.trim();
     if !s.starts_with('(') {
-        return Some(match parse_numeral(s) {
-            Some(r) => Lin::constant(r),
-            None => Lin::var(s.to_string()),
-        });
+        return match parse_numeral(s) {
+            Some(r) => Some(Lin::constant(r)),
+            None if printed_atom_starts_like_carcara_number(s) => None,
+            None if carcara_bare_linear_atom_is_supported(s) => Some(Lin::var(s.to_string())),
+            None => None,
+        };
     }
     let parts = split_sexpr(s)?;
     if parts.is_empty() {
@@ -267,6 +292,230 @@ fn parse_lin(s: &str) -> Option<Lin> {
         }
         _ => Some(Lin::var(s.to_string())),
     }
+}
+
+fn printed_atom_starts_like_carcara_number(atom: &str) -> bool {
+    let bytes = atom.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_digit)
+        || matches!(bytes, [b'-', next, ..] if next.is_ascii_digit())
+}
+
+fn carcara_bare_linear_atom_is_supported(atom: &str) -> bool {
+    if atom.starts_with('|') {
+        return atom.ends_with('|') && atom.len() >= 2;
+    }
+    !matches!(atom.as_bytes().first(), Some(b':' | b'#' | b'"'))
+        && !matches!(
+            atom,
+            "true"
+                | "false"
+                | "_"
+                | "!"
+                | "as"
+                | "let"
+                | "exists"
+                | "forall"
+                | "match"
+                | "choice"
+                | "lambda"
+                | "cl"
+                | "assume"
+                | "step"
+                | "anchor"
+                | "declare-fun"
+                | "declare-const"
+                | "declare-sort"
+                | "declare-datatype"
+                | "declare-datatypes"
+                | "par"
+                | "define-fun"
+                | "define-fun-rec"
+                | "define-funs-rec"
+                | "define-sort"
+                | "assert"
+                | "check-sat-assuming"
+                | "set-logic"
+                | "declare-rare-rule"
+        )
+}
+
+/// Conservative Carcara-faithful term grammar for the authored-assume
+/// arithmetic implication bridge.
+///
+/// The bridge needs only ordinary sums/subtractions and direct numeric
+/// scaling.  In particular it deliberately rejects multiplication whose
+/// coefficient is computed (`(* (+ 1 1) x)`) and opaque nonlinear products:
+/// the former is interpreted differently by AY and Carcara, while the latter
+/// is unnecessary for this narrow source-to-canonical normalization lane.
+fn carcara_bridge_linear_term_supported(
+    printed: &str,
+    depth: usize,
+    nodes_left: &mut usize,
+) -> bool {
+    const MAX_DEPTH: usize = 256;
+    if depth > MAX_DEPTH {
+        return false;
+    }
+    let Some(remaining) = nodes_left.checked_sub(1) else {
+        return false;
+    };
+    *nodes_left = remaining;
+
+    let printed = printed.trim();
+    if printed.is_empty() {
+        return false;
+    }
+    if !printed.starts_with('(') {
+        return parse_numeral(printed).is_some()
+            || (!printed_atom_starts_like_carcara_number(printed)
+                && carcara_bare_linear_atom_is_supported(printed));
+    }
+    let Some(parts) = split_sexpr(printed) else {
+        return false;
+    };
+    let Some((operator, operands)) = parts.split_first() else {
+        return false;
+    };
+    let recurse = |operand: &str, nodes_left: &mut usize| {
+        carcara_bridge_linear_term_supported(operand, depth + 1, nodes_left)
+    };
+    match operator.as_str() {
+        "+" => operands.len() >= 2 && operands.iter().all(|operand| recurse(operand, nodes_left)),
+        "-" => !operands.is_empty() && operands.iter().all(|operand| recurse(operand, nodes_left)),
+        "*" => matches!(operands, [left, right]
+            if (carcara_direct_fraction(left).is_some() && recurse(right, nodes_left))
+                || (carcara_direct_fraction(right).is_some() && recurse(left, nodes_left))),
+        "/" => carcara_direct_fraction(printed).is_some(),
+        // Every other application is one opaque arithmetic atom in Carcara's
+        // `LinearComb::from_term`; do not recurse into its arguments.
+        _ => true,
+    }
+}
+
+/// Parse exactly the direct numeric forms recognized by Carcara's
+/// `Term::as_fraction`: a numeral, its unary negation, or `/` over two
+/// signed numerals (optionally negated as a whole).
+fn carcara_direct_fraction(printed: &str) -> Option<BigRational> {
+    let printed = printed.trim();
+    if let Some(value) = parse_numeral(printed) {
+        return Some(value);
+    }
+    let parts = split_sexpr(printed)?;
+    match parts.as_slice() {
+        [minus, operand] if minus == "-" => {
+            let inner = carcara_unsigned_fraction(operand)?;
+            Some(-inner)
+        }
+        _ => carcara_unsigned_fraction(printed),
+    }
+}
+
+fn carcara_unsigned_fraction(printed: &str) -> Option<BigRational> {
+    if let Some(value) = parse_numeral(printed.trim()) {
+        return Some(value);
+    }
+    let parts = split_sexpr(printed)?;
+    let [operator, numerator, denominator] = parts.as_slice() else {
+        return None;
+    };
+    if operator != "/" {
+        return None;
+    }
+    let numerator = signed_numeral(numerator)?;
+    let denominator = signed_numeral(denominator)?;
+    (!denominator.is_zero()).then(|| numerator / denominator)
+}
+
+fn signed_numeral(printed: &str) -> Option<BigRational> {
+    if let Some(value) = parse_numeral(printed.trim()) {
+        return Some(value);
+    }
+    let parts = split_sexpr(printed)?;
+    let [minus, operand] = parts.as_slice() else {
+        return None;
+    };
+    (minus == "-")
+        .then(|| parse_numeral(operand.trim()).map(std::ops::Neg::neg))
+        .flatten()
+}
+
+fn carcara_bridge_comparison_supported(printed: &str) -> bool {
+    if !surface_audit::printed_atom_is_bounded(printed) {
+        return false;
+    }
+    let Some(parts) = split_sexpr(printed) else {
+        return false;
+    };
+    let [operator, left, right] = parts.as_slice() else {
+        return false;
+    };
+    if !matches!(operator.as_str(), "<" | "<=" | ">" | ">=") {
+        return false;
+    }
+    let mut nodes_left = 100_000;
+    carcara_bridge_linear_term_supported(left, 0, &mut nodes_left)
+        && carcara_bridge_linear_term_supported(right, 0, &mut nodes_left)
+}
+
+/// Whether a complete printed clause literal has exactly the relation and
+/// linear-term grammar consumed by pinned Carcara's `la_generic` rule.
+///
+/// This validates the full literal rather than an internally stripped atom:
+/// a surface override may be keyed on the outer `not` node and therefore
+/// replace both relation and polarity at once. Carcara accepts an unnegated
+/// order comparison, or one `not` around an order comparison/equality. Its
+/// linearizer recognizes only binary multiplication with a direct numeric
+/// operand; computed coefficients and n-ary products remain opaque atoms.
+pub(crate) fn carcara_printed_la_generic_literal_supported(printed: &str) -> bool {
+    if !surface_audit::printed_atom_is_bounded(printed) {
+        return false;
+    }
+    let Some(parts) = split_sexpr(printed) else {
+        return false;
+    };
+    let (relation, negated) = match parts.as_slice() {
+        [not, inner] if not == "not" => (inner.as_str(), true),
+        _ => (printed.trim(), false),
+    };
+    let Some(parts) = split_sexpr(relation) else {
+        return false;
+    };
+    let [operator, left, right] = parts.as_slice() else {
+        return false;
+    };
+    if !(matches!(operator.as_str(), "<" | "<=" | ">" | ">=") || (negated && operator == "=")) {
+        return false;
+    }
+    let mut nodes_left = 100_000;
+    carcara_bridge_linear_term_supported(left, 0, &mut nodes_left)
+        && carcara_bridge_linear_term_supported(right, 0, &mut nodes_left)
+}
+
+/// Whether Carcara can prove the exact implication `premise => conclusion`
+/// with the checked two-row bridge
+/// `(cl (not premise) conclusion) :rule la_generic :args (1 1)`.
+///
+/// This is intentionally narrower than general Farkas publication.  It is
+/// used only to confine an exact authored arithmetic comparison to its own
+/// `assume` before the rest of a proof returns to AY's canonical rendering.
+#[must_use]
+pub fn printed_la_generic_unit_implication_is_supported(premise: &str, conclusion: &str) -> bool {
+    if !carcara_bridge_comparison_supported(premise)
+        || !carcara_bridge_comparison_supported(conclusion)
+    {
+        return false;
+    }
+    let Some(premise_hypothesis) = hypothesis(premise, true) else {
+        return false;
+    };
+    let Some(negated_conclusion_hypothesis) = hypothesis(conclusion, false) else {
+        return false;
+    };
+    let coefficients = [Rational64::from_integer(1), Rational64::from_integer(1)];
+    coeffs_valid(
+        &[premise_hypothesis, negated_conclusion_hypothesis],
+        &coefficients,
+    )
 }
 
 /// Parse an exact printed arithmetic constant using the same linear grammar

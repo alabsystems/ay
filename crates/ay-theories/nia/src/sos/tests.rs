@@ -126,6 +126,14 @@ fn tamper_negative_multiplier_rejected() {
 }
 
 #[test]
+fn coefficient_just_over_resource_limit_is_rejected() {
+    let (constraints, mut cert) = linear_farkas_setup();
+    cert.terms[0].multiplier =
+        BigRational::from_integer(BigInt::from(1u8) << budget::MAX_SOS_COEFFICIENT_BITS as usize);
+    assert_eq!(cert.verify(&constraints), Err(SosError::ResourceLimit));
+}
+
+#[test]
 fn tamper_rhs_positive_rejected() {
     let (constraints, mut cert) = linear_farkas_setup();
     cert.rhs = r(1);

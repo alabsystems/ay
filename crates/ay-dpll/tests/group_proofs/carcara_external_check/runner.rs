@@ -12,7 +12,8 @@ fn solve_unsat_and_get_proof(problem: &str, label: &str) -> String {
     assert_eq!(
         outputs.first().map(String::as_str),
         Some("unsat"),
-        "{label}: expected UNSAT result before proof output, got {outputs:?}"
+        "{label}: expected UNSAT result before proof output, got {outputs:?}; unknown_reason={:?}",
+        exec.unknown_reason()
     );
     assert!(
         outputs.len() >= 2,

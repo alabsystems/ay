@@ -5,9 +5,11 @@
 use super::LogicCategory;
 
 /// Recognized combined logics whose component theories AY has but for which it
-/// lacks a sound combined decision procedure. They are accepted at `set-logic`
-/// but must NOT be routed through content detection: they stay `Other` so
-/// `check_sat` returns a sound `unknown`. (#combined-bv-arith)
+/// lacks a general sound combined decision procedure. They are accepted at
+/// `set-logic` but must NOT be routed through generic content detection. A
+/// dedicated closed validator may later select a proven live subset (currently
+/// the array-free QF_UFBVLIA/QF_AUFBVLIA scalar slice); every rejected residue
+/// stays `Other` so check-sat returns a sound `unknown`. (#combined-bv-arith)
 pub(crate) const FAIL_CLOSED_COMBINED: [&str; 4] =
     ["QF_BVLRA", "QF_AUFBVLIA", "QF_UFBVLIA", "QF_AUFBVLIRA"];
 

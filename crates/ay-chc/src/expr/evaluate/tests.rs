@@ -376,6 +376,370 @@ fn test_evaluate_expr_datatype_selector_and_tester() {
     assert_eq!(evaluate_expr(&equality, &model), Some(SmtValue::Bool(true)));
 }
 
+mod wide_bitvec {
+    use super::super::value_ops::smt_values_equal;
+    use super::*;
+    use num_bigint::{BigInt, BigUint};
+
+    fn high_bit_129() -> ChcExpr {
+        ChcExpr::Op(
+            ChcOp::BvConcat,
+            vec![a(ChcExpr::BitVec(1, 1)), a(ChcExpr::BitVec(0, 128))],
+        )
+    }
+
+    #[test]
+    fn concat_preserves_bit_128_exactly() {
+        assert_eq!(
+            evaluate_expr(&high_bit_129(), &FxHashMap::default()),
+            Some(SmtValue::bitvec_from_biguint(
+                BigUint::from(1u8) << 128,
+                129
+            ))
+        );
+    }
+
+    #[test]
+    fn concat_normalizes_direct_legacy_model_payloads() {
+        let x = ChcVar::new("x", ChcSort::BitVec(1));
+        let concat = ChcExpr::Op(
+            ChcOp::BvConcat,
+            vec![a(ChcExpr::BitVec(0, 1)), a(ChcExpr::var(x))],
+        );
+        let mut model = FxHashMap::default();
+        model.insert("x".to_string(), SmtValue::BitVec(2, 1));
+        assert_eq!(evaluate_expr(&concat, &model), Some(SmtValue::BitVec(0, 2)));
+    }
+
+    #[test]
+    fn equality_distinguishes_wide_high_bits() {
+        let exact = SmtValue::bitvec_from_biguint(BigUint::from(1u8) << 128, 129);
+        let low_only_legacy = SmtValue::BitVec(0, 129);
+        assert_eq!(smt_values_equal(&exact, &exact), Some(true));
+        assert_eq!(smt_values_equal(&exact, &low_only_legacy), Some(false));
+
+        let x = ChcVar::new("x", ChcSort::BitVec(129));
+        let equality = ChcExpr::eq(ChcExpr::var(x), high_bit_129());
+        let mut model = FxHashMap::default();
+        model.insert("x".to_string(), exact);
+        assert_eq!(evaluate_expr(&equality, &model), Some(SmtValue::Bool(true)));
+        model.insert("x".to_string(), low_only_legacy);
+        assert_eq!(
+            evaluate_expr(&equality, &model),
+            Some(SmtValue::Bool(false))
+        );
+    }
+
+    #[test]
+    fn extend_extract_repeat_and_bv2nat_are_exact_above_128_bits() {
+        let model = FxHashMap::default();
+
+        let zero_extended = ChcExpr::Op(ChcOp::BvZeroExtend(128), vec![a(ChcExpr::BitVec(1, 1))]);
+        assert_eq!(
+            evaluate_expr(&zero_extended, &model),
+            Some(SmtValue::bitvec_from_biguint(BigUint::from(1u8), 129))
+        );
+
+        let sign_extended = ChcExpr::Op(ChcOp::BvSignExtend(128), vec![a(ChcExpr::BitVec(1, 1))]);
+        let all_ones = (BigUint::from(1u8) << 129) - BigUint::from(1u8);
+        assert_eq!(
+            evaluate_expr(&sign_extended, &model),
+            Some(SmtValue::bitvec_from_biguint(all_ones, 129))
+        );
+
+        let high = high_bit_129();
+        let extracted = ChcExpr::Op(ChcOp::BvExtract(128, 128), vec![a(high.clone())]);
+        assert_eq!(
+            evaluate_expr(&extracted, &model),
+            Some(SmtValue::BitVec(1, 1))
+        );
+
+        let repeated = ChcExpr::Op(ChcOp::BvRepeat(129), vec![a(ChcExpr::BitVec(1, 1))]);
+        assert_eq!(
+            evaluate_expr(&repeated, &model),
+            Some(SmtValue::bitvec_from_biguint(
+                (BigUint::from(1u8) << 129) - BigUint::from(1u8),
+                129
+            ))
+        );
+
+        let to_int = ChcExpr::Op(ChcOp::Bv2Nat, vec![a(high)]);
+        assert_eq!(
+            evaluate_expr(&to_int, &model),
+            Some(SmtValue::int_from_bigint(BigInt::from(1u8) << 128))
+        );
+    }
+
+    fn wide_var(name: &str, width: u32) -> ChcExpr {
+        ChcExpr::var(ChcVar::new(name, ChcSort::BitVec(width)))
+    }
+
+    fn binary(op: ChcOp, lhs: ChcExpr, rhs: ChcExpr) -> ChcExpr {
+        ChcExpr::Op(op, vec![a(lhs), a(rhs)])
+    }
+
+    #[test]
+    fn wide_arithmetic_bitwise_and_comparisons_are_exact() {
+        let width = 192;
+        let modulus = BigUint::from(1u8) << width;
+        let mask = &modulus - BigUint::from(1u8);
+        let x_value: BigUint = (BigUint::from(1u8) << 191_usize) | BigUint::from(5u8);
+        let y_value = BigUint::from(7u8);
+        let mut model = FxHashMap::default();
+        model.insert(
+            "x".to_string(),
+            SmtValue::bitvec_from_biguint(x_value.clone(), width),
+        );
+        model.insert(
+            "y".to_string(),
+            SmtValue::bitvec_from_biguint(y_value.clone(), width),
+        );
+        let x = || wide_var("x", width);
+        let y = || wide_var("y", width);
+
+        for (op, expected) in [
+            (ChcOp::BvAdd, (&x_value + &y_value) & &mask),
+            (ChcOp::BvSub, (&x_value + &modulus - &y_value) & &mask),
+            (ChcOp::BvMul, (&x_value * &y_value) & &mask),
+            (ChcOp::BvUDiv, &x_value / &y_value),
+            (ChcOp::BvURem, &x_value % &y_value),
+            (ChcOp::BvAnd, &x_value & &y_value),
+            (ChcOp::BvOr, &x_value | &y_value),
+            (ChcOp::BvXor, &x_value ^ &y_value),
+            (ChcOp::BvNand, &mask ^ (&x_value & &y_value)),
+            (ChcOp::BvNor, &mask ^ (&x_value | &y_value)),
+            (ChcOp::BvXnor, &mask ^ (&x_value ^ &y_value)),
+        ] {
+            assert_eq!(
+                evaluate_expr(&binary(op, x(), y()), &model),
+                Some(SmtValue::bitvec_from_biguint(expected, width))
+            );
+        }
+
+        for (op, expected) in [
+            (ChcOp::BvULt, false),
+            (ChcOp::BvULe, false),
+            (ChcOp::BvUGt, true),
+            (ChcOp::BvUGe, true),
+            (ChcOp::BvSLt, true),
+            (ChcOp::BvSLe, true),
+            (ChcOp::BvSGt, false),
+            (ChcOp::BvSGe, false),
+        ] {
+            assert_eq!(
+                evaluate_expr(&binary(op, x(), y()), &model),
+                Some(SmtValue::Bool(expected))
+            );
+        }
+
+        assert_eq!(
+            evaluate_expr(&ChcExpr::Op(ChcOp::BvNeg, vec![a(x())]), &model),
+            Some(SmtValue::bitvec_from_biguint(&modulus - &x_value, width))
+        );
+        assert_eq!(
+            evaluate_expr(&ChcExpr::Op(ChcOp::BvNot, vec![a(x())]), &model),
+            Some(SmtValue::bitvec_from_biguint(&mask ^ &x_value, width))
+        );
+        assert_eq!(
+            evaluate_expr(&binary(ChcOp::BvComp, x(), x()), &model),
+            Some(SmtValue::BitVec(1, 1))
+        );
+        assert_eq!(
+            evaluate_expr(&binary(ChcOp::BvComp, x(), y()), &model),
+            Some(SmtValue::BitVec(0, 1))
+        );
+    }
+
+    #[test]
+    fn wide_signed_corner_cases_and_division_by_zero_match_smtlib() {
+        let width = 129;
+        let min_signed: BigUint = BigUint::from(1u8) << 128_usize;
+        let all_ones: BigUint = (BigUint::from(1u8) << (width as usize)) - BigUint::from(1u8);
+        let mut model = FxHashMap::default();
+        for (name, value) in [
+            ("min", min_signed.clone()),
+            ("minus_one", all_ones.clone()),
+            ("zero", BigUint::from(0u8)),
+            ("positive", BigUint::from(9u8)),
+            ("four", BigUint::from(4u8)),
+            ("minus_nine", (&all_ones - BigUint::from(8u8))),
+        ] {
+            model.insert(
+                name.to_string(),
+                SmtValue::bitvec_from_biguint(value, width),
+            );
+        }
+        let v = |name| wide_var(name, width);
+
+        assert_eq!(
+            evaluate_expr(&binary(ChcOp::BvSDiv, v("min"), v("minus_one")), &model),
+            Some(SmtValue::bitvec_from_biguint(min_signed.clone(), width))
+        );
+        assert_eq!(
+            evaluate_expr(&binary(ChcOp::BvSRem, v("min"), v("minus_one")), &model),
+            Some(SmtValue::bitvec_from_biguint(BigUint::from(0u8), width))
+        );
+        assert_eq!(
+            evaluate_expr(&binary(ChcOp::BvSDiv, v("positive"), v("zero")), &model),
+            Some(SmtValue::bitvec_from_biguint(all_ones.clone(), width))
+        );
+        assert_eq!(
+            evaluate_expr(&binary(ChcOp::BvSDiv, v("min"), v("zero")), &model),
+            Some(SmtValue::bitvec_from_biguint(BigUint::from(1u8), width))
+        );
+        for op in [ChcOp::BvSRem, ChcOp::BvSMod, ChcOp::BvURem] {
+            assert_eq!(
+                evaluate_expr(&binary(op, v("min"), v("zero")), &model),
+                Some(SmtValue::bitvec_from_biguint(min_signed.clone(), width))
+            );
+        }
+        assert_eq!(
+            evaluate_expr(&binary(ChcOp::BvUDiv, v("min"), v("zero")), &model),
+            Some(SmtValue::bitvec_from_biguint(all_ones, width))
+        );
+
+        let minus_two = (BigUint::from(1u8) << width) - BigUint::from(2u8);
+        let minus_one = (BigUint::from(1u8) << width) - BigUint::from(1u8);
+        assert_eq!(
+            evaluate_expr(&binary(ChcOp::BvSDiv, v("minus_nine"), v("four")), &model),
+            Some(SmtValue::bitvec_from_biguint(minus_two, width))
+        );
+        assert_eq!(
+            evaluate_expr(&binary(ChcOp::BvSRem, v("minus_nine"), v("four")), &model),
+            Some(SmtValue::bitvec_from_biguint(minus_one, width))
+        );
+        assert_eq!(
+            evaluate_expr(&binary(ChcOp::BvSMod, v("minus_nine"), v("four")), &model),
+            Some(SmtValue::bitvec_from_biguint(BigUint::from(3u8), width))
+        );
+    }
+
+    #[test]
+    fn wide_shifts_rotate_zero_and_int2bv_are_exact() {
+        let width = 192;
+        let top_bit: BigUint = BigUint::from(1u8) << 191_usize;
+        let all_ones = (BigUint::from(1u8) << width) - BigUint::from(1u8);
+        let mut model = FxHashMap::default();
+        model.insert(
+            "negative".to_string(),
+            SmtValue::bitvec_from_biguint(top_bit.clone(), width),
+        );
+        model.insert(
+            "amount".to_string(),
+            SmtValue::bitvec_from_biguint(BigUint::from(width), width),
+        );
+        model.insert(
+            "one".to_string(),
+            SmtValue::bitvec_from_biguint(BigUint::from(1u8), width),
+        );
+        let negative = || wide_var("negative", width);
+        let amount = || wide_var("amount", width);
+        let one = || wide_var("one", width);
+
+        for op in [ChcOp::BvShl, ChcOp::BvLShr] {
+            assert_eq!(
+                evaluate_expr(&binary(op, negative(), amount()), &model),
+                Some(SmtValue::bitvec_from_biguint(BigUint::from(0u8), width))
+            );
+        }
+        assert_eq!(
+            evaluate_expr(&binary(ChcOp::BvAShr, negative(), amount()), &model),
+            Some(SmtValue::bitvec_from_biguint(all_ones.clone(), width))
+        );
+        assert_eq!(
+            evaluate_expr(&binary(ChcOp::BvShl, negative(), one()), &model),
+            Some(SmtValue::bitvec_from_biguint(BigUint::from(0u8), width))
+        );
+        assert_eq!(
+            evaluate_expr(&binary(ChcOp::BvLShr, negative(), one()), &model),
+            Some(SmtValue::bitvec_from_biguint(
+                BigUint::from(1u8) << 190,
+                width
+            ))
+        );
+        assert_eq!(
+            evaluate_expr(&binary(ChcOp::BvAShr, negative(), one()), &model),
+            Some(SmtValue::bitvec_from_biguint(
+                &top_bit | (BigUint::from(1u8) << 190),
+                width
+            ))
+        );
+
+        for op in [ChcOp::BvRotateLeft(0), ChcOp::BvRotateRight(0)] {
+            assert_eq!(
+                evaluate_expr(&ChcExpr::Op(op, vec![a(negative())]), &model),
+                Some(SmtValue::bitvec_from_biguint(top_bit.clone(), width))
+            );
+        }
+        assert_eq!(
+            evaluate_expr(
+                &ChcExpr::Op(ChcOp::BvRotateLeft(1), vec![a(negative())]),
+                &model
+            ),
+            Some(SmtValue::bitvec_from_biguint(BigUint::from(1u8), width))
+        );
+        assert_eq!(
+            evaluate_expr(
+                &ChcExpr::Op(ChcOp::BvRotateRight(1), vec![a(negative())]),
+                &model
+            ),
+            Some(SmtValue::bitvec_from_biguint(
+                BigUint::from(1u8) << 190,
+                width
+            ))
+        );
+        // The u128 fast path must also avoid shifting by 128 when rotate=0.
+        assert_eq!(
+            evaluate_expr(
+                &ChcExpr::Op(ChcOp::BvRotateLeft(0), vec![a(ChcExpr::BitVec(1, 128))]),
+                &FxHashMap::default()
+            ),
+            Some(SmtValue::BitVec(1, 128))
+        );
+
+        let integer = ChcVar::new("integer", ChcSort::Int);
+        let big_integer = (BigInt::from(1u8) << 191) + BigInt::from(5u8);
+        model.insert(integer.name.clone(), SmtValue::int_from_bigint(big_integer));
+        let int2bv = ChcExpr::Op(ChcOp::Int2Bv(width), vec![a(ChcExpr::var(integer))]);
+        assert_eq!(
+            evaluate_expr(&int2bv, &model),
+            Some(SmtValue::bitvec_from_biguint(
+                top_bit + BigUint::from(5u8),
+                width
+            ))
+        );
+    }
+
+    #[test]
+    fn malformed_or_resource_unbounded_indexed_bv_ops_fail_closed() {
+        let model = FxHashMap::default();
+        let too_wide_extend = ChcExpr::Op(
+            ChcOp::BvZeroExtend(crate::MAX_BITVECTOR_WIDTH),
+            vec![a(ChcExpr::BitVec(0, 1))],
+        );
+        let zero_repeat = ChcExpr::Op(ChcOp::BvRepeat(0), vec![a(ChcExpr::BitVec(1, 1))]);
+        let too_wide_int2bv = ChcExpr::Op(
+            ChcOp::Int2Bv(crate::MAX_BITVECTOR_WIDTH + 1),
+            vec![a(ChcExpr::Int(0))],
+        );
+        let zero_width_concat = ChcExpr::Op(
+            ChcOp::BvConcat,
+            vec![a(ChcExpr::BitVec(0, 0)), a(ChcExpr::BitVec(1, 1))],
+        );
+        let zero_width_rotate = ChcExpr::Op(ChcOp::BvRotateLeft(1), vec![a(ChcExpr::BitVec(0, 0))]);
+
+        for expr in [
+            too_wide_extend,
+            zero_repeat,
+            too_wide_int2bv,
+            zero_width_concat,
+            zero_width_rotate,
+        ] {
+            assert_eq!(evaluate_expr(&expr, &model), None);
+        }
+    }
+}
+
 // --- Phase-2 BigInt escape: value_ops internals ---
 // (End-to-end coverage lives in expr/tests/bigint_escape.rs, smt/tests_model_verify.rs,
 // smt/tests_check_sat.rs, and lib_tests.rs.)
@@ -614,5 +978,58 @@ mod real_eval {
         assert_eq!(evaluate_expr(&expr, &model), Some(SmtValue::Bool(true)));
         model.insert("A".to_string(), real(4, 1));
         assert_eq!(evaluate_expr(&expr, &model), Some(SmtValue::Bool(false)));
+    }
+
+    #[test]
+    fn named_int_real_conversions_evaluate_exactly() {
+        let model = FxHashMap::default();
+        let to_real = ChcExpr::FuncApp(
+            "to_real".to_string(),
+            ChcSort::Real,
+            vec![ChcExpr::Int(-3).into()],
+        );
+        let to_int = ChcExpr::FuncApp(
+            "to_int".to_string(),
+            ChcSort::Int,
+            vec![ChcExpr::Real(-3, 2).into()],
+        );
+        let is_int_true = ChcExpr::FuncApp(
+            "is_int".to_string(),
+            ChcSort::Bool,
+            vec![ChcExpr::Real(4, 2).into()],
+        );
+        let is_int_false = ChcExpr::FuncApp(
+            "is_int".to_string(),
+            ChcSort::Bool,
+            vec![ChcExpr::Real(3, 2).into()],
+        );
+
+        assert_eq!(evaluate_expr(&to_real, &model), Some(real(-3, 1)));
+        assert_eq!(evaluate_expr(&to_int, &model), Some(SmtValue::Int(-2)));
+        assert_eq!(
+            evaluate_expr(&is_int_true, &model),
+            Some(SmtValue::Bool(true))
+        );
+        assert_eq!(
+            evaluate_expr(&is_int_false, &model),
+            Some(SmtValue::Bool(false))
+        );
+    }
+
+    #[test]
+    fn malformed_named_conversion_fails_closed() {
+        let model = FxHashMap::default();
+        let wrong_argument_sort = ChcExpr::FuncApp(
+            "to_real".to_string(),
+            ChcSort::Real,
+            vec![ChcExpr::Bool(true).into()],
+        );
+        let wrong_return_sort = ChcExpr::FuncApp(
+            "to_int".to_string(),
+            ChcSort::Real,
+            vec![ChcExpr::Real(3, 2).into()],
+        );
+        assert_eq!(evaluate_expr(&wrong_argument_sort, &model), None);
+        assert_eq!(evaluate_expr(&wrong_return_sort, &model), None);
     }
 }

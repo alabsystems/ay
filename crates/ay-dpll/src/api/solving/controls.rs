@@ -501,6 +501,10 @@ impl Solver {
         let verification = VerificationSummary {
             sat_model_validated: verified.was_model_validated(),
             unsat_proof_available: raw.is_unsat() && self.last_proof().is_some(),
+            unsat_proof_decline: raw
+                .is_unsat()
+                .then(|| self.executor.last_proof_decline())
+                .flatten(),
             unsat_proof_strictly_verified: verified.was_unsat_strictly_verified(),
             unsat_independently_verified: verified.was_unsat_independently_verified(),
             unsat_exact_semantically_verified: verified.was_unsat_exact_semantically_verified(),

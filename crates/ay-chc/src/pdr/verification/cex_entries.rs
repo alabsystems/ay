@@ -531,6 +531,22 @@ impl PdrSolver {
         for &premise_idx in &entry.premises {
             if let Some(premise_entry) = witness.entries.get(premise_idx) {
                 for (name, value) in &premise_entry.instances {
+                    // Clause-local binders are scoped independently in each
+                    // Horn clause.  A premise's model may contain locals such
+                    // as `n` or `tail`; importing those names into the parent
+                    // clause is both ill-scoped and may assign a value of the
+                    // wrong sort to a same-named parent local.  Only canonical
+                    // predicate-argument names are positional witness data
+                    // that may cross an entry boundary.
+                    //
+                    // Test for an existing binding before decoding the value:
+                    // a discarded, differently typed duplicate must not turn
+                    // an otherwise replayable witness into Unknown.
+                    if !super::is_canonical_arg_name(name)
+                        || subst.iter().any(|(existing, _)| existing.name == *name)
+                    {
+                        continue;
+                    }
                     let (var, expr) = instance_subst_var_and_value(
                         name,
                         value,
@@ -538,9 +554,7 @@ impl PdrSolver {
                         self.config.verbose,
                         saw_unknown,
                     );
-                    if !subst.iter().any(|(existing, _)| existing.name == *name) {
-                        subst.push((var, expr));
-                    }
+                    subst.push((var, expr));
                 }
             }
         }

@@ -176,6 +176,33 @@ const CUT_LOOP_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs
 /// convergence check, so the cost of a miss is bounded by this budget and the
 /// cost of a wrong f64 dual is zero (the bound is re-derived exactly).
 const F64_TIER_SIMPLEX_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+/// DETERMINISTIC counterpart of [`F64_TIER_SIMPLEX_BUDGET`], used only on the
+/// CERTIFICATE path ([`lp_dual_raw_diagnosed`], whose only callers are
+/// `cert::lp_dual_floor` and `cert::certified_bb`). A per-phase simplex
+/// ITERATION count, with no clock consulted at all.
+///
+/// WHY. The wall budget above makes the advisory dual — and therefore the tree
+/// `certified_bb` walks and the bytes it emits — a function of how busy the box
+/// is. That contradicts the invariant every other floor budget in this
+/// repository is written to preserve. Measured 2026-08-31 with ONE frozen
+/// binary (sha256 `be356a14…` / probe `baa31466…`) and ONE input set, two
+/// identical `xargs -P 4` batches over the 46 SEARCH-PROOF-GAP instances that
+/// had an incumbent: **10 of 46 disagreed** on `nodes/leaves/polls`, and two
+/// disagreed on the VERDICT — `addm4.r` (`exhausted(no-branch-variable)`,
+/// 15 nodes / 5,314 polls, against `certified` 249,950 B, 73 nodes / 9,724
+/// polls) and `fir04_trarea_ac` (`exhausted(node-lp-declined)`, 2 nodes / 4,230
+/// polls, against `certified` 67,016 B, 3 nodes / 2 leaves / 4,153 polls). The
+/// second is a COVERAGE conversion that existed only on the quieter of two runs.
+///
+/// SIZING. The count has to buy at least what 500 ms bought on an idle box, or
+/// the fix would trade nondeterminism for lost certificates. `should_stop`
+/// (the poll budget: `certified_bb::MAX_ROOT_LP_POLLS` = 4,096 at the root,
+/// `MAX_NODE_LP_POLLS` = 128 below it, `MAX_TOTAL_LP_POLLS` = 32,768 overall)
+/// is polled every 64 simplex iterations and remains the outer bound, so this
+/// constant only has to be large enough not to be the binding one on models
+/// that converge, and small enough to bound a decline on models that do not.
+/// See the sweep in the branch report.
+const F64_TIER_CERT_SIMPLEX_ITERS: usize = 20_000;
 /// Quality gate of the certified tier: reject (fall back to the exact path) when
 /// the certified exact bound sits more than this RELATIVE slack below the f64
 /// solve's own primal objective estimate — a converged-looking dual whose
@@ -567,6 +594,23 @@ pub(crate) struct LpDualRaw {
     /// Which tier produced `duals`, for the census. Advisory: nothing downstream
     /// branches on it, and every tier's point is dual-feasible.
     pub tier: &'static str,
+    /// The fractional PRIMAL point in ORIGINAL variable space (every tier
+    /// un-complements before storing it), or `None` when the winning tier could
+    /// not recover one.
+    ///
+    /// ADVISORY, AND ONLY EVER ADVISORY. Nothing in any certificate is derived
+    /// from it: the emitters read `duals`, whose validity is weak duality and
+    /// whose every multiplier is re-derived in exact integer arithmetic before a
+    /// byte is written. This field exists for the ONE consumer that needs to
+    /// make a CHOICE rather than a claim — `certified_bb`, which must pick a
+    /// branching variable and has nothing else to pick it from. A stale,
+    /// mismatched or absent primal there costs tree size and nothing else.
+    ///
+    /// Deliberately NOT kept in step with `duals`: when the denominator ladder
+    /// re-expresses the dual point (`reduce_dual_denominator`), `duals` moves to
+    /// a different vertex and this primal stays where it was. Making them agree
+    /// would mean re-solving for a primal that no caller is allowed to trust.
+    pub primal: Option<Vec<BigRational>>,
 }
 
 /// Why [`lp_dual_raw_diagnosed`] produced no dual point.
@@ -714,10 +758,35 @@ pub(crate) fn lp_dual_raw_diagnosed(
         .checked_sub(n)
         .ok_or(LpDualDecline::RowCount)?;
 
+    // EQUALITY-SPAN LANE (certificate path only: `target` is the claimed
+    // optimum, absent for the census diagnosis). When the objective is an
+    // EXACT rational combination of the `=` rows alone, the dual point is a
+    // LINEAR-ALGEBRA fact — sparse exact elimination finds it in milliseconds
+    // — while the simplex tiers must climb there through thousands of
+    // degenerate `y+/y-` pivot pairs (every equality contributes two split
+    // rows whose columns are exact negations). Measured on
+    // `mult_diagcomm_opt_less_teq_nbits_17` (1802 vars, 2669 rows, 935 of
+    // them `=`; LP* = 0 = incumbent): the proof arm burned 64.9 s against a
+    // 5 s budget and emitted nothing. The lane is fail-closed: any shape it
+    // cannot express exactly falls through to the tiers below unchanged, and
+    // instances with no `=` row skip it entirely.
+    if let Some(want) = target {
+        if let Some(raw) = equality_span_dual_point(
+            objective,
+            constraints,
+            num_vars,
+            &model.complement,
+            num_constraint_rows,
+            want,
+        ) {
+            return Ok(raw);
+        }
+    }
+
     // Cheap tier first (<= F64_TIER_SIMPLEX_BUDGET), so the exact tier can no
     // longer starve it of the clock it needs.
     let mut best = model
-        .solve_dual_f64_certified(should_stop)
+        .solve_dual_f64_certified(Some(F64_TIER_CERT_SIMPLEX_ITERS), should_stop)
         .map(|solution| (solution, "f64-certified"));
     let reached_target =
         |candidate: &Option<(DualSolution, &'static str)>| match (candidate, target) {
@@ -725,7 +794,9 @@ pub(crate) fn lp_dual_raw_diagnosed(
             _ => false,
         };
     if !reached_target(&best) {
-        if let Some(exact) = model.solve_dual(should_stop, target) {
+        if let Some(exact) =
+            model.solve_dual(should_stop, target, Some(F64_TIER_CERT_SIMPLEX_ITERS))
+        {
             // Strictly better bound wins; on a tie the CONVERGED point wins,
             // because only a converged solve licenses reading its shortfall as
             // an integrality gap (see `LpDualRaw::converged`).
@@ -745,6 +816,7 @@ pub(crate) fn lp_dual_raw_diagnosed(
     let mut bound = dual.bound;
     let mut duals = dual.duals;
     let mut converged = dual.optimal;
+    let primal = dual.primal;
 
     // --- Denominator reduction, when the emitter's scale cap would refuse. ---
     if let (Some(want), Some(cap)) = (target, max_scale) {
@@ -757,7 +829,9 @@ pub(crate) fn lp_dual_raw_diagnosed(
                 // is not the optimal one, so it licenses no `ceil(LP*)` reading.
                 converged = false;
                 tier = "denominator-reduced";
-            } else if let Some(exact) = model.solve_dual(should_stop, target) {
+            } else if let Some(exact) =
+                model.solve_dual(should_stop, target, Some(F64_TIER_CERT_SIMPLEX_ITERS))
+            {
                 // THE SNAP FAILED, SO DO NOT HAND BACK A POINT THE EMITTER IS
                 // GUARANTEED TO REFUSE. We are only here because the bound is
                 // already TIGHT (`bound == want`) and the sole obstacle is that
@@ -788,6 +862,264 @@ pub(crate) fn lp_dual_raw_diagnosed(
         complement: model.complement.clone(),
         num_constraint_rows,
         tier,
+        primal,
+    })
+}
+
+/// Deterministic work cap for [`equality_span_dual_point`]'s sparse
+/// elimination, in coefficient updates. It bounds the lane by a COUNT rather
+/// than a clock (the same discipline as the certifier recoveries), so the
+/// emitted bytes cannot depend on machine load; exceeding it declines the
+/// lane and the simplex tiers proceed exactly as before.
+const EQUALITY_SPAN_MAX_OPS: usize = 20_000_000;
+
+/// EQUALITY-SPAN dual point: expresses the (scaled) objective as an EXACT
+/// rational combination of the `=` rows alone, yielding a dual-feasible point
+/// with every box dual and every lift zero.
+///
+/// # Why this is a separate lane
+///
+/// An equality row's dual is sign-free: the LP model splits `a·x = b` into
+/// `a·x >= b` and `-a·x >= -b`, and a signed multiplier `λ` becomes `λ⁺` on
+/// the first half and `λ⁻` on the second, both non-negative. When the
+/// objective `c` lies in the ROW SPACE of the equality system — the
+/// `mult_diagcomm` shape, where two circuit encodings of the same product are
+/// forced equal row-by-row and the objective is their bit-weighted difference
+/// — the optimal dual needs NO inequality row, no box row and no simplex:
+/// solving `A_eq^T λ = c` by sparse exact elimination is the whole
+/// computation. For any feasible `x`, `c·x = Σ_r λ_r (a_r·x) = Σ_r λ_r b_r`,
+/// so the derived floor equals the objective's value on EVERY feasible point
+/// and the claimed optimum in particular.
+///
+/// # Soundness
+///
+/// Fail-closed at every step, and the returned point is nothing but a
+/// candidate: the caller's emitter re-derives the aggregate coefficient by
+/// coefficient in original space (`prepare_plan`), requires every lift to be
+/// non-negative and the reconstructed floor to EQUAL the claimed optimum, and
+/// the pinned external checker then re-proves the emitted text. Here the
+/// solved `λ` is additionally re-substituted into EVERY variable's equation
+/// (exact arithmetic) before it is returned, so an elimination defect cannot
+/// survive; a system the equalities cannot express (`c` outside the row
+/// space, an inconsistent reduction, the op cap) returns `None` and the
+/// simplex tiers run unchanged.
+fn equality_span_dual_point(
+    objective: &PbObjective,
+    constraints: &[PbConstraint],
+    num_vars: u32,
+    complement: &[bool],
+    num_constraint_rows: usize,
+    target: i128,
+) -> Option<LpDualRaw> {
+    let n = usize::try_from(num_vars).ok()?;
+
+    // Net signed objective per variable, original space. Plain positive
+    // single-literal terms only — the same shape the emitter's own
+    // `objective_coefficients` accepts, so the lane can never hand a point to
+    // a reconstruction that reads the objective differently.
+    let mut wanted: BTreeMap<u32, BigRational> = BTreeMap::new();
+    for term in &objective.terms {
+        let [literal] = term.lits.as_slice() else {
+            return None;
+        };
+        if literal.negated || literal.var == 0 || literal.var > num_vars {
+            return None;
+        }
+        let entry = wanted.entry(literal.var).or_insert_with(BigRational::zero);
+        *entry += BigRational::from_integer(BigInt::from(term.coeff));
+    }
+    wanted.retain(|_, coefficient| !coefficient.is_zero());
+
+    // Fold every `=` row to original-variable space (negated literals fold as
+    // `a·~x = a - a·x`, shifting the rhs), remembering its SPLIT row index:
+    // `Ge` occupies one dual slot, `Eq` two consecutive ones (`>=` then `<=`)
+    // — the same layout `linear_rows` and VeriPB's own importer use.
+    struct EqRow {
+        split_index: usize,
+        coefficients: BTreeMap<u32, BigRational>,
+        rhs: BigRational,
+    }
+    let mut eq_rows: Vec<EqRow> = Vec::new();
+    let mut split_index = 0usize;
+    for constraint in constraints {
+        match constraint.rel {
+            PbRel::Ge => split_index = split_index.checked_add(1)?,
+            PbRel::Eq => {
+                let mut coefficients: BTreeMap<u32, BigRational> = BTreeMap::new();
+                let mut rhs = BigRational::from_integer(BigInt::from(constraint.rhs));
+                for term in &constraint.terms {
+                    let [literal] = term.lits.as_slice() else {
+                        return None;
+                    };
+                    if literal.var == 0 || literal.var > num_vars {
+                        return None;
+                    }
+                    let coefficient = BigRational::from_integer(BigInt::from(term.coeff));
+                    let entry = coefficients
+                        .entry(literal.var)
+                        .or_insert_with(BigRational::zero);
+                    if literal.negated {
+                        rhs -= &coefficient;
+                        *entry -= coefficient;
+                    } else {
+                        *entry += coefficient;
+                    }
+                }
+                coefficients.retain(|_, coefficient| !coefficient.is_zero());
+                eq_rows.push(EqRow {
+                    split_index,
+                    coefficients,
+                    rhs,
+                });
+                split_index = split_index.checked_add(2)?;
+            }
+        }
+    }
+    if eq_rows.is_empty() || split_index != num_constraint_rows {
+        return None;
+    }
+
+    // One equation per variable: `Σ_j a_j[v]·λ_j = c_v`. A variable with an
+    // objective coefficient but no equality occurrence makes the system
+    // unsolvable and declines below.
+    let mut equations: BTreeMap<u32, (BTreeMap<usize, BigRational>, BigRational)> = BTreeMap::new();
+    for (unknown, row) in eq_rows.iter().enumerate() {
+        for (&variable, coefficient) in &row.coefficients {
+            equations
+                .entry(variable)
+                .or_insert_with(|| (BTreeMap::new(), BigRational::zero()))
+                .0
+                .insert(unknown, coefficient.clone());
+        }
+    }
+    for (&variable, coefficient) in &wanted {
+        match equations.get_mut(&variable) {
+            Some(equation) => equation.1 = coefficient.clone(),
+            None => return None, // c_v != 0, no equality touches v
+        }
+    }
+
+    // Sparse Gaussian elimination, deterministic (equations in ascending
+    // variable order, pivot = the smallest-index unknown), op-counted.
+    let mut ops = 0usize;
+    let mut pivots: Vec<(usize, BTreeMap<usize, BigRational>, BigRational)> = Vec::new();
+    for (_, (mut row, mut rhs)) in equations {
+        for (pivot, pivot_row, pivot_rhs) in &pivots {
+            let Some(factor) = row.remove(pivot) else {
+                continue;
+            };
+            for (&unknown, coefficient) in pivot_row {
+                ops = ops.checked_add(1)?;
+                if ops > EQUALITY_SPAN_MAX_OPS {
+                    return None;
+                }
+                let entry = row.entry(unknown).or_insert_with(BigRational::zero);
+                *entry -= &factor * coefficient;
+                if entry.is_zero() {
+                    row.remove(&unknown);
+                }
+            }
+            rhs -= factor * pivot_rhs;
+        }
+        let Some((&pivot, _)) = row.iter().next() else {
+            if rhs.is_zero() {
+                continue; // redundant equation
+            }
+            return None; // inconsistent: c is not in the equality row space
+        };
+        let lead = row.remove(&pivot)?;
+        for coefficient in row.values_mut() {
+            ops = ops.checked_add(1)?;
+            if ops > EQUALITY_SPAN_MAX_OPS {
+                return None;
+            }
+            *coefficient /= &lead;
+        }
+        rhs /= lead;
+        pivots.push((pivot, row, rhs));
+    }
+
+    // Back-substitution with every free unknown at zero, in REVERSE pivot
+    // creation order. That order resolves every reference: a stored pivot row
+    // was fully reduced against all EARLIER-created pivots, so it can only
+    // mention later-created pivots (already computed when walking in reverse)
+    // and free unknowns (zero). The reasoning is deliberately not
+    // load-bearing — the exact re-substitution below rechecks every equation.
+    let mut solution: Vec<BigRational> = vec![BigRational::zero(); eq_rows.len()];
+    let mut assigned: Vec<bool> = vec![false; eq_rows.len()];
+    for (pivot, _, _) in &pivots {
+        assigned[*pivot] = true;
+    }
+    for (pivot, row, rhs) in pivots.iter().rev() {
+        let mut value = rhs.clone();
+        for (&unknown, coefficient) in row {
+            if assigned[unknown] {
+                ops = ops.checked_add(1)?;
+                if ops > EQUALITY_SPAN_MAX_OPS {
+                    return None;
+                }
+                value -= coefficient * &solution[unknown];
+            }
+        }
+        solution[*pivot] = value;
+    }
+
+    // FAIL-CLOSED RE-SUBSTITUTION: every variable's equation must hold
+    // exactly, including the ordering subtleties the loop above reasons
+    // about — this check is what makes that reasoning non-load-bearing.
+    let mut residual: BTreeMap<u32, BigRational> = wanted;
+    for (unknown, row) in eq_rows.iter().enumerate() {
+        if solution[unknown].is_zero() {
+            continue;
+        }
+        for (&variable, coefficient) in &row.coefficients {
+            ops = ops.checked_add(1)?;
+            if ops > EQUALITY_SPAN_MAX_OPS {
+                return None;
+            }
+            let entry = residual.entry(variable).or_insert_with(BigRational::zero);
+            *entry -= coefficient * &solution[unknown];
+            if entry.is_zero() {
+                residual.remove(&variable);
+            }
+        }
+    }
+    if !residual.is_empty() {
+        return None;
+    }
+
+    // The derived floor `Σ_j λ_j·b_j` equals `c·x` on every feasible point;
+    // require it to be exactly the claimed optimum (an integer), so the
+    // emitter's own `raw.bound != optimum` guard can never fire on this lane.
+    let mut bound = BigRational::zero();
+    for (unknown, row) in eq_rows.iter().enumerate() {
+        bound += &solution[unknown] * &row.rhs;
+    }
+    if !bound.is_integer() || bound.to_integer().to_i128()? != target {
+        return None;
+    }
+
+    // Split each signed `λ` onto its equality's two dual slots.
+    let mut duals = vec![BigRational::zero(); num_constraint_rows.checked_add(n)?];
+    for (unknown, row) in eq_rows.iter().enumerate() {
+        let value = &solution[unknown];
+        if value.is_positive() {
+            duals[row.split_index] = value.clone();
+        } else if value.is_negative() {
+            duals[row.split_index.checked_add(1)?] = -value.clone();
+        }
+    }
+
+    Some(LpDualRaw {
+        bound: target,
+        duals,
+        complement: complement.to_vec(),
+        num_constraint_rows,
+        converged: false,
+        tier: "equality-span",
+        // Linear algebra over the `=` rows alone: this lane never forms a primal
+        // point, and no consumer may invent one.
+        primal: None,
     })
 }
 
@@ -912,7 +1244,7 @@ pub(crate) fn lp_lower_bound_with_cert(
     should_stop: &dyn Fn() -> bool,
 ) -> Option<(i128, Option<LpFarkasCert>, CertOutcome)> {
     let model = LpModel::build(objective, constraints, num_vars)?;
-    let dual = model.solve_dual(should_stop, None)?;
+    let dual = model.solve_dual(should_stop, None, None)?;
     let bound = dual.bound;
 
     if !farkas_cert::cert_emit_enabled() {
@@ -946,7 +1278,7 @@ pub(crate) fn lp_fractional_point(
     should_stop: &dyn Fn() -> bool,
 ) -> Option<Vec<f64>> {
     let model = LpModel::build(objective, constraints, num_vars)?;
-    let DualSolution { primal, .. } = model.solve_dual(should_stop, None)?;
+    let DualSolution { primal, .. } = model.solve_dual(should_stop, None, None)?;
     let primal = primal?;
     let point = primal
         .iter()
@@ -985,7 +1317,8 @@ fn lp_lower_bound_with_cuts(
 ) -> Option<i128> {
     // Round 0: the base LP (identical to the pre-cuts behaviour).
     let model = LpModel::build(objective, original_constraints, num_vars)?;
-    let DualSolution { bound, primal, .. } = model.solve_dual(should_stop, early_exit_target)?;
+    let DualSolution { bound, primal, .. } =
+        model.solve_dual(should_stop, early_exit_target, None)?;
     let mut best_bound = bound;
 
     // Early exit: the bound already certifies the caller's target (typically
@@ -1089,7 +1422,7 @@ fn lp_lower_bound_with_cuts(
             break;
         };
         let Some(DualSolution { bound, primal, .. }) =
-            model.solve_dual(&stop_or_deadline, early_exit_target)
+            model.solve_dual(&stop_or_deadline, early_exit_target, None)
         else {
             break;
         };
@@ -1219,7 +1552,7 @@ fn solve_with_cuts_for_fixing(
     should_stop: &dyn Fn() -> bool,
 ) -> Option<(LpModel, DualSolution)> {
     let model = LpModel::build(objective, original_constraints, num_vars)?;
-    let dual = model.solve_dual(should_stop, None)?;
+    let dual = model.solve_dual(should_stop, None, None)?;
 
     // Same work-proxy gate as the bound path: on larger instances keep the base LP
     // model + dual (still gives sound fixings) rather than spend the cut budget.
@@ -1278,7 +1611,7 @@ fn solve_with_cuts_for_fixing(
         let Some(model) = LpModel::build(objective, &working, num_vars) else {
             break;
         };
-        let Some(dual) = model.solve_dual(&stop_or_deadline, None) else {
+        let Some(dual) = model.solve_dual(&stop_or_deadline, None, None) else {
             break;
         };
         // Keep the model whose bound is at least as tight. The reduced-cost fixing
@@ -1303,7 +1636,7 @@ pub(crate) fn lp_lower_bound_no_cuts(
     should_stop: &dyn Fn() -> bool,
 ) -> Option<i128> {
     let model = LpModel::build(objective, constraints, num_vars)?;
-    model.solve_dual(should_stop, None).map(|s| s.bound)
+    model.solve_dual(should_stop, None, None).map(|s| s.bound)
 }
 
 /// The canonical LP we reason about, in *complemented* variable space.
@@ -1560,10 +1893,15 @@ impl LpModel {
     /// its incumbent as the target: a floor at the incumbent already proves it
     /// optimal, so pivoting further is pure waste. `None` preserves the full
     /// solve-to-optimality behaviour.
+    /// `iteration_budget` is `Some(k)` only on the CERTIFICATE path, where the
+    /// f64 rescue below must not consult a clock — see
+    /// [`F64_TIER_CERT_SIMPLEX_ITERS`]. The search path passes `None` and keeps
+    /// the wall budget.
     fn solve_dual(
         &self,
         should_stop: &dyn Fn() -> bool,
         early_stop_bound: Option<i128>,
+        iteration_budget: Option<usize>,
     ) -> Option<DualSolution> {
         match self.solve_dual_small(should_stop, early_stop_bound) {
             SmallDualOutcome::Solved(result) => {
@@ -1600,7 +1938,9 @@ impl LpModel {
                     Some(s) => s.primal.is_none(),
                 };
                 if unconverged {
-                    if let Some(certified) = self.solve_dual_f64_certified(should_stop) {
+                    if let Some(certified) =
+                        self.solve_dual_f64_certified(iteration_budget, should_stop)
+                    {
                         return match result {
                             Some(small) if small.bound >= certified.bound => Some(small),
                             _ => Some(certified),
@@ -1610,7 +1950,9 @@ impl LpModel {
                 result
             }
             SmallDualOutcome::Overflow { partial } => {
-                if let Some(certified) = self.solve_dual_f64_certified(should_stop) {
+                if let Some(certified) =
+                    self.solve_dual_f64_certified(iteration_budget, should_stop)
+                {
                     // Accept the certified floor only when it already satisfies
                     // the caller's target (or no target was given). A targeted
                     // caller uses `floor >= incumbent` to prove OPTIMUM at the
@@ -2078,7 +2420,11 @@ impl LpModel {
     ///
     /// The returned `primal` is the f64 point mapped back to original variable
     /// space (advisory, cut separation only), mirroring the exact tiers.
-    fn solve_dual_f64_certified(&self, should_stop: &dyn Fn() -> bool) -> Option<DualSolution> {
+    fn solve_dual_f64_certified(
+        &self,
+        iteration_budget: Option<usize>,
+        should_stop: &dyn Fn() -> bool,
+    ) -> Option<DualSolution> {
         let m = self.rows.len();
         let n = self.c.len();
         // Structural rows are everything before the n trailing box rows that
@@ -2158,14 +2504,28 @@ impl LpModel {
             })
             .collect();
 
-        let (dual_f64, primal_f64, converged) =
-            crate::optimize::safe_lp_bound::approx_dual_for_box_lp(
+        let (dual_f64, primal_f64, converged) = match iteration_budget {
+            // CERTIFICATE PATH: a deterministic ITERATION count, no clock. See
+            // [`F64_TIER_CERT_SIMPLEX_ITERS`].
+            Some(iterations) => {
+                crate::optimize::safe_lp_bound::approx_dual_for_box_lp_with_iteration_budget(
+                    n,
+                    c_scaled,
+                    rows_scaled,
+                    iterations,
+                    should_stop,
+                )?
+            }
+            // SEARCH PATH: unchanged, a wall budget. Nothing here is emitted, so
+            // a load-dependent dual costs bound quality and nothing else.
+            None => crate::optimize::safe_lp_bound::approx_dual_for_box_lp(
                 n,
                 c_scaled,
                 rows_scaled,
                 F64_TIER_SIMPLEX_BUDGET,
                 should_stop,
-            )?;
+            )?,
+        };
         // Convergence requirement: a dual from a stopped/capped simplex is not
         // worth the exact-verification pass — measured on the overflow corpus,
         // non-converged duals only get worse with more budget, and their
@@ -3363,7 +3723,7 @@ pub(crate) fn generate_farkas_anchor_json() -> Result<(String, String), String> 
     let model = LpModel::build(objective, &instance.constraints, instance.num_vars)
         .ok_or_else(|| "build Farkas anchor LP model".to_owned())?;
     let dual = model
-        .solve_dual(&|| false, None)
+        .solve_dual(&|| false, None, None)
         .ok_or_else(|| "solve Farkas anchor LP".to_owned())?;
     if dual.bound != 3 {
         return Err(format!(
@@ -3612,7 +3972,7 @@ mod tests {
         let constraints = vec![ge(vec![term(1, lit(1)), term(1, lit(2))], 1)];
         let model = LpModel::build(&obj, &constraints, 2).expect("model");
         let certified = model
-            .solve_dual_f64_certified(&never_stop)
+            .solve_dual_f64_certified(None, &never_stop)
             .expect("the f64 tier solves this trivially");
         assert!(
             !certified.optimal,
@@ -3750,6 +4110,131 @@ mod tests {
             rhs: 1,
         };
         assert_eq!(lp_lower_bound(&obj, &[c], 2, &never_stop), Some(1));
+    }
+
+    // --- EQUALITY-SPAN lane: the objective as an exact combination of `=`
+    // rows. The `mult_diagcomm` shape in miniature: a mixed-sign objective
+    // whose value is pinned to a constant by the equality system alone. ---
+
+    fn eq_row(terms: Vec<PbTerm>, rhs: i128) -> PbConstraint {
+        PbConstraint {
+            terms,
+            rel: PbRel::Eq,
+            rhs,
+        }
+    }
+
+    #[test]
+    fn equality_span_finds_the_positive_multiplier() {
+        // min x1 - x2  s.t.  x1 - x2 = 0: lambda = +1 on the `>=` half.
+        let obj = PbObjective {
+            terms: vec![term(1, lit(1)), term(-1, lit(2))],
+        };
+        let rows = vec![eq_row(vec![term(1, lit(1)), term(-1, lit(2))], 0)];
+        let raw = equality_span_dual_point(&obj, &rows, 2, &[false, true], 2, 0)
+            .expect("the span must solve");
+        assert_eq!(raw.tier, "equality-span");
+        assert_eq!(raw.bound, 0);
+        assert!(!raw.converged);
+        assert_eq!(raw.num_constraint_rows, 2);
+        assert_eq!(raw.duals.len(), 4, "two split rows plus two box rows");
+        assert_eq!(raw.duals[0], BigRational::one(), "the `>=` half carries +1");
+        assert!(raw.duals[1].is_zero());
+        assert!(raw.duals[2].is_zero() && raw.duals[3].is_zero());
+    }
+
+    #[test]
+    fn equality_span_routes_a_negative_multiplier_to_the_le_half() {
+        // min -x1 + x2  s.t.  x1 - x2 = 0: lambda = -1, i.e. +1 on `<=`.
+        let obj = PbObjective {
+            terms: vec![term(-1, lit(1)), term(1, lit(2))],
+        };
+        let rows = vec![eq_row(vec![term(1, lit(1)), term(-1, lit(2))], 0)];
+        let raw = equality_span_dual_point(&obj, &rows, 2, &[true, false], 2, 0)
+            .expect("the span must solve");
+        assert!(raw.duals[0].is_zero());
+        assert_eq!(raw.duals[1], BigRational::one(), "the `<=` half carries +1");
+    }
+
+    #[test]
+    fn equality_span_solves_rational_multipliers() {
+        // min x1  s.t.  2 x1 = 0: lambda = 1/2, floor 0.
+        let obj = PbObjective {
+            terms: vec![term(1, lit(1))],
+        };
+        let rows = vec![eq_row(vec![term(2, lit(1))], 0)];
+        let raw =
+            equality_span_dual_point(&obj, &rows, 1, &[false], 2, 0).expect("the span must solve");
+        assert_eq!(
+            raw.duals[0],
+            BigRational::new(BigInt::from(1), BigInt::from(2))
+        );
+    }
+
+    #[test]
+    fn equality_span_respects_the_split_row_layout() {
+        // A leading `Ge` row shifts the equality's split index by ONE, and a
+        // preceding equality shifts it by TWO; the lane must land its
+        // multiplier on the right id or the emitted `pol` would cite a wrong
+        // row (the historical row-id-shift defect class).
+        let obj = PbObjective {
+            terms: vec![term(1, lit(2)), term(-1, lit(3))],
+        };
+        let rows = vec![
+            ge(vec![term(1, lit(1))], 0),                       // split idx 0
+            eq_row(vec![term(1, lit(1))], 0),                   // split idx 1,2
+            eq_row(vec![term(1, lit(2)), term(-1, lit(3))], 0), // split idx 3,4
+        ];
+        let raw = equality_span_dual_point(&obj, &rows, 3, &[false, false, true], 5, 0)
+            .expect("the span must solve");
+        assert!(raw.duals[0].is_zero() && raw.duals[1].is_zero() && raw.duals[2].is_zero());
+        assert_eq!(raw.duals[3], BigRational::one());
+        assert!(raw.duals[4].is_zero());
+    }
+
+    #[test]
+    fn equality_span_declines_an_objective_outside_the_row_space() {
+        // min x1  s.t.  x1 + x2 = 1: no lambda satisfies both variables'
+        // equations (v1 wants 1, v2 wants 0). Must decline, never approximate.
+        let obj = PbObjective {
+            terms: vec![term(1, lit(1))],
+        };
+        let rows = vec![eq_row(vec![term(1, lit(1)), term(1, lit(2))], 1)];
+        assert!(equality_span_dual_point(&obj, &rows, 2, &[false, false], 2, 0).is_none());
+    }
+
+    #[test]
+    fn equality_span_declines_without_equality_rows() {
+        let obj = PbObjective {
+            terms: vec![term(1, lit(1))],
+        };
+        let rows = vec![ge(vec![term(1, lit(1))], 0)];
+        assert!(equality_span_dual_point(&obj, &rows, 1, &[false], 1, 0).is_none());
+    }
+
+    #[test]
+    fn equality_span_declines_a_floor_missing_the_target() {
+        // The span solves (lambda = 1, floor 0) but the claimed optimum is 1:
+        // the lane must decline rather than hand back a bound below target.
+        let obj = PbObjective {
+            terms: vec![term(1, lit(1)), term(-1, lit(2))],
+        };
+        let rows = vec![eq_row(vec![term(1, lit(1)), term(-1, lit(2))], 0)];
+        assert!(equality_span_dual_point(&obj, &rows, 2, &[false, true], 2, 1).is_none());
+    }
+
+    #[test]
+    fn equality_span_folds_negated_literals() {
+        // min x1 + x2 - 1  is not expressible; instead: the row
+        // `x1 + ~x2 = 1` folds to `x1 - x2 = 0`, so min x1 - x2 spans with
+        // lambda = +1 exactly as the unfolded form does.
+        let obj = PbObjective {
+            terms: vec![term(1, lit(1)), term(-1, lit(2))],
+        };
+        let rows = vec![eq_row(vec![term(1, lit(1)), term(1, neg(2))], 1)];
+        let raw = equality_span_dual_point(&obj, &rows, 2, &[false, true], 2, 0)
+            .expect("the folded span must solve");
+        assert_eq!(raw.duals[0], BigRational::one());
     }
 
     #[test]
@@ -4404,7 +4889,9 @@ mod tests {
 
         // Only x1=x2=1 satisfies 3x1+5x2 >= 7 over {0,1}^2 -> integer optimum.
         let int_opt = a + b;
-        let via_dispatch = model.solve_dual(&never_stop, None).expect("dispatch bound");
+        let via_dispatch = model
+            .solve_dual(&never_stop, None, None)
+            .expect("dispatch bound");
         let via_big = model.solve_dual_big(&never_stop, None).expect("big bound");
         // The dispatcher may resolve via the f64-certified tier, whose bound can
         // sit (slightly) below the BigRational LP optimum but NEVER above it —
@@ -4477,7 +4964,7 @@ mod tests {
                     // declines (dual-unbounded/ceil-range), and vacuously so on
                     // an infeasible primal. A dispatch None against a big Some
                     // is impossible (the dispatcher falls back to big).
-                    let dispatched = model.solve_dual(&never_stop, None);
+                    let dispatched = model.solve_dual(&never_stop, None, None);
                     match (&dispatched, &big) {
                         (None, None) | (Some(_), None) => {}
                         (Some(d), Some(b)) => {
@@ -4610,7 +5097,7 @@ mod tests {
             let Some(model) = LpModel::build(&obj, &constraints, n) else {
                 continue;
             };
-            let Some(cert) = model.solve_dual_f64_certified(&never_stop) else {
+            let Some(cert) = model.solve_dual_f64_certified(None, &never_stop) else {
                 continue; // fail-closed decline: the exact path would decide.
             };
             certified += 1;
@@ -4789,7 +5276,7 @@ mod tests {
         };
         let c = ge(vec![term(3, lit(1)), term(5, lit(2))], 7);
         let model = LpModel::build(&obj, &[c], 2).expect("model");
-        let Some(dual) = model.solve_dual_f64_certified(&never_stop) else {
+        let Some(dual) = model.solve_dual_f64_certified(None, &never_stop) else {
             // The tier may fail closed (then the big tier decides — covered
             // elsewhere); nothing to check here in that case.
             return;
@@ -4885,7 +5372,7 @@ mod tests {
         // overflow -> f64-certified or big) stays sound and never exceeds the
         // exact-tier floor (the certified tier may land slightly below it).
         let dispatched = model
-            .solve_dual(&never_stop, Some(full.bound))
+            .solve_dual(&never_stop, Some(full.bound), None)
             .expect("dispatched targeted bound");
         assert!(dispatched.bound <= int_opt);
         assert!(
@@ -4966,7 +5453,7 @@ mod tests {
             .solve_dual_big(&never_stop, None)
             .expect("exact fallback");
         let dispatched = huge_model
-            .solve_dual(&never_stop, None)
+            .solve_dual(&never_stop, None, None)
             .expect("public fallback");
         assert_eq!(integer_optimum, a + b);
         assert!(dispatched.bound <= exact.bound);
@@ -5008,7 +5495,7 @@ mod tests {
         ));
 
         let certified = model
-            .solve_dual_f64_certified(&never_stop)
+            .solve_dual_f64_certified(None, &never_stop)
             .expect("bounded overflow fixture must certify");
         let exact = model
             .solve_dual_big(&never_stop, None)
@@ -5044,7 +5531,7 @@ mod tests {
                 SmallDualOutcome::Overflow { .. }
             ));
             let certified = model
-                .solve_dual_f64_certified(&never_stop)
+                .solve_dual_f64_certified(None, &never_stop)
                 .expect("focused overflow fixture must certify");
             let exact = model
                 .solve_dual_big(&never_stop, None)
@@ -5113,7 +5600,7 @@ mod tests {
         assert!(primal.iter().all(|value| value.is_finite()));
 
         let certified = model
-            .solve_dual_f64_certified(&never_stop)
+            .solve_dual_f64_certified(None, &never_stop)
             .expect("certified cycle bound");
         assert_certified_dual_verifies(&model, &certified, "dominating cycle");
         assert_eq!(certified.bound, 4);
@@ -5183,7 +5670,7 @@ mod tests {
         };
         let c = ge(vec![term(1, lit(1)), term(1, lit(2)), term(1, lit(3))], 1);
         let model = LpModel::build(&obj, &[c], 3).expect("model");
-        let dual = model.solve_dual(&never_stop, None).expect("dual");
+        let dual = model.solve_dual(&never_stop, None, None).expect("dual");
         assert_eq!(dual.bound, 1, "the real LP bound is 1");
 
         let cert = model.build_farkas_cert(&dual).expect("cert");
@@ -5204,7 +5691,7 @@ mod tests {
         };
         let c = ge(vec![term(2, lit(1)), term(2, lit(2))], 3);
         let model = LpModel::build(&obj, &[c], 2).expect("model");
-        let dual = model.solve_dual(&never_stop, None).expect("dual");
+        let dual = model.solve_dual(&never_stop, None, None).expect("dual");
         assert_eq!(dual.bound, 2);
         let cert = model.build_farkas_cert(&dual).expect("cert");
         assert!(
@@ -5222,7 +5709,7 @@ mod tests {
         };
         let c = ge(vec![term(1, neg(1))], 1);
         let model = LpModel::build(&obj, &[c], 1).expect("model");
-        let dual = model.solve_dual(&never_stop, None).expect("dual");
+        let dual = model.solve_dual(&never_stop, None, None).expect("dual");
         assert_eq!(dual.bound, 1);
         let cert = model.build_farkas_cert(&dual).expect("cert");
         assert!(
@@ -5241,7 +5728,7 @@ mod tests {
         };
         let c = ge(vec![term(1, lit(1)), term(1, lit(2)), term(1, lit(3))], 1);
         let model = LpModel::build(&obj, &[c], 3).expect("model");
-        let dual = model.solve_dual(&never_stop, None).expect("dual");
+        let dual = model.solve_dual(&never_stop, None, None).expect("dual");
         let mut cert = model.build_farkas_cert(&dual).expect("cert");
 
         // Inflate the conclusion bound: c . x >= (L - offset) + 1. Ge-normalized
@@ -5287,7 +5774,7 @@ mod tests {
 
         let model =
             LpModel::build(&objective, &instance.constraints, instance.num_vars).expect("model");
-        let dual = model.solve_dual(&never_stop, None).expect("dual");
+        let dual = model.solve_dual(&never_stop, None, None).expect("dual");
         assert_eq!(dual.bound, 3);
         let valid = model.build_farkas_cert(&dual).expect("certificate");
         assert_eq!(valid.claimed_bound, dual.bound);
@@ -5493,7 +5980,7 @@ mod tests {
             let Some(model) = LpModel::build(&obj, &constraints, n) else {
                 continue;
             };
-            let Some(dual) = model.solve_dual(&never_stop, None) else {
+            let Some(dual) = model.solve_dual(&never_stop, None, None) else {
                 continue;
             };
             let Some(cert) = model.build_farkas_cert(&dual) else {

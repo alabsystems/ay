@@ -16,6 +16,11 @@ impl Executor {
         state: RebuildState,
     ) -> bool {
         let authored_premises = Self::rebuilt_authored_premises(plans);
+        let Some(raw_authored_premises) =
+            Self::rebuilt_raw_authored_quantifier_premises(originals, plans)
+        else {
+            return false;
+        };
         let Ok(mut next_overrides) = self.select_next_surface_overrides(plans) else {
             return false;
         };
@@ -33,9 +38,17 @@ impl Executor {
         ) else {
             return false;
         };
+        let Some(raw_authored_append) = prepare_rebuilt_premise_append(
+            &mut self.last_proof_raw_original_assertions,
+            &raw_authored_premises,
+        ) else {
+            return false;
+        };
         *proof = state.new_proof;
         self.last_proof_term_overrides = next_overrides;
         self.last_proof_rebuild_originals.extend(authored_append);
+        self.last_proof_raw_original_assertions
+            .extend(raw_authored_append);
         true
     }
 
@@ -74,6 +87,41 @@ impl Executor {
                 .map(|plan| plan.guard_source),
         );
         premises
+    }
+
+    /// Exact parsed-source quantifiers rebuilt by the negative E-matching
+    /// lane. Unlike general repair premises, these terms carry top-level raw
+    /// problem provenance: planning authenticated `assertion_index` against
+    /// `originals`, reconstructed the forall from that bounded parsed row,
+    /// and rechecked its ground substitution before creating the plan.
+    ///
+    /// Revalidate the immutable row shape here before transactionally adding
+    /// the raw root. Native-API rows need no extra grant: their rebuilt root is
+    /// the indexed canonical identity and source resolution already owns that
+    /// row directly.
+    fn rebuilt_raw_authored_quantifier_premises(
+        originals: &[(TermId, FrontendTerm)],
+        plans: &SurgeryPlans,
+    ) -> Option<Vec<TermId>> {
+        let mut premises = Vec::with_capacity(plans.quant_negations.len());
+        for plan in plans.quant_negations.values() {
+            let (canonical, parsed) = originals.get(plan.assertion_index)?;
+            let parsed = strip_frontend_annotations(parsed);
+            if matches!(
+                parsed,
+                FrontendTerm::Symbol(name) if name == NATIVE_API_ASSERTION_PLACEHOLDER
+            ) {
+                if plan.forall_term != *canonical {
+                    return None;
+                }
+                continue;
+            }
+            if !matches!(parsed, FrontendTerm::Forall(..)) {
+                return None;
+            }
+            premises.push(plan.forall_term);
+        }
+        Some(premises)
     }
 
     fn select_next_surface_overrides(

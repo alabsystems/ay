@@ -136,8 +136,15 @@ impl VerifiedCounterexample {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum VerifiedUnknownReason {
-    /// Generic solver inconclusive result. Covers budget exhaustion,
-    /// cancellation, or an engine being unable to finish its proof search.
+    /// Generic solver inconclusive result: the run ended without an answer and
+    /// the cause is not determinable at the point the `Unknown` was built.
+    ///
+    /// Covers budget exhaustion, cancellation, or an engine simply being unable
+    /// to finish its proof search. This stays the honest catch-all because the
+    /// internal `PortfolioResult`/`PdrResult` channel carries no reason, so
+    /// mid-search give-ups arrive here indistinguishable from one another. It
+    /// does not mean "no candidate verdict existed": a candidate refused by the
+    /// final acceptance boundary is [`Self::CandidateNotAdmitted`] instead.
     Inconclusive,
     /// BMC completed its bounded search up to `max_depth` without finding
     /// a counterexample. This is useful for proof cross-checking but is NOT
@@ -147,6 +154,22 @@ pub enum VerifiedUnknownReason {
     BmcBudgetExhausted,
     /// The selected solving path could not handle this problem class.
     NotApplicable,
+    /// An engine returned `Unsafe`, but it searched a deliberate
+    /// over-approximation of the original problem: a body-position `forall` was
+    /// stripped, weakening the antecedent (see
+    /// `ChcProblem::has_stripped_body_forall`). The counterexample may be an
+    /// artifact of that weakening, so the verdict fails closed to `Unknown`.
+    ///
+    /// This is not a resource limit or a safety claim. Search completed with a
+    /// refutation, but that refutation is inadmissible for the original problem.
+    OverApproximatedRefutation,
+    /// A candidate `Safe` or `Unsafe` reached the verified-result boundary and
+    /// the fail-closed acceptance gate refused it.
+    ///
+    /// This records only that a candidate existed and was refused. It does not
+    /// claim the candidate was refuted, nor that a resource limit could not have
+    /// contributed. BMC-specific rejections retain their more precise reasons.
+    CandidateNotAdmitted,
 }
 
 impl VerifiedUnknownReason {
@@ -157,6 +180,8 @@ impl VerifiedUnknownReason {
             Self::BmcExhaustedSearch => "bmc_exhausted_search",
             Self::BmcBudgetExhausted => "bmc_budget_exhausted",
             Self::NotApplicable => "not_applicable",
+            Self::OverApproximatedRefutation => "overapproximated_refutation",
+            Self::CandidateNotAdmitted => "candidate_not_admitted",
         }
     }
 
@@ -167,6 +192,8 @@ impl VerifiedUnknownReason {
             Self::BmcExhaustedSearch => "BMC exhausted search",
             Self::BmcBudgetExhausted => "BMC budget exhausted",
             Self::NotApplicable => "Not applicable",
+            Self::OverApproximatedRefutation => "Over-approximated refutation",
+            Self::CandidateNotAdmitted => "Candidate not admitted",
         }
     }
 }
@@ -219,6 +246,16 @@ impl std::fmt::Display for VerifiedUnknownMarker {
             VerifiedUnknownReason::NotApplicable => {
                 write!(f, "unknown (not applicable for this problem class)")
             }
+            VerifiedUnknownReason::OverApproximatedRefutation => write!(
+                f,
+                "unknown (a counterexample was found on an over-approximated problem and was \
+                 discarded as inadmissible for the original)"
+            ),
+            VerifiedUnknownReason::CandidateNotAdmitted => write!(
+                f,
+                "unknown (a candidate verdict was produced but the verified-result boundary did \
+                 not admit it)"
+            ),
         }
     }
 }
@@ -235,6 +272,26 @@ impl VerifiedUnknownMarker {
     pub(crate) fn not_applicable() -> Self {
         Self(VerifiedUnknownMetadata {
             reason: VerifiedUnknownReason::NotApplicable,
+            bmc_max_depth: None,
+            bmc_depth_reached: None,
+        })
+    }
+
+    /// The body-`forall` over-approximation guard discarded an inadmissible
+    /// refutation. This constructor is intentionally limited to the two
+    /// `Unsafe -> Unknown` polarity-guard sites.
+    pub(crate) fn overapproximated_refutation() -> Self {
+        Self(VerifiedUnknownMetadata {
+            reason: VerifiedUnknownReason::OverApproximatedRefutation,
+            bmc_max_depth: None,
+            bmc_depth_reached: None,
+        })
+    }
+
+    /// A fail-closed acceptance gate refused a candidate verdict.
+    pub(crate) fn candidate_not_admitted() -> Self {
+        Self(VerifiedUnknownMetadata {
+            reason: VerifiedUnknownReason::CandidateNotAdmitted,
             bmc_max_depth: None,
             bmc_depth_reached: None,
         })
@@ -332,7 +389,11 @@ impl std::fmt::Display for VerifiedChcResult {
 /// construction sites to find every path that produces verified results.
 ///
 /// Part of #5746: structural verification invariant Phase 2.
-#[derive(Debug, Clone)]
+// PartialEq/Eq so a test can say WHICH evidence it expected and print both
+// sides on failure. Every payload is a `usize`, so the derive is total and
+// carries no interpretation of its own: two evidences are equal iff they are
+// the same variant with the same provenance counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ValidationEvidence {
     /// Full verification: init + transition + query clauses checked with a
     /// fresh verifier and standard budget.
@@ -518,7 +579,7 @@ impl VerifiedChcResult {
                         "rejecting Safe result paired with unvalidated preprocessed query-only \
                          discharge evidence"
                     );
-                    Self::Unknown(VerifiedUnknownMarker::new())
+                    Self::Unknown(VerifiedUnknownMarker::candidate_not_admitted())
                 }
                 // Explicit accept (item 4 Stage 0): the DOUBLE-RUN discharge
                 // variant is only constructed after an independent
@@ -554,6 +615,17 @@ impl VerifiedChcResult {
                 Self::Unknown(VerifiedUnknownMarker::not_applicable())
             }
         }
+    }
+
+    /// Return the fail-closed `Unknown` used when a final acceptance gate
+    /// refuses a candidate verdict.
+    ///
+    /// This is a pure classification change: every caller previously created
+    /// `Unknown(Inconclusive)` at the same control-flow edge. It does not carry
+    /// `ValidationEvidence`, because a refused candidate establishes no proof
+    /// for that evidence to substantiate.
+    pub(crate) fn unknown_candidate_not_admitted() -> Self {
+        Self::Unknown(VerifiedUnknownMarker::candidate_not_admitted())
     }
 
     /// Returns `true` if the result is `Safe`.
@@ -696,12 +768,84 @@ mod tests {
                 "not_applicable",
                 "Not applicable",
             ),
+            (
+                VerifiedUnknownReason::OverApproximatedRefutation,
+                "overapproximated_refutation",
+                "Over-approximated refutation",
+            ),
+            (
+                VerifiedUnknownReason::CandidateNotAdmitted,
+                "candidate_not_admitted",
+                "Candidate not admitted",
+            ),
         ];
 
         for (reason, code, name) in cases {
             assert_eq!(reason.code(), code);
             assert_eq!(reason.name(), name);
         }
+    }
+
+    #[test]
+    fn verified_unknown_reason_codes_are_distinct() {
+        let mut codes = [
+            VerifiedUnknownReason::Inconclusive,
+            VerifiedUnknownReason::BmcExhaustedSearch,
+            VerifiedUnknownReason::BmcBudgetExhausted,
+            VerifiedUnknownReason::NotApplicable,
+            VerifiedUnknownReason::OverApproximatedRefutation,
+            VerifiedUnknownReason::CandidateNotAdmitted,
+        ]
+        .map(|reason| reason.code())
+        .to_vec();
+        let count = codes.len();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), count, "reason codes must be one-to-one");
+    }
+
+    #[test]
+    fn rejected_candidate_safe_stays_unknown_with_specific_reason() {
+        let result = VerifiedChcResult::from_validated(
+            ChcEngineResult::Safe(InvariantModel::new()),
+            ValidationEvidence::PreprocessedQueryOnlyDischarge { query_count: 1 },
+        );
+
+        assert!(result.is_unknown());
+        assert_eq!(
+            result.unknown_reason(),
+            Some(VerifiedUnknownReason::CandidateNotAdmitted)
+        );
+        let marker = result.unknown_marker().expect("Unknown carries a marker");
+        assert_eq!(marker.bmc_max_depth(), None);
+        assert_eq!(marker.bmc_depth_reached(), None);
+    }
+
+    #[test]
+    fn unattributed_or_ambiguous_unknown_stays_inconclusive() {
+        for evidence in [
+            ValidationEvidence::FullVerification,
+            ValidationEvidence::CounterexampleVerification,
+            ValidationEvidence::PreprocessedQueryOnlyDischarge { query_count: 1 },
+        ] {
+            let result = VerifiedChcResult::from_validated(ChcEngineResult::Unknown, evidence);
+            assert!(result.is_unknown());
+            assert_eq!(
+                result.unknown_reason(),
+                Some(VerifiedUnknownReason::Inconclusive),
+                "evidence does not prove that a candidate existed"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_not_admitted_helper_is_verdict_neutral() {
+        let result = VerifiedChcResult::unknown_candidate_not_admitted();
+        assert!(result.is_unknown());
+        assert_eq!(
+            result.unknown_reason(),
+            Some(VerifiedUnknownReason::CandidateNotAdmitted)
+        );
     }
 
     #[test]

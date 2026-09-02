@@ -14,6 +14,21 @@ struct SolveArgs {
     native: bool,
 }
 
+/// Validate a `--memory-mb` value. The result is DROPPED — `ay_sys::govern`
+/// read the same `argv` before `main` parsed anything and is the single source
+/// of truth for the budget — but a typo must fail here rather than silently
+/// fall back to the default divisor.
+fn check_memory_mb(value: &str) -> Result<(), String> {
+    let mb = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("invalid --memory-mb value: {value}"))?;
+    if mb == 0 {
+        return Err("--memory-mb must be greater than zero".to_string());
+    }
+    Ok(())
+}
+
 fn parse_solve_args(args: Vec<String>) -> Result<SolveArgs, String> {
     let mut file = None;
     let mut timeout = None;
@@ -63,6 +78,38 @@ fn parse_solve_args(args: Vec<String>) -> Result<SolveArgs, String> {
                     .get(i)
                     .ok_or_else(|| "--pb-two-club-branch requires a selector".to_string())?;
                 switches.two_club_branch = Some(&*Box::leak(value.clone().into_boxed_str()));
+            }
+            // Per-process memory budget in MiB for THIS solve (default:
+            // physical RAM / 16).
+            //
+            // The budget is kernel-held and armed by `ay_sys::govern::arm()` as
+            // the first statement of `main`, BEFORE this parser exists, so the
+            // value is read straight from `argv`; this arm exists so the flag is
+            // ACCEPTED and documented, and the parsed value is deliberately
+            // dropped. Without it `ay-pb pb solve --memory-mb 8000` died on
+            // `ERROR: unknown argument` while the identical `ay pb solve`
+            // invocation worked — the governor mechanism was already wired into
+            // this binary (`ay_sys::govern::arm()`), only the front door was
+            // missing, so seven pairs of the residual census's governor bucket
+            // could not use the flag at all.
+            //
+            // The value IS validated here even though it is dropped: a typo
+            // must be a parse error on both frontends, not a silent fallback to
+            // the default on one of them. `ay_sys::govern` independently
+            // ignores a malformed value rather than treating it as unbounded.
+            // BOTH spellings, because `ay_sys::govern::cli_budget_mb_from`
+            // reads both. A flag the governor honours but the parser rejects is
+            // the same class of two-surfaces-disagree bug this whole change is
+            // about, one level down.
+            "--memory-mb" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--memory-mb requires a value (MiB)".to_string())?;
+                check_memory_mb(value)?;
+            }
+            arg if arg.starts_with("--memory-mb=") => {
+                check_memory_mb(&arg["--memory-mb=".len()..])?;
             }
             // B57: parallel worker policy (0 = sequential, N = N workers).
             "--pb-parallel" => {

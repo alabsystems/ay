@@ -121,23 +121,26 @@ pub enum BudgetPolicy {
 }
 
 impl BudgetPolicy {
-    /// Minimum budget guarantee as a fraction of total, ensuring no engine
-    /// that participates in the portfolio receives less than 5% of total.
+    /// Minimum budget guarantee for percentage/default allocation policies.
     ///
-    /// This is the absolute floor for any non-disabled engine. Even
-    /// `MinPercent(1)` produces at least `MIN_BUDGET_FLOOR_PERCENT`.
+    /// Even `MinPercent(1)` produces at least
+    /// `MIN_BUDGET_FLOOR_PERCENT`. [`BudgetPolicy::Fixed`] is deliberately
+    /// exempt: a fixed short probe must remain independent of a long portfolio
+    /// timeout.
     pub const MIN_BUDGET_FLOOR_PERCENT: u8 = 5;
 }
 
 /// Post-solve report of how each engine consumed its budget.
 ///
-/// Returned by `AdaptivePortfolio::solve_with_budget_report()` alongside
-/// the `VerifiedChcResult`. Each entry describes one engine's time usage.
+/// Returned by portfolio solve APIs alongside the result. Concrete portfolio
+/// reports contain one entry per active engine in configured order, followed
+/// by any disabled engine-type policy rows. Composed adaptive routes may not
+/// expose inner-engine detail.
 ///
 /// Part of #8418: budget reporting for model-checker-consumer integration.
 #[derive(Debug, Clone)]
 pub struct BudgetReport {
-    /// Per-engine entries in the order engines were launched.
+    /// Active engines in configured order, followed by disabled policy rows.
     pub entries: Vec<EngineBudgetEntry>,
     /// Total wall-clock time for the entire solve.
     pub total_elapsed: Duration,
@@ -195,7 +198,8 @@ impl std::fmt::Display for BudgetReport {
 pub struct EngineBudgetEntry {
     /// Which engine this entry describes.
     pub engine: EngineType,
-    /// Engine index in the portfolio launch order.
+    /// Stable report index. Active engines use configured active order;
+    /// disabled engine-type policy rows follow them.
     pub index: usize,
     /// How much budget was allocated to this engine.
     pub budget_allocated: Duration,
@@ -217,6 +221,10 @@ pub enum EngineStopReason {
     Superseded,
     /// Engine returned Unknown within its budget.
     Unknown,
+    /// The engine remained queued when the portfolio terminated.
+    NotStarted,
+    /// The engine's worker thread could not be created.
+    LaunchFailed,
     /// Engine was disabled by budget policy and did not run.
     Disabled,
     /// Engine returned NotApplicable for the problem class.
@@ -235,6 +243,8 @@ impl std::fmt::Display for EngineStopReason {
             Self::Timeout => f.write_str("timeout"),
             Self::Superseded => f.write_str("superseded"),
             Self::Unknown => f.write_str("unknown"),
+            Self::NotStarted => f.write_str("not_started"),
+            Self::LaunchFailed => f.write_str("launch_failed"),
             Self::Disabled => f.write_str("disabled"),
             Self::NotApplicable => f.write_str("not_applicable"),
             Self::Hopeless => f.write_str("hopeless"),
@@ -460,10 +470,10 @@ pub struct PortfolioConfig {
     /// Per-portfolio term memory budget in bytes (#8629).
     ///
     /// When `Some(bytes)`, the portfolio divides this budget equally across
-    /// engines: each engine's `term_memory_budget` is `bytes / engine_count`.
-    /// This overrides the global `TermStore::per_engine_budget()` for THIS
-    /// portfolio, enabling multiple concurrent solves in a shared process
-    /// (e.g., model-checker-consumer) without OOM.
+    /// the concrete workers that may be live at once. This overrides the
+    /// global `TermStore::per_engine_budget()` for those worker threads.
+    /// It does not isolate aggregate RSS across nested or concurrent
+    /// portfolios, and validation may use separate solver state.
     ///
     /// When `None` (default), per-engine budgets fall back to the global
     /// `TermStore::per_engine_budget()`.
@@ -730,8 +740,8 @@ impl PortfolioConfig {
 
     /// Compute a per-engine budget from the policy, given total available time.
     ///
-    /// Applies the minimum floor guarantee: no active engine gets less than
-    /// `MIN_BUDGET_FLOOR_PERCENT`% of the total timeout.
+    /// Applies the minimum floor guarantee to percentage/default policies.
+    /// A fixed allocation is exact, except that it is clamped to `total`.
     ///
     /// Returns `None` if the engine is disabled or the total is zero.
     pub(crate) fn compute_engine_budget(
@@ -747,11 +757,7 @@ impl PortfolioConfig {
         let policy = self.budget_policy(engine_type);
         match policy {
             BudgetPolicy::Disabled => None,
-            BudgetPolicy::Fixed(dur) => {
-                // Clamp to total but respect the floor.
-                let floor = total.mul_f64(BudgetPolicy::MIN_BUDGET_FLOOR_PERCENT as f64 / 100.0);
-                Some(dur.max(floor).min(total))
-            }
+            BudgetPolicy::Fixed(dur) => Some(dur.min(total)),
             BudgetPolicy::MinPercent(pct) => {
                 let pct = pct.clamp(BudgetPolicy::MIN_BUDGET_FLOOR_PERCENT, 100);
                 let budget = total.mul_f64(pct as f64 / 100.0);
@@ -824,17 +830,16 @@ impl PortfolioConfig {
     /// Compute the per-engine term memory budget for this portfolio (#8629).
     ///
     /// When `self.memory_budget` is `Some(bytes)`, divides the budget equally
-    /// across `engine_count` engines. Otherwise falls back to the global
+    /// across the engines that may run concurrently. Otherwise falls back to the global
     /// `TermStore::per_engine_budget()` (which divides the process-level limit
     /// by engine count).
     ///
-    /// This enables per-portfolio memory isolation: multiple concurrent solves
-    /// in the same process (e.g., model-checker-consumer) each get their own memory budget,
-    /// rather than all sharing the process-wide `DEFAULT_TERM_MEMORY_LIMIT`.
-    pub(crate) fn per_engine_term_budget(&self) -> Option<usize> {
+    /// This scopes the configured term budget across the live workers of one
+    /// concrete portfolio. It is not a complete process-wide RSS envelope:
+    /// nested/concurrent portfolios and validation have separate accounting.
+    pub(crate) fn per_engine_term_budget(&self, concurrent_engines: usize) -> Option<usize> {
         if let Some(total_bytes) = self.memory_budget {
-            let engine_count = self.engines.len().max(1);
-            Some(total_bytes / engine_count)
+            Some(total_bytes / concurrent_engines.max(1))
         } else {
             // Fall back to global per-engine budget.
             Some(ay_core::TermStore::per_engine_budget())
@@ -962,6 +967,8 @@ mod tests {
     fn test_engine_stop_reason_hopeless_display() {
         // Item 5a: the budget report renders the new variant.
         assert_eq!(EngineStopReason::Hopeless.to_string(), "hopeless");
+        assert_eq!(EngineStopReason::NotStarted.to_string(), "not_started");
+        assert_eq!(EngineStopReason::LaunchFailed.to_string(), "launch_failed");
     }
 
     #[test]
@@ -1233,15 +1240,25 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_engine_budget_fixed_respects_floor() {
-        // Fixed(1s) should be raised to floor (5% of 100s = 5s)
+    fn test_compute_engine_budget_fixed_is_independent_of_percentage_floor() {
         let config = PortfolioConfig::default()
             .engine_budget(EngineType::Tpa, BudgetPolicy::Fixed(Duration::from_secs(1)));
-        let total = Duration::from_secs(100);
+        let total = Duration::from_secs(120);
 
         let budget = config.compute_engine_budget(EngineType::Tpa, total, 10);
         assert!(budget.is_some());
-        assert_eq!(budget.unwrap(), Duration::from_secs(5));
+        assert_eq!(budget.unwrap(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_compute_engine_budget_fixed_zero_is_an_exact_allocation() {
+        let config = PortfolioConfig::default()
+            .engine_budget(EngineType::Tpa, BudgetPolicy::Fixed(Duration::ZERO));
+
+        assert_eq!(
+            config.compute_engine_budget(EngineType::Tpa, Duration::from_secs(100), 10),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
@@ -1295,8 +1312,11 @@ mod tests {
             EngineStopReason::Timeout,
             EngineStopReason::Superseded,
             EngineStopReason::Unknown,
+            EngineStopReason::NotStarted,
+            EngineStopReason::LaunchFailed,
             EngineStopReason::Disabled,
             EngineStopReason::NotApplicable,
+            EngineStopReason::Hopeless,
         ];
         for (i, r1) in reasons.iter().enumerate() {
             for (j, r2) in reasons.iter().enumerate() {

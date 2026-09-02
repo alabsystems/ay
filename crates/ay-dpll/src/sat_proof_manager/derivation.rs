@@ -82,6 +82,53 @@ const MAX_RUP_WIDENING_VERSIONS: usize = 100_000;
 /// theory-conflict exit. The replay and the lemma mapping are both measured and
 /// cleared.
 ///
+/// ★★ SUPERSEDED 2026-08-31 — THE TWO PARAGRAPHS ABOVE ARE WRONG. DO NOT AIM
+/// WORK AT THEM. They are kept for provenance only; three separate campaigns
+/// have now started from them and died. Re-measured over 997 `.smt2` files
+/// (309 completed `process_trace` runs, 78 declines) with `--rup-fallback-trace`
+/// + `--proof-introspect`, plus an independent `ay-dpll --lib` pass:
+///
+/// * **`clause_versions` is NOT "essentially empty".** Replay-DB size: min 2,
+///   p25 4, median 6, p75 58, max 12333 — only 10/78 are ≤3. `trace_entries`
+///   median 90, max 119758, and **zero runs with an empty trace**.
+///   `proof_work_exhausted` and `trace_truncated` are false in all 309.
+/// * **`usable_hint_count` and `mapped` are THE SAME FIELD.**
+///   `derive_empty_via_level0_rup` passes `all_versions = (0..versions.len())`
+///   as `hint_versions`, so they are equal by construction. The two lines above
+///   are one measurement printed twice, not two corroborating observations.
+/// * **The level-0 theory-conflict exit named as the "next step" was fixed by
+///   `fb66135cfb` (2026-08-29), 25 days after this census was written.**
+///   `declare_level0_theory_conflict_unsat` now records the conflict lemma.
+///   The `TheoryLemma` mitigation is *reached and insufficient*, not missing:
+///   it adds +882/+850/+16 lemmas on the three fully-translatable files and RUP
+///   still stalls.
+///
+/// **The actual cause of `RupNoConflict`:** the traced clause set is
+/// propositionally SATISFIABLE — reproduced at 5657/5657 declines. Clausification
+/// records each assertion's Tseitin *definition* but not the level-0 unit
+/// asserting its root, so the database can be satisfied by falsifying every
+/// root. Seeding the `ProofStep::Assume` roots flips `base=SAT` to
+/// `+assume=UNSAT` on all three probe files (with `assume_alone=SAT`, so the
+/// units are not self-contradictory) and converts 4 files to `trust_free=yes`
+/// with **0 sat→unsat flips across all 997**.
+///
+/// That change is NOT landed, deliberately. It removes the multi-literal `Or`
+/// step that `test_or_clausification_forgery_is_rejected` corrupts, so that
+/// soundness test would panic in setup and silently stop testing anything —
+/// architectural, not placement (three placements fail identically, because any
+/// empty-clause derivation from `process_trace` preempts the downstream
+/// `rescue_residual_trust_steps` clausification lane). Measured price to the
+/// consumer: **0 tests** — all 13 of verification-consumer's UNSAT native-replay artifacts
+/// stay unavailable with the patch applied, because their dominant blocker is
+/// 94 × "no exact proof authority" (the exact-fragment quantifier-instance gate)
+/// versus 18 × "unverified trust rule". Patch preserved out-of-tree.
+///
+/// ⚠ **`RupNoConflict` counts are NOT a usable gate.** The same command yields
+/// 3042 / 2480 / 5678 at nominally the same pin, with *different test totals*
+/// (7639 vs 7652) — the binaries were not identical. Re-runs of one binary on
+/// one box agree to ~0.3%, so the spread is environmental. Compare only within
+/// a single binary on a single box.
+///
 /// `reason` is a closure so the `Err` arm does not format on the hot fallback
 /// path when tracing is off.
 fn rup_fallback_trace(reason: impl FnOnce() -> String) {

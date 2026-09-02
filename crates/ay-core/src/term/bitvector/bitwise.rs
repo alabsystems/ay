@@ -15,20 +15,25 @@ impl TermStore {
         else {
             return None;
         };
-        if name != "sign_extend" || indices.len() != 1 || args.len() != 1 {
+        if name != "sign_extend" {
             return None;
         }
+        let &[extend_by] = indices.as_slice() else {
+            return None;
+        };
+        let &[inner] = args.as_slice() else {
+            return None;
+        };
 
-        let inner = args[0];
         let inner_width = self.get_bv_width(inner)?;
-        if inner_width.checked_add(indices[0])? != width {
+        if inner_width.checked_add(extend_by)? != width {
             return None;
         }
         if mask != &Self::bv_ones(inner_width) {
             return None;
         }
 
-        Some(self.mk_bvzero_extend(indices[0], inner))
+        Some(self.mk_bvzero_extend(extend_by, inner))
     }
 
     /// Create bitvector bitwise AND with constant folding and simplifications
@@ -232,8 +237,10 @@ impl TermStore {
 
         // Double negation: bvnot(bvnot(x)) → x
         if let TermData::App(sym, args) = self.get(arg) {
-            if sym.name() == "bvnot" && args.len() == 1 {
-                return args[0];
+            if sym.name() == "bvnot" {
+                if let &[inner] = args.as_slice() {
+                    return inner;
+                }
             }
         }
 
@@ -275,8 +282,10 @@ impl TermStore {
 
         // Double negation: bvneg(bvneg(x)) → x
         if let TermData::App(sym, args) = self.get(arg) {
-            if sym.name() == "bvneg" && args.len() == 1 {
-                return args[0];
+            if sym.name() == "bvneg" {
+                if let &[inner] = args.as_slice() {
+                    return inner;
+                }
             }
         }
 

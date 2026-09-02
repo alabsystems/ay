@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use ay_core::kani_compat::DetHashSet as HashSet;
-use ay_core::term::TermData;
+use ay_core::term::{Symbol, TermData};
 use ay_core::{quote_symbol, string_literal, Sort, TermId};
 use num_bigint::BigInt;
 
@@ -20,8 +20,11 @@ use crate::executor_format::{
     format_rational, format_real, format_sort_surface,
 };
 
+use super::datatype_array_fields::AuthenticatedDatatypeArrayMembers;
 use super::Executor;
 use super::{EvalValue, Model};
+
+mod datatype_array_selectors;
 
 /// Typed failure from the exact row pipeline shared by model output and the
 /// independent gate.  Coverage failures remain distinct from a semantic
@@ -841,7 +844,7 @@ impl Executor {
     /// READ during array completion (O(reads × forest), fresh hash-set churn
     /// each call — the dominant completion cost on the pairwise-expanded
     /// `distinct` family).
-    fn term_is_required_by_last_query(&self, needle: TermId) -> bool {
+    pub(super) fn term_is_required_by_last_query(&self, needle: TermId) -> bool {
         let mut cache = self.required_terms_index.borrow_mut();
         let valid = cache.as_ref().is_some_and(|(asnap, usnap, _)| {
             *asnap == self.ctx.assertions && *usnap == self.last_assumptions
@@ -909,6 +912,7 @@ impl Executor {
             elem_sort,
             def_visited,
             ArrayInterpMode::Strict,
+            None,
         )
     }
 
@@ -925,14 +929,21 @@ impl Executor {
         array_term: TermId,
         elem_sort: &Sort,
         mode: ArrayInterpMode,
+        authenticated_dt_cells: Option<&AuthenticatedDatatypeArrayMembers>,
     ) -> Option<(String, Vec<(String, String)>)> {
         debug_assert!(
             mode.completes_missing_default(),
             "completion candidates must use a completion mode"
         );
         let mut def_visited = HashSet::default();
-        let (default, stores) =
-            self.array_witness_interp_inner(model, array_term, elem_sort, &mut def_visited, mode)?;
+        let (default, stores) = self.array_witness_interp_inner(
+            model,
+            array_term,
+            elem_sort,
+            &mut def_visited,
+            mode,
+            authenticated_dt_cells,
+        )?;
         // INTERNAL-DIALECT NORMALIZATION (#qfax-atom-spelling): this candidate
         // is installed into the model that internal evaluators, the completion
         // merge, and the independent gate all consume by STRING identity. The
@@ -964,6 +975,7 @@ impl Executor {
         elem_sort: &Sort,
         def_visited: &mut HashSet<TermId>,
         mode: ArrayInterpMode,
+        authenticated_dt_cells: Option<&AuthenticatedDatatypeArrayMembers>,
     ) -> Option<(String, Vec<(String, String)>)> {
         stacker::maybe_grow(ARRAY_FMT_STACK_RED_ZONE, ARRAY_FMT_STACK_SIZE, || {
             if model
@@ -981,6 +993,7 @@ impl Executor {
                         elem_sort,
                         def_visited,
                         mode,
+                        authenticated_dt_cells,
                     )?;
                     let idx_str =
                         self.format_array_index_value(model, args[1], def_visited, mode)?;
@@ -1006,13 +1019,24 @@ impl Executor {
                         Vec::new(),
                     ))
                 }
-                TermData::Let(bindings, body) if bindings.is_empty() => {
-                    self.array_witness_interp_inner(model, *body, elem_sort, def_visited, mode)
-                }
+                TermData::Let(bindings, body) if bindings.is_empty() => self
+                    .array_witness_interp_inner(
+                        model,
+                        *body,
+                        elem_sort,
+                        def_visited,
+                        mode,
+                        authenticated_dt_cells,
+                    ),
                 TermData::Let(_, _) if mode.completes_missing_default() => None,
-                TermData::Let(_, _) => {
-                    self.array_witness_base_interp(model, array_term, elem_sort, def_visited, mode)
-                }
+                TermData::Let(_, _) => self.array_witness_base_interp(
+                    model,
+                    array_term,
+                    elem_sort,
+                    def_visited,
+                    mode,
+                    authenticated_dt_cells,
+                ),
                 TermData::Ite(cond, then_br, else_br) => match self.evaluate_term(model, *cond) {
                     EvalValue::Bool(true) => self.array_witness_interp_inner(
                         model,
@@ -1020,6 +1044,7 @@ impl Executor {
                         elem_sort,
                         def_visited,
                         mode,
+                        authenticated_dt_cells,
                     ),
                     EvalValue::Bool(false) => self.array_witness_interp_inner(
                         model,
@@ -1027,6 +1052,7 @@ impl Executor {
                         elem_sort,
                         def_visited,
                         mode,
+                        authenticated_dt_cells,
                     ),
                     // An unresolved branch condition does not identify one
                     // array value.  In particular, model completion must not
@@ -1038,6 +1064,7 @@ impl Executor {
                         elem_sort,
                         def_visited,
                         mode,
+                        authenticated_dt_cells,
                     ),
                 },
                 // An array-valued read is itself a base array value.  Its
@@ -1056,7 +1083,14 @@ impl Executor {
                         && args.len() == 2
                         && matches!(self.ctx.terms.sort(array_term), Sort::Array(_)) =>
                 {
-                    self.array_witness_base_interp(model, array_term, elem_sort, def_visited, mode)
+                    self.array_witness_base_interp(
+                        model,
+                        array_term,
+                        elem_sort,
+                        def_visited,
+                        mode,
+                        authenticated_dt_cells,
+                    )
                 }
                 TermData::Var(_, _) => {
                     if def_visited.contains(&array_term) {
@@ -1076,84 +1110,77 @@ impl Executor {
                                 elem_sort,
                                 def_visited,
                                 mode,
+                                authenticated_dt_cells,
                             );
                         }
                     }
-                    self.array_witness_base_interp(model, array_term, elem_sort, def_visited, mode)
+                    self.array_witness_base_interp(
+                        model,
+                        array_term,
+                        elem_sort,
+                        def_visited,
+                        mode,
+                        authenticated_dt_cells,
+                    )
                 }
-                // An APPLICATION of a user-declared function whose result sort
-                // is an array is a free array LEAF, exactly like the `Var` arm
-                // above -- not an array CONSTRUCTOR. The exclusion below was
-                // written for lambda / as-array / map, where treating a
-                // constrained RHS as a free base would change the definition
-                // rather than complete it. A declared `f : S -> (Array I E)`
-                // constrains nothing: `(seq_array current)` is as free as a
-                // declared `(Array I E)` constant.
-                //
-                // Excluding it cost real verdicts. In `CompleteDefault` mode this
-                // returned `None`, so completion produced no candidate, so the
-                // array got no `default`, so `array_witness_base_interp` returned
-                // `None` in Strict mode, so the gate's `array_from_model` bailed
-                // at `interp.default.as_ref()?`, so `uf_app_value` was `None` and
-                // the assertion came back `Unevaluable`:
-                //
-                //   cannot_confirm_reason "model commits no value for this
-                //                          application of `seq_array`"
-                //
-                // Isolated by controlled variant, not by reading: the same
-                // formula with a DECLARED `(Array Int Int)` constant answers
-                // `sat` with a full store-chain model; reached through
-                // `(seq_array current)` it answers `unknown`; and adding
-                // `(= (seq_array current) ((as const (Array Int Int)) 0))` makes
-                // it `sat` again -- so the sole missing ingredient is `default`.
-                //
-                // It also let a `sat` escape that could not be RENDERED at all:
-                // `(select (seq_array current) (+ (seq_offset current) 1)) = 0`
-                // publishes `sat` and then `(error "model value for function
-                // seq_array is not available")`, because the `select` path
-                // resolves through `array_select_value` so the gate confirms
-                // while the printer cannot build the witness.
-                //
-                // Restricted to a USER-DECLARED symbol head so lambda,
-                // as-array, map and every future array constructor keep the
-                // original exclusion.
-                //
-                // A datatype SELECTOR application is NOT such a leaf, even
-                // though the selector is a declared symbol: `(dat (select A
-                // i))` denotes the `dat` field of whatever datatype value
-                // `(select A i)` holds, so its interpretation is FIXED by
-                // that value, not free. Completing it here as an independent
-                // base array fabricates one interpretation per syntactic
-                // read — `(dat (select A i))` and `(dat (select A j))` under
-                // `i = j` receive two DIFFERENT free arrays, the field
-                // arrays of one cell disagree, and the independent gate
-                // refuses the datatype equality `z = (select A i)` the
-                // census had certified (measured on the
-                // `datatype_array_field_select_congruence_certifies` pin:
-                // `sat` -> `unknown`, "Datatype vs Uninterpreted" /
-                // "model does not pin this leaf"). A selector read resolves
-                // through its subject's datatype value (the census /
-                // `datatype_leaf` route) exactly as before 93efdc1f1.
-                TermData::App(sym, _)
+                TermData::App(sym, args)
                     if mode.completes_missing_default()
-                        && self.ctx.symbol_info_by_identity(sym.name()).is_some()
-                        && !self.is_datatype_selector_symbol(sym.name()) =>
+                        && self.array_completion_application_is_base_leaf(
+                            sym,
+                            args,
+                            array_term,
+                            elem_sort,
+                            authenticated_dt_cells,
+                        ) =>
                 {
-                    self.array_witness_base_interp(model, array_term, elem_sort, def_visited, mode)
+                    self.array_witness_base_interp(
+                        model,
+                        array_term,
+                        elem_sort,
+                        def_visited,
+                        mode,
+                        authenticated_dt_cells,
+                    )
                 }
                 _ if mode.completes_missing_default() => None,
-                _ => {
-                    self.array_witness_base_interp(model, array_term, elem_sort, def_visited, mode)
-                }
+                _ => self.array_witness_base_interp(
+                    model,
+                    array_term,
+                    elem_sort,
+                    def_visited,
+                    mode,
+                    authenticated_dt_cells,
+                ),
             }
         })
     }
 
-    /// Whether `name` is a selector of some declared datatype constructor.
-    pub(super) fn is_datatype_selector_symbol(&self, name: &str) -> bool {
-        self.ctx
-            .ctor_selectors_iter()
-            .any(|(_, selectors)| selectors.iter().any(|selector| selector == name))
+    /// Whether an array-valued application may be completed as a free base leaf.
+    ///
+    /// A user-declared function application is a leaf, unlike lambda, as-array,
+    /// map, and future array constructors. This distinction is needed for values
+    /// such as `(seq_array current)`: refusing a default made the independent gate
+    /// unevaluable even though the declaration leaves the array unconstrained.
+    ///
+    /// Datatype selectors are not normally free leaves. Their result is fixed by
+    /// the subject value, and completing congruent reads independently can invent
+    /// incompatible field arrays. The sole exception is an exact selector whose W6
+    /// capability proves the relevant datatype-cell set is empty; then the field is
+    /// genuinely unobserved completion slack. A nonempty or withheld capability
+    /// remains fail closed.
+    fn array_completion_application_is_base_leaf(
+        &self,
+        symbol: &Symbol,
+        args: &[TermId],
+        result: TermId,
+        element_sort: &Sort,
+        authenticated_dt_cells: Option<&AuthenticatedDatatypeArrayMembers>,
+    ) -> bool {
+        self.ctx.symbol_info_by_identity(symbol.name()).is_some()
+            && (!self.is_datatype_selector_symbol(symbol.name())
+                || (self.is_exact_datatype_selector_application(symbol, args, result)
+                    && self.datatype_sort_carries_array_field(element_sort)
+                    && authenticated_dt_cells.is_some_and(|cells| cells.is_empty())))
     }
 
     /// Base (non-`store`-chain) interpretation of an array term: the
@@ -1168,6 +1195,7 @@ impl Executor {
         elem_sort: &Sort,
         def_visited: &mut HashSet<TermId>,
         mode: ArrayInterpMode,
+        authenticated_dt_cells: Option<&AuthenticatedDatatypeArrayMembers>,
     ) -> Option<(String, Vec<(String, String)>)> {
         let interp = model
             .array_model
@@ -1223,7 +1251,7 @@ impl Executor {
             // fresh store evidence makes a second completion pass grow new
             // default-valued points.  Only reads owned by the active solve are
             // semantic observations.  Existing solver stores are merged below.
-            if !self.term_is_required_by_last_query(tid) {
+            if !self.array_read_is_active(tid, authenticated_dt_cells) {
                 continue;
             }
             // Datatype/array index keys are concretized to constructor terms
@@ -1395,6 +1423,15 @@ impl Executor {
         Some((default, stores))
     }
 
+    fn array_read_is_active(
+        &self,
+        read: TermId,
+        authenticated_dt_cells: Option<&AuthenticatedDatatypeArrayMembers>,
+    ) -> bool {
+        self.term_is_required_by_last_query(read)
+            || authenticated_dt_cells.is_some_and(|cells| cells.contains(read))
+    }
+
     /// Render an array element value at `elem_sort`, recursing into nested array
     /// elements (so an `(Array X (Array Y Z))` default/store value is itself a
     /// fully rendered array).
@@ -1497,6 +1534,24 @@ impl Executor {
         let Sort::Array(arr_sort) = sort else {
             return None;
         };
+        if mode == ArrayInterpMode::Strict {
+            if self.last_model_validated {
+                if let Some((projected_sort, value)) =
+                    self.authenticated_unobserved_array_field(model, array_term)
+                {
+                    if &projected_sort != arr_sort.as_ref() {
+                        return None;
+                    }
+                    return self.format_gate_model_value(
+                        &ay_model_check::ModelValue::Array(Box::new(value)),
+                        sort,
+                    );
+                }
+            }
+            if self.unobserved_array_field_authority_claim(model, array_term) {
+                return None;
+            }
+        }
         let sort_str = format_sort_surface(&self.ctx, sort);
         let (default, stores) = self.array_witness_interp_inner(
             model,
@@ -1504,6 +1559,7 @@ impl Executor {
             &arr_sort.element_sort,
             def_visited,
             mode,
+            None,
         )?;
         let mut result = format!("((as const {sort_str}) {default})");
         for (idx, val) in stores {
@@ -2096,134 +2152,4 @@ mod array_store_order_tests {
 mod gate_fp_format_tests;
 
 #[cfg(test)]
-mod sequence_table_provenance_tests {
-    use ay_core::kani_compat::DetHashMap;
-    use ay_core::term::Symbol;
-    use ay_core::Sort;
-    use ay_frontend::parse;
-
-    use super::{Executor, Model};
-    use crate::executor_types::SolveResult;
-
-    #[test]
-    fn seq_argument_and_result_cells_use_aligned_source_terms() {
-        let mut exec = Executor::new();
-        let seq = Sort::Seq(Box::new(Sort::Int));
-        let arg = exec.ctx.terms.mk_var("seq-table-arg", seq.clone());
-        let app = exec.ctx.terms.mk_app(
-            Symbol::Named("seq_table_f".to_string()),
-            vec![arg],
-            seq.clone(),
-        );
-        let table = vec![(
-            vec!["@ay-seq!arg".to_string()],
-            "@ay-seq!result".to_string(),
-        )];
-
-        let rewritten = exec
-            .sequence_table_provenance_placeholders(
-                "seq_table_f",
-                std::slice::from_ref(&seq),
-                &seq,
-                &table,
-                Some(std::slice::from_ref(&app)),
-            )
-            .expect("aligned provenance rewrites");
-        assert_eq!(rewritten[0].0, vec![format!("@?{}", arg.0)]);
-        assert_eq!(rewritten[0].1, format!("@?{}", app.0));
-    }
-
-    #[test]
-    fn missing_misaligned_or_wrong_source_provenance_fails_closed() {
-        let mut exec = Executor::new();
-        let seq = Sort::Seq(Box::new(Sort::Int));
-        let arg = exec.ctx.terms.mk_var("seq-table-bad-arg", seq.clone());
-        let wrong_app = exec.ctx.terms.mk_app(
-            Symbol::Named("other_seq_table_f".to_string()),
-            vec![arg],
-            seq.clone(),
-        );
-        let table = vec![(vec!["opaque".to_string()], "opaque".to_string())];
-
-        assert!(exec
-            .sequence_table_provenance_placeholders(
-                "seq_table_f",
-                std::slice::from_ref(&seq),
-                &seq,
-                &table,
-                None,
-            )
-            .is_err());
-        assert!(exec
-            .sequence_table_provenance_placeholders(
-                "seq_table_f",
-                std::slice::from_ref(&seq),
-                &seq,
-                &table,
-                Some(&[]),
-            )
-            .is_err());
-        assert!(exec
-            .sequence_table_provenance_placeholders(
-                "seq_table_f",
-                std::slice::from_ref(&seq),
-                &seq,
-                &table,
-                Some(std::slice::from_ref(&wrong_app)),
-            )
-            .is_err());
-    }
-
-    #[test]
-    fn get_model_with_missing_sequence_table_provenance_errors_without_opaque_output() {
-        let commands = parse(
-            "(set-logic ALL)\n\
-             (declare-fun f ((Seq Int)) (Seq Int))",
-        )
-        .expect("valid declaration");
-        let mut exec = Executor::new();
-        exec.execute_all(&commands).expect("declaration executes");
-
-        let mut euf = ay_euf::EufModel::default();
-        euf.function_tables.insert(
-            "f".to_string(),
-            vec![(
-                vec!["@ay-seq!arg".to_string()],
-                "@ay-seq!result".to_string(),
-            )],
-        );
-        // Deliberately omit function_table_terms: no source application means
-        // no authority to reinterpret either opaque class as a concrete Seq.
-        exec.last_result = Some(SolveResult::Sat);
-        exec.last_model = Some(Model {
-            quantified_confirmation_seal: Default::default(),
-            quantified_grant_model_seal: Default::default(),
-            sat_model: Vec::new(),
-            term_to_var: DetHashMap::default(),
-            bool_overrides: DetHashMap::default(),
-            euf_model: Some(euf),
-            array_model: None,
-            lra_model: None,
-            lia_model: None,
-            bv_model: None,
-            fp_model: None,
-            string_model: None,
-            seq_model: None,
-            projection_ufs: Default::default(),
-            certified_total_ufs: Default::default(),
-            certified_const_interps: Default::default(),
-            formula_neutral_function_defaults: Default::default(),
-            completed_values: DetHashMap::default(),
-            dt_ground: DetHashMap::default(),
-            dt_pins: DetHashMap::default(),
-        });
-
-        let output = exec.model();
-        assert!(output.starts_with("(error \"model value for function f is not available:"));
-        assert!(output.contains("no aligned source-term provenance"));
-        assert!(
-            !output.contains("@ay-seq"),
-            "an error must not echo an opaque sequence token: {output}"
-        );
-    }
-}
+mod sequence_table_provenance_tests;

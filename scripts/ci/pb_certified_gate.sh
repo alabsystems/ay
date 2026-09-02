@@ -16,7 +16,7 @@
 #                silently certify newer sources, and shared-target worktrees
 #                cannot trigger a rebuild before every manifest row.
 #   2. PIN       resolve the checker named by ci/veripb.pin (build it from the
-#                pinned upstream commit + both pinned patches if we do not have it),
+#                pinned upstream commit + the pinned patch if we do not have it),
 #                and refuse to proceed if its --version disagrees with the pin.
 #                2b builds and tests `veripb-core-proved`, the proved kernel the
 #                pinned patch now carries. It is a workspace member NOTHING
@@ -68,6 +68,9 @@ cd "$REPO"
 
 # The ONE shell-side verdict gate, shared with scripts/cert_ci.sh.
 . "$REPO/scripts/lib/veripb_verdict.sh"
+# The ONE cache-key authority, shared with scripts/cert_ci.sh and pinned
+# byte-for-byte by the Rust resolvers' cross-language tests.
+. "$REPO/scripts/lib/veripb_build_id.sh"
 
 PIN_FILE=ci/veripb.pin
 [ -f "$PIN_FILE" ] || { echo "ERROR: missing pin file $PIN_FILE" >&2; exit 2; }
@@ -76,7 +79,7 @@ PIN_FILE=ci/veripb.pin
 . "./$PIN_FILE"
 
 for required in VERIPB_REPO VERIPB_COMMIT VERIPB_VERSION VERIPB_PATCH \
-                VERIPB_PATCH_SHA256 VERIPB_PATCH2 VERIPB_PATCH2_SHA256 \
+                VERIPB_PATCH_SHA256 \
                 VERIPB_SOUNDNESS_DIR VERIPB_CERT_MANIFEST; do
     eval "value=\${$required:-}"
     [ -n "$value" ] || { echo "ERROR: $PIN_FILE does not define $required" >&2; exit 2; }
@@ -192,27 +195,77 @@ if [ "$actual_patch_sha" != "$VERIPB_PATCH_SHA256" ]; then
     exit 2
 fi
 
-# The second patch is as much a part of the checker's identity as the first, so
-# it is hashed under the same rule. It is a SEPARATE file because the first one
-# is byte-verifiable against the private fork and a locally written fix folded
-# into it would destroy that property; see the prose in ci/veripb.pin.
-actual_patch2_sha=$(sha256_file "$VERIPB_PATCH2" 2>/dev/null || true)
-if [ "$actual_patch2_sha" != "$VERIPB_PATCH2_SHA256" ]; then
-    echo "ERROR: $VERIPB_PATCH2 does not match VERIPB_PATCH2_SHA256 in $PIN_FILE" >&2
-    echo "       pin:  $VERIPB_PATCH2_SHA256" >&2
-    echo "       file: ${actual_patch2_sha:-<could not hash>}" >&2
-    echo "       The patch defines what the trusted checker IS. Update both together." >&2
-    exit 2
+CACHE=${VERIPB_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/ay-veripb"}
+# Cache key covers the commit, the patch, AND THE COMPILER: repatching must
+# rebuild, and so must a toolchain change.
+#
+# WHY THE COMPILER IS IN THE KEY (added 2026-08-31). The gate failed with
+#   error[E0514]: found crate `malachite_bigint` compiled by an incompatible
+#                 version of rustc
+#   FAIL [proved-core] veripb-core-proved test suite FAILED
+# because the cache had been built by Homebrew rustc 1.96 and the gate was then
+# run with the Trust toolchain first on PATH (installed via aterm's `atpkg`).
+# One target dir, two compilers — the same defect class as sharing
+# CARGO_TARGET_DIR across worktrees, and it surfaced here first because
+# `veripb-core-proved`'s DOCTEST links rlibs directly.
+#
+# Read the failure correctly before reacting to it: the 22 soundness fixtures
+# and the 11 certified-track proofs had ALREADY passed under the cached
+# checker. The crate that could not link decides no verdict. So this was a
+# build-hygiene failure, never a soundness one — but the gate is fail-closed
+# and was right to refuse.
+#
+# Keying on the compiler makes each build self-consistent AND PRESERVES the
+# older one. That preservation is the point: recorded census verdicts cite the
+# checker by sha256, so the binary that produced them must not be silently
+# replaced by a rebuild under a different compiler.
+#
+# The key format and the compiler-resolution rules live in ONE place,
+# scripts/lib/veripb_build_id.sh (sourced above), shared with cert_ci.sh and
+# pinned by the Rust resolvers' tests. This gate accepts KEYED directories
+# only — never the legacy unkeyed layout — because phase 2b compiles and
+# tests veripb-core-proved INSIDE the cache directory, and a directory whose
+# key does not name the current compiler is exactly the mixed-rlib E0514
+# hazard again. Resolvers that only RUN the cached binary (cert_ci.sh, the
+# Rust gates) may keep accepting a legacy build; this gate must not.
+# The Trust toolchain ships `trustdoc`, NOT `rustdoc`. Cargo looks for a binary
+# literally named `rustdoc`, does not find one beside this `rustc`, and falls
+# through to whatever `rustdoc` is next on PATH. Phase 2b's doctests then link
+# THIS cache's rlibs with a foreign rustdoc and fail E0514 — which is exactly
+# how this gate failed even after the cache was keyed by compiler: the key
+# fixed the rlibs, but the tool reading them was still the wrong one. Only
+# `cargo test` runs doctests, which is why `cargo build` never showed it.
+# AY_VERIPB_RUSTC is the compiler the key names, resolved by the shared lib
+# ($RUSTC, then rustc on PATH, then the compiler_consumer sysroot's compat rustc — a
+# Trust-only machine has no bare rustc). Every cargo invocation against the
+# cache directory passes it explicitly as RUSTC so the compiler in the key is
+# provably the compiler that built (and re-tests) the artifact — otherwise
+# cargo's own resolution could drift from the fingerprinted one.
+AY_VERIPB_RUSTC=$(veripb_rustc_path) || exit 2
+
+if [ -z "${RUSTDOC:-}" ]; then
+    _rustc_dir=$(dirname "$AY_VERIPB_RUSTC")
+    if [ ! -x "$_rustc_dir/rustdoc" ] && [ -x "$_rustc_dir/trustdoc" ]; then
+        RUSTDOC="$_rustc_dir/trustdoc"; export RUSTDOC
+        echo "   RUSTDOC=$RUSTDOC (this toolchain names it trustdoc)"
+    fi
 fi
 
-CACHE=${VERIPB_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/ay-veripb"}
-# Cache key covers the commit AND EVERY patch: repatching must rebuild.
-BUILD_ID="${VERIPB_COMMIT}-$(printf '%s' "$VERIPB_PATCH_SHA256" | cut -c1-12)"
-BUILD_ID="${BUILD_ID}-$(printf '%s' "$VERIPB_PATCH2_SHA256" | cut -c1-12)"
+BUILD_ID=$(veripb_build_id "$VERIPB_COMMIT" "$VERIPB_PATCH_SHA256") || exit 2
 BUILD_DIR="$CACHE/$BUILD_ID"
+# The checker is the anchor that makes every certificate claim mean anything.
+# If it is about to be built by a -dev compiler, say so out loud rather than
+# letting it pass unremarked.
+case "$(veripb_rustc_release)" in
+    *-dev|*-nightly|*-beta)
+        echo "   NOTE: the pinned checker will be built by a NON-RELEASE compiler"
+        echo "         ($("$AY_VERIPB_RUSTC" --version 2>&1 | head -1)). The 22 must-reject"
+        echo "         fixtures below re-prove its behaviour either way, but a"
+        echo "         stable compiler is the conservative choice for the anchor." ;;
+esac
 
 CHECKER=${VERIPB_BIN:-}
-PROVENANCE="${VERIPB_COMMIT} + $(basename "$VERIPB_PATCH") + $(basename "$VERIPB_PATCH2")"
+PROVENANCE="${VERIPB_COMMIT} + $(basename "$VERIPB_PATCH")"
 if [ -n "$CHECKER" ]; then
     [ -x "$CHECKER" ] || { echo "ERROR: VERIPB_BIN='$CHECKER' is not executable" >&2; exit 2; }
     # Provenance is UNVERIFIED here: we did not build this binary, so the pin
@@ -233,8 +286,7 @@ else
             exit 2
         }
         git -C "$BUILD_DIR" apply "$REPO/$VERIPB_PATCH"
-        git -C "$BUILD_DIR" apply "$REPO/$VERIPB_PATCH2"
-        ( cd "$BUILD_DIR" && cargo build --release --quiet --bin veripb )
+        ( cd "$BUILD_DIR" && RUSTC="$AY_VERIPB_RUSTC" cargo build --release --quiet --bin veripb )
     else
         echo "   reusing cached pinned build $BUILD_DIR"
     fi
@@ -281,7 +333,7 @@ if [ -n "${VERIPB_BIN:-}" ]; then
 elif [ ! -d "$BUILD_DIR/veripb-core-proved" ]; then
     note_fail "[proved-core] $BUILD_DIR/veripb-core-proved is missing — the pinned patch should have created it"
 else
-    if ( cd "$BUILD_DIR" && cargo build --release --quiet -p veripb-core-proved ); then
+    if ( cd "$BUILD_DIR" && RUSTC="$AY_VERIPB_RUSTC" cargo build --release --quiet -p veripb-core-proved ); then
         echo "   built     veripb-core-proved"
     else
         note_fail "[proved-core] veripb-core-proved failed to COMPILE from the pinned patch"
@@ -289,7 +341,7 @@ else
     # island_sync (proof text in the Rust trust surface matches clean/veripb_kernel.lean)
     # and width_guards (the machine-width re-certification the kernel's checked
     # variants describe), plus the crate's own unit tests.
-    if ( cd "$BUILD_DIR" && cargo test --release --quiet -p veripb-core-proved ); then
+    if ( cd "$BUILD_DIR" && RUSTC="$AY_VERIPB_RUSTC" cargo test --release --quiet -p veripb-core-proved ); then
         echo "   tested    veripb-core-proved (unit + island_sync + width_guards)"
     else
         note_fail "[proved-core] veripb-core-proved test suite FAILED"

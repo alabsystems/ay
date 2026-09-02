@@ -198,16 +198,18 @@ pub fn validate_lia_mod_range(
         let TermData::App(Symbol::Named(name), args) = terms.get(mod_term) else {
             return None;
         };
+        let [dividend, divisor] = args.as_slice() else {
+            return None;
+        };
         if name != "mod"
-            || args.len() != 2
             || !matches!(terms.sort(mod_term), Sort::Int)
-            || !matches!(terms.sort(args[0]), Sort::Int)
-            || !matches!(terms.sort(args[1]), Sort::Int)
+            || !matches!(terms.sort(*dividend), Sort::Int)
+            || !matches!(terms.sort(*divisor), Sort::Int)
             || !matches!(terms.sort(remainder_term), Sort::Int)
         {
             return None;
         }
-        Some((int_constant(args[1])?, int_constant(remainder_term)?))
+        Some((int_constant(*divisor)?, int_constant(remainder_term)?))
     };
     let (divisor, remainder) = decode(lhs, rhs)
         .or_else(|| decode(rhs, lhs))
@@ -227,9 +229,10 @@ pub fn validate_lia_mod_range(
 fn decode_eq(terms: &TermStore, lit: TermId) -> Option<(TermId, TermId)> {
     use crate::term::{Symbol, TermData};
     match terms.get(lit) {
-        TermData::App(Symbol::Named(n), args) if n == "=" && args.len() == 2 => {
-            Some((args[0], args[1]))
-        }
+        TermData::App(Symbol::Named(n), args) if n == "=" => match args.as_slice() {
+            [a, b] => Some((*a, *b)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -377,12 +380,16 @@ pub fn arith_disequality_split_guard_multiplier(
         return None;
     };
     let decode_equality = |term: TermId| match terms.get(term) {
-        TermData::App(Symbol::Named(name), args) if name == "=" && args.len() == 2 => {
-            Some((args[0], args[1]))
-        }
+        TermData::App(Symbol::Named(name), args) if name == "=" => match args.as_slice() {
+            [a, b] => Some((*a, *b)),
+            _ => None,
+        },
         TermData::Not(inner) => match terms.get(*inner) {
-            TermData::App(Symbol::Named(name), args) if name == "distinct" && args.len() == 2 => {
-                Some((args[0], args[1]))
+            TermData::App(Symbol::Named(name), args) if name == "distinct" => {
+                match args.as_slice() {
+                    [a, b] => Some((*a, *b)),
+                    _ => None,
+                }
             }
             _ => None,
         },
@@ -396,9 +403,10 @@ pub fn arith_disequality_split_guard_multiplier(
     match terms.sort(lhs) {
         Sort::Real => {
             let decode_lt = |term: TermId| match terms.get(term) {
-                TermData::App(Symbol::Named(name), args) if name == "<" && args.len() == 2 => {
-                    Some((args[0], args[1]))
-                }
+                TermData::App(Symbol::Named(name), args) if name == "<" => match args.as_slice() {
+                    [a, b] => Some((*a, *b)),
+                    _ => None,
+                },
                 _ => None,
             };
             let a = decode_lt(*first);
@@ -650,9 +658,10 @@ fn decode_negated_eq(terms: &TermStore, lit: TermId) -> Option<(TermId, TermId)>
         _ => return None,
     };
     match terms.get(inner) {
-        TermData::App(Symbol::Named(n), args) if n == "=" && args.len() == 2 => {
-            Some((args[0], args[1]))
-        }
+        TermData::App(Symbol::Named(n), args) if n == "=" => match args.as_slice() {
+            [a, b] => Some((*a, *b)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -737,7 +746,10 @@ fn parse_int_comparison(
 )> {
     use crate::term::{Symbol, TermData};
     let (op, a, b) = match terms.get(bound) {
-        TermData::App(Symbol::Named(n), args) if args.len() == 2 => (n.as_str(), args[0], args[1]),
+        TermData::App(Symbol::Named(n), args) => match args.as_slice() {
+            [a, b] => (n.as_str(), *a, *b),
+            _ => return None,
+        },
         _ => return None,
     };
     let (coeffs, c0) = int_linear_diff(terms, a, b)?;

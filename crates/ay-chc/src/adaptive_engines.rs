@@ -245,7 +245,7 @@ impl AdaptivePortfolio {
         if !crate::ab_switches::get().dt_bmc {
             return None;
         }
-        if !self.problem.has_datatype_sorts()
+        if !self.problem.uses_datatype_features()
             || self.problem.has_real_sorts()
             || features.num_queries == 0
         {
@@ -500,13 +500,16 @@ impl AdaptivePortfolio {
             ..PdrConfig::default()
         }
         .with_tla_trace_from_env();
-        self.apply_user_hints(&mut config);
         if !Self::cap_pdr_solve_timeout_to_budget(&mut config, self.remaining_budget(deadline)) {
             if self.config.verbose {
                 safe_eprintln!("Adaptive: Budget exhausted before initial trivial PDR");
             }
             return PortfolioResult::Unknown;
         }
+        // Apply after installing the finite timeout so the common helper can
+        // attach an adaptive child cancellation token without changing truly
+        // unbounded PDR semantics.
+        self.apply_user_hints(&mut config);
 
         // Use solve_with_stats for failure analysis (#1870)
         let pdr_start = Instant::now();
@@ -1248,35 +1251,87 @@ impl AdaptivePortfolio {
     /// }
     /// ```
     pub fn solve_bmc_only(&self, bmc_config: BmcConfig) -> crate::VerifiedChcResult {
+        let solve_started = Instant::now();
+        let requested_deadline = bmc_config.time_budget.map(|budget| solve_started + budget);
+        // Resolve every caller-visible boundary before spawning: neither the
+        // ambient thread-local deadline nor constructor-time one-shot context
+        // is inherited by the BMC worker. The BMC-local budget may tighten an
+        // enclosing boundary, never replace it with a later deadline.
+        let solve_deadline = [requested_deadline, self.enclosing_subsolve_deadline()]
+            .into_iter()
+            .flatten()
+            .min();
+        let caller_cancellation = bmc_config.base.cancellation_token.clone();
         // Run on a dedicated thread with a large stack to prevent stack
         // overflow from deep Arc<ChcExpr> recursive Drop (#6847).
         let config_for_fallback = bmc_config.clone();
-        std::thread::scope(|scope| {
+        let result = std::thread::scope(|scope| {
             match std::thread::Builder::new()
                 .name("ay-bmc-only".to_string())
                 .stack_size(crate::adaptive::ADAPTIVE_SOLVER_STACK_SIZE)
-                .spawn_scoped(scope, || self.solve_bmc_only_internal(bmc_config))
-            {
+                .spawn_scoped(scope, || {
+                    self.solve_bmc_only_internal(bmc_config, solve_deadline)
+                }) {
                 Ok(handle) => match handle.join() {
                     Ok(result) => result,
                     Err(payload) => std::panic::resume_unwind(payload),
                 },
                 Err(_) => {
                     // Fallback: run on calling thread if spawn fails
-                    self.solve_bmc_only_internal(config_for_fallback)
+                    self.solve_bmc_only_internal(config_for_fallback, solve_deadline)
                 }
             }
-        })
+        });
+        let boundary_closed = self.budget_exhausted(solve_deadline)
+            || caller_cancellation
+                .as_ref()
+                .is_some_and(crate::CancellationToken::is_cancelled);
+        if boundary_closed
+            && matches!(
+                &result,
+                crate::VerifiedChcResult::Safe(_) | crate::VerifiedChcResult::Unsafe(_)
+            )
+        {
+            crate::VerifiedChcResult::Unknown(crate::engine_result::VerifiedUnknownMarker::new())
+        } else {
+            result
+        }
     }
 
     /// Internal BMC-only solve (runs on the solver thread).
-    fn solve_bmc_only_internal(&self, mut bmc_config: BmcConfig) -> crate::VerifiedChcResult {
+    fn solve_bmc_only_internal(
+        &self,
+        mut bmc_config: BmcConfig,
+        solve_deadline: Option<Instant>,
+    ) -> crate::VerifiedChcResult {
         use crate::bmc::BmcSolver;
         use crate::engine_result::ValidationEvidence;
 
-        let solve_start = Instant::now();
         let bmc_verbose = bmc_config.base.verbose;
         let config_for_evidence = bmc_config.clone();
+        let mut route_cancellation = self.cancellation_token.child();
+        if let Some(cancellation) = &bmc_config.base.cancellation_token {
+            route_cancellation.link_upstream(cancellation);
+        }
+        let _route_timeout = solve_deadline.map(|deadline| {
+            route_cancellation.cancel_after(deadline.saturating_duration_since(Instant::now()))
+        });
+        let _route_smt_deadline = solve_deadline.map(crate::smt::ScopedSmtDeadline::install_until);
+        let boundary_open = || {
+            !self.cancellation_token.is_cancelled()
+                && !route_cancellation.is_cancelled()
+                && solve_deadline.is_none_or(|deadline| Instant::now() < deadline)
+        };
+        let unknown = || {
+            crate::VerifiedChcResult::Unknown(crate::engine_result::VerifiedUnknownMarker::new())
+        };
+        if !boundary_open() {
+            return unknown();
+        }
+        // Every nested solver and final verifier observes this one linked
+        // route token. Per-stage timers use children so they cannot cancel the
+        // embedding caller's token.
+        bmc_config.base.cancellation_token = Some(route_cancellation.clone());
         if self.config.verbose {
             safe_eprintln!(
                 "BMC-only: Starting with max_depth={}, time_budget={:?}",
@@ -1302,23 +1357,37 @@ impl AdaptivePortfolio {
         // (item-3 compliance) behaves exactly as before by construction.
         // Identity-grade / disabled condense falls through to the
         // forwarding-only combination unchanged.
-        let condensed_first = if bmc_config
+        let condensed_first = if config_for_evidence
             .time_budget
             .is_some_and(|budget| budget >= Duration::from_secs(20))
             && crate::transform::condense_enabled()
         {
+            if !boundary_open() {
+                return unknown();
+            }
             let features = ProblemClassifier::classify(&self.problem);
+            if !boundary_open() {
+                return unknown();
+            }
             if Self::is_large_acyclic_linear_graph(&features) {
-                let condense_budget = bmc_config
-                    .time_budget
-                    .map(|budget| (budget / 3).min(Duration::from_secs(15)));
+                let condense_budget = solve_deadline.map(|deadline| {
+                    (deadline.saturating_duration_since(Instant::now()) / 3)
+                        .min(Duration::from_secs(15))
+                });
+                if condense_budget.is_some_and(|budget| budget.is_zero()) {
+                    return unknown();
+                }
                 let condense = crate::transform::CondenseSuperpass::new()
                     .with_verbose(self.config.verbose)
-                    .with_wall_budget(condense_budget);
+                    .with_wall_budget(condense_budget)
+                    .with_caller_boundary(solve_deadline, route_cancellation.clone());
                 let condensed = crate::transform::Transformer::transform(
                     Box::new(condense),
                     self.problem.clone(),
                 );
+                if !boundary_open() {
+                    return unknown();
+                }
                 let memory = condensed.back_translator.transform_memory();
                 if memory.is_identity_grade() {
                     None
@@ -1327,10 +1396,17 @@ impl AdaptivePortfolio {
                     // the bounded forwarding-only combination so dead table/
                     // memory array args are sliced (see the twin comment in
                     // run_direct_acyclic_bmc_probe).
-                    let post = PreprocessSummary::build_array_forwarding_only(
+                    let Some(post) = PreprocessSummary::build_array_forwarding_only_with_limits(
                         condensed.problem,
                         self.config.verbose,
-                    );
+                        solve_deadline,
+                        &route_cancellation,
+                    ) else {
+                        return unknown();
+                    };
+                    if !boundary_open() {
+                        return unknown();
+                    }
                     let back: Box<dyn crate::transform::BackTranslator> =
                         Box::new(crate::transform::CompositeBackTranslator {
                             inner: vec![post.back_translator, condensed.back_translator],
@@ -1358,9 +1434,8 @@ impl AdaptivePortfolio {
                     let scalarized_scalar_state = !memory.is_identity_grade()
                         && !scalarized_problem.has_datatype_sorts()
                         && !scalarized_problem.has_array_sorts();
-                    let probe_budget = bmc_config
-                        .time_budget
-                        .map(|budget| budget.saturating_sub(solve_start.elapsed()))
+                    let probe_budget = solve_deadline
+                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
                         .unwrap_or(Duration::ZERO);
                     if scalarized_scalar_state && !probe_budget.is_zero() {
                         let shared_back_translator: std::sync::Arc<
@@ -1373,15 +1448,24 @@ impl AdaptivePortfolio {
                             probe_budget,
                             "BMC-only",
                             self.config.verbose || bmc_verbose,
+                            solve_deadline,
+                            Some(&route_cancellation),
                         ) {
-                            return self.finalize_verified_result(result, evidence);
+                            return self.finalize_verified_result_with_boundary(
+                                result,
+                                evidence,
+                                solve_deadline,
+                                &route_cancellation,
+                            );
+                        }
+                        if !boundary_open() {
+                            return unknown();
                         }
                         // Follow-on: the pre-existing exact-DAG BMC lane runs
                         // on whatever budget the probe left (never more than
                         // the caller's solve-wide budget).
-                        bmc_config.time_budget = bmc_config
-                            .time_budget
-                            .map(|budget| budget.saturating_sub(solve_start.elapsed()));
+                        bmc_config.time_budget = solve_deadline
+                            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
                         let back: Box<dyn crate::transform::BackTranslator> = Box::new(
                             crate::transform::SharedBackTranslator(shared_back_translator),
                         );
@@ -1401,10 +1485,14 @@ impl AdaptivePortfolio {
         {
             (problem, Some((back, memory)))
         } else if self.problem.has_array_sorts() {
-            let summary = PreprocessSummary::build_array_forwarding_only(
+            let Some(summary) = PreprocessSummary::build_array_forwarding_only_with_limits(
                 self.problem.clone(),
                 self.config.verbose,
-            );
+                solve_deadline,
+                &route_cancellation,
+            ) else {
+                return unknown();
+            };
             if summary.transform_memory.is_identity_grade() {
                 (self.problem.clone(), None)
             } else {
@@ -1422,10 +1510,33 @@ impl AdaptivePortfolio {
         } else {
             (self.problem.clone(), None)
         };
+        if !boundary_open() {
+            return unknown();
+        }
+        let empty_safe_transfer_is_equisat_grade = forwarding_back
+            .as_ref()
+            .map_or(true, |(_, memory)| memory.is_equisat_grade());
 
+        if let Some(deadline) = solve_deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || !boundary_open() {
+                return unknown();
+            }
+            bmc_config.time_budget = Some(remaining);
+            bmc_config.per_depth_timeout = bmc_config
+                .per_depth_timeout
+                .map(|per_depth| per_depth.min(remaining));
+        }
+        bmc_config.base.cancellation_token = Some(route_cancellation.clone());
         let solver = BmcSolver::new(bmc_problem, bmc_config);
+        if !boundary_open() {
+            return unknown();
+        }
         let result = solver.solve();
         let stats = solver.stats();
+        if !boundary_open() {
+            return unknown();
+        }
 
         if self.config.verbose {
             safe_eprintln!("BMC-only: Result = {}", result);
@@ -1450,8 +1561,18 @@ impl AdaptivePortfolio {
                         back_translator.as_ref(),
                         "BMC-only",
                         self.config.verbose || bmc_verbose,
+                        solve_deadline,
+                        &route_cancellation,
                     ) {
-                        return self.finalize_verified_result(result, evidence);
+                        return self.finalize_verified_result_with_boundary(
+                            result,
+                            evidence,
+                            solve_deadline,
+                            &route_cancellation,
+                        );
+                    }
+                    if !boundary_open() {
+                        return unknown();
                     }
                     if !memory.unsafe_backtranslation_complete() {
                         if self.config.verbose {
@@ -1462,16 +1583,24 @@ impl AdaptivePortfolio {
                         }
                         crate::ChcEngineResult::Unknown
                     } else {
-                        crate::ChcEngineResult::Unsafe(back_translator.translate_invalidity(cex))
+                        let translated = back_translator.translate_invalidity(cex);
+                        if !boundary_open() {
+                            return unknown();
+                        }
+                        crate::ChcEngineResult::Unsafe(translated)
                     }
                 }
                 None => crate::ChcEngineResult::Unsafe(cex),
             },
             crate::ChcEngineResult::Safe(model) => {
-                crate::ChcEngineResult::Safe(match &forwarding_back {
+                let translated = match &forwarding_back {
                     Some((back_translator, _)) => back_translator.translate_validity(model),
                     None => model,
-                })
+                };
+                if !boundary_open() {
+                    return unknown();
+                }
+                crate::ChcEngineResult::Safe(translated)
             }
             other => other,
         };
@@ -1484,9 +1613,14 @@ impl AdaptivePortfolio {
                 crate::ChcEngineResult::Unsafe(cex),
                 ValidationEvidence::BmcCounterexample,
             ),
-            crate::ChcEngineResult::Safe(model) => {
-                self.validate_bmc_only_safe_result(model, &config_for_evidence, &stats)
-            }
+            crate::ChcEngineResult::Safe(model) => self.validate_bmc_only_safe_result(
+                model,
+                &config_for_evidence,
+                &stats,
+                empty_safe_transfer_is_equisat_grade,
+                solve_deadline,
+                &route_cancellation,
+            ),
             crate::ChcEngineResult::Unknown => (
                 crate::ChcEngineResult::Unknown,
                 self.classify_bmc_only_unknown(&config_for_evidence, &stats),
@@ -1497,7 +1631,12 @@ impl AdaptivePortfolio {
             ),
         };
 
-        self.finalize_verified_result(result, evidence)
+        self.finalize_verified_result_with_boundary(
+            result,
+            evidence,
+            solve_deadline,
+            &route_cancellation,
+        )
     }
 
     fn validate_bmc_only_safe_result(
@@ -1505,13 +1644,19 @@ impl AdaptivePortfolio {
         model: InvariantModel,
         bmc_config: &BmcConfig,
         stats: &crate::bmc::BmcStats,
+        empty_safe_transfer_is_equisat_grade: bool,
+        deadline: Option<Instant>,
+        cancellation: &crate::CancellationToken,
     ) -> (
         crate::ChcEngineResult,
         crate::engine_result::ValidationEvidence,
     ) {
         use crate::engine_result::ValidationEvidence;
 
-        if model.is_empty() && self.bmc_only_safe_is_complete_bounded_proof(bmc_config, stats) {
+        if model.is_empty()
+            && empty_safe_transfer_is_equisat_grade
+            && self.bmc_only_safe_is_complete_bounded_proof(bmc_config, stats)
+        {
             if self.bmc_only_empty_safe_is_proof_grade() {
                 return (
                     crate::ChcEngineResult::Safe(model),
@@ -1537,7 +1682,11 @@ impl AdaptivePortfolio {
             );
         }
 
-        match self.validate_adaptive_result(crate::ChcEngineResult::Safe(model)) {
+        match self.validate_adaptive_result_with_boundary(
+            crate::ChcEngineResult::Safe(model),
+            deadline,
+            cancellation,
+        ) {
             crate::ChcEngineResult::Safe(validated_model) => (
                 crate::ChcEngineResult::Safe(validated_model),
                 ValidationEvidence::FullVerification,
@@ -1965,6 +2114,61 @@ mod tests {
     }
 
     #[test]
+    fn solve_bmc_only_zero_budget_never_publishes_unsafe() {
+        let adaptive =
+            AdaptivePortfolio::new(make_bmc_unsafe_problem(), AdaptiveConfig::test_default());
+
+        let result = adaptive.solve_bmc_only(
+            BmcConfig::default()
+                .with_max_depth(10)
+                .with_time_budget(std::time::Duration::ZERO),
+        );
+
+        assert!(
+            result.is_unknown(),
+            "an already-expired absolute BMC-only deadline must fail closed: {result}"
+        );
+    }
+
+    #[test]
+    fn solve_bmc_only_inherits_expired_ambient_solve_deadline() {
+        let adaptive =
+            AdaptivePortfolio::new(make_bmc_unsafe_problem(), AdaptiveConfig::test_default());
+        let _deadline = crate::smt::ScopedSolveDeadline::new(Some(ay_core::time::Instant::now()));
+
+        let result = adaptive.solve_bmc_only(
+            BmcConfig::default()
+                .with_max_depth(10)
+                .with_time_budget(std::time::Duration::from_secs(5)),
+        );
+
+        assert!(
+            result.is_unknown(),
+            "an expired enclosing solve deadline must not be reset by the BMC-local budget: {result}"
+        );
+    }
+
+    #[test]
+    fn solve_bmc_only_pre_cancelled_caller_never_publishes_safe() {
+        let adaptive =
+            AdaptivePortfolio::new(make_acyclic_safe_problem(), AdaptiveConfig::test_default());
+        let cancellation = crate::CancellationToken::new();
+        cancellation.cancel();
+
+        let result = adaptive.solve_bmc_only(
+            BmcConfig::default()
+                .with_max_depth(2)
+                .with_acyclic_safe(true)
+                .with_cancellation(cancellation),
+        );
+
+        assert!(
+            result.is_unknown(),
+            "a pre-cancelled BMC-only caller must fail closed before preprocessing: {result}"
+        );
+    }
+
+    #[test]
     fn solve_bmc_only_strict_proofs_accepts_replayed_constructive_unsafe() {
         let adaptive = AdaptivePortfolio::new(
             make_bmc_unsafe_problem(),
@@ -2092,8 +2296,15 @@ mod tests {
             ..BmcStats::default()
         };
 
-        let (result, evidence) =
-            adaptive.validate_bmc_only_safe_result(InvariantModel::new(), &config, &stats);
+        let cancellation = crate::CancellationToken::new();
+        let (result, evidence) = adaptive.validate_bmc_only_safe_result(
+            InvariantModel::new(),
+            &config,
+            &stats,
+            true,
+            None,
+            &cancellation,
+        );
 
         assert!(
             matches!(result, ChcEngineResult::Unknown),
@@ -2118,8 +2329,15 @@ mod tests {
             ..BmcStats::default()
         };
 
-        let (result, evidence) =
-            adaptive.validate_bmc_only_safe_result(InvariantModel::new(), &config, &stats);
+        let cancellation = crate::CancellationToken::new();
+        let (result, evidence) = adaptive.validate_bmc_only_safe_result(
+            InvariantModel::new(),
+            &config,
+            &stats,
+            true,
+            None,
+            &cancellation,
+        );
 
         assert!(
             matches!(result, ChcEngineResult::Unknown),
@@ -2128,6 +2346,45 @@ mod tests {
         assert!(
             matches!(evidence, ValidationEvidence::FullVerification),
             "incomplete BMC Safe should not carry acyclic proof evidence: {evidence:?}"
+        );
+    }
+
+    #[test]
+    fn bmc_only_safe_rejects_non_equisat_transformed_empty_model() {
+        // Fabricate the result-side state reached after a non-equisat transform:
+        // exhaustive transformed BMC reported an empty Safe model, but that model
+        // does not validate on this acyclic unsafe original problem.  The complete
+        // bounded-proof shortcut must not transfer across that transform.
+        let adaptive = AdaptivePortfolio::new(
+            make_shallow_acyclic_unsafe_problem(),
+            AdaptiveConfig::test_default(),
+        );
+        let config = BmcConfig::default()
+            .with_max_depth(10)
+            .with_acyclic_safe(true);
+        let stats = BmcStats {
+            max_depth_reached: 10,
+            exhausted_search: true,
+            ..BmcStats::default()
+        };
+
+        let cancellation = crate::CancellationToken::new();
+        let (result, evidence) = adaptive.validate_bmc_only_safe_result(
+            InvariantModel::new(),
+            &config,
+            &stats,
+            false,
+            None,
+            &cancellation,
+        );
+
+        assert!(
+            matches!(result, ChcEngineResult::Unknown),
+            "non-equisat transformed empty Safe must fail closed, got {result:?}"
+        );
+        assert!(
+            matches!(evidence, ValidationEvidence::FullVerification),
+            "rejected transformed Safe must not carry exhaustive evidence: {evidence:?}"
         );
     }
 

@@ -38,9 +38,13 @@ impl Executor {
             crate::executor::unsat_cert::probe_cert_reject(|| {
                 "bv-identity-collapse: rebuilt both sides OK".to_string()
             });
-            // Both sides must share one BV sort for `=` to be well-formed.
+            // Both sides must share a Boolean/BV sort for `=` to be
+            // well-formed. Boolean is load-bearing for direct BV predicate
+            // identities such as `(bvult x 1) = (x = 0)`; the recursive
+            // congruence builder and the final independent bit-blast replay
+            // still authenticate the complete equality before it is used.
             if self.ctx.terms.sort(l_id) != self.ctx.terms.sort(r_id)
-                || !matches!(self.ctx.terms.sort(l_id), Sort::BitVec(_))
+                || !matches!(self.ctx.terms.sort(l_id), Sort::Bool | Sort::BitVec(_))
             {
                 crate::executor::unsat_cert::probe_cert_reject(|| {
                     "bv-identity-collapse: DECLINE sort gate".to_string()

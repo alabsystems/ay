@@ -2266,7 +2266,7 @@ mod tests {
         ));
     }
 
-    /// Z3 5.0.0's no-logic registry coerces Bool to Int/Real in arithmetic,
+    /// Z3 5.1.0's no-logic registry coerces Bool to Int/Real in arithmetic,
     /// so a Bool operand is not a valid negative typing control. Pin the
     /// genuinely invalid arity controls used by every affected signature.
     #[test]
@@ -2300,7 +2300,7 @@ mod tests {
             );
             assert!(
                 !witness.negative.contains("true"),
-                "Bool is numerically coercible in Z3 5.0.0: {}",
+                "Bool is numerically coercible in Z3 5.1.0: {}",
                 witness.negative
             );
         }
@@ -2315,7 +2315,7 @@ mod tests {
             );
             assert!(
                 !witness.negative.contains("true"),
-                "Bool is numerically coercible in Z3 5.0.0: {}",
+                "Bool is numerically coercible in Z3 5.1.0: {}",
                 witness.negative
             );
         }

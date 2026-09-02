@@ -84,10 +84,10 @@ fn known_build_locations() -> Vec<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
     if let Some(cache) = cache {
         let cache = cache.join("ay-veripb");
-        candidates.push(cache.join(pinned_build_id()).join("target/release/veripb"));
-        // Compatibility with the original unkeyed cache populated by
-        // scripts/cert_ci.sh. The pinned path above comes first: its directory
-        // identity covers both the upstream commit and the reviewed patch.
+        candidates.extend(pinned_cache_candidates(&cache));
+        // Compatibility with the original pre-pin cache layout populated by an
+        // early scripts/cert_ci.sh. The pinned paths above come first: their
+        // directory identity covers the upstream commit and the reviewed patch.
         candidates.push(cache.join("VeriPB/target/release/veripb"));
     }
     if let Some(home) = std::env::var_os("HOME") {
@@ -96,17 +96,70 @@ fn known_build_locations() -> Vec<PathBuf> {
     candidates
 }
 
-/// Cache-key contract shared with `scripts/ci/pb_certified_gate.sh`.
+/// Cache-key contract shared with `scripts/lib/veripb_build_id.sh` (the ONE
+/// shell-side authority, sourced by both `scripts/ci/pb_certified_gate.sh` and
+/// `scripts/cert_ci.sh`) and with `crates/ay/src/maxsat_cert.rs`.
 ///
-/// EVERY patch is part of the checker identity, so a changed or added patch
-/// must not silently reuse a binary built from the same upstream commit. Both
-/// prefixes are in the key for that reason.
-fn pinned_build_id() -> String {
+/// This is the checker's IDENTITY: the pinned upstream commit plus the first
+/// twelve hex digits of the reviewed patch's SHA-256, so a changed patch must
+/// not silently reuse a binary built from the same upstream commit. It is both
+/// the whole name of a legacy (pre-2026-08-30) cache directory and the prefix
+/// of a keyed one — the shell side appends [`RUSTC_KEY_INFIX`] plus a compiler
+/// fingerprint when it BUILDS, because compiling twice in one target dir with
+/// two compilers breaks (E0514, commit 8499748c6). This resolver never builds,
+/// and a finished binary runs the same under any of today's compilers, so
+/// resolution accepts every directory matching the identity — keyed or legacy
+/// — and the self-test plus version cross-check re-verify whichever is picked.
+/// The agreement with the shell format is pinned by an EXECUTABLE test below
+/// (`shell_and_rust_agree_on_the_cache_key`), not by convention.
+#[must_use]
+pub fn pinned_build_id() -> String {
     let patch_sha = pin::patch_sha256();
     let patch_prefix = patch_sha.get(..12).unwrap_or(patch_sha);
-    let patch2_sha = pin::patch2_sha256();
-    let patch2_prefix = patch2_sha.get(..12).unwrap_or(patch2_sha);
-    format!("{}-{patch_prefix}-{patch2_prefix}", pin::commit())
+    format!("{}-{patch_prefix}", pin::commit())
+}
+
+/// Separator between the identity prefix and the compiler fingerprint in a
+/// keyed cache-directory name. Must match the `printf` format in
+/// `scripts/lib/veripb_build_id.sh::veripb_build_id` (pinned by test).
+pub const RUSTC_KEY_INFIX: &str = "-rustc";
+
+/// Whether a `~/.cache/ay-veripb` entry name denotes a build of the pinned
+/// checker: exactly the identity (legacy layout) or the identity plus a
+/// compiler fingerprint (keyed layout).
+#[must_use]
+pub fn is_pinned_cache_dir(name: &str, pinned_id: &str) -> bool {
+    name == pinned_id
+        || name
+            .strip_prefix(pinned_id)
+            .is_some_and(|rest| rest.starts_with(RUSTC_KEY_INFIX))
+}
+
+/// Candidate checker binaries under the shared build cache, keyed builds
+/// before the legacy unkeyed one and lexically-later fingerprints first (the
+/// order is about determinism, not preference: every match is the same pinned
+/// source, and behaviour is re-proved on whichever binary wins). When nothing
+/// matching exists the legacy path is still named, so a "searched:" error
+/// message points at where a build would land.
+fn pinned_cache_candidates(cache: &Path) -> Vec<PathBuf> {
+    let pinned_id = pinned_build_id();
+    let mut names: Vec<String> = std::fs::read_dir(cache)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| is_pinned_cache_dir(name, &pinned_id))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort_by(|a, b| b.cmp(a));
+    if names.is_empty() {
+        names.push(pinned_id);
+    }
+    names
+        .iter()
+        .map(|name| cache.join(name).join("target/release/veripb"))
+        .collect()
 }
 
 fn path_lookup() -> Option<PathBuf> {
@@ -744,8 +797,12 @@ pub fn require_checker(suite: &str) -> Option<PathBuf> {
 /// twenty-one defects: defect 7 (normalization wrapping) has two opposite
 /// manifestations.
 ///
-/// The pin names TWO patch files ([`patch`] and [`patch2`]); both are part of
-/// the checker's identity and both are in the build-cache key.
+/// The pin names ONE patch file ([`patch`]): the private fork's `alab-main`
+/// delta over the shared upstream base, which carries the fix for every one of
+/// the twenty-one defects. It is part of the checker's identity and is in the
+/// build-cache key. (This repo previously carried a second, locally written
+/// patch for defects 9-21; those fixes now live in the fork and the second
+/// patch was dropped — see the prose in `ci/veripb.pin`.)
 pub mod pin {
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -809,26 +866,6 @@ pub mod pin {
     #[must_use]
     pub fn patch_sha256() -> &'static str {
         require("VERIPB_PATCH_SHA256")
-    }
-
-    /// Repo-relative path of the SECOND patch, applied on top of [`patch`].
-    ///
-    /// It exists as a separate file on purpose: [`patch`] is byte-verifiable
-    /// against the private fork, and folding a locally written fix into it would
-    /// destroy that property. This one is written here and may be edited here.
-    /// See the prose in `ci/veripb.pin`.
-    #[must_use]
-    pub fn patch2() -> &'static str {
-        require("VERIPB_PATCH2")
-    }
-
-    /// Expected SHA-256 of [`patch2`], the fix for the ninth and tenth
-    /// wrong-verdict defects (`pol` addition wrapping the cancellation
-    /// subtraction, and the propagator computing its slack in the row's own
-    /// integer width).
-    #[must_use]
-    pub fn patch2_sha256() -> &'static str {
-        require("VERIPB_PATCH2_SHA256")
     }
 
     /// Workspace root, derived from this crate's manifest directory.
@@ -966,26 +1003,13 @@ pub mod pin {
                 64,
                 "patch sha256 must be 64 hex chars"
             );
-            assert_eq!(
-                patch2_sha256().len(),
-                64,
-                "patch2 sha256 must be 64 hex chars"
-            );
-            assert_ne!(
-                patch_sha256(),
-                patch2_sha256(),
-                "the two patches must be different files"
-            );
             assert!(!version().is_empty());
         }
 
         #[test]
-        fn the_pinned_patches_match_their_recorded_hashes() {
+        fn the_pinned_patch_matches_its_recorded_hash() {
             use sha2::{Digest, Sha256};
-            for (path, expected, key) in [
-                (patch(), patch_sha256(), "VERIPB_PATCH_SHA256"),
-                (patch2(), patch2_sha256(), "VERIPB_PATCH2_SHA256"),
-            ] {
+            for (path, expected, key) in [(patch(), patch_sha256(), "VERIPB_PATCH_SHA256")] {
                 let path = repo_root().join(path);
                 let bytes = std::fs::read(&path).unwrap_or_else(|error| {
                     panic!("pinned patch {} unreadable: {error}", path.display())
@@ -994,7 +1018,7 @@ pub mod pin {
                 assert_eq!(
                     digest,
                     expected,
-                    "{} does not match {key} in {PIN_PATH}. The patches are part of \
+                    "{} does not match {key} in {PIN_PATH}. The patch is part of \
                      the checker's identity — update both together.",
                     path.display()
                 );
@@ -1030,17 +1054,292 @@ pub mod pin {
 mod tests {
     use super::*;
 
-    #[test]
-    fn pinned_cache_key_matches_the_shell_gate_contract() {
-        assert_eq!(
-            pinned_build_id(),
-            format!(
-                "{}-{}-{}",
-                pin::commit(),
-                &pin::patch_sha256()[..12],
-                &pin::patch2_sha256()[..12]
-            )
+    /// Repo-relative path of the ONE shell-side cache-key authority.
+    const BUILD_ID_LIB: &str = "scripts/lib/veripb_build_id.sh";
+
+    /// `-vV` output modelled on real rustc: commit-hash BEFORE release, which
+    /// is exactly the ordering that made a positional parse produce
+    /// unreadable directory names (commit 8499748c6).
+    #[cfg(unix)]
+    const STUB_VV: &str = "rustc 1.90.0 (abcdef12345 2026-01-01)\n\
+binary: rustc\n\
+commit-hash: abcdef1234567890ffffffffffffffffffffffff\n\
+commit-date: 2026-01-01\n\
+host: aarch64-apple-darwin\n\
+release: 1.90.0\n\
+LLVM version: 20.1.0\n";
+
+    /// Write an executable stub at `path` with the given body.
+    #[cfg(unix)]
+    fn write_stub(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).expect("write stub");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod stub");
+    }
+
+    /// An executable stub compiler whose `-vV` is [`STUB_VV`].
+    #[cfg(unix)]
+    fn write_stub_rustc(path: &Path) {
+        write_stub(
+            path,
+            &format!("#!/bin/sh\ncat <<'STUBEOF'\n{STUB_VV}STUBEOF\n"),
         );
+    }
+
+    /// Run `script` in a POSIX sh that has sourced the build-id lib, with
+    /// `$RUSTC` forced (or forcibly absent) so the lib's compiler resolution
+    /// is hermetic no matter what this machine carries on PATH.
+    #[cfg(unix)]
+    fn run_build_id_lib(rustc: Option<&Path>, script: &str) -> (Option<i32>, String, String) {
+        let lib = pin::repo_root().join(BUILD_ID_LIB);
+        assert!(lib.is_file(), "missing {BUILD_ID_LIB}");
+        let mut command = Command::new("sh");
+        command
+            .arg("-u")
+            .arg("-c")
+            .arg(format!(". '{}'\n{script}", lib.display()));
+        match rustc {
+            Some(path) => {
+                command.env("RUSTC", path);
+            }
+            None => {
+                command.env_remove("RUSTC");
+            }
+        }
+        let output = command.output().expect("run sh against the build-id lib");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout)
+                .trim_end()
+                .to_string(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// THE cross-language pin, and it is EXECUTABLE, not textual: the
+    /// cache-key format lives in one shell file, and this test runs that
+    /// file's functions under a stub compiler and compares byte-for-byte with
+    /// the Rust side. The two cannot drift the way pb_certified_gate.sh once
+    /// drifted from this resolver (the gate grew a -rustc<fingerprint> suffix
+    /// on 2026-08-30 while this file, cert_ci.sh and maxsat_cert.rs still
+    /// computed the unkeyed id, leaving the same pinned checker at two
+    /// different cache paths depending on which entry point built it).
+    #[cfg(unix)]
+    #[test]
+    fn shell_and_rust_agree_on_the_cache_key() {
+        let dir = unique_temp_dir("build-id-agree");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let stub = dir.join("rustc");
+        write_stub_rustc(&stub);
+
+        let (code, keyed, stderr) = run_build_id_lib(
+            Some(&stub),
+            &format!("veripb_build_id {} {}", pin::commit(), pin::patch_sha256()),
+        );
+        assert_eq!(code, Some(0), "veripb_build_id failed: {stderr}");
+        assert_eq!(
+            keyed,
+            format!("{}{RUSTC_KEY_INFIX}1.90.0-abcdef1234", pinned_build_id()),
+            "shell keyed id must be the Rust identity prefix plus -rustc<release>-<hash10>"
+        );
+        assert!(
+            is_pinned_cache_dir(&keyed, &pinned_build_id()),
+            "the resolver must accept every directory name the shell side builds"
+        );
+
+        let (code, legacy, stderr) = run_build_id_lib(
+            None,
+            &format!(
+                "veripb_legacy_build_id {} {}",
+                pin::commit(),
+                pin::patch_sha256()
+            ),
+        );
+        assert_eq!(code, Some(0), "veripb_legacy_build_id failed: {stderr}");
+        assert_eq!(
+            legacy,
+            pinned_build_id(),
+            "the legacy (pre-compiler-key) id IS the Rust identity"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail closed, out loud: no key may ever be minted for a compiler that
+    /// cannot be identified — a cache keyed blindly is a cache that hands a
+    /// foreign-compiler build to a gate that compiles inside it.
+    #[cfg(unix)]
+    #[test]
+    fn cache_key_refuses_an_unidentifiable_compiler() {
+        let dir = unique_temp_dir("build-id-refuse");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let broken = dir.join("rustc");
+        write_stub(&broken, "#!/bin/sh\nexit 1\n");
+        let (code, stdout, stderr) = run_build_id_lib(
+            Some(&broken),
+            &format!("veripb_build_id {} {}", pin::commit(), pin::patch_sha256()),
+        );
+        assert_ne!(
+            code,
+            Some(0),
+            "a compiler with no -vV output must be refused"
+        );
+        assert_eq!(stdout, "", "no key may be printed on the failure path");
+        assert!(
+            stderr.contains("ERROR"),
+            "the refusal must be loud: {stderr}"
+        );
+
+        // A $RUSTC that does not exist is refused too, with the fix named —
+        // cargo would fail on it as well, so silently falling through to a
+        // different compiler would key the cache with the wrong identity.
+        let (code, stdout, stderr) =
+            run_build_id_lib(Some(Path::new("/nonexistent/rustc")), "veripb_rustc_path");
+        assert_ne!(code, Some(0));
+        assert_eq!(stdout, "");
+        assert!(stderr.contains("not executable"), "{stderr}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Trust-only machine has no bare `rustc` on PATH; the lib must fall
+    /// back to the compiler_consumer sysroot's compat entry DELIBERATELY, and on a
+    /// machine that does carry a bare rustc the PATH one must outrank the
+    /// fallback (it is what cargo would run). Both branches assert a
+    /// documented rule.
+    #[cfg(unix)]
+    #[test]
+    fn cache_key_compiler_resolution_covers_a_trust_only_machine() {
+        let dir = unique_temp_dir("build-id-trust");
+        let bin = dir.join("bin");
+        let sysroot = dir.join("sysroot");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        std::fs::create_dir_all(sysroot.join("bin")).expect("mkdir");
+        let sysroot_rustc = sysroot.join("bin/rustc");
+        write_stub_rustc(&sysroot_rustc);
+        write_stub(
+            &bin.join("compiler_consumer"),
+            &format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", sysroot.display()),
+        );
+        let lib = pin::repo_root().join(BUILD_ID_LIB);
+        let output = Command::new("sh")
+            .arg("-u")
+            .arg("-c")
+            .arg(format!(
+                "PATH='{}:/usr/bin:/bin'; export PATH\n. '{}'\ncommand -v rustc || printf '\\n'\nveripb_rustc_path",
+                bin.display(),
+                lib.display()
+            ))
+            .env_remove("RUSTC")
+            .output()
+            .expect("run sh against the build-id lib");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let mut lines = stdout.lines();
+        let on_path = lines.next().unwrap_or("");
+        let resolved = lines.next().unwrap_or("");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if on_path.is_empty() {
+            assert_eq!(
+                resolved,
+                sysroot_rustc.to_str().unwrap(),
+                "with no rustc on PATH the compiler_consumer sysroot compat entry must key the cache"
+            );
+        } else {
+            assert_eq!(
+                resolved, on_path,
+                "a PATH rustc outranks the sysroot fallback — it is what cargo runs"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate scripts must SOURCE the one authority rather than carrying
+    /// their own copy of the format — inline reimplementation is exactly how
+    /// the key drifted apart in the first place — and the `-rustc` infix the
+    /// Rust resolver matches on must be the one the lib prints.
+    #[test]
+    fn gate_scripts_source_the_one_cache_key_authority() {
+        let root = pin::repo_root();
+        let lib = std::fs::read_to_string(root.join(BUILD_ID_LIB)).expect("read the build-id lib");
+        assert!(
+            lib.contains(&format!("'%s-%s{RUSTC_KEY_INFIX}%s\\n'")),
+            "the lib's keyed printf format must carry the `{RUSTC_KEY_INFIX}` infix \
+             the Rust resolver matches on"
+        );
+        for script in ["scripts/ci/pb_certified_gate.sh", "scripts/cert_ci.sh"] {
+            let text = std::fs::read_to_string(root.join(script))
+                .unwrap_or_else(|error| panic!("read {script}: {error}"));
+            assert!(
+                text.contains("scripts/lib/veripb_build_id.sh"),
+                "{script} must source the cache-key authority"
+            );
+            assert!(
+                text.contains("$(veripb_build_id "),
+                "{script} must compute its BUILD_ID via veripb_build_id"
+            );
+            for inline in ["-rustc${", "-rustc$("] {
+                assert!(
+                    !text.contains(inline),
+                    "{script} reimplements the keyed id inline (`{inline}`) \
+                     instead of using the lib"
+                );
+            }
+        }
+    }
+
+    /// The resolver accepts every cache directory the shell side may have
+    /// built — keyed by any compiler, or the pre-2026-08-30 legacy layout —
+    /// because a finished binary runs the same under any of today's compilers
+    /// and its behaviour is re-proved by the self-test either way. It must
+    /// NOT accept a directory belonging to a different pin.
+    #[test]
+    fn pinned_cache_scan_finds_keyed_and_legacy_builds_and_nothing_else() {
+        let cache = unique_temp_dir("cache-scan");
+        let pinned_id = pinned_build_id();
+        for name in [
+            pinned_id.clone(),
+            format!("{pinned_id}-rustc1.96.0-ac68faa20c"),
+            format!("{pinned_id}-rustc1.99.0-dev-acb08e7616"),
+        ] {
+            std::fs::create_dir_all(cache.join(name)).expect("mkdir");
+        }
+        let strangers = [
+            String::from("deadbeef-000000000000"),
+            format!("{pinned_id}x"),
+            format!("{pinned_id}-other"),
+        ];
+        for stranger in &strangers {
+            std::fs::create_dir_all(cache.join(stranger)).expect("mkdir");
+            assert!(
+                !is_pinned_cache_dir(stranger, &pinned_id),
+                "`{stranger}` is not a build of this pin"
+            );
+        }
+        let expected: Vec<PathBuf> = [
+            format!("{pinned_id}-rustc1.99.0-dev-acb08e7616"),
+            format!("{pinned_id}-rustc1.96.0-ac68faa20c"),
+            pinned_id.clone(),
+        ]
+        .iter()
+        .map(|name| cache.join(name).join("target/release/veripb"))
+        .collect();
+        assert_eq!(
+            pinned_cache_candidates(&cache),
+            expected,
+            "keyed builds first (later fingerprints first), legacy last, strangers never"
+        );
+
+        // An empty or absent cache still names the legacy path, so a
+        // NotFound error can say where a build would land.
+        let empty = unique_temp_dir("cache-scan-empty");
+        assert_eq!(
+            pinned_cache_candidates(&empty),
+            vec![empty.join(&pinned_id).join("target/release/veripb")]
+        );
+        let _ = std::fs::remove_dir_all(&cache);
     }
 
     #[test]

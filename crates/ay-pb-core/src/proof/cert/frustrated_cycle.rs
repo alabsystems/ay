@@ -117,8 +117,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use self::packing::{floor_of, Limits, Packing, Walk};
-use super::cp_replay::{eval_pol, CpRow};
-use super::{evaluate_linear_objective, format_assignment};
+use super::{evaluate_linear_objective, format_assignment, incumbent_is_feasible};
 use crate::proof::steps::{ConstraintId, ProofStep};
 use crate::proof::veripb::{veripb_input_constraint_count, veripb_input_row_ids, VeriPbWriter};
 use crate::types::{PbInstance, PbRel};
@@ -389,39 +388,6 @@ fn recover(instance: &PbInstance) -> Option<SignedGraph> {
 }
 
 // ---------------------------------------------------------------------------
-// Layer 3: the incumbent, re-verified against the ORIGINAL rows.
-// ---------------------------------------------------------------------------
-
-/// `true` iff `assignment` is complete for the instance and satisfies every row.
-fn incumbent_is_feasible(instance: &PbInstance, assignment: &[bool]) -> bool {
-    if assignment.len() < instance.num_vars as usize {
-        return false;
-    }
-    instance.constraints.iter().all(|constraint| {
-        let mut total: i128 = 0;
-        for term in &constraint.terms {
-            let mut satisfied = true;
-            for lit in &term.lits {
-                let Some(&value) = assignment.get((lit.var as usize).wrapping_sub(1)) else {
-                    return false;
-                };
-                if !(value ^ lit.negated) {
-                    satisfied = false;
-                    break;
-                }
-            }
-            if satisfied {
-                total += term.coeff;
-            }
-        }
-        match constraint.rel {
-            PbRel::Ge => total >= constraint.rhs,
-            PbRel::Eq => total == constraint.rhs,
-        }
-    })
-}
-
-// ---------------------------------------------------------------------------
 // Emission.
 // ---------------------------------------------------------------------------
 
@@ -517,171 +483,13 @@ fn emit(
 // Layer 4: parse the emitted bytes back and replay them.
 // ---------------------------------------------------------------------------
 
-// `DECLINE` records the first refusal site under test so a failure is
-// diagnosable instead of a bare `false`; production reads only success/failure.
-#[cfg(test)]
-thread_local! {
-    static DECLINE: std::cell::RefCell<Option<&'static str>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn decline<T>(_site: &'static str) -> Option<T> {
-    #[cfg(test)]
-    DECLINE.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(_site);
-        }
-    });
-    None
-}
-
-/// Replays the emitted proof text and returns `true` only if those BYTES
-/// establish `Σ_e x_e >= optimum` for THIS instance.
-fn self_check(
-    text: &str,
-    instance: &PbInstance,
-    incumbent: &[bool],
-    optimum: i128,
-    floor_id: u64,
-) -> bool {
-    self_check_inner(text, instance, incumbent, optimum, floor_id).is_some()
-}
-
-#[allow(clippy::too_many_lines)]
-fn self_check_inner(
-    text: &str,
-    instance: &PbInstance,
-    incumbent: &[bool],
-    optimum: i128,
-    floor_id: u64,
-) -> Option<()> {
-    let mut lines = text.lines();
-    if lines.next()? != "pseudo-Boolean proof version 3.0" {
-        return decline("header");
-    }
-    let f_line: Vec<&str> = lines.next()?.split_whitespace().collect();
-    if f_line.first()? != &"f" {
-        return decline("f-line");
-    }
-    let declared: u64 = f_line.get(1)?.parse().ok()?;
-    if declared != veripb_input_constraint_count(instance).ok()? {
-        return decline("f-count");
-    }
-
-    // Seed the database with the input rows at the ids VeriPB gives them. Every
-    // row of this family is a `>=` row, so the `=` split cannot arise; refuse
-    // rather than assume if one ever does.
-    let ids = veripb_input_row_ids(instance).ok()?;
-    let mut db: BTreeMap<u64, CpRow> = BTreeMap::new();
-    for (index, constraint) in instance.constraints.iter().enumerate() {
-        if constraint.rel != PbRel::Ge {
-            return decline("input-row-not-ge");
-        }
-        let mut row = CpRow {
-            coeff: BTreeMap::new(),
-            rhs: constraint.rhs,
-        };
-        for term in &constraint.terms {
-            let [lit] = term.lits.as_slice() else {
-                return decline("input-row-nonlinear");
-            };
-            if lit.negated {
-                row.add_coeff(lit.var, term.coeff.checked_neg()?)?;
-                row.rhs = row.rhs.checked_sub(term.coeff)?;
-            } else {
-                row.add_coeff(lit.var, term.coeff)?;
-            }
-        }
-        db.insert(ids.get(index)?.get(), row);
-    }
-
-    let mut next_id = declared.checked_add(1)?;
-    let mut conclusion: Option<String> = None;
-    let mut saw_end = false;
-    for line in lines {
-        let line = line.trim_end();
-        if line == "output NONE;" {
-            continue;
-        }
-        if line == "end pseudo-Boolean proof;" {
-            saw_end = true;
-            break;
-        }
-        if let Some(rest) = line.strip_prefix("conclusion ") {
-            if conclusion.is_some() {
-                return decline("second-conclusion");
-            }
-            conclusion = Some(rest.to_string());
-            continue;
-        }
-        // `pol` ONLY. No `red`, no `rup`, no `soli`, no `del`: every derived row
-        // is then a checked cutting-planes inference from the instance's own
-        // rows, there is no extension variable anywhere, and nothing in the
-        // proof is an assumption. Anything else is refused rather than modelled.
-        let Some(expression) = line.strip_prefix("pol ") else {
-            return decline("non-pol-rule");
-        };
-        if conclusion.is_some() {
-            return decline("rule-after-conclusion");
-        }
-        let body = expression.strip_suffix(';')?.trim_end();
-        let (row, _used) = eval_pol(body, &db)?;
-        // A feasible point must satisfy every row a sound derivation produces.
-        if !row.holds(incumbent) {
-            return decline("derived-row-false-at-incumbent");
-        }
-        db.insert(next_id, row);
-        next_id = next_id.checked_add(1)?;
-    }
-    if !saw_end {
-        return decline("missing-end");
-    }
-
-    // The row the conclusion cites must be the objective floor itself: unit
-    // coefficient on every objective variable, nothing else, degree `optimum`.
-    let floor = db.get(&floor_id)?;
-    if floor.rhs != optimum {
-        return decline("floor-degree");
-    }
-    let objective = instance.objective.as_ref()?;
-    if floor.coeff.len() != objective.terms.len() {
-        return decline("floor-support");
-    }
-    for term in &objective.terms {
-        let [lit] = term.lits.as_slice() else {
-            return decline("objective-nonlinear");
-        };
-        if lit.negated || term.coeff != 1 {
-            return decline("objective-not-unit");
-        }
-        if floor.coeff.get(&lit.var) != Some(&1) {
-            return decline("floor-coefficient");
-        }
-    }
-
-    // `BOUNDS <lb> : <id> <ub> : <witness>;`
-    let conclusion = conclusion?;
-    let rest = conclusion.strip_prefix("BOUNDS ")?;
-    let body = rest.strip_suffix(';')?;
-    let (lower_part, upper_part) = body.split_once(" : ")?;
-    let lower: i128 = lower_part.trim().parse().ok()?;
-    if lower != optimum {
-        return decline("conclusion-lower");
-    }
-    let (hint, upper_rest) = upper_part.split_once(' ')?;
-    if hint.trim().parse::<u64>().ok()? != floor_id {
-        return decline("conclusion-hint");
-    }
-    let (upper, witness) = upper_rest.split_once(" : ")?;
-    if upper.trim().parse::<i128>().ok()? != optimum {
-        return decline("conclusion-upper");
-    }
-    if witness.trim() != format_assignment(incumbent) {
-        return decline("conclusion-witness");
-    }
-    Some(())
-}
+// The whole of layer 4 lives in [`super::cp_replay`]. This certifier's emitted
+// contract — a `pol`-only derivation ending at `Σ_obj x_v >= optimum`, published
+// by a hinted `conclusion BOUNDS` — is byte-for-byte the contract
+// `odd_cycle_cover` emits from completely different mathematics, so the check
+// is shared for the same reason `CpRow` is: a private copy is a second chance
+// to model the wrong semantics in a file nobody diffs against the first.
+use super::cp_replay::self_check_pol_only_objective_floor as self_check;
 
 // ---------------------------------------------------------------------------
 // Entry point.

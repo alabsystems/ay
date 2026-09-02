@@ -174,7 +174,7 @@ struct Rows {
 
 impl Rows {
     fn len(&self) -> usize {
-        self.eqs.len() + self.ges.len()
+        self.eqs.len().saturating_add(self.ges.len())
     }
 }
 
@@ -257,34 +257,45 @@ fn parse_base(terms: &TermStore, clause: &[TermId]) -> Option<Base> {
                     base.or_splits.push(inner);
                     continue;
                 }
-                if name == "=" && args.len() == 2 {
-                    // Literal false ⟺ the equality HOLDS.
-                    if let Some(eq) = int_equality_row(terms, args[0], args[1]) {
-                        base.rows.eqs.push(eq);
+                if name == "=" {
+                    // Arity-exact destructure via iterator; a `&[_, _]` slice
+                    // pattern here carries slice-bounds obligations the
+                    // verifier cannot discharge through the `Vec` deref.
+                    let mut it = args.iter();
+                    if let (Some(&lhs), Some(&rhs), None) = (it.next(), it.next(), it.next()) {
+                        // Literal false ⟺ the equality HOLDS.
+                        if let Some(eq) = int_equality_row(terms, lhs, rhs) {
+                            base.rows.eqs.push(eq);
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
         } else if let TermData::App(Symbol::Named(name), args) = terms.get(literal) {
-            if name == "=" && args.len() == 2 {
-                // Literal false ⟺ the equality FAILS. Recorded as the
-                // equality it negates; `disequality_branches` turns that into
-                // the two ℤ branches. Never pushed to `base.rows` — the
-                // hypothesis contains the DISEQUALITY, not the equality.
-                //
-                // A VARIABLE-FREE form is declined: `int_linear_diff` returns
-                // an empty map for `(= a a)` at ANY sort (the two sides cancel
-                // before the `Sort::Int` check can run on anything), and the
-                // resulting `0 != 0` split is a reflexivity tautology, not an
-                // integer lattice fact. Leaving it to the reflexivity and
-                // ground-evaluation rules that own it keeps this rule's reach
-                // exactly what its soundness argument describes.
-                if let Some(eq) = int_equality_row(terms, args[0], args[1]) {
-                    if !eq.form.is_empty() {
-                        base.diseq_splits.push(eq);
+            if name == "=" {
+                let mut it = args.iter();
+                if let (Some(&lhs), Some(&rhs), None) = (it.next(), it.next(), it.next()) {
+                    // Literal false ⟺ the equality FAILS. Recorded as the
+                    // equality it negates; `disequality_branches` turns that
+                    // into the two ℤ branches. Never pushed to `base.rows` —
+                    // the hypothesis contains the DISEQUALITY, not the
+                    // equality.
+                    //
+                    // A VARIABLE-FREE form is declined: `int_linear_diff`
+                    // returns an empty map for `(= a a)` at ANY sort (the two
+                    // sides cancel before the `Sort::Int` check can run on
+                    // anything), and the resulting `0 != 0` split is a
+                    // reflexivity tautology, not an integer lattice fact.
+                    // Leaving it to the reflexivity and ground-evaluation
+                    // rules that own it keeps this rule's reach exactly what
+                    // its soundness argument describes.
+                    if let Some(eq) = int_equality_row(terms, lhs, rhs) {
+                        if !eq.form.is_empty() {
+                            base.diseq_splits.push(eq);
+                        }
                     }
+                    continue;
                 }
-                continue;
             }
         }
         if let Some(row) = literal_false_ge_row(terms, literal) {
@@ -324,16 +335,16 @@ fn branch_refuted(mut rows: Rows) -> bool {
     // (1) Equality substitution to fixpoint; each round removes one equality.
     let max_rounds = rows.eqs.len();
     for _ in 0..max_rounds {
-        let Some((index, pivot)) = rows.eqs.iter().enumerate().find_map(|(i, eq)| {
+        // `k` is the pivot's coefficient, ±1 by the `find` filter.
+        let Some((index, pivot, k)) = rows.eqs.iter().enumerate().find_map(|(i, eq)| {
             eq.form
                 .iter()
                 .find(|(_, c)| c.abs() == BigInt::from(1))
-                .map(|(v, _)| (i, *v))
+                .map(|(v, c)| (i, *v, c.clone()))
         }) else {
             break;
         };
         let eq = rows.eqs.swap_remove(index);
-        let k = eq.form[&pivot].clone(); // ±1
         let mut rest = eq.form.clone();
         rest.remove(&pivot);
         // k·pivot = bound − rest  ⟹  pivot = (bound − rest)/k, exact since
@@ -403,13 +414,14 @@ fn branch_refuted(mut rows: Rows) -> bool {
         return true;
     }
     // (4) Canonical two-row eliminations.
-    for (i, left) in ges.iter().enumerate() {
-        for right in ges.iter().skip(i + 1) {
-            for var in left.form.keys() {
+    let mut tail = ges.as_slice();
+    while let Some((left, rest)) = tail.split_first() {
+        tail = rest;
+        for right in rest {
+            for (var, left_coeff) in &left.form {
                 let Some(right_coeff) = right.form.get(var) else {
                     continue;
                 };
-                let left_coeff = &left.form[var];
                 if left_coeff.is_negative() == right_coeff.is_negative() {
                     continue;
                 }

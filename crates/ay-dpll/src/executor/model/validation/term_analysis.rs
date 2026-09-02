@@ -55,12 +55,12 @@ impl Executor {
             .any(|&assertion| self.term_has_datatype_carrying_array_sort(assertion))
     }
 
-    /// Whether any assertion mentions an ARRAY-sorted subterm — the trigger for
-    /// the general select-congruence model gate
-    /// (`array_select_congruence_violated`). Cheap SAT-path-only walk.
+    /// Whether the exact public query mentions an ARRAY-sorted subterm — the
+    /// trigger for the general select-congruence model gate
+    /// (`array_select_congruence_violated`). Solver-generated axioms may
+    /// constrain search but cannot arm a public model-observation gate.
     pub(crate) fn problem_has_array(&self) -> bool {
-        self.ctx
-            .assertions
+        self.independent_gate_query_roots()
             .iter()
             .any(|&assertion| self.term_mentions_array_sort(assertion))
     }

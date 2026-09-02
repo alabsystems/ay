@@ -33,8 +33,12 @@
 //! different values at one `(class, index, field)` slot — whole-element
 //! values are reconciled with field values by exact constructor projection,
 //! and the constrained fields of one element must fit a single constructor.
-//! In that case the confirmed partial model EXTENDS to a full model, so
-//! `ConfirmedSat` is returned; otherwise the blanket `CannotConfirm` stands.
+//! The decision then MATERIALIZES that proof as one bounded
+//! `(default, finite-store)` value per alias class, overlays those values on
+//! every class member, and runs the ordinary independent model checker again
+//! with residual admission disabled. `ConfirmedSat` is returned only when the
+//! fresh replay computes every original assertion to `Bool(true)`; otherwise
+//! the blanket `CannotConfirm` stands.
 //!
 //! ## Soundness argument (why `true` here cannot fabricate a `sat`)
 //!
@@ -52,15 +56,18 @@
 //! per-(class, index, slot) entry map (direct `select`/selector-chain reads)
 //! or refuses. Explicit extension: give every member of an alias class the
 //! SAME array value, whose element at each constrained index-value is the
-//! whole-element entry if present, else the common constructor applied to
-//! the field entries with the remaining fields arbitrary — SMT sorts are
-//! non-empty, so such values exist. Every residual alias then holds
+//! whole-element entry if present, else a fitting constructor applied to the
+//! field entries with the remaining fields filled by bounded canonical
+//! inhabitants. Its default is another bounded canonical datatype inhabitant.
+//! Every residual alias then holds
 //! (identical values), every residual read holds (selector projection of a
 //! matching constructor), every pinned read keeps its committed value
 //! (entry-consistency was checked), and every previously-true assertion
-//! keeps its computed truth. Hence the formula is satisfiable and
+//! keeps its computed truth. The FRESH replay checks those claims rather than
+//! relying on this argument alone. Hence the formula is satisfiable and
 //! `ConfirmedSat` is correct. The map is `Sat -> {Sat, Unknown}` only: a
-//! `false` from any check keeps today's fail-closed verdict.
+//! failure from any construction or replay check keeps today's fail-closed
+//! verdict.
 //!
 //! Committed pins are never TRUSTED to discharge residue: a residual
 //! requirement is discharged only by consistency of the FORMULA's own ground
@@ -92,10 +99,15 @@
 //!    yields a value is localized into the entry map when the term is a
 //!    direct `(select m i)` / `(fld (select m i))` read with an evaluable
 //!    index, and refuses otherwise.
-//! 4. Canonical const-array completion is deliberately NOT used anywhere
-//!    (proven unsound on `qf_abv_incremental_false_unsat`): no value is ever
-//!    fabricated for a free array — the decision is purely about joint
-//!    satisfiability of the residual constraint set.
+//! 4. The witness is local to this PROVED residual fragment. It never adopts
+//!    the solver's canonical const-array or committed store chain (the former
+//!    was proven unsound on `qf_abv_incremental_false_unsat`). Defaults and
+//!    unconstrained fields are synthesized from the DECLARED sorts under hard
+//!    depth/work bounds, and every synthesized array is replayed through a
+//!    fresh evaluator before it has any authority.
+//! 5. Classification, occurrence traversal, alias members, entries, semantic
+//!    index comparisons, and witness synthesis all have explicit hard bounds.
+//!    Exhaustion is `CannotConfirm`, never a partial witness.
 
 use std::collections::{HashMap, HashSet};
 
@@ -103,30 +115,24 @@ use ay_core::term::{Symbol, TermData};
 use ay_core::{DatatypeSort, Sort, TermId, TermStore};
 
 use crate::dt_axiom::DtResolve;
-use crate::{is_datatype_tautology_with, value_eq, EvalOutcome, Evaluator, ModelValue, ModelView};
+use crate::{is_datatype_tautology_with, EvalOutcome, Evaluator, ModelValue, ModelView};
+
+mod witness;
+pub(super) use witness::MAX_WITNESS_ENTRIES;
+use witness::{materialize_and_replay, Entry, Slot};
 
 /// Recursion bound for the residual-constraint classifier (top-level Boolean
 /// structure only; residual assertions are shallow in practice).
 const MAX_CLASSIFY_DEPTH: usize = 64;
 
-/// Which slot of an array element an entry constrains.
-#[derive(Clone, PartialEq, Eq)]
-enum Slot {
-    /// The whole element: `(= <ground> (select a i))` or a pinned select.
-    Whole,
-    /// One selector field: `(= <ground> (fld (select a i)))` or a pinned
-    /// selector-chain read.
-    Field(String),
-}
+/// Maximum alias edges admitted by one residual witness.
+const MAX_WITNESS_ALIASES: usize = 512;
 
-/// One entry of the joint constraint map: `(array, index-value, slot) ->
-/// value`, from either a residual requirement or a pinned read.
-struct Entry {
-    array: TermId,
-    index: ModelValue,
-    slot: Slot,
-    value: ModelValue,
-}
+/// Maximum free array leaves completed by one residual witness.
+const MAX_WITNESS_MEMBERS: usize = 256;
+
+/// Maximum assertion-DAG nodes inspected by the occurrence guard.
+const MAX_OCCURRENCE_NODES: usize = 16_384;
 
 /// Decide whether the unevaluable `residue` is exactly the free-datatype-array
 /// fragment AND jointly satisfiable, so the confirmed partial model provably
@@ -167,12 +173,18 @@ pub(crate) fn free_dt_array_residue_extends(
     let mut uf: HashMap<TermId, TermId> = HashMap::new();
     let mut members: HashSet<TermId> = HashSet::new();
     for &(l, r) in &cx.aliases {
-        members.insert(l);
-        members.insert(r);
+        if members.insert(l) && members.len() > MAX_WITNESS_MEMBERS {
+            return false;
+        }
+        if members.insert(r) && members.len() > MAX_WITNESS_MEMBERS {
+            return false;
+        }
         union(&mut uf, l, r);
     }
     for e in &cx.entries {
-        members.insert(e.array);
+        if members.insert(e.array) && members.len() > MAX_WITNESS_MEMBERS {
+            return false;
+        }
     }
 
     // Occurrence guard over the whole (non-quantifier) assertion DAG, and
@@ -187,6 +199,9 @@ pub(crate) fn free_dt_array_residue_extends(
     while let Some(t) = stack.pop() {
         if !seen.insert(t) {
             continue;
+        }
+        if seen.len() > MAX_OCCURRENCE_NODES {
+            return false;
         }
         match terms.get(t) {
             TermData::App(sym, args) => {
@@ -204,9 +219,17 @@ pub(crate) fn free_dt_array_residue_extends(
                 // a member: the ONE pin site that can commit a value without
                 // evaluating its argument (`eval_selector_via_model`).
                 if let (Symbol::Named(name), [arg]) = (sym, args.as_slice()) {
-                    if cx.selector_shaped(name, *arg)
-                        && contains_member(terms, *arg, &members, &mut contains_memo)
-                    {
+                    let contains = if cx.selector_shaped(name, *arg) {
+                        let Some(contains) =
+                            contains_member(terms, *arg, &members, &mut contains_memo)
+                        else {
+                            return false;
+                        };
+                        contains
+                    } else {
+                        false
+                    };
+                    if contains {
                         match cx.direct_chain(*arg, name) {
                             Some((m, i)) => chain_sites.push((t, m, i, name.clone())),
                             None => other_selector_sites.push(t),
@@ -241,12 +264,14 @@ pub(crate) fn free_dt_array_residue_extends(
             let EvalOutcome::Value(index) = ev.evaluate(idx_term) else {
                 return false; // pinned read at an unkeyable index
             };
-            cx.entries.push(Entry {
+            if !cx.push_entry(Entry {
                 array: arr,
                 index,
                 slot: Slot::Whole,
                 value: v,
-            });
+            }) {
+                return false;
+            }
         }
     }
     for (t, m, idx_term, fld) in chain_sites {
@@ -254,12 +279,14 @@ pub(crate) fn free_dt_array_residue_extends(
             let EvalOutcome::Value(index) = ev.evaluate(idx_term) else {
                 return false; // pinned field read at an unkeyable index
             };
-            cx.entries.push(Entry {
+            if !cx.push_entry(Entry {
                 array: m,
                 index,
                 slot: Slot::Field(fld),
                 value: v,
-            });
+            }) {
+                return false;
+            }
         }
     }
     for t in other_selector_sites {
@@ -268,100 +295,19 @@ pub(crate) fn free_dt_array_residue_extends(
         }
     }
 
-    // Joint satisfiability of the entry map: group by (class, index-value)
-    // and check that no two entries force different values at one slot.
-    let entries = std::mem::take(&mut cx.entries);
-    let keyed: Vec<(TermId, &Entry)> = entries
-        .iter()
-        .map(|e| (find(&mut uf, e.array), e))
-        .collect();
-    let mut grouped: Vec<usize> = (0..keyed.len()).collect();
-    // For each group representative, gather its group and check consistency.
-    let mut done: Vec<bool> = vec![false; keyed.len()];
-    for gi in grouped.drain(..) {
-        if done[gi] {
-            continue;
-        }
-        let (root, first) = keyed[gi];
-        let mut group: Vec<&Entry> = Vec::new();
-        for (j, &(r2, e2)) in keyed.iter().enumerate() {
-            if r2 != root {
-                continue;
-            }
-            match value_eq(&first.index, &e2.index) {
-                Ok(true) => {
-                    group.push(e2);
-                    done[j] = true;
-                }
-                Ok(false) => {}
-                Err(_) => return false, // incomparable index values
-            }
-        }
-        // Whole entries must all agree; field entries must agree per field.
-        let mut whole: Option<&ModelValue> = None;
-        let mut fields: Vec<(&str, &ModelValue)> = Vec::new();
-        for e in &group {
-            match &e.slot {
-                Slot::Whole => match whole {
-                    None => whole = Some(&e.value),
-                    Some(w) => {
-                        if !matches!(value_eq(w, &e.value), Ok(true)) {
-                            return false; // conflicting whole-element values
-                        }
-                    }
-                },
-                Slot::Field(f) => {
-                    if let Some((_, prev)) = fields.iter().find(|(g, _)| *g == f.as_str()) {
-                        if !matches!(value_eq(prev, &e.value), Ok(true)) {
-                            return false; // conflicting values at one field
-                        }
-                    } else {
-                        fields.push((f.as_str(), &e.value));
-                    }
-                }
-            }
-        }
-        if fields.is_empty() {
-            continue;
-        }
-        let Some(dt) = cx.element_dt_of_array(root) else {
-            return false;
-        };
-        match whole {
-            // Whole + fields: reconcile by EXACT constructor projection.
-            Some(ModelValue::Datatype { ctor, args }) => {
-                let Some(cons) = dt.constructors.iter().find(|c| c.name == *ctor) else {
-                    return false;
-                };
-                for (f, v) in &fields {
-                    let Some(pos) = cons.fields.iter().position(|cf| cf.name == *f) else {
-                        return false; // field not of the element's constructor
-                    };
-                    let Some(actual) = args.get(pos) else {
-                        return false;
-                    };
-                    if !matches!(value_eq(actual, v), Ok(true)) {
-                        return false; // field value contradicts the element
-                    }
-                }
-            }
-            // An opaque element token cannot be projected — refuse.
-            Some(_) => return false,
-            // Fields only: they must fit a single constructor.
-            None => {
-                let fits_one_ctor = dt.constructors.iter().any(|c| {
-                    fields
-                        .iter()
-                        .all(|(f, _)| c.fields.iter().any(|cf| cf.name == *f))
-                });
-                if !fits_one_ctor {
-                    return false;
-                }
-            }
-        }
+    let mut member_roots: HashMap<TermId, TermId> = HashMap::new();
+    for &member in &members {
+        let root = find(&mut uf, member);
+        member_roots.insert(member, root);
     }
-
-    true
+    materialize_and_replay(
+        terms,
+        model,
+        assertions,
+        resolve,
+        member_roots,
+        std::mem::take(&mut cx.entries),
+    )
 }
 
 /// Classification state: the alias edges, the classified alias-equality terms
@@ -378,6 +324,23 @@ struct Classifier<'a> {
 }
 
 impl Classifier<'_> {
+    fn push_alias(&mut self, equality: TermId, left: TermId, right: TermId) -> bool {
+        if self.aliases.len() >= MAX_WITNESS_ALIASES {
+            return false;
+        }
+        self.aliases.push((left, right));
+        self.alias_eq_terms.push(equality);
+        true
+    }
+
+    fn push_entry(&mut self, entry: Entry) -> bool {
+        if self.entries.len() >= MAX_WITNESS_ENTRIES {
+            return false;
+        }
+        self.entries.push(entry);
+        true
+    }
+
     /// Classify one residual assertion/conjunct. `true` = admitted (either
     /// satisfied by the pinned partial model or recorded as an allowed
     /// free-dt-array constraint); `false` = refuse the whole decision.
@@ -461,8 +424,7 @@ impl Classifier<'_> {
                 return false;
             }
             if l != r {
-                self.aliases.push((l, r));
-                self.alias_eq_terms.push(t);
+                return self.push_alias(t, l, r);
             }
             return true;
         }
@@ -494,13 +456,12 @@ impl Classifier<'_> {
             {
                 return false;
             }
-            self.entries.push(Entry {
+            return self.push_entry(Entry {
                 array,
                 index,
                 slot,
                 value,
             });
-            return true;
         }
         false
     }
@@ -570,14 +531,6 @@ impl Classifier<'_> {
             .iter()
             .any(|c| c.fields.iter().any(|f| f.name == name))
     }
-
-    /// The element datatype of the array sort of `array_var` (a class member).
-    fn element_dt_of_array(&self, array_var: TermId) -> Option<DatatypeSort> {
-        let Sort::Array(arr) = self.terms.sort(array_var) else {
-            return None;
-        };
-        element_dt(&arr.element_sort, self.resolve)
-    }
 }
 
 /// Resolve a sort to its datatype definition (native or registry-abstracted).
@@ -597,7 +550,7 @@ fn contains_member(
     t: TermId,
     members: &HashSet<TermId>,
     memo: &mut HashMap<TermId, bool>,
-) -> bool {
+) -> Option<bool> {
     // Explicit post-order: (node, children_expanded).
     let mut stack: Vec<(TermId, bool)> = vec![(t, false)];
     while let Some((cur, expanded)) = stack.pop() {
@@ -605,6 +558,9 @@ fn contains_member(
             continue;
         }
         if members.contains(&cur) {
+            if memo.len() >= MAX_OCCURRENCE_NODES {
+                return None;
+            }
             memo.insert(cur, true);
             continue;
         }
@@ -613,6 +569,9 @@ fn contains_member(
                 .children(cur)
                 .iter()
                 .any(|c| memo.get(c).copied().unwrap_or(false));
+            if memo.len() >= MAX_OCCURRENCE_NODES {
+                return None;
+            }
             memo.insert(cur, found);
         } else {
             stack.push((cur, true));
@@ -623,7 +582,7 @@ fn contains_member(
             }
         }
     }
-    memo.get(&t).copied().unwrap_or(false)
+    Some(memo.get(&t).copied().unwrap_or(false))
 }
 
 /// Tiny union-find over `TermId` (path-halving find, union by direct link).

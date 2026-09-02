@@ -37,7 +37,7 @@ use crate::cdcl::{objective_lower_bound_from_constraints, PbCdclResult, PbCdclSo
 use crate::encoding::CnfEncoder;
 use crate::optimize::max_clique::{self, MaxCliqueSolveOutcome};
 use crate::optimize::OptimizationEngine;
-use crate::output::PbSolution;
+use crate::output::{PbExactSolution, PbSolution};
 use crate::preprocess::{preprocess_one_shot_interruptible, PreprocessResult};
 use crate::types::{PbInstance, PbObjective, PbRel, PbTerm};
 use crate::{
@@ -47,38 +47,20 @@ use crate::{
 
 use ay_sat::SatResult;
 
-/// VIG-backed soundness guard for the `OptimumFound` upgrade.
-///
-/// Returns `true` iff it is sound to upgrade a `Satisfiable` incumbent with
-/// objective `value` to `OptimumFound`: the incumbent must (a) meet a SOUND lower
-/// bound `floor` on the objective (`value <= floor`, so `value == floor ==`
-/// optimum), AND (b) re-pass the Verified Incumbent Gate against the ORIGINAL
-/// constraints (defence-in-depth on the bound's soundness). The `&&`
-/// short-circuits, so the VIG re-check runs only when the cheap `value <= floor`
-/// test already holds — preserving the prior inline behaviour exactly.
-///
-/// # Embedded deductive contract (`a deductive postcondition`)
-///
-/// The postcondition pins the gate decision to EXACTLY `value <= floor &&
-/// verify_all_constraints(..)`: the upgrade can NEVER fire when `value > floor`
-/// (sound bound not met) or when the incumbent fails the VIG. Combined with the
-/// sound-LB hypothesis `floor <= obj_x` at every feasible point, this yields
-/// global optimality of `value`; the embedded deductive contract below pins the
-/// implementation to that exact gate. It activates only under
-/// `--cfg deductive_verify`.
-///
-/// NEGATIVE CONTROL (non-vacuity): dropping the lower-bound guard
-/// (`result == verify_all_constraints(..)`, i.e. upgrading any feasible incumbent
-/// to OPTIMUM regardless of `value` vs `floor`) is UNSOUND and MUST be rejected
-/// by this gate's negative-control tests.
-fn optimum_upgrade_guard(
-    value: i128,
-    floor: i128,
-    constraints: &[crate::types::PbConstraint],
-    assignment: &[bool],
-) -> bool {
-    value <= floor && verify_all_constraints(constraints, assignment)
-}
+// `optimum_upgrade_guard` — the VIG-backed soundness guard for the `OptimumFound`
+// upgrade — is defined below, in a fragment, and its documentation moved with it.
+//
+// The gate's `ensures` clause is RAW GRAMMAR — cfg-stripping runs after parsing —
+// so it cannot be hidden from a compiler that lacks the extension, and it would
+// make all 10k lines of this file unreadable to one. It therefore lives alone in a
+// fragment: the verifier reads `portfolio/optimum_guard.rs`, everyone else reads
+// `portfolio/optimum_guard_stock.rs`, and the two are pinned together by
+// `tests/native_contract_twins.rs`. Both are `include!`d rather than made a
+// submodule so the function keeps this module, its visibility and its doc links.
+#[cfg(deductive_verify)]
+include!("portfolio/optimum_guard.rs");
+#[cfg(not(deductive_verify))]
+include!("portfolio/optimum_guard_stock.rs");
 
 const SAT_IMPORT_POLL_INTERVAL: usize = 1024;
 
@@ -1061,6 +1043,38 @@ fn solve_optimization_portfolio_with_timings_impl(
         }
     }
 
+    // CONSTRUCTED WITNESS for the LAYERED GROUP-DIVISION family (certifier #8,
+    // the `linearized_pebbling_opt_layeredfan_*` CoreGuidedPB class; mirrors
+    // the König / 2-packing / clique-coloring / injcomp paths above). The
+    // certifier's fail-closed recovery proves the exact integral floor
+    // `Σ_r f(r)` from structure alone (the same value floors-as-bounds
+    // installs as the search's dual bound), and setting exactly `f(r)`
+    // variables of each group true ATTAINS it: row `r` reads
+    // `2·Σ(G_r) - Σ_p Σ(G_p) >= d_r`, and `2·f(r) - Σ_p f(p) >= d_r` is the
+    // definition `f(r) = ceil((d_r + Σ_p f(p))/2)`. Without this lane the
+    // four deep family members hold search incumbents FAR above the installed
+    // floor at the 5 s protocol (e.g. `down_r20_c39_a6`: 9126 against floor
+    // 4563), so the `floor == incumbent` verdict flip never fires and a known
+    // optimum goes unreported. 0-wrong like the shortcuts above: the witness
+    // is re-verified feasible against the ORIGINAL constraints and its exact
+    // objective must EQUAL the proven floor, so any detection/construction
+    // slip falls through to the general portfolio. Off-family cost is the
+    // recovery's O(1) header gate plus an O(1) first-row coefficient probe.
+    {
+        let phase_start = Instant::now();
+        if let Some((assignment, value)) =
+            crate::proof::layered_pebbling_constructed_optimum(instance, objective)
+        {
+            let timings = PbPortfolioPhaseTimings::default();
+            let solution = PbSolution {
+                status: PbStatus::OptimumFound,
+                assignment,
+                objective: Some(value),
+            };
+            return portfolio_outcome(solution, timings, phase_start);
+        }
+    }
+
     let linear_opt = is_linear_optimization(instance, objective);
     let lp_upgrade_eligible =
         instance.num_vars > 0 && instance.num_vars <= PORTFOLIO_LP_UPGRADE_MAX_VARS && linear_opt;
@@ -1215,6 +1229,17 @@ fn solve_optimization_portfolio_with_timings_impl(
         };
         let floor =
             objective_lower_bound_from_constraints(&instance.constraints, objective, &floor_stop);
+        // FLOORS AS BOUNDS: the certifier-recovery structural floor (today the
+        // odd-cycle-cover packing bound; see
+        // `proof::recovered_structural_search_floor` for the chain and the
+        // soundness argument). `max`-combined so it can only TIGHTEN the
+        // constraint floor, never replace a better one. Deterministic and
+        // count-bounded, so no stop context is threaded.
+        let certifier_floor = crate::proof::recovered_structural_search_floor(instance, objective);
+        let floor = match (floor, certifier_floor) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
         if let Some(floor) = floor {
             // `value` is a feasible incumbent's objective; `floor` is a sound lower
             // bound. `value <= floor` => `value == floor == optimum`. Re-verify the
@@ -5035,6 +5060,19 @@ fn run_parallel_optimization_traced_with_upgrade(
         objective_lower_bound_from_constraints(&instance.constraints, objective, &bus_floor_stop)
     {
         let _ = shared_bounds.publish_lb(GlobalSoundFloor::from_structural_constraint_floor(floor));
+    }
+    // FLOORS AS BOUNDS (pre-search): install the certifier-recovery structural
+    // floor as the search's initial dual bound. On the odd-cycle vertex-cover
+    // family the search cannot close the gap at any measured budget while the
+    // recovery proves the exact optimal floor in under a millisecond — with it
+    // on the bus, the first incumbent that MEETS the floor upgrades to OPTIMUM
+    // mid-search (`shared_bounds_optimum_upgrade` re-verifies the model from
+    // raw bits first) and the certificate chain gets the whole remaining
+    // budget. `publish_lb` keeps the max, so this only ever TIGHTENS the
+    // constraint floor above; off-family instances pay the ns-scale recovery
+    // gates and nothing else.
+    if let Some(floor) = crate::proof::recovered_structural_search_floor(instance, objective) {
+        let _ = shared_bounds.publish_lb(GlobalSoundFloor::from_certifier_recovery(floor));
     }
 
     // Each worker owns `Arc` clones of the instance/objective and is DETACHED so
@@ -9659,12 +9697,27 @@ pub fn finalize_optimum_verdict(
     let gate_stop = crate::cdcl::strided_process_memory_stop(|| {
         should_stop() || Instant::now() >= gate_deadline
     });
-    let certified_optimum = crate::proof::certified_objective_floor_interruptible(
-        &instance.constraints,
-        objective,
-        &gate_stop,
-    )
-    .is_some_and(|floor| floor >= actual_objective);
+    // FLOORS AS BOUNDS (auditT2 required fix 1): the certifier-recovery
+    // structural floor must be visible to THIS gate too. In proof mode the
+    // OPT-LIN-CERT fallback funnels its candidate through here, and on the
+    // odd-cycle family the cutting-planes floor stalls below the optimum while
+    // `recovered_structural_search_floor` proves it exactly (measured:
+    // oddrowevencolsquare_dim_054 at the 5 s protocol — incumbent 1512 ==
+    // structural floor == optimum, yet `--proof` reported `s UNKNOWN` 3/3
+    // because this gate could not see the floor). Checked FIRST because it is
+    // deterministic and count-bounded (ns-scale refusal off-family); the
+    // heavier self-budgeted cutting-planes certificate only runs when
+    // structure alone does not already meet the incumbent. `||` can only
+    // WIDEN the set of certified upgrades, never narrow it, and the upgrade
+    // below still rides on the raw-bits re-verification above.
+    let certified_optimum = crate::proof::recovered_structural_search_floor(instance, objective)
+        .is_some_and(|floor| floor >= actual_objective)
+        || crate::proof::certified_objective_floor_interruptible(
+            &instance.constraints,
+            objective,
+            &gate_stop,
+        )
+        .is_some_and(|floor| floor >= actual_objective);
 
     let mut status = result.status;
     if status == PbStatus::Satisfiable && certified_optimum {
@@ -9678,6 +9731,70 @@ pub fn finalize_optimum_verdict(
         status,
         assignment: result.assignment,
         objective: result.objective,
+    }
+}
+
+/// Candidate WIDENING for the OPT-LIN-CERT fallback (auditT2 required fix 1,
+/// the other half): pick the better re-verifiable incumbent between the
+/// portfolio's own result and the caller's phase-cached best model — in proof
+/// mode that cache holds the NATIVE CDCL phase's incumbent, which the fallback
+/// previously wrote but never read. Measured consequence on
+/// `oddrowevencolsquare_dim_054` at the 5 s protocol: the native phase finds
+/// the optimal incumbent (1512 == the odd-cycle structural floor), the
+/// portfolio's certification-reserve slice does not rediscover it, and the
+/// candidate handed to [`finalize_optimum_verdict`] was the portfolio's
+/// weaker one — so certified mode reported `s UNKNOWN` while plain mode
+/// reported `s OPTIMUM FOUND`.
+///
+/// Soundness: this function only CHOOSES between candidates, it never mints a
+/// verdict. Both arms are re-verified from raw bits here
+/// (`sanitize_optimization_incumbent`: constraints + exact objective
+/// recompute, fail-closed), the returned status is at most `Satisfiable`, and
+/// every OPTIMUM upgrade still has to pass [`finalize_optimum_verdict`]'s
+/// certified-floor gate, after which the certificate chain re-derives both
+/// bounds and the pinned external checker re-proves the emitted text. The
+/// comparison is on VERIFIED exact objectives (minimization: smaller is
+/// better); ties keep the portfolio's result so off-family byte streams
+/// cannot move.
+#[must_use]
+pub fn widen_optimum_candidate_with_cached_incumbent(
+    portfolio_solution: PbSolution,
+    cached: Option<PbExactSolution>,
+    instance: &PbInstance,
+    objective: &PbObjective,
+) -> PbSolution {
+    let Some(cached) = cached else {
+        return portfolio_solution;
+    };
+    // Only a re-verifiable feasible model can widen anything; the cached
+    // status is deliberately ignored (whatever phase produced it, here it is
+    // only ever a CANDIDATE).
+    let Some((cached_assignment, cached_objective)) =
+        sanitize_optimization_incumbent(&cached.assignment, cached.objective, instance, objective)
+    else {
+        return portfolio_solution;
+    };
+    let portfolio_objective = matches!(
+        portfolio_solution.status,
+        PbStatus::Satisfiable | PbStatus::OptimumFound
+    )
+    .then(|| {
+        sanitize_optimization_incumbent(
+            &portfolio_solution.assignment,
+            portfolio_solution.objective,
+            instance,
+            objective,
+        )
+    })
+    .flatten()
+    .map(|(_assignment, objective)| objective);
+    if portfolio_objective.is_some_and(|objective| objective <= cached_objective) {
+        return portfolio_solution;
+    }
+    PbSolution {
+        status: PbStatus::Satisfiable,
+        assignment: cached_assignment,
+        objective: Some(cached_objective),
     }
 }
 

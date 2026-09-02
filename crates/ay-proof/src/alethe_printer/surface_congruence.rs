@@ -204,6 +204,21 @@ impl AlethePrinter<'_> {
         let left_surface = &application.left_args[position];
         let right_surface = &application.right_args[position];
         if left == right {
+            // Different SMT-LIB spellings of the same bit-vector literal are
+            // parsed as the same term. The bounded positional comparator also
+            // admits this equivalence below otherwise identical applications;
+            // make that identity explicit with `refl` before using it as a
+            // congruence premise. Changed values, widths, heads, or argument
+            // positions still fall through to the existing narrow repair.
+            if surface_literal::equal_modulo_bitvec_literal_spelling(left_surface, right_surface) {
+                return Ok(SurfacePositionRepair {
+                    steps: vec![format!(
+                        "(step {bridge_id} (cl (= {left_surface} {right_surface})) :rule refl)"
+                    )],
+                    premise: bridge_id.to_string(),
+                    consumed_premise: None,
+                });
+            }
             let steps = self.multiplication_surface_pair_steps(
                 bridge_id,
                 left_surface,

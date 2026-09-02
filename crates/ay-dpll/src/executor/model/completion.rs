@@ -44,6 +44,7 @@ use num_rational::BigRational;
 use num_traits::{ToPrimitive, Zero};
 use std::time::Duration;
 
+use super::datatype_array_fields::DatatypeArrayConstructionAuthorization;
 use super::datatype_cell_authority::ExactDatatypeCellCompletions;
 use super::dt_construct_budget::MAX_OPAQUE_DT_COLLECTION_ROOTS;
 use super::{string_witness, EvalValue, Model};
@@ -51,6 +52,7 @@ use crate::executor::Executor;
 use crate::executor_types::SolveResult;
 
 mod const_interp;
+mod datatype_arrays;
 
 /// Bound on graph, declaration, and commit work for checked-projection output completion.
 ///
@@ -78,6 +80,23 @@ fn checked_datatype_root_augmentation(
     roots.extend_from_slice(extra_roots);
     roots.extend_from_slice(authenticated_roots);
     Some(roots)
+}
+
+/// Return the internal equality-carrier namespace for a supported sort.
+///
+/// Uninterpreted carriers are admitted only when their caller has established
+/// authority; sequence carriers always use their complete sort as the domain
+/// key so different element sorts cannot share a class namespace.
+fn carrier_sort_key(sort: &Sort, allow_uninterpreted: bool) -> Option<String> {
+    match sort {
+        Sort::Uninterpreted(name) if allow_uninterpreted => Some(name.clone()),
+        // This is an INTERNAL EufModel namespace, not an SMT-LIB sort
+        // declaration. Including the complete sort keeps Seq Int and Seq Bool
+        // class domains separate even if their printable class names happen to
+        // match.
+        Sort::Seq(_) => Some(format!("@ay-seq-carrier:{sort}")),
+        _ => None,
+    }
 }
 
 /// Typed outcome of the output-only completion pass for a checked projection
@@ -350,6 +369,8 @@ impl Executor {
                 .set_int("model_completion.late_defaulted", late_defaulted as u64);
         }
 
+        let datatype_array_plan = self.datatype_array_completion_plan(extra_roots);
+        let pre_dt_roots = datatype_array_plan.roots();
         // Phase 3: synthesize equality-class values for opaque carriers that
         // carry no model value. The eager BV/AUFBV path bit-blasts only the
         // BV/array index structure; an array whose element sort is an
@@ -363,84 +384,13 @@ impl Executor {
         // distinct, model-resident element so exact validation can decide
         // equality-only uses. Sequence builtins still require a concrete
         // SeqModel value and remain fail-closed.
-        self.complete_uninterpreted_sort_model(&mut model, extra_roots);
+        self.complete_uninterpreted_sort_model(
+            &mut model,
+            pre_dt_roots,
+            datatype_array_plan.eligible_carriers(),
+        );
 
-        // Phase 4 (#g4-dt-ce-select): re-derive substituted BV/Bool vars whose
-        // defining term reads a DATATYPE/uninterpreted-ELEMENT array. Phase 2's
-        // fixpoint ran BEFORE the EUF element model existed — Phase 3
-        // (`complete_uninterpreted_sort_model`) is what pins each `select`
-        // congruence-class element into `euf_model.term_values` — so a
-        // datatype-selector-over-array read (e.g. `(fld_rhs (select a i))`)
-        // evaluated to Unknown then and the variable kept the STALE BV-lane
-        // default the pre-EUF recovery produced (e.g. 0), invalidating the
-        // emitted model (a subst-recovered guard mis-derived). Now that the
-        // elements are pinned, the array-aware `evaluate_term` — via the
-        // committed-element `select` fallback in `bv_select_fallback` — resolves
-        // the read; re-derive to a small fixpoint so chained defs settle. SOUND:
-        // `evaluate_term` reads only committed theory-model values and fails
-        // closed to Unknown (the value is then left unchanged and validation
-        // degrades to Unknown), so this only ever replaces a stale value with
-        // the committed-model value, never fabricates one — and validation
-        // re-checks every assertion under the result.
-        let sub_pairs: Vec<(TermId, TermId)> = self
-            .recorded_var_substitutions
-            .iter()
-            .map(|(&from, &to)| (from, to))
-            .collect();
-        // Closure: substituted vars whose value transitively depends on a
-        // datatype-element-array read — the direct readers, plus any substituted
-        // var whose def references one of them (e.g. `kani_assert_12` reads
-        // `local_6_0`). Only these need re-derivation; leaving the rest untouched
-        // keeps the change minimal and avoids disturbing correctly-recovered vars.
-        let mut dt_dep: HashSet<TermId> = sub_pairs
-            .iter()
-            .filter(|&&(_, to)| Self::target_reads_datatype_element_array(&self.ctx.terms, to))
-            .map(|&(from, _)| from)
-            .collect();
-        loop {
-            let mut added = false;
-            for &(from, to) in &sub_pairs {
-                if !dt_dep.contains(&from)
-                    && Self::term_references_var_in_set(&self.ctx.terms, to, &dt_dep)
-                {
-                    dt_dep.insert(from);
-                    added = true;
-                }
-            }
-            if !added {
-                break;
-            }
-        }
-        let dt_targets: Vec<(TermId, TermId)> = sub_pairs
-            .into_iter()
-            .filter(|&(f, _)| dt_dep.contains(&f))
-            .collect();
-        if !dt_targets.is_empty() {
-            // Re-derive to a fixpoint: each pass overwrites any dt-dependent var
-            // whose def now evaluates (through the committed EUF element model) to
-            // a concrete value different from its stale one; `insert_completed_value`
-            // clears the eval memo so dependents see the update next pass. Bounded
-            // by chain length. Fail-closed: Unknown leaves the value as-is.
-            let max_passes = dt_targets.len() + 1;
-            for _ in 0..max_passes {
-                let mut changed = false;
-                for &(from, to) in &dt_targets {
-                    let value = self.evaluate_term(&model, to);
-                    if matches!(value, EvalValue::Unknown)
-                        || value == self.evaluate_term(&model, from)
-                    {
-                        continue;
-                    }
-                    if Self::insert_completed_value(&self.ctx.terms, &mut model, from, &value) {
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    break;
-                }
-            }
-        }
-
+        self.replay_datatype_array_dependent_substitutions(&mut model);
         // Phase 5 (#dt-total-model): total datatype model construction. Build
         // equivalence classes over the datatype-sorted terms, assign every
         // class a concrete constructor value (forced constructor with
@@ -460,18 +410,36 @@ impl Executor {
         // datatype result. This is enough to put both source terms in the
         // total-DT class builder without granting arbitrary preprocessed-away
         // formulas construction authority.
-        let dt_constructed = if extra_roots.len() > MAX_OPAQUE_DT_COLLECTION_ROOTS {
-            0
-        } else {
-            let authenticated = self.authored_datatype_array_cell_equalities(extra_roots);
-            if authenticated.is_empty() {
-                self.construct_total_datatype_model(&mut model, extra_roots)
-            } else {
-                checked_datatype_root_augmentation(extra_roots, &authenticated).map_or(0, |roots| {
-                    self.construct_total_datatype_model(&mut model, &roots)
+        // Each authenticated slice is atomic, but one unavailable optional
+        // producer must not suppress ordinary datatype construction. In
+        // particular, stale/over-budget extensionality evidence withholds only
+        // that generated root slice; authored hard roots and the caller's base
+        // roots remain usable. Hazardous values still require a complete W6
+        // inventory at every consumer, so this fallback cannot authorize a
+        // partial structured row.
+        let authored_array_cells = self
+            .authored_datatype_array_construction_cells()
+            .unwrap_or_default();
+        let mut extensionality_cells = Vec::new();
+        let extensional_dt_roots = match self.authenticated_datatype_array_extensionality(&model) {
+            Some(evidence) if !evidence.roots.is_empty() => {
+                checked_datatype_root_augmentation(pre_dt_roots, &evidence.roots).map(|roots| {
+                    // Authorization accompanies only the exact generated roots
+                    // that were successfully appended to this construction
+                    // call. A withheld slice contributes no capability.
+                    extensionality_cells = evidence.cells;
+                    roots
                 })
             }
+            _ => None,
         };
+        let dt_roots = extensional_dt_roots.as_deref().unwrap_or(pre_dt_roots);
+        let array_field_authorization = DatatypeArrayConstructionAuthorization::from_cells(
+            authored_array_cells,
+            extensionality_cells,
+        );
+        let dt_constructed =
+            self.construct_total_datatype_model(&mut model, dt_roots, &array_field_authorization);
         if dt_constructed > 0 {
             self.last_statistics
                 .set_int("model_completion.dt_constructed", dt_constructed as u64);
@@ -484,8 +452,9 @@ impl Executor {
         // and are deliberately left partial.  The printer is not a completion
         // authority and will fail closed if this phase cannot build a coherent
         // candidate.
+        let array_roots = dt_roots;
         let (arrays_completed, _) =
-            self.complete_array_models_for_validation(&mut model, extra_roots);
+            self.complete_array_models_for_validation(&mut model, array_roots);
         if arrays_completed > 0 {
             self.last_statistics
                 .set_int("model_completion.arrays_completed", arrays_completed as u64);
@@ -558,83 +527,32 @@ impl Executor {
     /// facts only (top-level roots and recursively flattened `and` conjuncts),
     /// with bounded traversal and exact theory identity/signature checks.
     fn authored_datatype_array_cell_equalities(&self, existing_roots: &[TermId]) -> Vec<TermId> {
-        const MAX_TERMS: usize = 4_096;
-
-        let Some(authored) = self.independent_gate_authored_assertions.as_ref() else {
+        let Some(equalities) = self.datatype_array_hard_equalities() else {
             return Vec::new();
         };
-        if authored.len() > MAX_OPAQUE_DT_COLLECTION_ROOTS {
-            return Vec::new();
-        }
         let guard = super::rendered_dt_guard::RenderedDatatypeGuard::new(self);
         if !guard.is_bounded() {
             return Vec::new();
         }
-        let canonical_control_head_is_coherent = |identity: &str| {
-            self.ctx
-                .symbol_info_by_identity(identity)
-                .is_none_or(|info| {
-                    self.ctx.effective_declaration_kind(info.declaration_id())
-                        == Some(DeclarationKind::Theory)
-                })
-        };
-        let mut stack = authored.clone();
-        let mut seen = HashSet::default();
         let mut roots = Vec::new();
-        while let Some(root) = stack.pop() {
-            if self.ctx.terms.entry_stamp(root).is_none() {
-                return Vec::new();
-            }
-            if !seen.insert(root) {
-                continue;
-            }
-            if seen.len() > MAX_TERMS {
-                return Vec::new();
-            }
-            let TermData::App(symbol, args) = self.ctx.terms.get(root) else {
-                continue;
-            };
-            if matches!(symbol, Symbol::Named(_)) && symbol.name() == "and" {
-                if !canonical_control_head_is_coherent("and")
-                    || !matches!(self.ctx.terms.sort(root), Sort::Bool)
-                    || args
-                        .iter()
-                        .any(|&arg| !matches!(self.ctx.terms.sort(arg), Sort::Bool))
-                    || stack
-                        .len()
-                        .checked_add(args.len())
-                        .is_none_or(|pending| pending > MAX_TERMS)
-                {
-                    return Vec::new();
+        for equality in equalities {
+            let eligible = [equality.lhs, equality.rhs].into_iter().any(|select| {
+                match self.ctx.terms.get(select) {
+                    TermData::App(select_symbol, select_args) => self
+                        .dt_completion_array_select_application_guarded(
+                            &guard,
+                            select_symbol,
+                            select_args,
+                            select,
+                        ),
+                    _ => false,
                 }
-                stack.extend(args.iter().copied());
-                continue;
-            }
-            if !matches!(symbol, Symbol::Named(_)) || symbol.name() != "=" {
-                continue;
-            }
-            if !canonical_control_head_is_coherent("=")
-                || !matches!(self.ctx.terms.sort(root), Sort::Bool)
-                || args.len() != 2
-                || self.ctx.terms.sort(args[0]) != self.ctx.terms.sort(args[1])
+            });
+            if eligible
+                && !self.ctx.assertions.contains(&equality.root)
+                && !existing_roots.contains(&equality.root)
             {
-                return Vec::new();
-            }
-            let eligible =
-                [args[0], args[1]]
-                    .into_iter()
-                    .any(|select| match self.ctx.terms.get(select) {
-                        TermData::App(select_symbol, select_args) => self
-                            .dt_completion_array_select_application_guarded(
-                                &guard,
-                                select_symbol,
-                                select_args,
-                                select,
-                            ),
-                        _ => false,
-                    });
-            if eligible && !self.ctx.assertions.contains(&root) && !existing_roots.contains(&root) {
-                roots.push(root);
+                roots.push(equality.root);
                 if roots.len() > MAX_OPAQUE_DT_COLLECTION_ROOTS {
                     return Vec::new();
                 }
@@ -730,6 +648,7 @@ impl Executor {
                         read,
                         &array_sort.element_sort,
                         super::output_format::ArrayInterpMode::CompleteDefault,
+                        None,
                     )
                     .is_none(),
                 _ => {
@@ -821,7 +740,6 @@ impl Executor {
                 }
             }
         }
-
         // Directed hard definitions (including recorded substitutions and
         // active assumption equalities) are solved to a bounded fixpoint.  A
         // target's pre-existing explicit default is checked against, never
@@ -1350,11 +1268,15 @@ impl Executor {
         // nested field read anywhere (a bare asserted disequality, say) has
         // nothing to mis-spell and keeps its printable completed witness —
         // the case cead05ab0 dropped the sort-wide guard for.
-        if self.array_field_datatype_cells_observed(array_sort) {
-            return None;
-        }
-        let (default, mut stores) =
-            self.array_completion_candidate_interp(model, term, &array_sort.element_sort, mode)?;
+        let authenticated_dt_cells =
+            self.authenticated_datatype_array_completion_members(model, array_sort)?;
+        let (default, mut stores) = self.array_completion_candidate_interp(
+            model,
+            term,
+            &array_sort.element_sort,
+            mode,
+            Some(&authenticated_dt_cells),
+        )?;
         stores.reverse();
         Some(ArrayInterpretation {
             default: Some(default),
@@ -1956,25 +1878,23 @@ impl Executor {
     /// Unknown — never a wrong SAT. No opaque sequence identity is exposed as a
     /// sequence value: both validation and output consume the same concrete
     /// `EvalValue::Seq` entries.
-    fn complete_uninterpreted_sort_model(&mut self, model: &mut Model, extra_roots: &[TermId]) {
+    fn complete_uninterpreted_sort_model(
+        &mut self,
+        model: &mut Model,
+        extra_roots: &[TermId],
+        authenticated_datatype_terms: Option<&HashSet<TermId>>,
+    ) {
         use ay_core::kani_compat::DetHashMap as HashMap;
 
         // Uninterpreted-sort completion remains confined to the eager BV/AUFBV
         // gap: the array-theory paths produce their own EUF + array model and
         // must not be perturbed. Sequence equality carriers are independent of
         // that lane and may need completion even when no BV model exists.
-        fn carrier_sort_key(sort: &Sort, allow_uninterpreted: bool) -> Option<String> {
-            match sort {
-                Sort::Uninterpreted(name) if allow_uninterpreted => Some(name.clone()),
-                // This is an INTERNAL EufModel namespace, not an SMT-LIB sort
-                // declaration. Including the complete sort keeps Seq Int and
-                // Seq Bool class domains separate even if their printable class
-                // names happen to match.
-                Sort::Seq(_) => Some(format!("@ay-seq-carrier:{sort}")),
-                _ => None,
-            }
-        }
         let allow_uninterpreted = model.bv_model.is_some();
+        let carrier_allowed = |term: TermId| {
+            allow_uninterpreted
+                || authenticated_datatype_terms.is_some_and(|terms| terms.contains(&term))
+        };
 
         // 1. Gather supported carrier subterms + same-carrier equality atoms
         //    reachable from the assertions (skip quantifier/let bodies, whose
@@ -2003,7 +1923,7 @@ impl Executor {
             if !seen.insert(tid) {
                 continue;
             }
-            if carrier_sort_key(self.ctx.terms.sort(tid), allow_uninterpreted).is_some() {
+            if carrier_sort_key(self.ctx.terms.sort(tid), carrier_allowed(tid)).is_some() {
                 carrier_terms.push(tid);
             }
             match self.ctx.terms.get(tid) {
@@ -2012,7 +1932,8 @@ impl Executor {
                         let lhs_sort = self.ctx.terms.sort(args[0]);
                         let rhs_sort = self.ctx.terms.sort(args[1]);
                         if lhs_sort == rhs_sort
-                            && carrier_sort_key(lhs_sort, allow_uninterpreted).is_some()
+                            && carrier_sort_key(lhs_sort, carrier_allowed(args[0])).is_some()
+                            && carrier_sort_key(rhs_sort, carrier_allowed(args[1])).is_some()
                         {
                             eq_atoms.push((tid, args[0], args[1]));
                         }
@@ -2205,7 +2126,7 @@ impl Executor {
             if matches!(sort, Sort::Seq(_)) {
                 continue;
             }
-            let Some(sort_name) = carrier_sort_key(sort, allow_uninterpreted) else {
+            let Some(sort_name) = carrier_sort_key(sort, carrier_allowed(t)) else {
                 continue;
             };
             let root = find(&mut parent, idx);
@@ -5380,356 +5301,7 @@ mod bv_missing_entry_completion_tests {
 }
 
 #[cfg(test)]
-mod equality_carrier_completion_tests {
-    use super::{Executor, Model};
-    use ay_core::kani_compat::DetHashMap as HashMap;
-    use ay_core::term::Symbol;
-    use ay_core::Sort;
-    use ay_frontend::parse;
-    use ay_seq::SeqModel;
-    use num_bigint::BigInt;
-    use num_rational::BigRational;
-
-    fn completed_seq(model: &Model, term: ay_core::TermId) -> &Vec<super::EvalValue> {
-        match model.completed_values.get(&term) {
-            Some(super::EvalValue::Seq(elems)) => elems,
-            other => panic!("expected concrete completed sequence, got {other:?}"),
-        }
-    }
-
-    fn declared_seq_var(exec: &mut Executor, name: &str, sort: Sort) -> ay_core::TermId {
-        let term = exec.ctx.terms.mk_var(name, sort.clone());
-        exec.ctx.register_symbol(name.to_string(), term, sort);
-        term
-    }
-
-    #[test]
-    fn nested_sat_true_sequence_equality_gets_one_model_class_without_bv() {
-        let mut exec = Executor::new();
-        exec.set_self_check(true);
-        let seq_int = Sort::Seq(Box::new(Sort::Int));
-        let x = declared_seq_var(&mut exec, "seq-class-x", seq_int.clone());
-        let y = declared_seq_var(&mut exec, "seq-class-y", seq_int.clone());
-        let z = declared_seq_var(&mut exec, "seq-class-z", seq_int);
-        let equal = exec.ctx.terms.mk_eq(x, y);
-        let guard = exec.ctx.terms.mk_var("seq-class-guard", Sort::Bool);
-        let nested = exec.ctx.terms.mk_or(vec![equal, guard]);
-        let distinct = exec.ctx.terms.mk_distinct(vec![x, z]);
-        exec.self_check_authored_assertions = Some(vec![nested, distinct]);
-        assert!(exec.ctx.assertions.is_empty());
-
-        let mut model = Model::empty();
-        model.sat_model = vec![true];
-        model.term_to_var.insert(equal, 0);
-        assert!(model.bv_model.is_none());
-
-        exec.complete_uninterpreted_sort_model(&mut model, &[]);
-
-        assert_eq!(completed_seq(&model, x), completed_seq(&model, y));
-        assert_ne!(completed_seq(&model, x), completed_seq(&model, z));
-        assert!(model.euf_model.as_ref().is_none_or(|euf| {
-            [x, y, z].iter().all(|term| {
-                !euf.term_values
-                    .get(term)
-                    .is_some_and(|v| v.starts_with("@ay-seq"))
-            })
-        }));
-    }
-
-    #[test]
-    fn default_completion_ignores_independent_gate_only_authored_roots() {
-        let mut exec = Executor::new();
-        let seq_int = Sort::Seq(Box::new(Sort::Int));
-        let x = declared_seq_var(&mut exec, "seq-gate-only-x", seq_int.clone());
-        let y = declared_seq_var(&mut exec, "seq-gate-only-y", seq_int.clone());
-        let z = declared_seq_var(&mut exec, "seq-gate-only-z", seq_int);
-        let equal = exec.ctx.terms.mk_eq(x, y);
-        let guard = exec.ctx.terms.mk_var("seq-gate-only-guard", Sort::Bool);
-        let nested = exec.ctx.terms.mk_or(vec![equal, guard]);
-        let distinct = exec.ctx.terms.mk_distinct(vec![x, z]);
-        exec.independent_gate_authored_assertions = Some(vec![nested, distinct]);
-        assert!(!exec.self_check(), "the regression exercises default mode");
-        assert!(exec.self_check_authored_assertions.is_none());
-        assert!(exec.ctx.assertions.is_empty());
-
-        let mut model = Model::empty();
-        model.sat_model = vec![true];
-        model.term_to_var.insert(equal, 0);
-
-        exec.complete_uninterpreted_sort_model(&mut model, &[]);
-
-        assert!(
-            [x, y, z]
-                .iter()
-                .all(|term| !model.completed_values.contains_key(term)),
-            "installing independent-gate roots must not make default model \
-             completion consume self-check-only carrier roots"
-        );
-    }
-
-    #[test]
-    fn nested_sat_false_sequence_equality_does_not_merge_classes() {
-        let mut exec = Executor::new();
-        let seq_int = Sort::Seq(Box::new(Sort::Int));
-        let x = declared_seq_var(&mut exec, "seq-false-x", seq_int.clone());
-        let y = declared_seq_var(&mut exec, "seq-false-y", seq_int);
-        let equal = exec.ctx.terms.mk_eq(x, y);
-        let guard = exec.ctx.terms.mk_var("seq-false-guard", Sort::Bool);
-        let nested = exec.ctx.terms.mk_or(vec![equal, guard]);
-        exec.ctx.assertions.push(nested);
-
-        let mut model = Model::empty();
-        model.sat_model = vec![false];
-        model.term_to_var.insert(equal, 0);
-
-        exec.complete_uninterpreted_sort_model(&mut model, &[]);
-
-        assert_ne!(
-            completed_seq(&model, x),
-            completed_seq(&model, y),
-            "a nested equality assigned false must not merge its operands"
-        );
-    }
-
-    #[test]
-    fn sequence_completion_reuses_an_existing_model_class() {
-        let mut exec = Executor::new();
-        let seq_int = Sort::Seq(Box::new(Sort::Int));
-        let x = declared_seq_var(&mut exec, "seq-existing-x", seq_int.clone());
-        let y = declared_seq_var(&mut exec, "seq-existing-y", seq_int);
-        let equal = exec.ctx.terms.mk_eq(x, y);
-        exec.ctx.assertions.push(equal);
-
-        let mut model = Model::empty();
-        let mut euf = ay_euf::EufModel::default();
-        euf.term_values.insert(x, "model-class-7".to_string());
-        model.euf_model = Some(euf);
-
-        exec.complete_uninterpreted_sort_model(&mut model, &[]);
-
-        assert_eq!(completed_seq(&model, x), completed_seq(&model, y));
-        assert!(matches!(
-            model.euf_model.as_ref().and_then(|euf| euf.term_values.get(&x)),
-            Some(value) if value == "model-class-7"
-        ));
-    }
-
-    #[test]
-    fn conflicting_concrete_sequences_forced_equal_do_not_fill_missing_member() {
-        let mut exec = Executor::new();
-        let seq_int = Sort::Seq(Box::new(Sort::Int));
-        let x = declared_seq_var(&mut exec, "seq-conflict-x", seq_int.clone());
-        let y = declared_seq_var(&mut exec, "seq-conflict-y", seq_int.clone());
-        let missing = declared_seq_var(&mut exec, "seq-conflict-missing", seq_int);
-        let xy = exec.ctx.terms.mk_eq(x, y);
-        let ym = exec.ctx.terms.mk_eq(y, missing);
-        exec.ctx.assertions.extend([xy, ym]);
-
-        let mut model = Model::empty();
-        let mut values = HashMap::default();
-        values.insert(x, Vec::new());
-        values.insert(y, vec!["7".to_string()]);
-        model.seq_model = Some(SeqModel { values });
-
-        exec.complete_uninterpreted_sort_model(&mut model, &[]);
-
-        assert!(
-            !model.completed_values.contains_key(&missing),
-            "a conflicting concrete class must remain unresolved and fail closed"
-        );
-    }
-
-    #[test]
-    fn concrete_sequence_class_is_propagated_without_an_opaque_identity() {
-        let mut exec = Executor::new();
-        let seq_int = Sort::Seq(Box::new(Sort::Int));
-        let concrete = declared_seq_var(&mut exec, "seq-concrete", seq_int.clone());
-        let missing = declared_seq_var(&mut exec, "seq-missing", seq_int);
-        let equal = exec.ctx.terms.mk_eq(concrete, missing);
-        exec.ctx.assertions.push(equal);
-
-        let mut model = Model::empty();
-        let mut values = HashMap::default();
-        values.insert(concrete, vec!["11".to_string()]);
-        model.seq_model = Some(SeqModel { values });
-
-        exec.complete_uninterpreted_sort_model(&mut model, &[]);
-
-        assert_eq!(
-            completed_seq(&model, concrete),
-            completed_seq(&model, missing)
-        );
-        assert_eq!(completed_seq(&model, missing).len(), 1);
-        assert!(model.euf_model.as_ref().is_none_or(|euf| {
-            !euf.term_values
-                .get(&missing)
-                .is_some_and(|v| v.starts_with("@ay-seq"))
-        }));
-    }
-
-    #[test]
-    fn native_sequence_term_anchors_class_but_is_never_completed() {
-        let mut exec = Executor::new();
-        let seq_int = Sort::Seq(Box::new(Sort::Int));
-        let x = declared_seq_var(&mut exec, "seq-native-anchor-x", seq_int.clone());
-        let seven = exec.ctx.terms.mk_int(BigInt::from(7));
-        let unit =
-            exec.ctx
-                .terms
-                .mk_app(Symbol::Named("seq.unit".to_string()), vec![seven], seq_int);
-        let equal = exec.ctx.terms.mk_eq(x, unit);
-        exec.ctx.assertions.push(equal);
-
-        let mut model = Model::empty();
-        exec.complete_uninterpreted_sort_model(&mut model, &[]);
-
-        assert_eq!(completed_seq(&model, x).len(), 1);
-        assert_eq!(
-            completed_seq(&model, x)[0],
-            super::EvalValue::Rational(BigRational::from_integer(BigInt::from(7)))
-        );
-        assert!(
-            !model.completed_values.contains_key(&unit),
-            "native seq.unit is a semantic class anchor, never a completion target"
-        );
-    }
-
-    #[test]
-    fn opaque_uninterpreted_elements_do_not_become_public_sequence_witnesses() {
-        let mut exec = Executor::new();
-        let elem = Sort::Uninterpreted("SeqElem".to_string());
-        let seq = Sort::Seq(Box::new(elem));
-        let x = declared_seq_var(&mut exec, "seq-uninterp-x", seq.clone());
-        let y = declared_seq_var(&mut exec, "seq-uninterp-y", seq);
-        let distinct = exec.ctx.terms.mk_distinct(vec![x, y]);
-        exec.ctx.assertions.push(distinct);
-
-        let mut model = Model::empty();
-        exec.complete_uninterpreted_sort_model(&mut model, &[]);
-
-        assert!(model.completed_values.get(&x).is_none());
-        assert!(model.completed_values.get(&y).is_none());
-        assert_eq!(
-            exec.last_statistics
-                .get_int("model_completion.sequence_budget_or_value_blocked"),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn sequence_completion_cell_budget_has_exact_fail_closed_boundary() {
-        // Lengths 0..63 consume 2016 cells in class representatives and 2016
-        // more in per-term completed values: 4032 <= the 4096-cell budget.
-        // Adding class 64 would consume 4160 total cells and must commit none.
-        for (classes, should_complete) in [(64usize, true), (65usize, false)] {
-            let mut exec = Executor::new();
-            let seq = Sort::Seq(Box::new(Sort::Int));
-            let vars: Vec<_> = (0..classes)
-                .map(|idx| {
-                    declared_seq_var(
-                        &mut exec,
-                        &format!("seq-budget-{classes}-{idx}"),
-                        seq.clone(),
-                    )
-                })
-                .collect();
-            let distinct = exec.ctx.terms.mk_distinct(vars.clone());
-            exec.ctx.assertions.push(distinct);
-            let mut model = Model::empty();
-
-            exec.complete_uninterpreted_sort_model(&mut model, &[]);
-
-            assert_eq!(
-                vars.iter()
-                    .all(|term| model.completed_values.contains_key(term)),
-                should_complete,
-                "unexpected completion decision for {classes} classes"
-            );
-            if !should_complete {
-                assert!(vars
-                    .iter()
-                    .all(|term| !model.completed_values.contains_key(term)));
-                assert_eq!(
-                    exec.last_statistics
-                        .get_int("model_completion.sequence_budget_or_value_blocked"),
-                    Some(1)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn equality_only_sequence_model_and_values_round_trip_without_opaque_tokens() {
-        let input = "\
-(set-logic QF_SEQ)\n\
-(set-option :produce-models true)\n\
-(declare-const x (Seq Int))\n\
-(declare-const y (Seq Int))\n\
-(declare-const z (Seq Int))\n\
-(assert (= x y))\n\
-(assert (distinct x z))\n\
-(check-sat)\n\
-(get-model)\n\
-(get-value (x y z))";
-        let commands = parse(input).expect("valid sequence equality query");
-        let mut exec = Executor::new();
-        exec.set_self_check(true);
-        let outputs = exec.execute_all(&commands).expect("query executes");
-        assert_eq!(outputs.first().map(String::as_str), Some("sat"));
-
-        let model = outputs.get(1).expect("get-model output");
-        let values = outputs.get(2).expect("get-value output");
-        assert!(!model.contains("@ay-seq"), "opaque class leaked: {model}");
-        assert!(!values.contains("@ay-seq"), "opaque class leaked: {values}");
-        assert!(model.contains("(define-fun x () (Seq Int)"));
-        assert!(model.contains("(define-fun y () (Seq Int)"));
-        assert!(model.contains("(define-fun z () (Seq Int)"));
-
-        // Re-feed the emitted definitions as an ordinary SMT-LIB query. This
-        // checks both syntax and semantics: the concrete model must still make
-        // x=y and x!=z true, and its get-value answers must match the original.
-        let definitions = model
-            .strip_prefix("(model\n")
-            .and_then(|body| body.strip_suffix("\n)"))
-            .expect("canonical model response");
-        let replay = format!(
-            "(set-logic QF_SEQ)\n{definitions}\n\
-             (assert (= x y))\n\
-             (assert (distinct x z))\n\
-             (check-sat)\n\
-             (get-value (x y z))"
-        );
-        let replay_commands = parse(&replay).expect("emitted model reparses");
-        let mut replay_exec = Executor::new();
-        let replay_outputs = replay_exec
-            .execute_all(&replay_commands)
-            .expect("emitted model re-executes");
-        assert_eq!(replay_outputs.first().map(String::as_str), Some("sat"));
-        assert_eq!(replay_outputs.get(1), Some(values));
-    }
-
-    #[test]
-    fn sequence_semantic_builtins_cannot_be_repaired_into_sat() {
-        let cases = [
-            "(assert (= (seq.len (seq.unit 7)) 0))",
-            "(assert (distinct (seq.++ (seq.unit 1) (seq.unit 2)) \
-                               (seq.++ (seq.unit 1) (seq.unit 2))))",
-            "(assert (distinct (seq.extract (seq.unit 1) 0 1) (seq.unit 1)))",
-        ];
-        for assertion in cases {
-            let input = format!("(set-logic QF_SEQ)\n{assertion}\n(check-sat)");
-            let commands = parse(&input).expect("valid adversarial sequence query");
-            let mut exec = Executor::new();
-            exec.set_self_check(true);
-            let outputs = exec.execute_all(&commands).expect("query executes");
-            assert_ne!(
-                outputs.first().map(String::as_str),
-                Some("sat"),
-                "false native-sequence assertion was repaired into sat: {assertion}"
-            );
-        }
-    }
-}
+mod equality_carrier_completion_tests;
 
 #[cfg(test)]
 mod gap_pad_char_tests {

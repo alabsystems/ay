@@ -39,7 +39,7 @@ impl<'a> InvariantParser<'a> {
             pred_map.insert(pred.name.clone(), (pred.id, pred.arg_sorts.clone()));
         }
         let datatype_sorts = collect_datatype_sorts(problem);
-        let function_sigs = datatype_function_signatures(problem, &datatype_sorts);
+        let function_sigs = replay_function_signatures(problem, &datatype_sorts);
         Self {
             input,
             pos: 0,
@@ -209,16 +209,16 @@ impl<'a> InvariantParser<'a> {
 
                 match sort_name.as_str() {
                     "BitVec" => {
-                        const MAX_INVARIANT_BITVECTOR_WIDTH: u32 = 1 << 20;
                         let parsed_width = self.parse_numeral()?;
                         let width = u32::try_from(parsed_width).map_err(|_| {
                             ChcError::Parse(format!(
                                 "bitvector width {parsed_width} does not fit in u32"
                             ))
                         })?;
-                        if width == 0 || width > MAX_INVARIANT_BITVECTOR_WIDTH {
+                        if width == 0 || width > crate::MAX_BITVECTOR_WIDTH {
                             return Err(ChcError::Parse(format!(
-                                "bitvector width {width} is outside the supported range 1..={MAX_INVARIANT_BITVECTOR_WIDTH}"
+                                "bitvector width {width} is outside the supported range 1..={}",
+                                crate::MAX_BITVECTOR_WIDTH
                             )));
                         }
                         self.skip_whitespace_and_comments();
@@ -506,6 +506,33 @@ fn datatype_function_signatures(
     signatures
 }
 
+/// Function signatures that a strict invariant replay may reference.
+///
+/// Datatype operations are reconstructed from the problem's datatype table.
+/// Ordinary scalar UFs have no separate declaration table in `ChcProblem`, so
+/// recover their already-validated signatures from the source expressions.
+/// A conflicting source signature makes the collector fail; retaining only
+/// datatype signatures in that case is conservative because every ordinary UF
+/// in the candidate invariant is then rejected as unknown.
+fn replay_function_signatures(
+    problem: &ChcProblem,
+    datatype_sorts: &FxHashMap<String, ChcSort>,
+) -> FxHashMap<String, (ChcSort, Vec<ChcSort>)> {
+    let mut signatures = datatype_function_signatures(problem, datatype_sorts);
+    if let Ok(declarations) =
+        crate::smt::executor_adapter::collect_uninterpreted_function_declarations_for_problem(
+            problem,
+        )
+    {
+        for declaration in declarations {
+            signatures
+                .entry(declaration.name)
+                .or_insert((declaration.return_sort, declaration.argument_sorts));
+        }
+    }
+    signatures
+}
+
 fn sorts_compatible(expected: &ChcSort, actual: &ChcSort) -> bool {
     match (expected, actual) {
         (ChcSort::Array(expected_key, expected_val), ChcSort::Array(actual_key, actual_val)) => {
@@ -532,7 +559,7 @@ pub(crate) fn validate_qf_expression(
     expression: &ChcExpr,
 ) -> ChcResult<ChcSort> {
     let datatype_sorts = collect_datatype_sorts(problem);
-    let function_sigs = datatype_function_signatures(problem, &datatype_sorts);
+    let function_sigs = replay_function_signatures(problem, &datatype_sorts);
     let mut bindings = FxHashMap::default();
     for variable in vars {
         validate_qf_sort(&variable.sort)?;
@@ -549,15 +576,12 @@ pub(crate) fn validate_qf_expression(
     validate_qf_expression_inner(expression, &bindings, &function_sigs)
 }
 
-const MAX_QF_INVARIANT_BITVECTOR_WIDTH: u32 = 1 << 20;
-
 fn validate_qf_sort(sort: &ChcSort) -> ChcResult<()> {
     match sort {
-        ChcSort::BitVec(width)
-            if *width == 0 || *width > MAX_QF_INVARIANT_BITVECTOR_WIDTH =>
-        {
+        ChcSort::BitVec(width) if *width == 0 || *width > crate::MAX_BITVECTOR_WIDTH => {
             Err(ChcError::Parse(format!(
-                "bitvector width {width} is outside the replay range 1..={MAX_QF_INVARIANT_BITVECTOR_WIDTH}"
+                "bitvector width {width} is outside the replay range 1..={}",
+                crate::MAX_BITVECTOR_WIDTH
             )))
         }
         ChcSort::Array(key, value) => {

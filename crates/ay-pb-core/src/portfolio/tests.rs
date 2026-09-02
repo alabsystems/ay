@@ -6470,3 +6470,154 @@ fn external_upgrade_boundary_rejects_invalid_result_and_stream() {
     assert!(result.is_none());
     assert!(streamed.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// FLOORS AS BOUNDS, certified-mode conversion (auditT2 required fix 1).
+//
+// The measured defect: on `oddrowevencolsquare_dim_054` at the 5 s protocol,
+// `--proof` reported `s UNKNOWN` while plain mode reported `s OPTIMUM FOUND`,
+// because (a) `finalize_optimum_verdict`'s certified-floor gate could not see
+// the odd-cycle structural floor and (b) the fallback never read the native
+// phase's cached incumbent. These tests pin both halves on a miniature of the
+// family: two disjoint triangles plus a matching edge, where the packing bound
+// (2 + 2 + 1 = 5) exceeds the whole-instance aggregation surrogate
+// (ceil(7/2) = 4), i.e. exactly the shape on which the search dual stalls.
+// ---------------------------------------------------------------------------
+
+fn two_triangles_plus_edge_vertex_cover_instance() -> PbInstance {
+    parse_opb(
+        "* #variable= 8 #constraint= 7\n\
+         min: +1 x1 +1 x2 +1 x3 +1 x4 +1 x5 +1 x6 +1 x7 +1 x8 ;\n\
+         +1 x1 +1 x2 >= 1 ;\n\
+         +1 x2 +1 x3 >= 1 ;\n\
+         +1 x1 +1 x3 >= 1 ;\n\
+         +1 x4 +1 x5 >= 1 ;\n\
+         +1 x5 +1 x6 >= 1 ;\n\
+         +1 x4 +1 x6 >= 1 ;\n\
+         +1 x7 +1 x8 >= 1 ;\n",
+    )
+    .expect("two-triangles-plus-edge fixture should parse")
+}
+
+/// The optimal cover {x1,x2,x4,x5,x7}: objective 5 == packing bound.
+fn two_triangles_optimal_cover() -> Vec<bool> {
+    vec![true, true, false, true, true, false, true, false]
+}
+
+#[test]
+fn finalize_optimum_verdict_upgrades_on_certifier_recovery_floor() {
+    let instance = two_triangles_plus_edge_vertex_cover_instance();
+    let objective = instance.objective.clone().expect("objective");
+    // Premise guard: the structural floor is the exact optimum here, and it
+    // exceeds the aggregation surrogate (which is why the gate needs it).
+    assert_eq!(
+        crate::proof::recovered_structural_search_floor(&instance, &objective),
+        Some(5)
+    );
+    let result = PbSolution {
+        status: PbStatus::Satisfiable,
+        assignment: two_triangles_optimal_cover(),
+        objective: Some(5),
+    };
+    let finalized = finalize_optimum_verdict(result, &instance, &objective, &|| false);
+    assert_eq!(finalized.status, PbStatus::OptimumFound);
+    assert_eq!(finalized.objective, Some(5));
+}
+
+#[test]
+fn finalize_optimum_verdict_keeps_satisfiable_above_the_floor() {
+    let instance = two_triangles_plus_edge_vertex_cover_instance();
+    let objective = instance.objective.clone().expect("objective");
+    // A feasible but SUB-optimal cover (objective 6 > floor 5) must not be
+    // upgraded by any floor: every floor is a sound lower bound on the
+    // optimum 5 < 6.
+    let result = PbSolution {
+        status: PbStatus::Satisfiable,
+        assignment: vec![true, true, true, true, true, false, true, false],
+        objective: Some(6),
+    };
+    let finalized = finalize_optimum_verdict(result, &instance, &objective, &|| false);
+    assert_eq!(finalized.status, PbStatus::Satisfiable);
+}
+
+#[test]
+fn widen_candidate_reads_the_cached_native_incumbent() {
+    let instance = two_triangles_plus_edge_vertex_cover_instance();
+    let objective = instance.objective.clone().expect("objective");
+    // The portfolio slice came back empty-handed (the dim_054 shape) …
+    let portfolio_solution = unknown_solution();
+    // … but the native phase cached the optimal incumbent.
+    let cached = PbExactSolution {
+        status: PbStatus::Satisfiable,
+        assignment: two_triangles_optimal_cover(),
+        objective: Some(5),
+    };
+    let widened = widen_optimum_candidate_with_cached_incumbent(
+        portfolio_solution,
+        Some(cached),
+        &instance,
+        &objective,
+    );
+    assert_eq!(widened.status, PbStatus::Satisfiable);
+    assert_eq!(widened.objective, Some(5));
+    // End-to-end: the widened candidate clears the certified-floor gate — the
+    // exact conversion `--proof` mode was measured missing.
+    let finalized = finalize_optimum_verdict(widened, &instance, &objective, &|| false);
+    assert_eq!(finalized.status, PbStatus::OptimumFound);
+    assert_eq!(finalized.objective, Some(5));
+}
+
+#[test]
+fn widen_candidate_ignores_unverifiable_cache_and_keeps_ties() {
+    let instance = two_triangles_plus_edge_vertex_cover_instance();
+    let objective = instance.objective.clone().expect("objective");
+    // An INFEASIBLE cached model (all-false covers nothing) must never widen.
+    let infeasible = PbExactSolution {
+        status: PbStatus::Satisfiable,
+        assignment: vec![false; 8],
+        objective: Some(0),
+    };
+    let kept = widen_optimum_candidate_with_cached_incumbent(
+        unknown_solution(),
+        Some(infeasible),
+        &instance,
+        &objective,
+    );
+    assert_eq!(kept.status, PbStatus::Unknown);
+
+    // A cached model that only TIES the portfolio's verified incumbent keeps
+    // the portfolio's result (assignment included), so byte streams cannot
+    // move on instances where nothing improves.
+    let portfolio_solution = PbSolution {
+        status: PbStatus::Satisfiable,
+        assignment: two_triangles_optimal_cover(),
+        objective: Some(5),
+    };
+    let tied_cache = PbExactSolution {
+        status: PbStatus::Satisfiable,
+        assignment: vec![true, false, true, true, false, true, true, false],
+        objective: Some(5),
+    };
+    let kept = widen_optimum_candidate_with_cached_incumbent(
+        portfolio_solution.clone(),
+        Some(tied_cache),
+        &instance,
+        &objective,
+    );
+    assert_eq!(kept.assignment, portfolio_solution.assignment);
+
+    // A cached model WORSE than the portfolio's verified incumbent is ignored.
+    let worse_cache = PbExactSolution {
+        status: PbStatus::Satisfiable,
+        assignment: vec![true, true, true, true, true, false, true, false],
+        objective: Some(6),
+    };
+    let kept = widen_optimum_candidate_with_cached_incumbent(
+        portfolio_solution.clone(),
+        Some(worse_cache),
+        &instance,
+        &objective,
+    );
+    assert_eq!(kept.assignment, portfolio_solution.assignment);
+    assert_eq!(kept.objective, Some(5));
+}

@@ -49,7 +49,7 @@ pub(super) fn split_smt_terms(s: &str) -> Option<Vec<String>> {
 }
 
 /// Borrow the top-level terms in one SMT-LIB fragment under explicit caps.
-pub(super) fn split_smt_term_slices_bounded(
+pub(crate) fn split_smt_term_slices_bounded(
     input: &str,
     max_terms: usize,
     max_bytes: usize,

@@ -422,19 +422,23 @@ impl TermStore {
         // Deep ITE chains from expand_select_store (store chains of depth N)
         // cause O(2^N) blowup without a depth limit. When budget is exhausted,
         // the equality is left structural for the Tseitin encoder to handle.
-        if expand_ite_equalities && ite_depth > 0 {
-            if let TermData::Ite(c, a, b) = self.get(lhs).clone() {
-                if *self.sort(a) != Sort::Bool {
-                    let eq_a = self.mk_eq_depth_mode(a, rhs, ite_depth - 1, expand_ite_equalities);
-                    let eq_b = self.mk_eq_depth_mode(b, rhs, ite_depth - 1, expand_ite_equalities);
-                    return self.mk_ite(c, eq_a, eq_b);
+        if expand_ite_equalities {
+            // checked_sub encodes the `ite_depth > 0` budget gate: None means
+            // the budget is exhausted and the equality stays structural.
+            if let Some(next_depth) = ite_depth.checked_sub(1) {
+                if let TermData::Ite(c, a, b) = self.get(lhs).clone() {
+                    if *self.sort(a) != Sort::Bool {
+                        let eq_a = self.mk_eq_depth_mode(a, rhs, next_depth, expand_ite_equalities);
+                        let eq_b = self.mk_eq_depth_mode(b, rhs, next_depth, expand_ite_equalities);
+                        return self.mk_ite(c, eq_a, eq_b);
+                    }
                 }
-            }
-            if let TermData::Ite(c, a, b) = self.get(rhs).clone() {
-                if *self.sort(a) != Sort::Bool {
-                    let eq_a = self.mk_eq_depth_mode(lhs, a, ite_depth - 1, expand_ite_equalities);
-                    let eq_b = self.mk_eq_depth_mode(lhs, b, ite_depth - 1, expand_ite_equalities);
-                    return self.mk_ite(c, eq_a, eq_b);
+                if let TermData::Ite(c, a, b) = self.get(rhs).clone() {
+                    if *self.sort(a) != Sort::Bool {
+                        let eq_a = self.mk_eq_depth_mode(lhs, a, next_depth, expand_ite_equalities);
+                        let eq_b = self.mk_eq_depth_mode(lhs, b, next_depth, expand_ite_equalities);
+                        return self.mk_ite(c, eq_a, eq_b);
+                    }
                 }
             }
         }
@@ -470,20 +474,22 @@ impl TermStore {
         ite_depth: u32,
         expand_ite_equalities: bool,
     ) -> Option<TermId> {
-        // Extract store components from lhs
-        let lhs_store = match self.get(lhs).clone() {
-            TermData::App(Symbol::Named(name), args) if name == "store" && args.len() == 3 => {
-                Some((args[0], args[1], args[2]))
+        // Extract store components from both sides. `split_first` chains
+        // instead of a `&[a, b, c]` slice pattern: same arity discrimination,
+        // no index projections whose bounds the L0 prover loses.
+        fn store_triple(terms: &TermStore, id: TermId) -> Option<(TermId, TermId, TermId)> {
+            match terms.get(id) {
+                TermData::App(Symbol::Named(name), args) if name == "store" => {
+                    let (&base, rest) = args.split_first()?;
+                    let (&idx, rest) = rest.split_first()?;
+                    let (&val, rest) = rest.split_first()?;
+                    rest.is_empty().then_some((base, idx, val))
+                }
+                _ => None,
             }
-            _ => None,
-        };
-        // Extract store components from rhs
-        let rhs_store = match self.get(rhs).clone() {
-            TermData::App(Symbol::Named(name), args) if name == "store" && args.len() == 3 => {
-                Some((args[0], args[1], args[2]))
-            }
-            _ => None,
-        };
+        }
+        let lhs_store = store_triple(self, lhs);
+        let rhs_store = store_triple(self, rhs);
 
         // Self-store: (= (store a i v) a) -> (= (select a i) v)
         if let Some((base, idx, val)) = lhs_store {
@@ -521,23 +527,27 @@ impl TermStore {
         }
 
         debug_assert!(
-            args.windows(2).all(|w| self.sort(w[0]) == self.sort(w[1])),
+            args.iter()
+                .zip(args.iter().skip(1))
+                .all(|(a, b)| self.sort(*a) == self.sort(*b)),
             "BUG: mk_distinct expects same sort args"
         );
 
         // Duplicate detection: if any two terms are identical, result is false
         let mut sorted_args = args.clone();
         sorted_args.sort();
-        for i in 1..sorted_args.len() {
-            if sorted_args[i - 1] == sorted_args[i] {
-                return self.false_term();
-            }
+        if sorted_args
+            .iter()
+            .zip(sorted_args.iter().skip(1))
+            .any(|(a, b)| a == b)
+        {
+            return self.false_term();
         }
 
         // Binary distinct: normalize to NOT(eq) so Tseitin encoding assigns
         // related CNF variables, enabling contradiction detection
-        if args.len() == 2 {
-            let eq = self.mk_eq(args[0], args[1]);
+        if let &[a, b] = args.as_slice() {
+            let eq = self.mk_eq(a, b);
             return self.mk_not(eq);
         }
 
@@ -546,12 +556,14 @@ impl TermStore {
         //                            (not (= b c)) (not (= b d)) (not (= c d)))
         // This fixes #301: LIA/LRA solvers don't handle n-ary distinct directly
         let mut pairwise_neqs = Vec::new();
-        for i in 0..args.len() {
-            for j in (i + 1)..args.len() {
-                let eq = self.mk_eq(args[i], args[j]);
+        let mut rest = args.as_slice();
+        while let Some((&a, tail)) = rest.split_first() {
+            for &b in tail {
+                let eq = self.mk_eq(a, b);
                 let neq = self.mk_not(eq);
                 pairwise_neqs.push(neq);
             }
+            rest = tail;
         }
 
         // Constant folding: if all args are distinct constants, result is true

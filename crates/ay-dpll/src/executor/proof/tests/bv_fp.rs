@@ -213,10 +213,16 @@ fn test_qf_fp_classification_is_strict_checkable() {
         assert_eq!(outputs, vec!["unsat"], "{body} must be UNSAT");
         let text = exec.get_proof();
         assert!(
-            !text.contains(":rule trust"),
-            "{body} must not fall back to trust; got:\n{text}"
+            text.contains("UNVERIFIABLE PROOF")
+                && text.contains("unsupported by pinned Carcara"),
+            "the native FP proof is strict, but its unsupported sort must fail \
+             closed at the pinned-Carcara boundary; got:\n{text}"
         );
         let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+        assert!(
+            ay_proof::terminal_trust_report(proof).is_trust_free(),
+            "{body} must not fall back to a native trust step"
+        );
         match ay_proof::check_proof_strict(proof, &exec.ctx.terms) {
             Ok(quality) => assert_eq!(
                 quality.trust_count, 0,
@@ -252,13 +258,9 @@ fn test_qf_fplra_forward_error_is_strict_checkable() {
     assert_eq!(outputs, vec!["unsat"]);
     let text = exec.get_proof();
     assert!(
-        text.contains(":rule hole") && !text.contains(":rule fp_forward_error"),
-        "FpForwardError is an internally certified AY kind, not an Alethe rule; \
-         the wire proof must expose the unsupported semantic step as an honest hole:\n{text}"
-    );
-    assert!(
-        !text.contains(":rule trust"),
-        "forward-error UNSAT must not fall back to trust; got:\n{text}"
+        text.contains("UNVERIFIABLE PROOF") && text.contains("unsupported by pinned Carcara"),
+        "FpForwardError is internally certified, while pinned Carcara cannot \
+         parse the FP sort at all; the Alethe boundary must fail closed:\n{text}"
     );
     let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
     assert!(proof.steps.iter().any(|step| matches!(

@@ -138,10 +138,12 @@ pub fn recognize_fresh_def_eq(
     // Arity is checked as well as the head. `mk_eq` only ever builds the binary
     // form, but a step's clause can be any interned term, and an n-ary `=`
     // would leave "which operand is the definiens" undefined.
-    if sym.name() != "=" || operands.len() != 2 {
+    if sym.name() != "=" {
         return Err(FreshDefEqShapeError::NotBinaryEq);
     }
-    let (lhs, rhs) = (operands[0], operands[1]);
+    let &[lhs, rhs] = operands.as_slice() else {
+        return Err(FreshDefEqShapeError::NotBinaryEq);
+    };
     // EXACTLY one operand may be the definiendum. `(= d d)` cannot describe a
     // definition (and `mk_eq` folds it to `true` anyway), and a step whose
     // declared symbol appears on neither side declares nothing — that step's

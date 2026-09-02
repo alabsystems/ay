@@ -8,6 +8,8 @@ use crate::transform::{
     BackTranslator, IdentityBackTranslator, InvalidityWitness, TransformMemoryReport,
     ValidityWitness,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 struct ReplacingBackTranslator {
     validity: Option<InvariantModel>,
@@ -26,6 +28,60 @@ impl BackTranslator for ReplacingBackTranslator {
 
 struct CyclicGroundBackTranslator {
     original_derivation: crate::ground_derivation::GroundDerivation,
+}
+
+struct DeadlineBlockingBackTranslator {
+    validation_active: Arc<AtomicBool>,
+    sibling_cancelled_during_validation: Arc<AtomicBool>,
+    completed_engine_token: Arc<Mutex<Option<CancellationToken>>>,
+}
+
+impl BackTranslator for DeadlineBlockingBackTranslator {
+    fn translate_validity(&self, witness: ValidityWitness) -> ValidityWitness {
+        self.validation_active.store(true, Ordering::SeqCst);
+        let wait_deadline = ay_core::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            let completed_engine_cancelled = self
+                .completed_engine_token
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled);
+            if completed_engine_cancelled
+                && self
+                    .sibling_cancelled_during_validation
+                    .load(Ordering::SeqCst)
+            {
+                break;
+            }
+            assert!(
+                ay_core::time::Instant::now() < wait_deadline,
+                "global parallel deadline did not cancel workers during validation"
+            );
+            thread::yield_now();
+        }
+        self.validation_active.store(false, Ordering::SeqCst);
+        witness
+    }
+
+    fn translate_invalidity(&self, witness: InvalidityWitness) -> InvalidityWitness {
+        witness
+    }
+}
+
+struct DisabledParallelLaneTimerGuard;
+
+impl DisabledParallelLaneTimerGuard {
+    fn for_engine(index: usize) -> Self {
+        PARALLEL_TEST_DISABLE_LANE_TIMER.with(|disabled| disabled.set(Some(index)));
+        Self
+    }
+}
+
+impl Drop for DisabledParallelLaneTimerGuard {
+    fn drop(&mut self) {
+        PARALLEL_TEST_DISABLE_LANE_TIMER.with(|disabled| disabled.set(None));
+    }
 }
 
 impl BackTranslator for CyclicGroundBackTranslator {
@@ -60,6 +116,99 @@ fn make_query_only_but_not_inductive_model(problem: &ChcProblem) -> InvariantMod
         ),
     );
     model
+}
+
+#[test]
+#[timeout(8000)]
+fn parallel_deadline_watchdog_cancels_sibling_while_candidate_validation_blocks() {
+    // Disable only the sibling's lane-local timer. Its cancellation must then
+    // propagate from the shared scheduler watchdog while validation blocks.
+    let _disabled_sibling_timer = DisabledParallelLaneTimerGuard::for_engine(1);
+    let problem = create_safe_problem();
+    let predicate = problem.predicates()[0].id;
+    let x = ChcVar::new("watchdog_x", ChcSort::Int);
+    let mut winning_model = InvariantModel::new();
+    winning_model.set(
+        predicate,
+        PredicateInterpretation::new(
+            vec![x.clone()],
+            ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(10)),
+        ),
+    );
+
+    let sibling_started = Arc::new(AtomicBool::new(false));
+    let validation_active = Arc::new(AtomicBool::new(false));
+    let sibling_cancelled_during_validation = Arc::new(AtomicBool::new(false));
+    let completed_engine_token = Arc::new(Mutex::new(None));
+    let engine_sibling_started = sibling_started.clone();
+    let engine_validation_active = validation_active.clone();
+    let engine_sibling_cancelled = sibling_cancelled_during_validation.clone();
+    let engine_completed_token = completed_engine_token.clone();
+
+    let config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![
+            EngineConfig::Pdr(PdrConfig::default()),
+            EngineConfig::Bmc(BmcConfig::default()),
+        ],
+        parallel: true,
+        timeout: None,
+        parallel_timeout: Some(Duration::from_secs(2)),
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: true,
+    };
+    let mut solver = PortfolioSolver::new(problem, config)
+        .with_parallel_worker_limit(2)
+        .with_sequential_test_engine(move |idx, cancellation| {
+            if idx == 0 {
+                *engine_completed_token.lock().unwrap() = Some(cancellation);
+                let rendezvous_deadline = ay_core::time::Instant::now() + Duration::from_secs(1);
+                while !engine_sibling_started.load(Ordering::SeqCst) {
+                    assert!(
+                        ay_core::time::Instant::now() < rendezvous_deadline,
+                        "sibling worker did not enter its test body"
+                    );
+                    thread::yield_now();
+                }
+                EngineResult::Unified(
+                    PortfolioResult::Safe(winning_model.clone()),
+                    "TEST_WATCHDOG_WINNER",
+                )
+            } else {
+                engine_sibling_started.store(true, Ordering::SeqCst);
+                while !cancellation.is_cancelled() {
+                    thread::yield_now();
+                }
+                engine_sibling_cancelled.store(
+                    engine_validation_active.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+                EngineResult::Unified(PortfolioResult::Unknown, "TEST_WATCHDOG_SIBLING")
+            }
+        });
+    solver.back_translator = Box::new(DeadlineBlockingBackTranslator {
+        validation_active: validation_active.clone(),
+        sibling_cancelled_during_validation: sibling_cancelled_during_validation.clone(),
+        completed_engine_token: completed_engine_token.clone(),
+    });
+
+    let mut report = BudgetReport::new();
+    let result = solver.solve_parallel_with_report(&mut report);
+
+    assert!(matches!(result, PortfolioResult::Safe(_)));
+    assert!(!validation_active.load(Ordering::SeqCst));
+    assert!(sibling_cancelled_during_validation.load(Ordering::SeqCst));
+    assert!(
+        completed_engine_token
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled),
+        "the completed lane's stopped timer must not be mistaken for the shared watchdog"
+    );
 }
 
 #[test]
@@ -111,6 +260,13 @@ fn test_validation_rejects_empty_model_when_only_transformed_problem_is_predicat
         bv_abstracted: false,
         transform_memory: TransformMemoryReport::identity(),
         cancellation_token: crate::CancellationToken::new(),
+        deterministic_sequential_schedule: false,
+        deterministic_global_deadline: None,
+        construction_deadline: None,
+        construction_aborted: false,
+        sequential_test_engine: None,
+        sequential_test_publish_delay: None,
+        parallel_worker_limit_override: None,
     };
 
     match solver.validate_safe(&InvariantModel::new()) {
@@ -637,6 +793,13 @@ fn test_accept_or_reject_preprocessed_individually_inductive_model_rejected() {
         bv_abstracted: false,
         transform_memory: TransformMemoryReport::identity(),
         cancellation_token: crate::CancellationToken::new(),
+        deterministic_sequential_schedule: false,
+        deterministic_global_deadline: None,
+        construction_deadline: None,
+        construction_aborted: false,
+        sequential_test_engine: None,
+        sequential_test_publish_delay: None,
+        parallel_worker_limit_override: None,
     };
 
     assert!(
@@ -719,6 +882,13 @@ fn test_accept_or_reject_preprocessed_non_individually_inductive_model_rejected(
         bv_abstracted: false,
         transform_memory: TransformMemoryReport::identity(),
         cancellation_token: crate::CancellationToken::new(),
+        deterministic_sequential_schedule: false,
+        deterministic_global_deadline: None,
+        construction_deadline: None,
+        construction_aborted: false,
+        sequential_test_engine: None,
+        sequential_test_publish_delay: None,
+        parallel_worker_limit_override: None,
     };
 
     // Verify test setup: different predicate counts simulate preprocessing
@@ -1108,6 +1278,13 @@ fn test_accept_rejects_backtranslated_safe_invalid_on_original_problem() {
         bv_abstracted: false,
         transform_memory: TransformMemoryReport::identity(),
         cancellation_token: crate::CancellationToken::new(),
+        deterministic_sequential_schedule: false,
+        deterministic_global_deadline: None,
+        construction_deadline: None,
+        construction_aborted: false,
+        sequential_test_engine: None,
+        sequential_test_publish_delay: None,
+        parallel_worker_limit_override: None,
     };
 
     assert!(
@@ -1190,6 +1367,13 @@ fn test_accept_rejects_backtranslated_unsafe_invalid_on_original_problem() {
         bv_abstracted: false,
         transform_memory: TransformMemoryReport::identity(),
         cancellation_token: crate::CancellationToken::new(),
+        deterministic_sequential_schedule: false,
+        deterministic_global_deadline: None,
+        construction_deadline: None,
+        construction_aborted: false,
+        sequential_test_engine: None,
+        sequential_test_publish_delay: None,
+        parallel_worker_limit_override: None,
     };
 
     assert!(
@@ -1209,6 +1393,29 @@ fn test_accept_rejects_backtranslated_unsafe_invalid_on_original_problem() {
     assert!(
         matches!(result, AcceptDecision::Reject),
         "invalid original-domain Unsafe witness must be rejected so the portfolio can return Unknown"
+    );
+}
+
+#[test]
+fn generic_ground_backtranslation_observes_portfolio_cancellation() {
+    use crate::ground_derivation::GroundDerivation;
+
+    let candidate = Counterexample::new(Vec::new()).with_ground_derivation(GroundDerivation {
+        steps: Vec::new(),
+        query_step: 0,
+    });
+    let cancellation = crate::CancellationToken::new();
+    cancellation.cancel();
+
+    let translated = backtranslate_counterexample_with_ground_evidence(
+        &IdentityBackTranslator,
+        &ChcProblem::new(),
+        &candidate,
+        &cancellation,
+    );
+    assert!(
+        translated.ground_derivation.is_none(),
+        "cancelled portfolio backtranslation must not retain or rebuild ground evidence"
     );
 }
 
@@ -1333,6 +1540,13 @@ fn test_unsafe_validation_replaces_stale_ground_derivation_for_cyclic_original()
         bv_abstracted: false,
         transform_memory: TransformMemoryReport::identity(),
         cancellation_token: crate::CancellationToken::new(),
+        deterministic_sequential_schedule: false,
+        deterministic_global_deadline: None,
+        construction_deadline: None,
+        construction_aborted: false,
+        sequential_test_engine: None,
+        sequential_test_publish_delay: None,
+        parallel_worker_limit_override: None,
     };
 
     let translated = solver

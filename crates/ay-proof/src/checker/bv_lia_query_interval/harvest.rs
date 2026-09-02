@@ -38,6 +38,14 @@ impl QueryChecker<'_> {
             }
         }
 
+        // Add only independently checked universal source-semantics clauses.
+        // They are derived after the authored harvest is known complete, so a
+        // source disjunct abandoned under a budget can never be hidden by a
+        // generated bridge fact.
+        if !self.append_int2bv_no_wrap_clauses(&mut clauses, &mut nodes, entry_work)? {
+            return Ok(false);
+        }
+
         let Some(mut state) = self.initial_interval_state(&clauses)? else {
             return Ok(false);
         };
@@ -122,6 +130,215 @@ impl QueryChecker<'_> {
             }
         }
         Ok(Some(state))
+    }
+
+    /// Append the universally valid guarded round-trip clause for every
+    /// `int2bv` term whose unsigned view occurs in an interpreted literal.
+    ///
+    /// For `r = int2bv_w(e)` and `M = 2^w`, the clause is
+    ///
+    /// ```text
+    /// e < 0  OR  e >= M  OR  unsigned(r) = e
+    /// ```
+    ///
+    /// The equality is therefore used only on the exact no-wrap interval
+    /// `[0, M)`. The term, width and source are all read back from the validated
+    /// source store; no production bridge assertion carries authority here.
+    fn append_int2bv_no_wrap_clauses(
+        &mut self,
+        clauses: &mut Vec<Vec<ClauseLiteral>>,
+        nodes: &mut u64,
+        entry_work: u64,
+    ) -> Result<bool, BvLiaUnsatAuthenticationError> {
+        let mut relevant = BTreeSet::new();
+        for clause in clauses.iter() {
+            for literal in clause {
+                let ClauseLiteral::Arithmetic { form, .. } = literal else {
+                    continue;
+                };
+                for &atom in form.atoms.keys() {
+                    self.meter.charge(1)?;
+                    if self.meter.work.saturating_sub(entry_work) > MAX_INTERVAL_WORK {
+                        return Ok(false);
+                    }
+                    let LinearAtom::UnsignedBv(term) = atom else {
+                        continue;
+                    };
+                    if self.int2bv_source(term).is_none() {
+                        continue;
+                    }
+                    relevant.insert(term);
+                    if relevant.len() > MAX_RESIDUE_SCHEMAS {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
+        let Some(combined_clause_count) = clauses.len().checked_add(relevant.len()) else {
+            return Ok(false);
+        };
+        if combined_clause_count > MAX_CLAUSES {
+            return Ok(false);
+        }
+        clauses.try_reserve(relevant.len()).map_err(|_| {
+            BvLiaUnsatAuthenticationError::ResourceLimit {
+                resource: "interval residue clause allocation",
+            }
+        })?;
+
+        let mut retained_atom_copies = 0usize;
+        let mut retained_limb_units = 0u64;
+        for bv in relevant {
+            let Some((source, width)) = self.int2bv_source(bv) else {
+                // The immutable term store was validated before this lane and
+                // cannot change through this borrowed checker. If the two reads
+                // disagree, decline rather than derive from an unstable shape.
+                return Ok(false);
+            };
+            let Some(clause) = self.int2bv_no_wrap_clause(bv, source, width, nodes, entry_work)?
+            else {
+                // A three-disjunct theorem may only be appended atomically.
+                // Dropping either guard would strengthen it and could forge a
+                // contradiction on a wrapping source value.
+                return Ok(false);
+            };
+
+            // Bound the retained generated formula independently of work. The
+            // form combiner bounds one form, but without this aggregate cap a
+            // query could retain thousands of maximally wide coefficient maps.
+            let mut clause_atom_copies = 0usize;
+            let mut clause_limb_units = 0u64;
+            for literal in &clause {
+                let ClauseLiteral::Arithmetic { form, .. } = literal else {
+                    return Ok(false);
+                };
+                let Some(atoms) = clause_atom_copies.checked_add(form.atoms.len()) else {
+                    return Ok(false);
+                };
+                clause_atom_copies = atoms;
+                let Some(limbs) = clause_limb_units.checked_add(integer_limb_units(&form.constant))
+                else {
+                    return Ok(false);
+                };
+                clause_limb_units = limbs;
+                for coefficient in form.atoms.values() {
+                    let Some(limbs) =
+                        clause_limb_units.checked_add(integer_limb_units(coefficient))
+                    else {
+                        return Ok(false);
+                    };
+                    clause_limb_units = limbs;
+                }
+            }
+            self.meter.charge(
+                u64::try_from(clause_atom_copies)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(clause_limb_units)
+                    .max(1),
+            )?;
+            if self.meter.work.saturating_sub(entry_work) > MAX_INTERVAL_WORK {
+                return Ok(false);
+            }
+            let Some(atom_copies) = retained_atom_copies.checked_add(clause_atom_copies) else {
+                return Ok(false);
+            };
+            let Some(limb_units) = retained_limb_units.checked_add(clause_limb_units) else {
+                return Ok(false);
+            };
+            if atom_copies > MAX_RESIDUE_ATOM_COPIES || limb_units > MAX_RESIDUE_LIMBS {
+                return Ok(false);
+            }
+            retained_atom_copies = atom_copies;
+            retained_limb_units = limb_units;
+            clauses.push(clause);
+        }
+        Ok(true)
+    }
+
+    /// Re-read one well-sorted `int2bv` application's exact source and width.
+    fn int2bv_source(&self, term: TermId) -> Option<(TermId, u32)> {
+        let Sort::BitVec(result_width) = self.terms.sort(term) else {
+            return None;
+        };
+        let TermData::App(Symbol::Indexed(name, indices), args) = self.terms.get(term) else {
+            return None;
+        };
+        let ([width], [source]) = (indices.as_slice(), args.as_slice()) else {
+            return None;
+        };
+        (name == "int2bv"
+            && *width > 0
+            && *width <= 64
+            && result_width.width == *width
+            && self.terms.sort(*source) == &Sort::Int)
+            .then_some((*source, *width))
+    }
+
+    /// Build one complete guarded no-wrap theorem clause, or decline without
+    /// returning any prefix when a form/magnitude budget prevents construction.
+    fn int2bv_no_wrap_clause(
+        &mut self,
+        bv: TermId,
+        source: TermId,
+        width: u32,
+        nodes: &mut u64,
+        entry_work: u64,
+    ) -> Result<Option<Vec<ClauseLiteral>>, BvLiaUnsatAuthenticationError> {
+        self.meter.charge(1)?;
+        if width == 0 || width > 64 || self.terms.sort(source) != &Sort::Int {
+            return Ok(None);
+        }
+
+        let source_form = self.linear_form(source, 0, nodes)?;
+        if self.meter.work.saturating_sub(entry_work) > MAX_INTERVAL_WORK {
+            return Ok(None);
+        }
+        let one = LinearForm::constant(BigInt::one());
+        let Some(negative) = self.combine_forms(&source_form, &one, &BigInt::one())? else {
+            return Ok(None);
+        };
+        if self.meter.work.saturating_sub(entry_work) > MAX_INTERVAL_WORK {
+            return Ok(None);
+        }
+
+        let modulus = BigInt::one() << width;
+        self.meter.charge(integer_limb_units(&modulus).max(1))?;
+        if self.meter.work.saturating_sub(entry_work) > MAX_INTERVAL_WORK {
+            return Ok(None);
+        }
+        let modulus = LinearForm::constant(modulus);
+        let Some(overflow) = self.combine_forms(&modulus, &source_form, &-BigInt::one())? else {
+            return Ok(None);
+        };
+        if self.meter.work.saturating_sub(entry_work) > MAX_INTERVAL_WORK {
+            return Ok(None);
+        }
+
+        let unsigned = LinearForm::unsigned_bv_atom(bv);
+        let Some(round_trip) = self.combine_forms(&unsigned, &source_form, &-BigInt::one())? else {
+            return Ok(None);
+        };
+        if self.meter.work.saturating_sub(entry_work) > MAX_INTERVAL_WORK {
+            return Ok(None);
+        }
+
+        Ok(Some(vec![
+            ClauseLiteral::Arithmetic {
+                // `e < 0` iff `e + 1 <= 0` over the integers.
+                form: negative,
+                relation: Relation::LessOrEqual,
+            },
+            ClauseLiteral::Arithmetic {
+                // `e >= 2^w` iff `2^w - e <= 0`.
+                form: overflow,
+                relation: Relation::LessOrEqual,
+            },
+            ClauseLiteral::Arithmetic {
+                form: round_trip,
+                relation: Relation::Equal,
+            },
+        ]))
     }
 
     // -----------------------------------------------------------------------
@@ -249,8 +466,8 @@ impl QueryChecker<'_> {
         Ok(Harvest::Complete)
     }
 
-    /// Read a comparison over Int operands as `form REL 0` at the given
-    /// polarity. Anything else returns `None` and stays opaque.
+    /// Read an Int comparison or unsigned BV order literal as `form REL 0` at
+    /// the given polarity. Anything else returns `None` and stays opaque.
     fn arithmetic_literal(
         &mut self,
         term: TermId,
@@ -266,25 +483,64 @@ impl QueryChecker<'_> {
             return Ok(None);
         }
         let (left, right) = (args[0], args[1]);
-        if terms.sort(left) != &Sort::Int || terms.sort(right) != &Sort::Int {
+        // `(low, high, strict)` denotes `low <[=] high` at this polarity.
+        let int_order = match (name.as_str(), polarity) {
+            ("<=", true) => Some((left, right, false, Relation::LessOrEqual)),
+            ("<=", false) => Some((right, left, true, Relation::LessOrEqual)),
+            ("<", true) => Some((left, right, true, Relation::LessOrEqual)),
+            ("<", false) => Some((right, left, false, Relation::LessOrEqual)),
+            (">=", true) => Some((right, left, false, Relation::LessOrEqual)),
+            (">=", false) => Some((left, right, true, Relation::LessOrEqual)),
+            (">", true) => Some((right, left, true, Relation::LessOrEqual)),
+            (">", false) => Some((left, right, false, Relation::LessOrEqual)),
+            ("=", true) => Some((left, right, false, Relation::Equal)),
+            ("=", false) => Some((left, right, false, Relation::Distinct)),
+            _ => None,
+        };
+        if let Some((low, high, strict, relation)) = int_order {
+            if terms.sort(low) != &Sort::Int || terms.sort(high) != &Sort::Int {
+                return Ok(None);
+            }
+            let low_form = self.linear_form(low, depth, nodes)?;
+            let high_form = self.linear_form(high, depth, nodes)?;
+            return self.comparison_literal(low_form, high_form, strict, relation);
+        }
+
+        let unsigned_order = match (name.as_str(), polarity) {
+            ("bvult", true) => Some((left, right, true)),
+            ("bvult", false) => Some((right, left, false)),
+            ("bvule", true) => Some((left, right, false)),
+            ("bvule", false) => Some((right, left, true)),
+            _ => None,
+        };
+        let Some((low, high, strict)) = unsigned_order else {
+            return Ok(None);
+        };
+        let (Sort::BitVec(low_width), Sort::BitVec(high_width)) =
+            (terms.sort(low), terms.sort(high))
+        else {
+            return Ok(None);
+        };
+        if low_width.width == 0 || low_width.width > 64 || low_width.width != high_width.width {
             return Ok(None);
         }
-        // `(left, right, strict, is_equality)` for the literal at this
-        // polarity, where a non-equality means `left - right (+1 if strict) <= 0`.
-        let (low, high, strict, equality) = match (name.as_str(), polarity) {
-            ("<=", true) => (left, right, false, false),
-            ("<=", false) => (right, left, true, false),
-            ("<", true) => (left, right, true, false),
-            ("<", false) => (right, left, false, false),
-            (">=", true) => (right, left, false, false),
-            (">=", false) => (left, right, true, false),
-            (">", true) => (right, left, true, false),
-            (">", false) => (left, right, false, false),
-            ("=", _) => (left, right, false, true),
-            _ => return Ok(None),
+        let Some(low_form) = self.unsigned_bv_form(low)? else {
+            return Ok(None);
         };
-        let low_form = self.linear_form(low, depth, nodes)?;
-        let high_form = self.linear_form(high, depth, nodes)?;
+        let Some(high_form) = self.unsigned_bv_form(high)? else {
+            return Ok(None);
+        };
+        self.comparison_literal(low_form, high_form, strict, Relation::LessOrEqual)
+    }
+
+    /// Construct `low <[=] high` as one arithmetic clause literal.
+    fn comparison_literal(
+        &mut self,
+        low_form: LinearForm,
+        high_form: LinearForm,
+        strict: bool,
+        relation: Relation,
+    ) -> Result<Option<ClauseLiteral>, BvLiaUnsatAuthenticationError> {
         let Some(mut form) = self.combine_forms(&low_form, &high_form, &-BigInt::one())? else {
             return Ok(None);
         };
@@ -294,12 +550,34 @@ impl QueryChecker<'_> {
             };
             form.constant = constant;
         }
-        let relation = match (equality, polarity) {
-            (false, _) => Relation::LessOrEqual,
-            (true, true) => Relation::Equal,
-            (true, false) => Relation::Distinct,
-        };
         Ok(Some(ClauseLiteral::Arithmetic { form, relation }))
+    }
+
+    /// The exact unsigned integer denotation of one validated BV term.
+    fn unsigned_bv_form(
+        &mut self,
+        term: TermId,
+    ) -> Result<Option<LinearForm>, BvLiaUnsatAuthenticationError> {
+        let Sort::BitVec(sort_width) = self.terms.sort(term) else {
+            return Ok(None);
+        };
+        let width = sort_width.width;
+        if width == 0 || width > 64 {
+            return Ok(None);
+        }
+        if let TermData::Const(Constant::BitVec {
+            value,
+            width: literal_width,
+        }) = self.terms.get(term)
+        {
+            self.meter.charge(integer_limb_units(value).max(1))?;
+            let modulus = BigInt::one() << width;
+            if *literal_width != width || value.is_negative() || value >= &modulus {
+                return Ok(None);
+            }
+            return Ok(Some(LinearForm::constant(value.clone())));
+        }
+        Ok(Some(LinearForm::unsigned_bv_atom(term)))
     }
 
     // -----------------------------------------------------------------------
@@ -335,6 +613,9 @@ impl QueryChecker<'_> {
         };
         let args = args.clone();
         match name.as_str() {
+            "bv2nat" if args.len() == 1 => Ok(self
+                .unsigned_bv_form(args[0])?
+                .unwrap_or_else(|| LinearForm::atom(term))),
             "+" => {
                 let mut accumulated = LinearForm::default();
                 for arg in args {

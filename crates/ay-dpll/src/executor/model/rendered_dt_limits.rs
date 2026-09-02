@@ -49,7 +49,22 @@ impl SchemaSourceBudget {
     /// Bound borrowed sort descriptors before any schema clone. Inline
     /// datatype descriptors can contain arbitrarily large trees and names.
     pub(super) fn charge_sort(&mut self, sort: &Sort) -> bool {
-        let mut stack = vec![(sort, 0usize)];
+        self.charge_sort_at_depth(sort, 0)
+    }
+
+    /// Bound a synthetic array descriptor without first cloning its borrowed
+    /// index/element sorts. The outer node and depth offset are part of the
+    /// same envelope as an ordinary [`Self::charge_sort`] walk.
+    pub(super) fn charge_array_sort(&mut self, index: &Sort, element: &Sort) -> bool {
+        self.sort_nodes = match self.sort_nodes.checked_add(1) {
+            Some(next) if next <= MAX_RENDERED_DT_NODES => next,
+            _ => return false,
+        };
+        self.charge_sort_at_depth(index, 1) && self.charge_sort_at_depth(element, 1)
+    }
+
+    fn charge_sort_at_depth(&mut self, sort: &Sort, initial_depth: usize) -> bool {
+        let mut stack = vec![(sort, initial_depth)];
         while let Some((sort, depth)) = stack.pop() {
             if depth > MAX_RENDERED_DT_DEPTH {
                 return false;

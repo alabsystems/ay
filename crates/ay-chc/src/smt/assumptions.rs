@@ -257,7 +257,7 @@ impl SmtContext {
                     model.insert(name.clone(), SmtValue::Int(*value));
                 }
                 for (name, (value, width)) in &propagated_bv_equalities {
-                    model.insert(name.clone(), SmtValue::BitVec(*value, *width));
+                    model.insert(name.clone(), SmtValue::bitvec_from_u128(*value, *width));
                 }
                 return SmtResult::Sat(model);
             }
@@ -515,7 +515,7 @@ impl SmtContext {
                             for (name, (value, width)) in &propagated_bv_equalities {
                                 values
                                     .entry(name.clone())
-                                    .or_insert(SmtValue::BitVec(*value, *width));
+                                    .or_insert_with(|| SmtValue::bitvec_from_u128(*value, *width));
                             }
 
                             // #7380: Reverse-map namespaced model entries to un-namespaced base names.

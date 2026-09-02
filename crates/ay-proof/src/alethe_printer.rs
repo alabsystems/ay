@@ -37,6 +37,7 @@ mod term_format;
 #[cfg(test)]
 #[path = "alethe_printer_wire_regression_tests.rs"]
 mod wire_regression_tests;
+pub(crate) use surface_tokens::split_smt_term_slices_bounded;
 use surface_tokens::split_smt_terms;
 pub use surface_tokens::{split_alethe_application_bounded, AletheSurfaceParseError};
 // #8529: Use deterministic hash maps in all builds.
@@ -266,6 +267,21 @@ struct RowChainGuards {
     bridges: Vec<String>,
 }
 
+/// One bounded, exact plan for presenting an authored `let` assumption and
+/// deriving the root spelling used by the rest of the proof.
+struct LetAssumeBridgePlan {
+    levels: Vec<(Vec<(String, String)>, String)>,
+    innermost_body: String,
+    eliminated: String,
+    substituted: String,
+}
+
+impl LetAssumeBridgePlan {
+    fn is_certified(&self) -> bool {
+        self.substituted == self.eliminated
+    }
+}
+
 /// What one chain walk contributes to the surrounding equality chain.
 enum RowChainPathProof {
     /// The walk's value IS `(select root index)`; nothing to prove.
@@ -343,6 +359,24 @@ pub(crate) struct AlethePrinter<'a> {
     /// one interned term, and each row emits (and must be charged for) its own
     /// bridge.
     authored_assume_bridged: std::cell::RefCell<HashSet<ProofId>>,
+    /// Override-bearing terms whose every `Assume` row is unused.
+    ///
+    /// Their authored spelling is still required at those `assume` commands,
+    /// but no proof edge licenses that spelling at any other occurrence. The
+    /// term formatter therefore suppresses the ordinary override for this
+    /// exact set, and the assume formatter retrieves it explicitly.
+    assume_only_override_terms: std::cell::RefCell<HashSet<TermId>>,
+    /// Authored-assume terms whose checked source-to-canonical bridge is the
+    /// narrow two-row `la_generic` implication rather than a Boolean
+    /// equivalence derivation.
+    linear_arithmetic_assume_bridges: std::cell::RefCell<HashSet<TermId>>,
+    /// Surface overrides visible to downstream wire-rule selection after
+    /// exact authored-assume bridges confine their source text to `assume`.
+    wire_term_overrides: std::cell::RefCell<Option<HashMap<TermId, String>>>,
+    /// Whether [`Self::wire_term_overrides`] has passed its borrowed
+    /// entry/byte/work preflight and been cloned. Keeping construction lazy is
+    /// load-bearing: the clone itself must not run before that admission.
+    wire_term_overrides_initialized: std::cell::Cell<bool>,
     /// Subset of [`Self::folded_assume_surfaces`] whose `assume` is a PREMISE
     /// of some step, and therefore owes the consumers a derivation of the
     /// folded clause. An assumption nothing consumes owes nothing and is
@@ -356,6 +390,10 @@ pub(crate) struct AlethePrinter<'a> {
     work: std::cell::Cell<u64>,
     /// Optional cap on `work` (#A2b, synthesized-default emission only).
     work_budget: Option<u64>,
+    /// Shared proof-wide admission for the expensive arithmetic `poly_simp`
+    /// promotion. `prepare_proof` replaces the standalone default with a cheap
+    /// whole-document preflight before any step is rendered.
+    poly_simp_promotion_budget: std::cell::RefCell<crate::wire_rule::ArithPolySimpPromotionBudget>,
 }
 
 impl<'a> AlethePrinter<'a> {
@@ -386,10 +424,17 @@ impl<'a> AlethePrinter<'a> {
             folded_assume_surfaces: std::cell::RefCell::new(HashMap::default()),
             authored_assume_surfaces: std::cell::RefCell::new(HashMap::default()),
             authored_assume_bridged: std::cell::RefCell::new(HashSet::default()),
+            assume_only_override_terms: std::cell::RefCell::new(HashSet::default()),
+            linear_arithmetic_assume_bridges: std::cell::RefCell::new(HashSet::default()),
+            wire_term_overrides: std::cell::RefCell::new(None),
+            wire_term_overrides_initialized: std::cell::Cell::new(false),
             folded_assume_bridged: std::cell::RefCell::new(HashSet::default()),
             proof_clauses: std::cell::RefCell::new(HashMap::default()),
             work: std::cell::Cell::new(0),
             work_budget,
+            poly_simp_promotion_budget: std::cell::RefCell::new(
+                crate::wire_rule::ArithPolySimpPromotionBudget::standalone(),
+            ),
         }
     }
 
@@ -397,6 +442,12 @@ impl<'a> AlethePrinter<'a> {
     /// step is emitted. This is intentionally eager: arithmetic/theory steps
     /// may mention the witness before the `sko_forall` step's proof ID.
     pub(crate) fn prepare_proof(&self, proof: &Proof) -> Result<(), AlethePrintError> {
+        // This must precede the proof-clause copies below. In particular, an
+        // over-cap override ledger may not allocate its clone (or trigger other
+        // eager proof preparation) before the borrowed fail-closed preflight.
+        self.initialize_wire_term_overrides()?;
+        *self.poly_simp_promotion_budget.borrow_mut() =
+            crate::wire_rule::ArithPolySimpPromotionBudget::for_proof(proof);
         {
             let mut clauses = self.proof_clauses.borrow_mut();
             clauses.clear();
@@ -420,6 +471,11 @@ impl<'a> AlethePrinter<'a> {
         // printed before its own `assume`.
         self.plan_equivalent_authored_assumes(proof)?;
         self.plan_folded_and_assumes(proof);
+        if !carcara_proof_surface_is_supported(proof, self.terms, self.term_overrides) {
+            return Err(AlethePrintError::UnavailableAuthenticatedSurface {
+                reason: "proof uses a sort or symbol spelling unsupported by pinned Carcara",
+            });
+        }
         crate::checker::quantifier::validate_sko_forall_uniqueness(proof, self.terms).map_err(
             |err| AlethePrintError::InvalidSkolemStep {
                 id: match err {
@@ -644,7 +700,7 @@ impl<'a> AlethePrinter<'a> {
     fn array_ext_choice_term(&self, array_a: TermId, array_b: TermId, witness: TermId) -> String {
         let a = self.format_term(array_a);
         let b = self.format_term(array_b);
-        let sort = self.terms.sort(witness);
+        let sort = format_sort_alethe(self.terms.sort(witness));
         let binder = EXT_CHOICE_BINDER;
         format!(
             "(choice (({binder} {sort})) \
@@ -1267,7 +1323,7 @@ impl<'a> AlethePrinter<'a> {
     /// confined to ONE step whose obligation is exactly "this `let` eliminates
     /// to this term". Closing it needs the arithmetic/commutative
     /// normalization equalities, not more printing work.
-    fn format_let_assume_bridge(&self, id: ProofId, term: TermId, surface: &str) -> Option<String> {
+    fn plan_let_assume_bridge(&self, term: TermId, surface: &str) -> Option<LetAssumeBridgePlan> {
         if !surface.starts_with("(let") {
             return None;
         }
@@ -1303,6 +1359,21 @@ impl<'a> AlethePrinter<'a> {
         } else {
             String::new()
         };
+        Some(LetAssumeBridgePlan {
+            levels,
+            innermost_body,
+            eliminated,
+            substituted,
+        })
+    }
+
+    fn format_let_assume_bridge(&self, id: ProofId, term: TermId, surface: &str) -> Option<String> {
+        let LetAssumeBridgePlan {
+            levels,
+            innermost_body,
+            eliminated,
+            substituted,
+        } = self.plan_let_assume_bridge(term, surface)?;
 
         let mut out = String::new();
         let _ = std::fmt::Write::write_fmt(&mut out, format_args!("(assume {id}.a {surface})\n"));
@@ -1741,6 +1812,10 @@ impl<'a> AlethePrinter<'a> {
         step: &ProofStep,
         id: ProofId,
     ) -> Result<String, AlethePrintError> {
+        // Normal export initializes this in `prepare_proof`; isolated
+        // step-formatting helpers enter here directly. Both paths must apply
+        // the same pre-clone admission before consulting wire-rule predicates.
+        self.initialize_wire_term_overrides()?;
         match step {
             ProofStep::Assume(term_id) => {
                 self.assume_terms.borrow_mut().insert(id, *term_id);
@@ -2177,13 +2252,75 @@ impl<'a> AlethePrinter<'a> {
         lia: Option<&ay_core::LiaAnnotation>,
     ) -> Result<String, AlethePrintError> {
         if matches!(kind, ay_core::TheoryLemmaKind::ArithEqTriangle) {
-            return self.format_arith_eq_triangle(id, clause);
+            let wire_overrides = self.wire_term_overrides.borrow();
+            if crate::arith_eq_triangle_lowering_supported(
+                self.terms,
+                clause,
+                wire_overrides.as_ref(),
+            ) {
+                return self.format_arith_eq_triangle(id, clause);
+            }
+            return Err(AlethePrintError::InvalidSurfaceStep {
+                id,
+                reason: "arithmetic equality triangle changed under surface rewriting".to_string(),
+            });
         }
         if matches!(kind, ay_core::TheoryLemmaKind::ArithEqImpliesBound) {
-            return self.format_arith_eq_implies_bound(id, clause);
+            let wire_overrides = self.wire_term_overrides.borrow();
+            if crate::arith_eq_implies_bound_lowering_supported(
+                self.terms,
+                clause,
+                wire_overrides.as_ref(),
+            ) {
+                return self.format_arith_eq_implies_bound(id, clause);
+            }
+            return Err(AlethePrintError::InvalidSurfaceStep {
+                id,
+                reason: "arithmetic equality implication changed under surface rewriting"
+                    .to_string(),
+            });
         }
         if matches!(kind, ay_core::TheoryLemmaKind::IntBoundsTautology) {
-            return self.format_unit_farkas_clause(id, clause, "integer bounds tautology");
+            let wire_overrides = self.wire_term_overrides.borrow();
+            if crate::int_bounds_tautology_lowering_supported(
+                self.terms,
+                clause,
+                wire_overrides.as_ref(),
+            ) {
+                return self.format_unit_farkas_clause(id, clause, "integer bounds tautology");
+            }
+            return Err(AlethePrintError::InvalidSurfaceStep {
+                id,
+                reason: "integer bounds tautology changed under surface rewriting".to_string(),
+            });
+        }
+        // `ArithClauseTautology` is a broad native rule, while
+        // `LiaGeneric`/`LinearIdentity` is a unit positive equality that
+        // Carcara cannot check as `la_generic`. Their one-equality polynomial
+        // identity subset has a standard, premise-free Alethe rule:
+        // `poly_simp`. Re-run the narrower checker on the exact internal clause
+        // before selecting that wire spelling; all other arithmetic
+        // tautologies retain their honest unsupported-rule fallback.
+        if matches!(
+            kind,
+            ay_core::TheoryLemmaKind::ArithClauseTautology | ay_core::TheoryLemmaKind::LiaGeneric
+        ) {
+            let supported = {
+                let mut budget = self.poly_simp_promotion_budget.borrow_mut();
+                let wire_overrides = self.wire_term_overrides.borrow();
+                crate::theory_lemma_poly_simp_lowering_supported(
+                    self.terms,
+                    kind,
+                    lia,
+                    clause,
+                    wire_overrides.as_ref(),
+                    &mut budget,
+                )
+            };
+            if supported {
+                let clause_str = self.format_clause(clause);
+                return Ok(format!("(step {id} {clause_str} :rule poly_simp)"));
+            }
         }
         if self.arith_disequality_split_is_exactly_lowerable(kind, clause) {
             return self.format_arith_disequality_split(id, clause);
@@ -2259,8 +2396,13 @@ impl<'a> AlethePrinter<'a> {
         // split behind a unit Divisibility theorem. Emit that derivation only
         // when the shared publication predicate replays the native witness
         // against an identity surface.
-        if crate::lia_divisibility_lowering_supported(self.terms, clause, lia, self.term_overrides)
-        {
+        let wire_overrides = self.wire_term_overrides.borrow();
+        if crate::lia_divisibility_lowering_supported(
+            self.terms,
+            clause,
+            lia,
+            wire_overrides.as_ref(),
+        ) {
             return self.format_lia_divisibility(id, clause).ok_or_else(|| {
                 AlethePrintError::InvalidSurfaceStep {
                     id,
@@ -2271,7 +2413,7 @@ impl<'a> AlethePrinter<'a> {
 
         let clause_str = self.format_clause(clause);
         let wire_rule =
-            crate::promoted_wire_rule(self.terms, kind, clause, farkas, self.term_overrides);
+            crate::promoted_wire_rule(self.terms, kind, clause, farkas, wire_overrides.as_ref());
         if let Some(text) = self.format_promoted_lia_evaluation(id, clause, &clause_str, wire_rule)
         {
             return Ok(text);
@@ -4695,6 +4837,43 @@ impl<'a> AlethePrinter<'a> {
         premises: &[ProofId],
         args: &[TermId],
     ) -> Result<String, AlethePrintError> {
+        if matches!(rule, ay_core::AletheRule::Trans) {
+            let proof_clauses = self.proof_clauses.borrow();
+            let Some(premise_clauses) = premises
+                .iter()
+                .map(|premise| proof_clauses.get(premise).map(Vec::as_slice))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Err(AlethePrintError::InvalidSurfaceStep {
+                    id,
+                    reason: "trans step references an unavailable premise clause".to_string(),
+                });
+            };
+            let wire_overrides = self.wire_term_overrides.borrow();
+            if !trans_step_surface_is_supported(
+                self.terms,
+                clause,
+                &premise_clauses,
+                wire_overrides.as_ref(),
+            ) {
+                return Err(AlethePrintError::InvalidSurfaceStep {
+                    id,
+                    reason: "transitivity chain changed under surface rewriting".to_string(),
+                });
+            }
+        }
+        let evaluate_supported = if matches!(rule, ay_core::AletheRule::Evaluate) {
+            let wire_overrides = self.wire_term_overrides.borrow();
+            crate::evaluate_step_lowering_supported(self.terms, clause, wire_overrides.as_ref())
+        } else {
+            true
+        };
+        if !evaluate_supported {
+            return Err(AlethePrintError::InvalidSurfaceStep {
+                id,
+                reason: "evaluate conclusion changed under surface rewriting".to_string(),
+            });
+        }
         if matches!(rule, ay_core::AletheRule::FreshDefBound) {
             return self.format_fresh_def_bound(id, clause, premises, args);
         }
@@ -5631,7 +5810,9 @@ impl<'a> AlethePrinter<'a> {
         if !variables.is_empty() {
             let vars_str: Vec<String> = variables
                 .iter()
-                .map(|(name, sort)| format!("({} {sort})", quote_symbol(name)))
+                .map(|(name, sort)| {
+                    format!("({} {})", quote_symbol(name), format_sort_alethe(sort))
+                })
                 .collect();
             let _ = std::fmt::Write::write_fmt(
                 &mut result,
@@ -5745,7 +5926,7 @@ impl<'a> AlethePrinter<'a> {
     fn format_quantifier(&self, keyword: &str, vars: &[(String, Sort)], body: TermId) -> String {
         let vars_str: Vec<String> = vars
             .iter()
-            .map(|(name, sort)| format!("({} {})", quote_symbol(name), sort))
+            .map(|(name, sort)| format!("({} {})", quote_symbol(name), format_sort_alethe(sort)))
             .collect();
         format!(
             "({} ({}) {})",
@@ -6553,6 +6734,13 @@ pub(crate) enum ClauseSurfaceAgreement {
     /// a canonicalized order atom — the printed text is a different byte
     /// string denoting the SAME atom, not a different formula.
     OrderReversed,
+    /// At least one reachable override is the exact argument-reversed spelling
+    /// of its canonical binary equality, and every other override is an
+    /// identity spelling, another equality symmetry, or [`Self::OrderReversed`]
+    /// comparison converse. Equality is the same Boolean atom under symmetry,
+    /// but its signed `la_generic` row orientation changes; callers must replay
+    /// the effective printed certificate before publishing numeric evidence.
+    EqualityReversed,
     /// The channel changes what the clause says.
     Divergent,
 }
@@ -6565,16 +6753,19 @@ pub(crate) enum ClauseSurfaceAgreement {
 /// overrides for its own spelling, and that alone downgraded independently
 /// checked steps such as `(= (+ 2 3) 5)` to `hole`.
 ///
-/// [`ClauseSurfaceAgreement::OrderReversed`] is not a weaker BAR, it is a
-/// weaker EQUALITY: byte-equality is replaced by same-atom equality on the one
-/// relation where AY's own term constructors introduce the difference. It adds
-/// no reliance on any model of the external checker's arithmetic — the same
-/// converse identity is already load-bearing in this file, where
-/// [`surface_order_reversal`] drives the `comp_simplify` congruence bridge.
+/// [`ClauseSurfaceAgreement::OrderReversed`] and
+/// [`ClauseSurfaceAgreement::EqualityReversed`] are not weaker barriers, but
+/// stronger same-atom classifications: byte-equality is replaced only by the
+/// exact converse spelling AY's order constructors canonicalize or the exact
+/// symmetry of a binary equality. The former adds no reliance on a model of
+/// external arithmetic — the same converse identity is already load-bearing
+/// in this file, where [`surface_order_reversal`] drives the `comp_simplify`
+/// congruence bridge. The latter remains distinguished because a signed
+/// equality row must be replayed against its effective orientation.
 ///
 /// This is deliberately the ONE classifier: the printer and the publication
-/// wire-gap gate both reach it through `promoted_wire_rule`, so neither can
-/// drift from the other.
+/// wire-gap gate both reach it through shared wire-promotion predicates, so
+/// neither can drift from the other.
 pub(crate) fn clause_surface_agreement(
     terms: &TermStore,
     clause: &[TermId],
@@ -6635,12 +6826,67 @@ pub(crate) fn clause_surface_agreement(
         // operand, and it cannot cross strictness (`(>= x 0)` reverses to
         // `(<= 0 x)`, never to `(< 0 x)`).
         if surface_order_reversal(surface).is_some_and(|reversed| reversed == canonical) {
-            agreement = ClauseSurfaceAgreement::OrderReversed;
+            if agreement != ClauseSurfaceAgreement::EqualityReversed {
+                agreement = ClauseSurfaceAgreement::OrderReversed;
+            }
+            continue;
+        }
+        // Equality is symmetric as a Boolean atom, but reversing its operands
+        // reverses the signed arithmetic row an external `la_generic` checker
+        // builds. Preserve that distinction so the Farkas gate can demand a
+        // bounded replay of the exact effective certificate.
+        if surface_equality_reversal(surface).is_some_and(|reversed| reversed == canonical) {
+            agreement = ClauseSurfaceAgreement::EqualityReversed;
             continue;
         }
         return ClauseSurfaceAgreement::Divergent;
     }
     agreement
+}
+
+/// Compute the exact override channel visible to downstream wire rules after
+/// bounded authored-assume planning confines supported consumed spellings and
+/// all wholly unused assumption spellings to their own `assume` commands.
+///
+/// This runs the same planner the Alethe printer runs before emission. An
+/// An unsupported spelling with any consumed `Assume` id remains in the
+/// returned map and therefore remains subject to the ordinary fail-closed
+/// surface gate; a planning error is returned rather than silently hiding an
+/// override.
+pub fn effective_wire_term_overrides_for_proof(
+    proof: &Proof,
+    terms: &TermStore,
+    term_overrides: Option<&HashMap<TermId, String>>,
+) -> Result<Option<HashMap<TermId, String>>, AlethePrintError> {
+    let printer = AlethePrinter::new_with_overrides(terms, term_overrides);
+    printer.plan_equivalent_authored_assumes(proof)?;
+    Ok(printer.wire_term_overrides.into_inner())
+}
+
+/// Whether an exact authored `let` spelling takes the printer's fully checked
+/// elimination arm rather than its visible `hole` fallback.
+///
+/// The terminal wire-policy gate calls this over the same effective override
+/// map used by emission. Keeping the decision here prevents strict proof mode
+/// from rejecting a bridge the printer can certify—or accepting a `let` whose
+/// normalization would still require a hole. A local work cap makes this a
+/// conservative preflight for unusually large term DAGs.
+#[must_use]
+pub fn certified_let_assume_bridge_is_supported(
+    terms: &TermStore,
+    term: TermId,
+    surface: &str,
+    term_overrides: Option<&HashMap<TermId, String>>,
+) -> bool {
+    const PREFLIGHT_WORK_BUDGET: u64 = 4 * 1024 * 1024;
+    let printer = AlethePrinter::new_with_overrides_and_budget(
+        terms,
+        term_overrides,
+        Some(PREFLIGHT_WORK_BUDGET),
+    );
+    printer
+        .plan_let_assume_bridge(term, surface)
+        .is_some_and(|plan| plan.is_certified())
 }
 
 /// Split a surface-override string of the form `(=> A B)` into (`A`, `B`)
@@ -6691,6 +6937,12 @@ fn surface_order_reversal(s: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Exact symmetric spelling of a binary equality.
+fn surface_equality_reversal(s: &str) -> Option<String> {
+    let args = split_application(s, "=")?;
+    (args.len() == 2).then(|| format!("(= {} {})", args[1], args[0]))
 }
 
 /// The head symbol of a printed application, or `None` when `s` is not one
@@ -6860,6 +7112,270 @@ fn parse_printed_bitvec_literal(text: &str) -> Option<(num_bigint::BigUint, u32)
     (value.bits() <= u64::from(width)).then_some((value, width))
 }
 
+/// Whether a native bit-vector bit-blast lemma is in the exact bounded subset
+/// for which the Alethe printer emits a checked Carcara derivation.
+///
+/// This is the single capability predicate shared by proof publication and
+/// rendering. It invokes the same formatter dispatch, including its
+/// surface-text checks and width/circuit budgets, so the terminal policy
+/// cannot reject a lowering the exporter supports or admit one that would
+/// fall back to `hole`.
+#[must_use]
+pub fn checked_bv_bitblast_lowering_supported(
+    terms: &TermStore,
+    kind: &ay_core::TheoryLemmaKind,
+    clause: &[TermId],
+    term_overrides: Option<&HashMap<TermId, String>>,
+) -> bool {
+    let printer = AlethePrinter::new_with_overrides(terms, term_overrides);
+    (matches!(kind, ay_core::TheoryLemmaKind::BvBitBlast)
+        && printer
+            .format_binary_bvand_aci_simp(ProofId(0), clause)
+            .is_some())
+        || (matches!(
+            kind,
+            ay_core::TheoryLemmaKind::BvBitBlast | ay_core::TheoryLemmaKind::BvBitBlastGate { .. }
+        ) && printer
+            .format_checked_bv_bitblast_lowering(ProofId(0), clause)
+            .is_some())
+}
+
+pub(crate) fn format_sort_alethe(sort: &Sort) -> String {
+    match sort {
+        Sort::Bool => "Bool".to_string(),
+        Sort::Int => "Int".to_string(),
+        Sort::Real => "Real".to_string(),
+        Sort::BitVec(bits) => format!("(_ BitVec {})", bits.width),
+        Sort::Array(array) => format!(
+            "(Array {} {})",
+            format_sort_alethe(&array.index_sort),
+            format_sort_alethe(&array.element_sort)
+        ),
+        Sort::String => "String".to_string(),
+        Sort::RegLan => "RegLan".to_string(),
+        Sort::FloatingPoint(exponent, significand) => {
+            format!("(_ FloatingPoint {exponent} {significand})")
+        }
+        Sort::Uninterpreted(name) => quote_symbol(name),
+        Sort::Datatype(datatype) => quote_symbol(&datatype.name),
+        Sort::Seq(element) => format!("(Seq {})", format_sort_alethe(element)),
+        Sort::Char => "Char".to_string(),
+        Sort::FiniteDomain(name, _) | Sort::TypeVar(name) => quote_symbol(name),
+        _ => sort.to_string(),
+    }
+}
+
+fn carcara_symbol_is_losslessly_renderable(name: &str) -> bool {
+    !name.contains('|') && !name.contains('\\')
+}
+
+fn carcara_sort_is_supported(sort: &Sort) -> bool {
+    match sort {
+        Sort::FloatingPoint(..) | Sort::Seq(_) | Sort::Char => false,
+        Sort::Array(array) => {
+            carcara_sort_is_supported(&array.index_sort)
+                && carcara_sort_is_supported(&array.element_sort)
+        }
+        Sort::Uninterpreted(name) | Sort::FiniteDomain(name, _) | Sort::TypeVar(name) => {
+            carcara_symbol_is_losslessly_renderable(name)
+        }
+        Sort::Datatype(datatype) => {
+            carcara_symbol_is_losslessly_renderable(&datatype.name)
+                && datatype.constructors.iter().all(|constructor| {
+                    carcara_symbol_is_losslessly_renderable(&constructor.name)
+                        && constructor.fields.iter().all(|field| {
+                            carcara_symbol_is_losslessly_renderable(&field.name)
+                                && carcara_sort_is_supported(&field.sort)
+                        })
+                })
+        }
+        Sort::Bool | Sort::Int | Sort::Real | Sort::BitVec(_) | Sort::String | Sort::RegLan => true,
+        _ => false,
+    }
+}
+
+/// Whether every proof term has a lossless spelling in the pinned Carcara
+/// parser's sort and symbol grammar.
+///
+/// Carcara does not parse AY's `Seq`, `FloatingPoint`, or `Char` sorts, and it
+/// follows standard quoted-symbol syntax rather than Z3's `\|`/`\\` escape
+/// extension. A strict proof containing either class has no independently
+/// checkable Alethe artifact and must fail closed before publication.
+#[must_use]
+pub fn carcara_proof_surface_is_supported(
+    proof: &Proof,
+    terms: &TermStore,
+    term_overrides: Option<&HashMap<TermId, String>>,
+) -> bool {
+    if term_overrides.is_some_and(|overrides| {
+        overrides.values().any(|surface| {
+            !crate::la_generic_signs::carcara_quoted_symbols_are_lexically_supported(surface)
+        })
+    }) {
+        return false;
+    }
+
+    let mut stack = Vec::new();
+    for step in &proof.steps {
+        match step {
+            ProofStep::Assume(term) => stack.push(*term),
+            ProofStep::Resolution { clause, pivot, .. } => {
+                stack.extend(clause.iter().copied());
+                stack.push(*pivot);
+            }
+            ProofStep::TheoryLemma { clause, .. } => stack.extend(clause.iter().copied()),
+            ProofStep::Step { clause, args, .. } => {
+                stack.extend(clause.iter().copied());
+                stack.extend(args.iter().copied());
+            }
+            ProofStep::Anchor { variables, .. } => {
+                if variables.iter().any(|(name, sort)| {
+                    !carcara_symbol_is_losslessly_renderable(name)
+                        || !carcara_sort_is_supported(sort)
+                }) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    let mut visited = HashSet::default();
+    while let Some(term) = stack.pop() {
+        if !visited.insert(term) {
+            continue;
+        }
+        if !carcara_sort_is_supported(terms.sort(term)) {
+            return false;
+        }
+        match terms.get(term) {
+            TermData::Var(name, _) => {
+                if !carcara_symbol_is_losslessly_renderable(name) {
+                    return false;
+                }
+            }
+            TermData::App(symbol, _) => {
+                if !carcara_symbol_is_losslessly_renderable(symbol.name()) {
+                    return false;
+                }
+            }
+            TermData::Let(bindings, _) => {
+                if bindings
+                    .iter()
+                    .any(|(name, _)| !carcara_symbol_is_losslessly_renderable(name))
+                {
+                    return false;
+                }
+            }
+            TermData::Forall(variables, _, _) | TermData::Exists(variables, _, _) => {
+                if variables.iter().any(|(name, sort)| {
+                    !carcara_symbol_is_losslessly_renderable(name)
+                        || !carcara_sort_is_supported(sort)
+                }) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        stack.extend(terms.children(term));
+    }
+    true
+}
+
+/// Whether the rendered equalities still form the exact non-redundant path
+/// certified for a generic transitivity step.
+///
+/// Carcara consumes the printed endpoints, while AY's strict checker consumes
+/// the internal term DAG. A document-wide authored override can change that
+/// graph without changing the checked terms, so the renderer and terminal
+/// policy both rebuild the bounded path from the effective wire spelling and
+/// fail closed on a disconnected or redundant premise.
+#[must_use]
+pub fn trans_step_surface_is_supported(
+    terms: &TermStore,
+    clause: &[TermId],
+    premise_clauses: &[&[TermId]],
+    term_overrides: Option<&HashMap<TermId, String>>,
+) -> bool {
+    const MAX_TRANS_PREMISES: usize = 1_024;
+    const MAX_TRANS_SURFACE_WORK: u64 = 1024 * 1024;
+    if !(2..=MAX_TRANS_PREMISES).contains(&premise_clauses.len()) {
+        return false;
+    }
+    let printer = AlethePrinter::new_with_overrides_and_budget(
+        terms,
+        term_overrides,
+        Some(MAX_TRANS_SURFACE_WORK),
+    );
+    let decode = |clause: &[TermId]| -> Option<(String, String)> {
+        let [literal] = clause else {
+            return None;
+        };
+        let rendered = printer.format_term(*literal);
+        if printer.work_used() > MAX_TRANS_SURFACE_WORK {
+            return None;
+        }
+        let endpoints =
+            split_alethe_application_bounded(&rendered, "=", 2, MAX_TRANS_SURFACE_WORK as usize)
+                .ok()?;
+        let [left, right] = endpoints.as_slice() else {
+            return None;
+        };
+        Some(((*left).to_string(), (*right).to_string()))
+    };
+    let Some((goal_left, goal_right)) = decode(clause) else {
+        return false;
+    };
+    let Some(edges) = premise_clauses
+        .iter()
+        .map(|premise| decode(premise))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+
+    let mut adjacency: HashMap<String, Vec<(String, usize)>> = HashMap::default();
+    for (index, (left, right)) in edges.iter().enumerate() {
+        adjacency
+            .entry(left.clone())
+            .or_default()
+            .push((right.clone(), index));
+        adjacency
+            .entry(right.clone())
+            .or_default()
+            .push((left.clone(), index));
+    }
+    let mut parent: HashMap<String, (String, usize)> = HashMap::default();
+    parent.insert(goal_left.clone(), (goal_left.clone(), usize::MAX));
+    let mut frontier = std::collections::VecDeque::from([goal_left.clone()]);
+    while let Some(current) = frontier.pop_front() {
+        if current == goal_right {
+            break;
+        }
+        if let Some(neighbors) = adjacency.get(&current) {
+            for (next, edge) in neighbors {
+                if !parent.contains_key(next) {
+                    parent.insert(next.clone(), (current.clone(), *edge));
+                    frontier.push_back(next.clone());
+                }
+            }
+        }
+    }
+    if !parent.contains_key(&goal_right) {
+        return false;
+    }
+    let mut path_length = 0usize;
+    let mut current = goal_right;
+    while current != goal_left {
+        let Some((previous, _)) = parent.get(&current) else {
+            return false;
+        };
+        path_length += 1;
+        current = previous.clone();
+    }
+    path_length == edges.len()
+}
+
 /// Split a rendered application string `(op A1 ... An)` into its top-level
 /// argument strings by balanced-token scanning. Returns `None` when `s` is
 /// not an application of `op`.
@@ -6894,7 +7410,10 @@ fn split_printed_let(s: &str) -> Option<PrintedLetLevel> {
         .strip_prefix('(')?
         .strip_prefix("let")?
         .strip_suffix(')')?;
-    if !inner.starts_with(|c: char| c.is_whitespace()) {
+    // An opening parenthesis is an SMT-LIB token delimiter, so the compact
+    // spelling `(let((x true))x)` is just as lexical as the spaced form.  The
+    // binding-list and body checks below still require the exact `let` grammar.
+    if !inner.starts_with('(') && !inner.starts_with(|c: char| c.is_ascii_whitespace()) {
         return None;
     }
     let mut tokens = split_sexpr_tokens(inner)?;

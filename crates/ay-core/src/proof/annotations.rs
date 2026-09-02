@@ -8,6 +8,10 @@ use crate::term::TermId;
 use num_rational::Rational64;
 use serde::{Deserialize, Serialize};
 
+/// Capacity-hint clamp for clause-length-sized scratch vectors; clause length
+/// is producer-controlled, and longer clauses just grow past the hint.
+const MAX_PREALLOC_CLAUSE_LITERALS: usize = 1 << 16;
+
 /// Farkas annotation for arithmetic theory lemmas
 ///
 /// When an arithmetic theory (LRA/LIA) produces an UNSAT conflict, the
@@ -75,13 +79,15 @@ impl FarkasAnnotation {
     /// source literals are summed; the sum is placed on the first target
     /// occurrence and later duplicates receive zero. A source literal may be
     /// dropped only when its merged coefficient is zero. Target-only literals
-    /// are sound weakening rows and receive zero. Any other mismatch declines.
+    /// are sound weakening rows and receive zero. A duplicate-literal merge
+    /// whose sum overflows `Rational64` declines. Any other mismatch declines.
     #[must_use]
     pub fn rebind_by_literal(
         &self,
         source_clause: &[TermId],
         target_clause: &[TermId],
     ) -> Option<Self> {
+        use num_traits::CheckedAdd;
         use std::collections::{BTreeMap, BTreeSet};
 
         if self.coefficients.len() != source_clause.len() {
@@ -94,11 +100,12 @@ impl FarkasAnnotation {
         let zero = Rational64::from(0);
         let mut by_literal: BTreeMap<TermId, Rational64> = BTreeMap::new();
         for (&literal, coefficient) in source_clause.iter().zip(self.coefficients.iter()) {
-            *by_literal.entry(literal).or_insert(zero) += *coefficient;
+            let merged = by_literal.entry(literal).or_insert(zero);
+            *merged = merged.checked_add(coefficient)?;
         }
 
         let mut seen = BTreeSet::new();
-        let mut rebound = Vec::with_capacity(target_clause.len());
+        let mut rebound = Vec::with_capacity(target_clause.len().min(MAX_PREALLOC_CLAUSE_LITERALS));
         for &literal in target_clause {
             if seen.insert(literal) {
                 rebound.push(by_literal.remove(&literal).unwrap_or(zero));

@@ -5,6 +5,7 @@
 //! Authenticated rebuilds for preprocessor-folded ground arithmetic
 //! literals and their closed disjunctions.
 
+use super::and_collapse::LinearAndSourceProvenance;
 use super::*;
 
 /// Whether `literal` is a (possibly negated) binary linear-arithmetic atom.
@@ -52,15 +53,28 @@ impl Executor {
             // The expanded form is accepted by external checkers that compare
             // premises modulo let expansion.
             let expanded;
+            let expanded_let_provenance;
             let stripped = if matches!(stripped, FrontendTerm::Let(..)) {
+                let source_surface =
+                    crate::executor::proof_surface_syntax::format_frontend_term(stripped);
                 match expand_surface_lets(stripped, &std::collections::HashMap::new()) {
                     Some(term) => {
                         expanded = term;
-                        strip_frontend_annotations(&expanded)
+                        let stripped = strip_frontend_annotations(&expanded);
+                        expanded_let_provenance =
+                            self.raw_intern_surface(stripped).map(|expanded_root| {
+                                LinearAndSourceProvenance::ExpandedLet {
+                                    expanded_root,
+                                    source_index: original_idx,
+                                    source_surface,
+                                }
+                            });
+                        stripped
                     }
                     None => continue,
                 }
             } else {
+                expanded_let_provenance = None;
                 stripped
             };
             let FrontendTerm::App(head, operands) = stripped else {
@@ -97,7 +111,16 @@ impl Executor {
                         );
                         authored_root.is_some_and(|root| {
                             self.rebuild_complementary_and_collapse(proof, root, operands.len())
-                        }) || self.rebuild_linear_and_collapse(proof, operands)
+                        }) || match expanded_let_provenance {
+                            None => self.rebuild_linear_and_collapse(
+                                proof,
+                                operands,
+                                LinearAndSourceProvenance::IndexedApplication,
+                            ),
+                            Some(provenance) => {
+                                self.rebuild_linear_and_collapse(proof, operands, provenance)
+                            }
+                        }
                     }
                     _ => false,
                 };

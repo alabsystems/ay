@@ -356,7 +356,7 @@ fn execute() -> Result<Execution, String> {
     ));
 
     let mut profile_drift = starter_contract(Subject::default())?;
-    profile_drift.profile.z3_overlay.version = "not-5.0.0".to_string();
+    profile_drift.profile.z3_overlay.version = "not-5.1.0".to_string();
     rows.push(contract_control(
         "gate.profile-drift",
         &profile_drift,

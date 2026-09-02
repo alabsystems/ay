@@ -11,6 +11,10 @@
 use super::*;
 use num_traits::ToPrimitive;
 
+/// Capacity-hint clamp for the rewritten assertion list; assertion counts are
+/// caller-controlled, and longer lists just grow past the hint.
+const MAX_PREALLOC_ASSERTIONS: usize = 1 << 20;
+
 impl TermStore {
     /// Rewrite pseudo-boolean cardinality constraints into boolean clauses.
     ///
@@ -26,19 +30,17 @@ impl TermStore {
     /// recognized as a cardinality constraint.
     fn try_rewrite_cardinality(&mut self, term: TermId) -> Option<Vec<TermId>> {
         // Match: (<= sum bound) where sum = (+ ite1 ite2 ... iten [+ other])
-        let (pred_name, pred_args) = match self.get(term).clone() {
-            TermData::App(Symbol::Named(ref name), ref args) if args.len() == 2 => {
-                (name.clone(), args.clone())
-            }
+        let (pred_name, sum_term, bound_term) = match self.get(term).clone() {
+            TermData::App(Symbol::Named(ref name), ref args) => match args.as_slice() {
+                &[sum_term, bound_term] => (name.clone(), sum_term, bound_term),
+                _ => return None,
+            },
             _ => return None,
         };
 
         if pred_name != "<=" {
             return None;
         }
-
-        let sum_term = pred_args[0];
-        let bound_term = pred_args[1];
 
         // Extract bound value (must be a constant integer)
         let bound_val: i64 = match self.get(bound_term) {
@@ -86,13 +88,15 @@ impl TermStore {
 
         // Generate at-most-1: for each pair (ci, cj), add not-ci or not-cj
         let mut clauses = Vec::new();
-        for i in 0..conditions.len() {
-            for j in (i + 1)..conditions.len() {
-                let not_ci = self.mk_not(conditions[i]);
-                let not_cj = self.mk_not(conditions[j]);
+        let mut rest = conditions.as_slice();
+        while let Some((&ci, tail)) = rest.split_first() {
+            for &cj in tail {
+                let not_ci = self.mk_not(ci);
+                let not_cj = self.mk_not(cj);
                 let clause = self.mk_or(vec![not_ci, not_cj]);
                 clauses.push(clause);
             }
+            rest = tail;
         }
 
         Some(clauses)
@@ -122,7 +126,7 @@ impl TermStore {
     /// with pairwise boolean exclusion constraints. Returns a new assertion
     /// list with cardinality constraints expanded.
     pub fn rewrite_cardinality_constraints(&mut self, terms: &[TermId]) -> Vec<TermId> {
-        let mut result = Vec::with_capacity(terms.len());
+        let mut result = Vec::with_capacity(terms.len().min(MAX_PREALLOC_ASSERTIONS));
         for &t in terms {
             if let Some(replacements) = self.try_rewrite_cardinality(t) {
                 result.extend(replacements);

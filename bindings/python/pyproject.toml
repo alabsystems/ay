@@ -41,7 +41,7 @@ dependencies = []
 [project.optional-dependencies]
 # Match the recorded reference version named in this repository's differential
 # tests. The ordinary ayz3 wheel remains dependency-free.
-dev = ["pytest>=8", "z3-solver==5.0.0.0"]
+dev = ["pytest>=8", "z3-solver==5.1.0.0"]
 
 [project.urls]
 Homepage = "https://github.com/alabsystems/ay"

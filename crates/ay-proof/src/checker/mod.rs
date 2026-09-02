@@ -29,6 +29,7 @@ mod boolean_derived;
 mod boolean_negation;
 mod bv_bitblast;
 mod bv_lia_query;
+mod closed_bv_evaluate;
 pub use bv_bitblast::{
     authenticate_atom_leaf_bool_bv_unsat_query, authenticate_bool_bv_unsat_query,
     authenticate_uf_leaf_bool_bv_unsat_query, bv_bitblast_requires_proof_producer,
@@ -86,6 +87,8 @@ pub use nra_univariate::recognize_nra_univariate_unsat;
 mod order_ite;
 pub(crate) use order_ite::assignment_count as order_ite_assignment_count;
 pub use order_ite::recognize_order_ite_tautology;
+mod poly_simp;
+pub use poly_simp::recognize_arith_poly_simp;
 mod regex_empty;
 mod reordering;
 pub use regex_empty::recognize_regex_intersect_empty;
@@ -127,6 +130,7 @@ mod ground_evaluate;
 pub use ground_evaluate::recognize_ground_evaluate;
 pub(crate) use ground_evaluate::validate_ground_evaluate as validate_ground_evaluate_for_printer;
 mod lia;
+pub use lia::recognize_arith_eq_implies_bound;
 pub use lia::recognize_arith_eq_triangle;
 mod lra_farkas;
 pub(crate) use lra_farkas::uses_progress_metered_path as farkas_uses_progress_meter;
@@ -798,16 +802,28 @@ fn validate_generic_step(
             )
             .is_err()
             {
-                // `evaluate` also has a deliberately separate closed-BV
-                // concat fragment.  Both validators are independent and
-                // fail-closed; admission by either exact semantics is enough.
+                // `evaluate` also has deliberately separate closed-BV
+                // fragments: the legacy <=64-bit concat evaluator and the
+                // bounded exact wide evaluator. All validators are
+                // independent and fail closed; admission by any exact
+                // semantics is enough.
                 bv_bitblast::validate_bv_ground_evaluate(
                     terms,
                     step_id,
                     clause,
                     premises.len(),
                     args,
-                )?;
+                )
+                .or_else(|_| {
+                    closed_bv_evaluate::validate_closed_bv_evaluate(
+                        terms,
+                        step_id,
+                        clause,
+                        premises.len(),
+                        args,
+                        progress,
+                    )
+                })?;
             }
         }
         AletheRule::LaDisequality if strict => {

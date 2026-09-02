@@ -1194,16 +1194,16 @@ static int test_string_accessors(void) {
     assert(!Z3_is_string(ctx, five));
     assert(Z3_get_string(ctx, five) == NULL);
 
-    // Version APIs report the pinned Z3 5.0.0 compatibility identity.
+    // Version APIs report the pinned Z3 5.1.0 compatibility identity.
     unsigned int major = 0, minor = 0, build = 0, revision = 0;
     Z3_get_version(&major, &minor, &build, &revision);
     assert(major == 5);
-    assert(minor == 0);
+    assert(minor == 1);
     assert(build == 0);
     assert(revision == 0);
     Z3_string ver = Z3_get_full_version();
     assert(ver != NULL);
-    assert(strstr(ver, "(Z3 5.0.0.0 compatible)") != NULL);
+    assert(strstr(ver, "(Z3 5.1.0.0 compatible)") != NULL);
 
     // Global params are sound no-ops (must not crash or change state).
     Z3_global_param_set("smt.random_seed", "1");

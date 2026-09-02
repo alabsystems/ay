@@ -224,9 +224,10 @@ fn distinct_arrays_card1_ctor_infinite_field_is_sat() {
          (declare-const v3 (Array Int U1))\
          (declare-const v5 (Array Int U1))\
          (assert (distinct v3 v5))\
+         (check-sat)\
          (check-sat)",
     );
-    assert_eq!(result, vec!["sat"]);
+    assert_eq!(result, vec!["sat", "sat"]);
 }
 
 /// A single-constructor datatype whose one field is `Int` is not a singleton,

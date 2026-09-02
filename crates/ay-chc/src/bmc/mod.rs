@@ -49,7 +49,11 @@ use crate::pdr::counterexample::{
 };
 use crate::pdr::model::InvariantModel;
 use crate::pdr::{CexVerificationResult, PdrConfig, PdrSolver};
-use crate::smt::executor_adapter::{parse_model_into, quote_symbol, sort_to_smtlib};
+use crate::smt::executor_adapter::{
+    collect_uninterpreted_function_applications_for_exprs,
+    collect_uninterpreted_function_declarations_for_problem, emit_declare_uninterpreted_function,
+    install_observed_uf_application_values, parse_model_into, quote_symbol, sort_to_smtlib,
+};
 use crate::smt::executor_sort_guard::unsupported_executor_expr_reason;
 use crate::smt::{IncrementalQueryContext, SmtContext, SmtResult, SmtValue};
 use crate::transition_system::TransitionSystem;
@@ -112,6 +116,11 @@ const MAX_NESTED_ARRAY_CANDIDATE_TOKENS: usize = 4096;
 /// Direct nested-array equality edges retained for finite model completion.
 const MAX_NESTED_ARRAY_CANDIDATE_EQUALITIES: usize = 8192;
 
+/// Maximum exact scalar-UF applications queried after one BMC SAT result.
+/// Exceeding the cap abandons that witness rather than truncating the finite
+/// function view used by source-clause replay.
+const MAX_UF_APPLICATION_OBSERVATIONS: usize = 4096;
+
 fn log_nested_array_candidate(args: std::fmt::Arguments<'_>) {
     if ay_core::misc_cli_flags().chc_bmc_nested_debug {
         safe_eprintln!("BMC nested-array candidate: {args}");
@@ -165,6 +174,11 @@ const REPEATED_BODY_TREE_FALLBACK_BUDGET: std::time::Duration = std::time::Durat
 /// Below this the reroute is skipped outright: building one unfolding already
 /// costs more than the remaining slice, so attempting it would only overrun.
 const REPEATED_BODY_TREE_MIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Maximum clause/body entries inspected between cooperative stop polls in
+/// the repeated-body safety preflight. The hash set itself holds at most one
+/// entry per distinct predicate in the current clause body.
+const REPEATED_BODY_SCAN_STOP_POLL_INTERVAL: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IntInterval {
@@ -629,6 +643,13 @@ impl BmcConfig {
 #[derive(Debug, Clone)]
 enum BmcTraceValue {
     Var(ChcVar),
+    /// Exact result of one syntactic ordinary-UF application used by the
+    /// flattened bounded formula. The observation enriches witness replay; it
+    /// never supplies a total/default interpretation for the function.
+    UfApplication {
+        application: ChcExpr,
+        return_sort: ChcSort,
+    },
     /// A scalar-valued read through one or more nested arrays.
     ///
     /// Keeping the whole path matters for arrays indexed by arrays. The
@@ -648,6 +669,7 @@ impl BmcTraceValue {
     fn sort(&self) -> &ChcSort {
         match self {
             Self::Var(var) => &var.sort,
+            Self::UfApplication { return_sort, .. } => return_sort,
             Self::ArraySelectPath { value_sort, .. } => value_sort,
         }
     }
@@ -655,6 +677,7 @@ impl BmcTraceValue {
     fn term(&self) -> ChcExpr {
         match self {
             Self::Var(var) => ChcExpr::var(var.clone()),
+            Self::UfApplication { application, .. } => application.clone(),
             Self::ArraySelectPath { array, indices, .. } => indices
                 .iter()
                 .fold(ChcExpr::var(array.clone()), |read, (index, _)| {
@@ -979,15 +1002,37 @@ impl BmcSolver {
     /// [`Self::solve_bounded_tree_refutation`] carries the exact encoding for
     /// these bodies and is where [`Self::resolve_unrepresentable_safe`] routes
     /// them.
-    fn has_repeated_body_predicate(&self) -> bool {
-        self.problem.clauses().iter().any(|clause| {
-            let body = &clause.body.predicates;
-            body.iter().enumerate().any(|(index, (predicate, _))| {
-                body[index + 1..]
-                    .iter()
-                    .any(|(other, _)| other == predicate)
-            })
-        })
+    ///
+    /// `None` means cancellation or the authoritative solve deadline stopped
+    /// the scan. Callers must treat that as `Unknown`, never as proof that all
+    /// bodies are distinct.
+    fn has_repeated_body_predicate(&self) -> Option<bool> {
+        if self.model_extraction_should_stop() {
+            return None;
+        }
+
+        let mut seen = FxHashSet::default();
+        for clause in self.problem.clauses() {
+            // Poll at every clause boundary as well as within wide bodies, so
+            // a proof with many empty/unit clauses remains interruptible.
+            if self.model_extraction_should_stop() {
+                return None;
+            }
+            seen.clear();
+            for (index, (predicate, _)) in clause.body.predicates.iter().enumerate() {
+                if index > 0
+                    && index % REPEATED_BODY_SCAN_STOP_POLL_INTERVAL == 0
+                    && self.model_extraction_should_stop()
+                {
+                    return None;
+                }
+                if !seen.insert(*predicate) {
+                    return (!self.model_extraction_should_stop()).then_some(true);
+                }
+            }
+        }
+
+        (!self.model_extraction_should_stop()).then_some(false)
     }
 
     /// Never publish a `Safe` the level-flat encoding cannot justify; try to
@@ -1017,8 +1062,19 @@ impl BmcSolver {
     /// Only `Safe` is affected. `Unsafe` still rests on its own witness replay
     /// and is untouched.
     fn resolve_unrepresentable_safe(&self, result: ChcEngineResult) -> ChcEngineResult {
-        if !matches!(result, ChcEngineResult::Safe(_)) || !self.has_repeated_body_predicate() {
+        if !matches!(result, ChcEngineResult::Safe(_)) {
             return result;
+        }
+        match self.has_repeated_body_predicate() {
+            Some(true) => {}
+            Some(false) => return result,
+            None => {
+                if matches!(self.solve_deadline.get(), Some(deadline) if ay_core::time::Instant::now() >= deadline)
+                {
+                    self.stats.borrow_mut().budget_exhausted = true;
+                }
+                return ChcEngineResult::Unknown;
+            }
         }
         tracing::warn!(
             "BMC: discarding Safe — a clause body applies one predicate more than once, \
@@ -2092,8 +2148,9 @@ impl BmcSolver {
         let mut conjuncts = Vec::with_capacity(values.len());
         for (idx, (sort, value)) in pred.arg_sorts.iter().zip(values.iter()).enumerate() {
             let var = ChcVar::new(format!("__p{}_a{}", predicate.index(), idx), sort.clone());
-            let value_expr = Self::smt_value_expr_for_sort(value, sort)?;
-            instances.insert(var.name.clone(), value.clone());
+            let value = Self::model_smt_value_for_sort(value, sort)?;
+            let value_expr = Self::smt_value_expr_for_sort(&value, sort)?;
+            instances.insert(var.name.clone(), value);
             conjuncts.push(ChcExpr::eq(ChcExpr::var(var), value_expr));
         }
 
@@ -2115,17 +2172,21 @@ impl BmcSolver {
     fn smt_value_expr_for_sort(value: &SmtValue, sort: &ChcSort) -> Option<ChcExpr> {
         match (sort, value) {
             (ChcSort::Int, SmtValue::Int(value)) => Some(ChcExpr::int(*value)),
+            (ChcSort::Int, SmtValue::BigInt(value)) => {
+                Some(ChcExpr::from_bigint(value.as_ref().clone()))
+            }
             (ChcSort::Bool, SmtValue::Bool(value)) => Some(ChcExpr::bool_const(*value)),
             (ChcSort::Bool, SmtValue::Int(value)) => Some(ChcExpr::bool_const(*value != 0)),
-            (ChcSort::BitVec(width), SmtValue::BitVec(value, value_width))
-                if width == value_width =>
-            {
-                Some(ChcExpr::BitVec(*value, *width))
+            (
+                ChcSort::BitVec(width),
+                value @ (SmtValue::BitVec(_, value_width) | SmtValue::BigBitVec(_, value_width)),
+            ) if width == value_width => value.bitvec_to_chc_expr(),
+            (ChcSort::BitVec(width), SmtValue::Int(value)) => {
+                SmtValue::bitvec_from_bigint((*value).into(), *width).bitvec_to_chc_expr()
             }
-            (ChcSort::BitVec(width), SmtValue::Int(value)) => Some(ChcExpr::BitVec(
-                Self::concrete_bitvec_value(*width, *value)?,
-                *width,
-            )),
+            (ChcSort::BitVec(width), SmtValue::BigInt(value)) => {
+                SmtValue::bitvec_from_bigint(value.as_ref().clone(), *width).bitvec_to_chc_expr()
+            }
             (ChcSort::Array(index_sort, element_sort), SmtValue::ConstArray(default)) => {
                 Some(ChcExpr::ConstArray(
                     index_sort.as_ref().clone(),
@@ -2212,8 +2273,8 @@ impl BmcSolver {
         match sort {
             ChcSort::Int => Some(SmtValue::Int(value)),
             ChcSort::Bool => Some(SmtValue::Bool(value != 0)),
-            ChcSort::BitVec(width) => Some(SmtValue::BitVec(
-                Self::concrete_bitvec_value(*width, value)?,
+            ChcSort::BitVec(width) => Some(SmtValue::bitvec_from_biguint(
+                num_bigint::BigUint::from(Self::concrete_bitvec_value(*width, value)?),
                 *width,
             )),
             _ => None,
@@ -2763,103 +2824,7 @@ impl BmcSolver {
     /// Whether BMC's encoded problem contains datatype features that make the
     /// legacy fallback's SAT/Unsafe result unsafe to trust.
     fn problem_uses_datatype_features(&self) -> bool {
-        if self.problem.datatype_defs().is_empty() {
-            return false;
-        }
-
-        if self.problem.has_datatype_sorts() {
-            return true;
-        }
-
-        let datatype_function_names = self.datatype_function_names();
-        self.problem
-            .clauses()
-            .iter()
-            .any(|clause| Self::clause_uses_datatype_features(clause, &datatype_function_names))
-    }
-
-    fn datatype_function_names(&self) -> FxHashSet<String> {
-        let mut names = FxHashSet::default();
-        for constructors in self.problem.datatype_defs().values() {
-            for (ctor_name, selectors) in constructors {
-                names.insert(ctor_name.clone());
-                names.insert(format!("is-{ctor_name}"));
-                for (selector_name, _) in selectors {
-                    names.insert(selector_name.clone());
-                }
-            }
-        }
-        names
-    }
-
-    fn clause_uses_datatype_features(
-        clause: &HornClause,
-        datatype_function_names: &FxHashSet<String>,
-    ) -> bool {
-        clause
-            .body
-            .constraint
-            .as_ref()
-            .is_some_and(|expr| Self::expr_uses_datatype_features(expr, datatype_function_names))
-            || clause
-                .body
-                .predicates
-                .iter()
-                .flat_map(|(_, args)| args)
-                .any(|expr| Self::expr_uses_datatype_features(expr, datatype_function_names))
-            || match &clause.head {
-                ClauseHead::Predicate(_, args) => args
-                    .iter()
-                    .any(|expr| Self::expr_uses_datatype_features(expr, datatype_function_names)),
-                ClauseHead::False => false,
-            }
-    }
-
-    fn expr_uses_datatype_features(
-        expr: &ChcExpr,
-        datatype_function_names: &FxHashSet<String>,
-    ) -> bool {
-        match expr {
-            ChcExpr::Bool(_) | ChcExpr::Int(_) | ChcExpr::Real(_, _) | ChcExpr::BitVec(_, _) => {
-                false
-            }
-            ChcExpr::Var(var) => Self::sort_contains_datatype(&var.sort),
-            ChcExpr::Op(_, args) | ChcExpr::PredicateApp(_, _, args) => args
-                .iter()
-                .any(|arg| Self::expr_uses_datatype_features(arg, datatype_function_names)),
-            ChcExpr::FuncApp(name, sort, args) => {
-                datatype_function_names.contains(name)
-                    || Self::sort_contains_datatype(sort)
-                    || args
-                        .iter()
-                        .any(|arg| Self::expr_uses_datatype_features(arg, datatype_function_names))
-            }
-            ChcExpr::ConstArrayMarker(sort) => Self::sort_contains_datatype(sort),
-            ChcExpr::IsTesterMarker(_) => true,
-            ChcExpr::ConstArray(key_sort, value) => {
-                // ChcExpr::ConstArray stores the key sort; the element sort is
-                // recovered from the VALUE expression itself, so a
-                // datatype-valued array constant is detected precisely. The
-                // previous blanket `!datatype_function_names.is_empty()` guard
-                // armed on ANY declared datatype, which made every model-checker-consumer
-                // system (they always declare Option/Tuple/... even when
-                // unused) downgrade legacy-fallback Unsafe verdicts to
-                // Unknown despite purely scalar const arrays.
-                Self::sort_contains_datatype(key_sort)
-                    || Self::sort_contains_datatype(&value.sort())
-                    || Self::expr_uses_datatype_features(value, datatype_function_names)
-            }
-        }
-    }
-
-    fn sort_contains_datatype(sort: &ChcSort) -> bool {
-        match sort {
-            ChcSort::Datatype { .. } => true,
-            ChcSort::Array(key, value) => {
-                Self::sort_contains_datatype(key) || Self::sort_contains_datatype(value)
-            }
-            _ => false,
-        }
+        self.problem.uses_datatype_features()
     }
 
     fn executor_conjuncts_supported(&self, conjuncts: &[ChcExpr], phase: &str) -> bool {
@@ -2870,6 +2835,18 @@ impl BmcSolver {
             return false;
         }
         true
+    }
+
+    /// Declare every ordinary UF used by the source problem before a BMC
+    /// executor session sees derived/unrolled applications of those symbols.
+    /// Conflicting typed signatures make the lane inapplicable (fail closed).
+    fn append_problem_uf_declarations(&self, script: &mut String) -> Option<()> {
+        let declarations =
+            collect_uninterpreted_function_declarations_for_problem(&self.problem).ok()?;
+        for declaration in &declarations {
+            script.push_str(&emit_declare_uninterpreted_function(declaration));
+        }
+        Some(())
     }
 
     /// Legacy BMC solve using IncrementalQueryContext (non-incremental theory solver).
@@ -3081,8 +3058,10 @@ impl BmcSolver {
     ///
     /// This expands the predicate DAG directly, freshening clause variables per
     /// expansion occurrence, then asks the native CHC SMT context whether any
-    /// query is reachable. Only UNSAT is trusted as a safety proof; SAT/Unknown
-    /// are deliberately reported as Unknown.
+    /// query is reachable. UNSAT is trusted as a safety proof. SAT is promoted
+    /// only when a concrete derivation is reconstructed and validated on this
+    /// problem (or the established strict witness replay succeeds); every
+    /// unvalidated SAT and every solver Unknown remains Unknown.
     fn solve_acyclic_safe_first_once(
         &self,
         queries: &[&HornClause],
@@ -3519,6 +3498,40 @@ impl BmcSolver {
                     if let Some(witness) =
                         self.acyclic_branch_witness(&extended, path, query_clause)
                     {
+                        // The exact-path witness is already grounded by the
+                        // branch model.  Preserve that stronger evidence for
+                        // enclosing transform lanes: reshape it into a ground
+                        // derivation over THIS problem, validate every clause
+                        // and premise link here, and attach it to the
+                        // counterexample.  A legacy witness replay can prove
+                        // Unsafe on this transformed problem while still
+                        // losing values for parameters removed by an enclosing
+                        // transform; only the ground derivation gives that
+                        // transform enough information to reconstruct and
+                        // validate the ORIGINAL derivation.
+                        if let Some(derivation) = self
+                            .ground_derivation_from_acyclic_branch_witness(
+                                &witness, &extended, deadline,
+                            )
+                        {
+                            let steps = self.steps_from_derivation_witness(&witness);
+                            let cex = Counterexample::with_witness(steps, witness)
+                                .with_ground_derivation(derivation);
+                            self.record_depth(max_depth, start.elapsed().as_secs_f64());
+                            return AcyclicBranchEnumeration::Unsafe(Box::new(cex));
+                        }
+                        if ay_core::time::Instant::now() >= deadline
+                            || self.config.base.is_cancelled()
+                        {
+                            self.stats.borrow_mut().budget_exhausted = true;
+                            self.record_depth(max_depth, start.elapsed().as_secs_f64());
+                            return AcyclicBranchEnumeration::TimedOut;
+                        }
+                        // Fail-closed compatibility fallback for the ground
+                        // kill switch or an incomplete printable model.  This
+                        // may still prove Unsafe for an untransformed caller;
+                        // transformed callers must independently replay it on
+                        // their original clauses before promotion.
                         if let ChcEngineResult::Unsafe(cex) =
                             self.verified_unsafe_from_witness(witness, "exact-acyclic branch")
                         {
@@ -6858,6 +6871,7 @@ impl BmcSolver {
         let deadline = self.config.time_budget.map(|budget| start + budget);
         let logic = self.detect_bmc_logic();
         let mut smt = format!("(set-logic {logic})\n(set-option :produce-models true)\n");
+        self.append_problem_uf_declarations(&mut smt)?;
         let mut declared_vars: FxHashSet<String> = FxHashSet::default();
         let mut query_parts = Vec::new();
         let mut trace_query_conjuncts = Vec::new();
@@ -7444,6 +7458,7 @@ impl BmcSolver {
 
         let init0 = ts.init_at(0);
         let mut script = format!("(set-logic {logic})\n");
+        solver.append_problem_uf_declarations(&mut script)?;
         Self::append_ts_decls_and_asserts(&mut script, &init0, &mut declared, true);
         segments.push(script);
 
@@ -7531,6 +7546,7 @@ impl BmcSolver {
             return None;
         }
         let mut script = format!("(set-logic {logic})\n");
+        self.append_problem_uf_declarations(&mut script)?;
         Self::append_ts_decls_and_asserts(&mut script, &init0, &mut declared, true);
 
         let commands = ay_frontend::parse(&script).ok()?;
@@ -7821,6 +7837,7 @@ impl BmcSolver {
             return None;
         }
         let mut script = format!("(set-logic {logic})\n");
+        self.append_problem_uf_declarations(&mut script)?;
         Self::append_ts_decls_and_asserts(&mut script, &init0, &mut declared, true);
 
         let commands = ay_frontend::parse(&script).ok()?;
@@ -8215,6 +8232,7 @@ impl BmcSolver {
         let start = ay_core::time::Instant::now();
         let logic = self.detect_bmc_logic();
         let mut smt_cmds = format!("(set-logic {logic})\n(set-option :produce-models true)\n");
+        self.append_problem_uf_declarations(&mut smt_cmds)?;
         let mut declared_vars: FxHashSet<String> = FxHashSet::default();
 
         // Build level 0 constraints + declarations
@@ -8469,6 +8487,7 @@ impl BmcSolver {
         let start = ay_core::time::Instant::now();
         let logic = self.detect_bmc_logic();
         let mut smt_prefix = format!("(set-logic {logic})\n(set-option :produce-models true)\n");
+        self.append_problem_uf_declarations(&mut smt_prefix)?;
         let mut declared_vars: FxHashSet<String> = FxHashSet::default();
         let mut prefix_conjuncts = Vec::new();
         let mut ema_depth_time: f64 = 0.0;
@@ -8697,6 +8716,7 @@ impl BmcSolver {
         // Serialize and check
         let logic = self.detect_bmc_logic();
         let mut smt = format!("(set-logic {logic})\n");
+        self.append_problem_uf_declarations(&mut smt)?;
 
         // Declare all variables
         let mut declared: FxHashSet<String> = FxHashSet::default();
@@ -8737,6 +8757,19 @@ impl BmcSolver {
     /// SYNTHETIC problem: the location encoding adds Int state variables, so
     /// e.g. a pure-Bool original still needs an Int-capable logic.
     fn detect_bmc_logic_for(problem: &ChcProblem) -> &'static str {
+        // Ordinary UFs require a UF-capable logic.  The sort-only selection
+        // below intentionally ignores term structure and would otherwise emit
+        // QF_LIA/QF_LIRA/QF_BV for scalar problems containing `FuncApp`, making
+        // the declaration we add to every executor session illegal under the
+        // advertised logic.  `ALL` preserves every source-theory constraint and
+        // lets the executor select its conservative combined lane.  A signature
+        // conflict is rejected later by `append_problem_uf_declarations`.
+        if collect_uninterpreted_function_declarations_for_problem(problem)
+            .is_ok_and(|declarations| !declarations.is_empty())
+        {
+            return "ALL";
+        }
+
         let mut has_bv = false;
         let mut has_real = false;
         let mut has_array = false;
@@ -9089,7 +9122,7 @@ impl BmcSolver {
         &self,
         max_depth: usize,
         query_conjuncts: &[ChcExpr],
-    ) -> Vec<BmcTraceValue> {
+    ) -> Option<Vec<BmcTraceValue>> {
         let mut values = Vec::new();
         let mut seen_vars = FxHashSet::default();
         for level in 0..=max_depth {
@@ -9114,32 +9147,61 @@ impl BmcSolver {
         // independent of that command by explicitly querying every scalar
         // variable used by the flattened levels and query: reachability flags,
         // rule-local variables, and predicate arguments alike.
+        let mut trace_exprs = Vec::new();
         for level in 0..=max_depth {
             let mut level_conjuncts = Vec::new();
             self.compile_level_flat(level, &mut level_conjuncts);
             for conjunct in &level_conjuncts {
                 Self::collect_trace_scalar_vars(conjunct, &mut values, &mut seen_vars);
             }
+            trace_exprs.extend(level_conjuncts);
         }
         for conjunct in query_conjuncts {
             Self::collect_trace_scalar_vars(conjunct, &mut values, &mut seen_vars);
         }
+        trace_exprs.extend(query_conjuncts.iter().cloned());
+
+        // Parameterized function definitions are intentionally not parsed
+        // from get-model. Observe every finite scalar application that can be
+        // needed by exact source-clause replay instead. Signature conflicts
+        // were already rejected when the BMC session declared source UFs; an
+        // unexpected derived conflict leaves the observations absent and the
+        // replay therefore fails closed.
+        let applications =
+            collect_uninterpreted_function_applications_for_exprs(trace_exprs.iter()).ok()?;
+        if applications.len() > MAX_UF_APPLICATION_OBSERVATIONS {
+            tracing::debug!(
+                "BMC trace model needs {} scalar-UF observations (cap {}); returning Unknown",
+                applications.len(),
+                MAX_UF_APPLICATION_OBSERVATIONS
+            );
+            return None;
+        }
+        for application in applications {
+            let ChcExpr::FuncApp(_, return_sort, args) = &application else {
+                continue;
+            };
+            if Self::trace_assignment_sort_supported(return_sort)
+                && args
+                    .iter()
+                    .all(|argument| Self::trace_assignment_sort_supported(&argument.sort()))
+            {
+                let return_sort = return_sort.clone();
+                values.push(BmcTraceValue::UfApplication {
+                    application,
+                    return_sort,
+                });
+            }
+        }
 
         if self.problem.has_array_sorts() {
             let mut seen = FxHashSet::default();
-            for level in 0..=max_depth {
-                let mut level_conjuncts = Vec::new();
-                self.compile_level_flat(level, &mut level_conjuncts);
-                for conjunct in &level_conjuncts {
-                    Self::collect_trace_array_selects(conjunct, &mut values, &mut seen);
-                }
-            }
-            for conjunct in query_conjuncts {
+            for conjunct in &trace_exprs {
                 Self::collect_trace_array_selects(conjunct, &mut values, &mut seen);
             }
         }
 
-        values
+        Some(values)
     }
 
     fn collect_trace_scalar_vars(
@@ -9155,7 +9217,10 @@ impl BmcSolver {
     }
 
     fn trace_assignment_sort_supported(sort: &ChcSort) -> bool {
-        matches!(sort, ChcSort::Bool | ChcSort::Int | ChcSort::BitVec(_))
+        matches!(
+            sort,
+            ChcSort::Bool | ChcSort::Int | ChcSort::Real | ChcSort::BitVec(_)
+        )
     }
 
     /// Keep only trace values whose terms reference DECLARED symbols (inc-9).
@@ -9892,6 +9957,7 @@ impl BmcSolver {
             "(set-logic {})\n(set-option :produce-models true)\n",
             self.detect_bmc_logic()
         );
+        self.append_problem_uf_declarations(&mut smt)?;
         let mut declared_vars = FxHashSet::default();
         for conjunct in prefix_conjuncts
             .iter()
@@ -10104,7 +10170,7 @@ impl BmcSolver {
             return None;
         }
 
-        let mut trace_values = self.bmc_trace_values(max_depth, query_conjuncts);
+        let mut trace_values = self.bmc_trace_values(max_depth, query_conjuncts)?;
         trace_values.retain(|value| {
             !matches!(
                 value,
@@ -10124,7 +10190,12 @@ impl BmcSolver {
         let mut model = FxHashMap::default();
         let dt_ctor_names = FxHashSet::default();
         parse_model_into(&mut model, Self::model_output(&outputs), &dt_ctor_names);
-        Self::parse_trace_get_value_outputs_into_model(&mut model, &trace_values, &outputs);
+        if !Self::parse_trace_get_value_outputs_into_model(&mut model, &trace_values, &outputs) {
+            tracing::debug!(
+                "BMC trace model omitted or contradicted a scalar-UF application; returning Unknown"
+            );
+            return None;
+        }
         Some(model)
     }
 
@@ -10268,9 +10339,14 @@ impl BmcSolver {
         model: &mut FxHashMap<String, SmtValue>,
         values: &[BmcTraceValue],
         outputs: &[String],
-    ) {
-        if values.is_empty() || outputs.len() < values.len() {
-            return;
+    ) -> bool {
+        if values.is_empty() {
+            return true;
+        }
+        if outputs.len() < values.len() {
+            return !values
+                .iter()
+                .any(|value| matches!(value, BmcTraceValue::UfApplication { .. }));
         }
 
         // The trace commands are emitted last and each produces exactly one
@@ -10295,6 +10371,23 @@ impl BmcSolver {
             }
         }
 
+        let mut uf_observations = Vec::new();
+        for (trace_value, value) in values.iter().zip(&parsed) {
+            let BmcTraceValue::UfApplication { application, .. } = trace_value else {
+                continue;
+            };
+            let Some(value) = value else {
+                // A missing application value cannot be replaced with a
+                // function default: the bounded witness would no longer be
+                // the solver's model.
+                return false;
+            };
+            uf_observations.push((application.clone(), value.clone()));
+        }
+        if !install_observed_uf_application_values(model, &uf_observations) {
+            return false;
+        }
+
         let observations: Vec<BmcArrayObservation> = values
             .iter()
             .zip(parsed)
@@ -10310,6 +10403,7 @@ impl BmcSolver {
             })
             .collect();
         Self::reconstruct_trace_array_observations(model, &observations);
+        true
     }
 
     /// Materialize the finite nested-array cells returned by trace
@@ -10511,7 +10605,10 @@ impl BmcSolver {
             SmtValue::Int(value) => Some(format!("int:{value}")),
             SmtValue::BigInt(value) => Some(format!("bigint:{value}")),
             SmtValue::Real(value) => Some(format!("real:{value}")),
-            SmtValue::BitVec(value, width) => Some(format!("bv:{width}:{value}")),
+            value @ (SmtValue::BitVec(..) | SmtValue::BigBitVec(..)) => {
+                let (value, width) = value.bitvec_to_biguint()?;
+                Some(format!("bv:{width}:{value}"))
+            }
             SmtValue::Opaque(_) => None,
             SmtValue::ConstArray(default) => {
                 let default = Self::trace_value_semantic_key(default)?;
@@ -10593,9 +10690,10 @@ impl BmcSolver {
         match sort {
             ChcSort::Bool => Some(SmtValue::Bool(!nonce.is_multiple_of(2))),
             ChcSort::Int => Some(SmtValue::Int(n.checked_neg()?.checked_sub(1)?)),
-            ChcSort::BitVec(width) if *width != 0 => {
-                Some(SmtValue::BitVec((nonce as u128) & bv_mask(*width), *width))
-            }
+            ChcSort::BitVec(width) if *width != 0 => Some(SmtValue::bitvec_from_biguint(
+                num_bigint::BigUint::from((nonce as u128) & bv_mask(*width)),
+                *width,
+            )),
             ChcSort::Array(_, _) => Self::fresh_trace_array_key(sort, nonce),
             ChcSort::BitVec(_)
             | ChcSort::Real
@@ -10611,7 +10709,10 @@ impl BmcSolver {
             ChcSort::Int => Some(SmtValue::Int(n.checked_add(1)?)),
             ChcSort::BitVec(width) if *width != 0 => {
                 let value = ((nonce as u128) & bv_mask(*width)).max(1);
-                Some(SmtValue::BitVec(value, *width))
+                Some(SmtValue::bitvec_from_biguint(
+                    num_bigint::BigUint::from(value),
+                    *width,
+                ))
             }
             ChcSort::Array(_, _) => Self::fresh_trace_array_key(sort, nonce),
             ChcSort::BitVec(_)
@@ -10705,7 +10806,10 @@ impl BmcSolver {
         match sort {
             ChcSort::Bool => Some(SmtValue::Bool(false)),
             ChcSort::Int => Some(SmtValue::Int(0)),
-            ChcSort::BitVec(width) => Some(SmtValue::BitVec(0, *width)),
+            ChcSort::BitVec(width) => Some(SmtValue::bitvec_from_biguint(
+                num_bigint::BigUint::from(0u8),
+                *width,
+            )),
             ChcSort::Array(_, value_sort) => Some(SmtValue::ConstArray(Box::new(
                 Self::default_smt_value_for_sort(value_sort)?,
             ))),
@@ -10721,22 +10825,71 @@ impl BmcSolver {
                 _ => None,
             },
             ChcSort::Int => Self::trace_get_value_i128(value).map(SmtValue::Int),
+            ChcSort::Real => Self::trace_get_value_real(value).map(SmtValue::Real),
             ChcSort::BitVec(width) => {
                 let value = match value {
-                    SExpr::Hexadecimal(literal) => {
-                        u128::from_str_radix(literal.strip_prefix("#x")?, 16).ok()?
-                    }
+                    SExpr::Hexadecimal(literal) => num_bigint::BigUint::parse_bytes(
+                        literal.strip_prefix("#x")?.as_bytes(),
+                        16,
+                    )?,
                     SExpr::Binary(literal) => {
-                        u128::from_str_radix(literal.strip_prefix("#b")?, 2).ok()?
+                        num_bigint::BigUint::parse_bytes(literal.strip_prefix("#b")?.as_bytes(), 2)?
                     }
-                    SExpr::Numeral(literal) => literal.parse::<u128>().ok()?,
+                    SExpr::Numeral(literal) => literal.parse::<num_bigint::BigUint>().ok()?,
                     SExpr::List(items) => Self::trace_get_value_indexed_bitvec(items, *width)?,
                     _ => return None,
                 };
-                if *width < 128 && value > bv_mask(*width) {
+                Some(SmtValue::bitvec_from_biguint(value, *width))
+            }
+            _ => None,
+        }
+    }
+
+    fn trace_get_value_real(value: &SExpr) -> Option<num_rational::BigRational> {
+        use num_bigint::BigInt;
+        use num_rational::BigRational;
+        use num_traits::Zero;
+
+        fn atom(text: &str) -> Option<BigRational> {
+            let (negative, unsigned) = text
+                .strip_prefix('-')
+                .map_or((false, text), |rest| (true, rest));
+            if let Some((integer, fraction)) = unsigned.split_once('.') {
+                if integer.is_empty() || fraction.is_empty() {
                     return None;
                 }
-                Some(SmtValue::BitVec(value & bv_mask(*width), *width))
+                let denominator = BigInt::from(10u8).pow(fraction.len() as u32);
+                let mut numerator = format!("{integer}{fraction}").parse::<BigInt>().ok()?;
+                if negative {
+                    numerator = -numerator;
+                }
+                return Some(BigRational::new(numerator, denominator));
+            }
+            let integer = text.parse::<BigInt>().ok()?;
+            Some(BigRational::from_integer(integer))
+        }
+
+        match value {
+            SExpr::Numeral(text) | SExpr::Decimal(text) | SExpr::Symbol(text) => atom(text),
+            SExpr::List(items) if items.len() == 2 => {
+                let [SExpr::Symbol(operator), argument] = items.as_slice() else {
+                    return None;
+                };
+                if operator != "-" {
+                    return None;
+                }
+                Some(-Self::trace_get_value_real(argument)?)
+            }
+            SExpr::List(items) if items.len() == 3 => {
+                let [SExpr::Symbol(operator), numerator, denominator] = items.as_slice() else {
+                    return None;
+                };
+                if operator != "/" {
+                    return None;
+                }
+                let numerator = Self::trace_get_value_real(numerator)?;
+                let denominator = Self::trace_get_value_real(denominator)?;
+                (!denominator.is_zero()).then(|| numerator / denominator)
             }
             _ => None,
         }
@@ -10758,7 +10911,7 @@ impl BmcSolver {
         }
     }
 
-    fn trace_get_value_indexed_bitvec(items: &[SExpr], width: u32) -> Option<u128> {
+    fn trace_get_value_indexed_bitvec(items: &[SExpr], width: u32) -> Option<num_bigint::BigUint> {
         let [SExpr::Symbol(underscore), SExpr::Symbol(value), SExpr::Numeral(value_width)] = items
         else {
             return None;
@@ -10809,7 +10962,14 @@ impl BmcSolver {
         if crate::ground_derivation::ground_backtranslation_enabled() {
             // Give this back-translation its own witness-solve chain budget.
             let _witness_budget =
-                crate::ground_derivation::witness::ScopedWitnessChainBudget::new();
+                crate::ground_derivation::witness::ScopedWitnessChainBudget::new_bounded(
+                    crate::smt::current_thread_solve_deadline(),
+                    self.config
+                        .base
+                        .cancellation_token
+                        .clone()
+                        .unwrap_or_default(),
+                );
             for index in 0..candidates.len() {
                 // Reshaping + validating a lane is pure evaluation, but it runs
                 // once per lane; keep the whole walk inside the solve budget.
@@ -10844,6 +11004,9 @@ impl BmcSolver {
                         .is_ok()
                     });
                 if let Some(derivation) = ground {
+                    if self.model_extraction_should_stop() {
+                        return ChcEngineResult::Unknown;
+                    }
                     let witness = candidates.swap_remove(index).witness;
                     let steps = self.steps_from_derivation_witness(&witness);
                     let cex = Counterexample::with_witness(steps, witness)
@@ -11122,6 +11285,74 @@ impl BmcSolver {
         })
     }
 
+    /// Reshape an exact acyclic branch witness into a fully-ground derivation
+    /// over `self.problem` and validate it before it leaves BMC.
+    ///
+    /// Unlike the level encoding, exact path expansion keeps query variables at
+    /// their source names while fresh-renaming variables in defining clauses.
+    /// `extended_model` is the branch model after equality propagation and
+    /// fail-closed scalar grounding, so query environments are read directly
+    /// from those source names.  Missing array/datatype/UF observations are
+    /// never defaulted: reconstruction returns `None`, and the caller retains
+    /// its legacy replay/Unknown fallback.
+    fn ground_derivation_from_acyclic_branch_witness(
+        &self,
+        witness: &DerivationWitness,
+        extended_model: &FxHashMap<String, SmtValue>,
+        deadline: ay_core::time::Instant,
+    ) -> Option<GroundDerivation> {
+        let boundary_open =
+            || ay_core::time::Instant::now() < deadline && !self.config.base.is_cancelled();
+        if !crate::ground_derivation::ground_backtranslation_enabled() || !boundary_open() {
+            return None;
+        }
+        let witness_cancellation = self
+            .config
+            .base
+            .cancellation_token
+            .clone()
+            .unwrap_or_default();
+        let _witness_budget =
+            crate::ground_derivation::witness::ScopedWitnessChainBudget::new_bounded(
+                Some(deadline),
+                witness_cancellation,
+            );
+        let level_witness = LevelDerivationWitness {
+            witness: witness.clone(),
+            query_roots: vec![witness.root],
+        };
+        let env = Self::model_i128_env(extended_model);
+        let mut derivation =
+            self.ground_derivation_from_witness_with(&level_witness, |query_clause| {
+                let mut instances = FxHashMap::default();
+                for var in query_clause.body.vars() {
+                    let value = Self::model_expr_smt_value_for_sort(
+                        &ChcExpr::Var(var.clone()),
+                        &var.sort,
+                        extended_model,
+                        &env,
+                    )?;
+                    instances.insert(var.name, value);
+                }
+                Some(instances)
+            })?;
+        if !boundary_open() {
+            return None;
+        }
+        Self::copy_uf_application_model_into_derivation(&mut derivation, extended_model);
+        if !boundary_open() {
+            return None;
+        }
+        crate::ground_derivation::validate_ground_derivation(&self.problem, &derivation)
+            .inspect_err(|err| {
+                crate::ground_derivation::log_ground_translation_detail(format_args!(
+                    "exact-acyclic branch derivation rejected on its own problem: {err}"
+                ));
+            })
+            .ok()?;
+        boundary_open().then_some(derivation)
+    }
+
     /// A level-BMC derivation witness together with the entry index of EVERY
     /// body predicate of the violated query, in body order.
     ///
@@ -11217,9 +11448,33 @@ impl BmcSolver {
         model: &FxHashMap<String, SmtValue>,
         k: usize,
     ) -> Option<GroundDerivation> {
-        self.ground_derivation_from_witness_with(level_witness, |query_clause| {
-            self.query_clause_instances(query_clause, k, model)
-        })
+        let mut derivation = self
+            .ground_derivation_from_witness_with(level_witness, |query_clause| {
+                self.query_clause_instances(query_clause, k, model)
+            })?;
+        Self::copy_uf_application_model_into_derivation(&mut derivation, model);
+        Some(derivation)
+    }
+
+    /// Make the exact finite UF observations used to extract a BMC witness
+    /// available to pure ground replay. These NUL-prefixed entries are private
+    /// evaluator metadata, not clause variables; completion/backtranslation
+    /// code already ignores environment names absent from the clause.
+    fn copy_uf_application_model_into_derivation(
+        derivation: &mut GroundDerivation,
+        model: &FxHashMap<String, SmtValue>,
+    ) {
+        let observations: Vec<(String, SmtValue)> = model
+            .iter()
+            .filter(|(name, _)| name.starts_with("\0ay.uf-"))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        if observations.is_empty() {
+            return;
+        }
+        for step in &mut derivation.steps {
+            step.env.extend(observations.iter().cloned());
+        }
     }
 
     /// Encoding-agnostic core of [`Self::ground_derivation_from_witness`].
@@ -11652,13 +11907,22 @@ impl BmcSolver {
             {
                 i128::try_from(*value).ok()
             }
+            (ChcSort::BitVec(width), SmtValue::BigBitVec(value, value_width))
+                if width == value_width =>
+            {
+                num_traits::ToPrimitive::to_i128(value.as_ref())
+            }
             _ => None,
         }
     }
 
     fn model_smt_value_for_sort(value: &SmtValue, sort: &ChcSort) -> Option<SmtValue> {
         match sort {
-            ChcSort::Int | ChcSort::Bool => {
+            ChcSort::Int => match value {
+                SmtValue::Int(_) | SmtValue::BigInt(_) => Some(value.clone()),
+                _ => None,
+            },
+            ChcSort::Bool => {
                 let scalar = Self::model_value_for_sort(value, sort)?;
                 Self::concrete_value_smt(sort, scalar)
             }
@@ -11669,12 +11933,16 @@ impl BmcSolver {
             // evaluation fail closed on genuine counterexamples.
             ChcSort::BitVec(width) => match value {
                 SmtValue::BitVec(value, value_width) if width == value_width => {
-                    Some(SmtValue::BitVec(*value & bv_mask(*width), *width))
+                    Some(SmtValue::bitvec_from_u128(*value, *width))
                 }
-                SmtValue::Int(value) => Some(SmtValue::BitVec(
-                    Self::concrete_bitvec_value(*width, *value)?,
-                    *width,
-                )),
+                SmtValue::BigBitVec(_, value_width) if width == value_width => {
+                    let (bits, _) = value.bitvec_to_biguint()?;
+                    Some(SmtValue::bitvec_from_biguint(bits, *width))
+                }
+                SmtValue::Int(value) => Some(SmtValue::bitvec_from_bigint((*value).into(), *width)),
+                SmtValue::BigInt(value) => {
+                    Some(SmtValue::bitvec_from_bigint(value.as_ref().clone(), *width))
+                }
                 _ => None,
             },
             ChcSort::Array(index_sort, element_sort) => match value {
@@ -11723,7 +11991,17 @@ impl BmcSolver {
                 }
                 _ => None,
             },
-            ChcSort::Real | ChcSort::Uninterpreted(_) => None,
+            ChcSort::Real => match value {
+                SmtValue::Real(value) => Some(SmtValue::Real(value.clone())),
+                SmtValue::Int(value) => Some(SmtValue::Real(
+                    num_rational::BigRational::from_integer((*value).into()),
+                )),
+                SmtValue::BigInt(value) => Some(SmtValue::Real(
+                    num_rational::BigRational::from_integer(value.as_ref().clone()),
+                )),
+                _ => None,
+            },
+            ChcSort::Uninterpreted(_) => None,
         }
     }
 
@@ -11735,6 +12013,8 @@ impl BmcSolver {
                 SmtValue::Bool(value) => Some((name.clone(), i128::from(*value))),
                 SmtValue::BitVec(value, _) => i128::try_from(*value)
                     .ok()
+                    .map(|value| (name.clone(), value)),
+                SmtValue::BigBitVec(value, _) => num_traits::ToPrimitive::to_i128(value.as_ref())
                     .map(|value| (name.clone(), value)),
                 _ => None,
             })
@@ -11795,6 +12075,10 @@ impl BmcSolver {
                             SmtValue::Bool(value) => Some((name, i64::from(*value))),
                             SmtValue::BitVec(value, _) => {
                                 i64::try_from(*value).ok().map(|value| (name, value))
+                            }
+                            SmtValue::BigBitVec(value, _) => {
+                                num_traits::ToPrimitive::to_i64(value.as_ref())
+                                    .map(|value| (name, value))
                             }
                             _ => None,
                         }
@@ -12133,9 +12417,12 @@ impl BmcSolver {
                     },
                     query_roots,
                 };
-                if let ChcEngineResult::Unsafe(cex) =
-                    self.tree_verified_unsafe(level_witness, &model, "bounded tree refutation")
-                {
+                if let ChcEngineResult::Unsafe(cex) = self.tree_verified_unsafe(
+                    level_witness,
+                    &model,
+                    "bounded tree refutation",
+                    "__tree_q_",
+                ) {
                     return ChcEngineResult::Unsafe(cex);
                 }
                 // Witness failed original-CHC replay at this depth: deepen.
@@ -12171,13 +12458,25 @@ impl BmcSolver {
         level_witness: LevelDerivationWitness,
         model: &FxHashMap<String, SmtValue>,
         source: &str,
+        query_var_prefix: &str,
     ) -> ChcEngineResult {
         if crate::ground_derivation::ground_backtranslation_enabled() {
             let _witness_budget =
-                crate::ground_derivation::witness::ScopedWitnessChainBudget::new();
+                crate::ground_derivation::witness::ScopedWitnessChainBudget::new_bounded(
+                    crate::smt::current_thread_solve_deadline(),
+                    self.config
+                        .base
+                        .cancellation_token
+                        .clone()
+                        .unwrap_or_default(),
+                );
             let ground = self
                 .ground_derivation_from_witness_with(&level_witness, |query_clause| {
-                    Self::tree_query_clause_instances(query_clause, model)
+                    Self::tree_query_clause_instances(query_clause, model, query_var_prefix)
+                })
+                .map(|mut derivation| {
+                    Self::copy_uf_application_model_into_derivation(&mut derivation, model);
+                    derivation
                 })
                 .filter(|derivation| {
                     crate::ground_derivation::validate_ground_derivation(&self.problem, derivation)
@@ -12189,6 +12488,9 @@ impl BmcSolver {
                         .is_ok()
                 });
             if let Some(derivation) = ground {
+                if self.model_extraction_should_stop() {
+                    return ChcEngineResult::Unknown;
+                }
                 let steps = self.steps_from_derivation_witness(&level_witness.witness);
                 let cex = Counterexample::with_witness(steps, level_witness.witness)
                     .with_ground_derivation(derivation);
@@ -12225,10 +12527,11 @@ impl BmcSolver {
     fn tree_query_clause_instances(
         query: &HornClause,
         model: &FxHashMap<String, SmtValue>,
+        query_var_prefix: &str,
     ) -> Option<FxHashMap<String, SmtValue>> {
         let mut instances = FxHashMap::default();
         for var in query.body.vars() {
-            let renamed = ChcVar::new(format!("__tree_q_{}", var.name), var.sort.clone());
+            let renamed = ChcVar::new(format!("{query_var_prefix}{}", var.name), var.sort.clone());
             let value = crate::expr::evaluate::evaluate_expr(&ChcExpr::Var(renamed), model)
                 .and_then(|value| Self::model_smt_value_for_sort(&value, &var.sort))?;
             instances.insert(var.name.clone(), value);
@@ -12290,7 +12593,7 @@ impl BmcSolver {
         // Scope: datatype-bearing problems. Reals have no witness-model
         // extraction (`smt_value_expr_for_sort` / `model_smt_value_for_sort`
         // bail), so a mixed ADT+Real problem stays on the existing routes.
-        if !self.problem.has_datatype_sorts() || self.problem.has_real_sorts() {
+        if !self.problem.uses_datatype_features() || self.problem.has_real_sorts() {
             return ChcEngineResult::Unknown;
         }
         let queries: Vec<_> = self.problem.queries().collect();
@@ -12868,34 +13171,41 @@ impl BmcSolver {
         for &ridx in &premise_roots {
             Self::assign_derivation_levels(&mut entries, ridx);
         }
-        // The witness `root` pins the query clause (the verifier resolves a
-        // False-head clause referencing the root's predicate). Try each
-        // body-predicate sub-tree as the root: whichever the verifier can link
-        // to the query and replay Valid yields the Unsafe.
+        // Preserve every query premise. In particular, repeated occurrences
+        // of one predicate are distinct reached facts; replaying only one root
+        // would either lose the join or incorrectly reuse one state twice.
+        // `tree_verified_unsafe` reshapes the complete forest into a ground
+        // derivation and validates it against the original clauses.
         let query_clause = self.query_clause_index(query);
-        for &root_idx in &premise_roots {
-            let witness = DerivationWitness {
+        let root = *premise_roots.first()?;
+        let level_witness = LevelDerivationWitness {
+            witness: DerivationWitness {
                 query_clause,
-                root: root_idx,
-                entries: entries.clone(),
-            };
-            let replay =
-                self.verified_unsafe_from_witness(witness, "datatype committed refutation");
-            if trace {
-                safe_eprintln!(
-                    "[DT-BMC] depth={depth} root={root_idx} replay={}",
-                    match &replay {
-                        ChcEngineResult::Unsafe(_) => "UNSAFE",
-                        ChcEngineResult::Unknown => "unknown",
-                        _ => "other",
-                    }
-                );
-            }
-            if let ChcEngineResult::Unsafe(cex) = replay {
-                return Some(cex);
-            }
+                root,
+                entries,
+            },
+            query_roots: premise_roots,
+        };
+        let replay = self.tree_verified_unsafe(
+            level_witness,
+            model,
+            "datatype committed refutation",
+            "__dt_q_",
+        );
+        if trace {
+            safe_eprintln!(
+                "[DT-BMC] depth={depth} replay={}",
+                match &replay {
+                    ChcEngineResult::Unsafe(_) => "UNSAFE",
+                    ChcEngineResult::Unknown => "unknown",
+                    _ => "other",
+                }
+            );
         }
-        None
+        match replay {
+            ChcEngineResult::Unsafe(cex) => Some(cex),
+            _ => None,
+        }
     }
 
     /// Diagnostic-only: build the datatype-BMC per-depth top-level conjuncts for

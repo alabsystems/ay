@@ -138,10 +138,133 @@ def exact_upper(objective, rows, num_vars, result):
     return best
 
 
-def exact_lower(objective, rows, result):
-    """Best exact lower bound on LP* from a self-certifying dual pair."""
+def exact_upper_margin(objective, rows, num_vars, base_result, target=None,
+                       margins=(1.0, 0.1, 0.01, 0.001)):
+    """Exact upper bound on LP* from a point solved with a FEASIBILITY MARGIN.
+
+    `exact_upper` snaps the LP vertex itself, so it returns nothing whenever the
+    optimal vertex has a large denominator — the normal case on scheduling and
+    knapsack rows. Here the LP is re-solved as `Ax >= b + margin` so its optimum
+    carries slack that rounding to a denominator `D` cannot eat: rounding moves
+    each `x_j` by at most `1/(2D)`, hence row `i` by at most
+    `(sum_j |a_ij|)/(2D)`.
+
+    THE MARGIN CANNOT GO ON EVERY ROW. A row like `+1 x82 >= 1` pins a variable
+    to its upper bound; asking for `x82 >= 1.01` is infeasible and the whole
+    re-solve returns status 2, which is what killed a blanket margin on the PB25
+    BNN and job-shop instances. Rounding cannot move a variable that is already
+    AT 0 or 1 (those snap to themselves at every `D`), so the margin is applied
+    ONLY to rows whose support contains a variable that is fractional in the
+    unmargined optimum — exactly the rows rounding can break.
+
+    All of that only says where to look. What is REPORTED rests on the exact
+    `Fraction` row-by-row check below, so a wrong margin, a wrong `D`, or a
+    lying LP engine can only make this return `None` — never an invalid bound.
+    """
+    import numpy as np
+    from scipy.optimize import linprog
+    from scipy.sparse import coo_matrix
+
+    fractional = {
+        var for var in range(1, num_vars + 1)
+        if TOL < base_result.x[var - 1] < 1 - TOL
+    }
+    cost = np.zeros(num_vars)
+    for var, coeff in objective.items():
+        cost[var - 1] = coeff
+    row_idx, col_idx, data = [], [], []
+    base = np.zeros(len(rows))
+    movable = np.zeros(len(rows))
+    for i, (terms, rhs) in enumerate(rows):
+        for var, coeff in terms.items():
+            row_idx.append(i)
+            col_idx.append(var - 1)
+            data.append(-float(coeff))
+        base[i] = -float(rhs)
+        movable[i] = 1.0 if any(var in fractional for var in terms) else 0.0
+    matrix = coo_matrix((data, (row_idx, col_idx)), shape=(len(rows), num_vars))
+
+    candidates = []
+    for margin in margins:
+        result = linprog(cost, A_ub=matrix, b_ub=base - margin * movable,
+                         bounds=(0, 1), method="highs")
+        if result.status == 0:
+            candidates.append(result.x)
+
+    # A FIXED margin ladder guesses how much slack the polytope has. When every
+    # rung is infeasible, ASK instead: maximise the slack `t` carried by the
+    # movable rows subject to the objective staying under `target`. A strictly
+    # positive `t*` makes the snap provable — round at any
+    # `D > max_i(sum_j |a_ij|) / (2 t*)` and no row can be broken. `t* = 0` means
+    # the optimal face has no room at all in those rows, and the honest answer
+    # is that this route cannot bound LP* here.
+    if target is not None:
+        wide = coo_matrix(
+            (list(matrix.data) + list(movable[movable > 0]),
+             (list(matrix.row) + [i for i in range(len(rows)) if movable[i] > 0],
+              list(matrix.col) + [num_vars] * int((movable > 0).sum()))),
+            shape=(len(rows), num_vars + 1))
+        cap = coo_matrix((cost, (np.zeros(num_vars, dtype=int), np.arange(num_vars))),
+                         shape=(1, num_vars + 1))
+        from scipy.sparse import vstack
+        slack_cost = np.zeros(num_vars + 1)
+        slack_cost[num_vars] = -1.0
+        result = linprog(
+            slack_cost, A_ub=vstack([wide, cap]),
+            b_ub=np.concatenate([base, [float(target)]]),
+            bounds=[(0, 1)] * num_vars + [(0, None)], method="highs")
+        if result.status == 0 and result.x[num_vars] > 0:
+            candidates.append(result.x[:num_vars])
+
+    best = None
+    for point_float in candidates:
+        for denominator in (10, 100, 1000, 10**5, 10**7, 10**9, 10**12, 10**15):
+            point = {}
+            for var in range(1, num_vars + 1):
+                snapped = Fraction(round(point_float[var - 1] * denominator),
+                                   denominator)
+                point[var] = min(Fraction(1), max(Fraction(0), snapped))
+            if any(
+                sum(coeff * point[var] for var, coeff in terms.items()) < rhs
+                for terms, rhs in rows
+            ):
+                continue
+            value = sum(coeff * point[var] for var, coeff in objective.items())
+            if best is None or value < best:
+                best = value
+            break  # coarser denominators cannot beat this one on this point
+    return best
+
+
+def exact_lower(objective, rows, result, num_vars=None):
+    """Best exact lower bound on LP* from a self-certifying dual pair.
+
+    The dual of `min c'x  s.t. Ax >= b, 0 <= x <= 1` is
+    `max b'y - 1'w  s.t. A'y - w <= c, y >= 0, w >= 0`, so for ANY `y >= 0` the
+    pair `(y, w := max(0, A'y - c))` is dual feasible and `b'y - 1'w <= LP*`.
+
+    `w` MUST be swept over EVERY variable, not only the variables touched by a
+    row with `y_i != 0`. An untouched variable has `A'y = 0`, so its excess is
+    `-c_j`, which is POSITIVE exactly when the objective coefficient is
+    NEGATIVE. Skipping those variables drops real `w` terms and inflates the
+    bound above LP* — an unsound "lower bound" that fails OPEN, in the one
+    direction that matters: it can report a floor as LP-reachable when weak
+    duality caps every LP-dual floor below the optimum. 34 of the 90 PB25
+    OPT-LIN residual-miss instances have a negative objective coefficient, and
+    `bnn_mnist_rot_16_label5_adversarial_norm_1` returned 15502 against a true
+    LP* of 0 before this sweep covered all variables.
+
+    `num_vars` is optional only so old two-positional callers keep working; when
+    it is omitted the sweep still covers every variable named anywhere.
+    """
     best = None
     marginals = result.ineqlin.marginals
+    if num_vars is None:
+        every_var = set(objective)
+        for terms, _rhs in rows:
+            every_var.update(terms)
+    else:
+        every_var = range(1, num_vars + 1)
     for denominator in SNAP_DENOMINATORS:
         duals = []
         for marginal in marginals:
@@ -154,8 +277,8 @@ def exact_lower(objective, rows, result):
             for var, coeff in terms.items():
                 transposed[var] = transposed.get(var, Fraction(0)) + coeff * duals[i]
         bound = sum(rhs * duals[i] for i, (_terms, rhs) in enumerate(rows))
-        for var, value in transposed.items():
-            excess = value - objective.get(var, 0)
+        for var in every_var:
+            excess = transposed.get(var, Fraction(0)) - objective.get(var, 0)
             if excess > 0:  # w_var = excess, priced at 1 per unit
                 bound -= excess
         if best is None or bound > best:

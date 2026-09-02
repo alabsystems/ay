@@ -248,6 +248,24 @@ fn test_term_to_chc_expr_wide_bv_succeeds() {
     );
 }
 
+/// Core model terms must retain bits above the legacy u128 boundary when they
+/// are translated back into CHC witness expressions.
+#[test]
+fn test_term_to_chc_expr_preserves_bit_128() {
+    let mut ctx = SmtContext::new();
+    let value = (num_bigint::BigInt::from(1_u8) << 128_u32) + num_bigint::BigInt::from(3_u8);
+    let term = ctx.terms.mk_bitvec(value.clone(), 129);
+
+    let expr = ctx
+        .term_to_chc_expr(term)
+        .expect("a bounded BV129 term must reconstruct exactly");
+    assert_eq!(expr.sort(), ChcSort::BitVec(129));
+    assert_eq!(
+        crate::expr::evaluate_expr(&expr, &FxHashMap::default()),
+        Some(SmtValue::bitvec_from_bigint(value, 129))
+    );
+}
+
 /// #6175: term_to_chc_expr succeeds for BV constants that fit in u64.
 #[test]
 fn test_term_to_chc_expr_normal_bv_succeeds() {

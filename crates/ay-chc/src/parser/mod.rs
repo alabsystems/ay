@@ -22,7 +22,10 @@
 //! - `(set-logic HORN)` - Set logic (ignored but checked)
 //! - `(declare-rel <name> (<sorts>))` - Declare a predicate
 //! - `(declare-var <name> <sort>)` - Declare a variable
-//! - `(declare-fun <name> (<sorts>) <return-sort>)` - Declare a function (predicates return Bool)
+//! - `(declare-fun <name> (<scalar-sorts>) <scalar-return-sort>)` - Declare a predicate or UF
+//!   (`Bool` return means a Horn relation on this textual surface; other scalar
+//!   returns mean an ordinary UF). The typed API can still represent an
+//!   ordinary Bool-returning function explicitly as `ChcExpr::FuncApp`.
 //! - `(declare-datatype <name> ((<ctor> (<sel> <sort>)*)*))` - Declare a datatype (#1279)
 //! - `(rule <expr>)` or `(rule (=> <body> <head>))` - Add a Horn clause
 //! - `(ay-declare-action <name>)` - Fixture-only declaration for action-decomposed CHC
@@ -40,6 +43,14 @@ mod lexer;
 mod sorts;
 #[cfg(test)]
 mod tests;
+
+/// Whether `name` belongs to the active SMT theory's term namespace.
+///
+/// Typed problem construction bypasses command parsing, so validation reuses
+/// this exact parser policy instead of maintaining a second builtin list.
+pub(crate) fn is_builtin_term_symbol(name: &str) -> bool {
+    commands::BUILTIN_TERM_SYMBOLS.contains(&name)
+}
 
 use crate::{ActionId, ChcError, ChcProblem, ChcResult, ChcSort, PredicateId};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
@@ -94,6 +105,13 @@ pub struct ChcParser {
     /// Declared functions (constructors, selectors, testers)
     /// Maps name -> (return_sort, arg_sorts)
     functions: FxHashMap<String, (ChcSort, Vec<ChcSort>)>,
+    /// Ordinary non-Bool functions introduced by `declare-fun`.
+    ///
+    /// Datatype constructors/selectors may be overloaded by the SMT-LIB
+    /// datatype surface, while ordinary uninterpreted functions may not.  Keep
+    /// their names separate so a later datatype declaration cannot silently
+    /// turn a user UF into an overload (or make lookup ambiguous).
+    uninterpreted_functions: FxHashSet<String>,
     /// Overloaded declared functions keyed by surface name.
     overloaded_functions: FxHashMap<String, Vec<(ChcSort, Vec<ChcSort>)>>,
     /// Polarity of the expression position currently being parsed:
@@ -125,6 +143,7 @@ impl ChcParser {
             declared_sorts: FxHashSet::default(),
             declared_datatype_sorts: FxHashMap::default(),
             functions: FxHashMap::default(),
+            uninterpreted_functions: FxHashSet::default(),
             overloaded_functions: FxHashMap::default(),
             polarity: 1,
             pos: 0,

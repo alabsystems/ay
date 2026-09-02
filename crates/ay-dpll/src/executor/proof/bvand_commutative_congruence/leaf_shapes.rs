@@ -181,13 +181,18 @@ pub(super) fn is_ult_one_eq_zero_of(terms: &TermStore, ult_side: TermId, eq_side
     if eq_op.as_str() != "=" {
         return false;
     }
-    let [zero_subject, zero] = eq_args.as_slice() else {
+    let [first, second] = eq_args.as_slice() else {
         return false;
     };
-    let (zero_subject, zero) = (*zero_subject, *zero);
-    if !is_bv_const(terms, zero, 0, width) {
+    // `mk_eq` canonicalizes by TermId, so a zero created before a composite
+    // gate is stored on the left even when the source wrote `(= gate 0)`.
+    let zero_subject = if is_bv_const(terms, *second, 0, width) {
+        *first
+    } else if is_bv_const(terms, *first, 0, width) {
+        *second
+    } else {
         return false;
-    }
+    };
     zero_subject == subject || is_idempotent_bv_gate_of(terms, zero_subject, subject)
 }
 
@@ -281,7 +286,7 @@ mod ult_one_eq_zero_tests {
 
     /// Build `(bvult v 1)` and `(= z 0)` over a fresh width-`w` variable,
     /// with `z` either the variable itself or its `(bvand v v)` collapse.
-    fn zero_test_pair(width: u32, gate: bool) -> (TermStore, TermId, TermId) {
+    fn zero_test_pair(width: u32, gate: bool, zero_reversed: bool) -> (TermStore, TermId, TermId) {
         let mut terms = TermStore::new();
         let sort = Sort::bitvec(width);
         let v = terms.mk_var("v", sort.clone());
@@ -293,20 +298,23 @@ mod ult_one_eq_zero_tests {
         } else {
             v
         };
-        let eqz = terms.mk_app(Symbol::named("="), [z, zero], Sort::Bool);
+        let eq_args = if zero_reversed { [zero, z] } else { [z, zero] };
+        let eqz = terms.mk_app(Symbol::named("="), eq_args, Sort::Bool);
         (terms, ult, eqz)
     }
 
-    /// Both the pure and the idempotent-gate forms are recognized, in the one
-    /// orientation the predicate is written for (the caller tries both).
+    /// Both the pure and the idempotent-gate forms are recognized with the
+    /// zero constant on either side of the symmetric inner equality.
     #[test]
     fn admits_pure_and_gate_forms() {
         for gate in [false, true] {
-            let (terms, ult, eqz) = zero_test_pair(32, gate);
-            assert!(
-                is_ult_one_eq_zero_of(&terms, ult, eqz),
-                "gate={gate}: the zero-test duality must be recognized"
-            );
+            for zero_reversed in [false, true] {
+                let (terms, ult, eqz) = zero_test_pair(32, gate, zero_reversed);
+                assert!(
+                    is_ult_one_eq_zero_of(&terms, ult, eqz),
+                    "gate={gate} zero_reversed={zero_reversed}: the zero-test duality must be recognized"
+                );
+            }
         }
     }
 
@@ -355,12 +363,14 @@ mod ult_one_eq_zero_tests {
     fn recognizer_authorizes_zero_test_and_refuses_false_bound() {
         for width in [8_u32, 32, 64] {
             for gate in [false, true] {
-                let (mut terms, ult, eqz) = zero_test_pair(width, gate);
-                let crux = terms.mk_app(Symbol::named("="), [ult, eqz], Sort::Bool);
-                assert!(
-                    ay_proof::recognize_bv_bitblast(&terms, &[crux]),
-                    "w={width} gate={gate}: the semantic gate must decide the zero test"
-                );
+                for zero_reversed in [false, true] {
+                    let (mut terms, ult, eqz) = zero_test_pair(width, gate, zero_reversed);
+                    let crux = terms.mk_app(Symbol::named("="), [ult, eqz], Sort::Bool);
+                    assert!(
+                        ay_proof::recognize_bv_bitblast(&terms, &[crux]),
+                        "w={width} gate={gate} zero_reversed={zero_reversed}: the semantic gate must decide the zero test"
+                    );
+                }
             }
             let mut terms = TermStore::new();
             let sort = Sort::bitvec(width);
@@ -382,14 +392,22 @@ mod ult_one_eq_zero_tests {
     #[test]
     fn walker_produces_a_step_for_both_forms_and_orders() {
         for gate in [false, true] {
-            for reversed in [false, true] {
-                let (mut terms, ult, eqz) = zero_test_pair(32, gate);
-                let (l, r) = if reversed { (eqz, ult) } else { (ult, eqz) };
-                let mut proof = Proof::default();
-                assert!(
-                    add_bvand_commutative_congruence_proof(&mut terms, &mut proof, l, r).is_some(),
-                    "gate={gate} reversed={reversed}: the walker must produce a step"
-                );
+            for zero_reversed in [false, true] {
+                for reversed in [false, true] {
+                    let (mut terms, ult, eqz) = zero_test_pair(32, gate, zero_reversed);
+                    let (l, r) = if reversed { (eqz, ult) } else { (ult, eqz) };
+                    let mut proof = Proof::default();
+                    assert!(
+                        add_bvand_commutative_congruence_proof(
+                            &mut terms,
+                            &mut proof,
+                            l,
+                            r,
+                        )
+                        .is_some(),
+                        "gate={gate} zero_reversed={zero_reversed} reversed={reversed}: the walker must produce a step"
+                    );
+                }
             }
         }
     }

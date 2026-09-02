@@ -33,7 +33,7 @@
 //! correct UNSAT published as `unsat` or as `unknown` depending on machine load.
 //!
 //! This module closes that by CHECKING the schemas instead of searching them.
-//! Both are exact theorems of the SMT-LIB `bv2nat` semantics with a two-line
+//! All are exact theorems of the SMT-LIB `bv2nat` semantics with a two-line
 //! derivation, and every quantity the derivation needs (the operand widths and
 //! the modulus) is READ FROM THE TERM STORE AND VERIFIED — nothing is assumed
 //! and no coefficient is hardcoded.
@@ -46,7 +46,14 @@
 //! unchanged. It performs no solving and consults no solver verdict, so it
 //! cannot inherit a wrong UNSAT.
 //!
-//! ## Schema A — modular add/sub residue
+//! ## Schema A — unsigned range
+//!
+//! For a width-`w` bit-vector `A`, `bv2nat(A)` is by definition an unsigned
+//! integer in `[0, 2^w - 1]`. The bridge emits both endpoints as unit clauses;
+//! checking the width and exact endpoint constants authenticates them without
+//! enumerating the carrier.
+//!
+//! ## Schema B — modular add/sub residue
 //!
 //! For `T = (bvadd A B)` of width `w`, writing `a = bv2nat(A)`, `b = bv2nat(B)`:
 //! `bv2nat(T) = (a + b) mod 2^w` by definition of `bvadd`. Since
@@ -62,7 +69,7 @@
 //! Both derivations need `width(A) = width(B) = width(T) = w` and the literal
 //! modulus to be exactly `2^w`; both are checked here.
 //!
-//! ## Schema B — unsigned order bridge
+//! ## Schema C — unsigned order bridge
 //!
 //! `bvult(A, B)` holds iff `bv2nat(A) < bv2nat(B)`, and `bvule(A, B)` iff
 //! `bv2nat(A) <= bv2nat(B)` — this IS the SMT-LIB definition of the unsigned
@@ -87,6 +94,16 @@ use num_traits::{One, Zero};
 /// handful of nodes; a larger term is not one of them, so exceeding the budget
 /// declines rather than costing time.
 const MAX_NODES: usize = 4_096;
+/// Largest modular-residue word discharged by this closed-form lane. MODEL_CHECKER_CONSUMER
+/// obligations are machine-word sized; wider words fall back to checked solver
+/// lanes instead of allocating a width-sized `BigInt` here.
+const MAX_MODULAR_RESIDUE_WIDTH: u32 = 128;
+/// Maximum recursive Int-expression depth accepted by the linear normalizer.
+const MAX_LINEAR_DEPTH: usize = 64;
+/// Maximum distinct opaque atoms retained in one normalized linear form.
+const MAX_LINEAR_ATOMS: usize = 64;
+/// Maximum magnitude of any normalized constant or coefficient.
+const MAX_LINEAR_INTEGER_BITS: u64 = 256;
 /// Maximum authored assertions scanned for Schema B premises.
 const MAX_PREMISE_ROOTS: usize = 4_096;
 /// Maximum `and`-conjunct nesting descended when harvesting Schema B premises.
@@ -113,14 +130,56 @@ pub(super) fn discharge_bv_int_bridge_schema(
     if literal.index() >= terms.len() {
         return false;
     }
-    if discharges_modular_residue(terms, literal) {
+    if discharges_bv2nat_range(terms, literal) || discharges_modular_residue(terms, literal) {
         return true;
     }
     discharges_unsigned_order(terms, literal, assertions)
 }
 
 // ---------------------------------------------------------------------------
-// Schema A: modular add/sub residue
+// Schema A: unsigned range
+// ---------------------------------------------------------------------------
+
+/// `0 <= bv2nat(A)` or `bv2nat(A) <= 2^w - 1`, with the endpoint and the
+/// operand width read from the term store. These are the two exact unit clauses
+/// emitted by `push_bv2nat_width_bounds`.
+fn discharges_bv2nat_range(terms: &TermStore, literal: TermId) -> bool {
+    let Some(args) = named_app(terms, literal, "<=") else {
+        return false;
+    };
+    let [lhs, rhs] = args.as_slice() else {
+        return false;
+    };
+    if let Some(bv) = bv2nat_argument(terms, *rhs) {
+        return int_constant(terms, *lhs).is_some_and(BigInt::is_zero)
+            && bounded_bv_width(terms, bv).is_some();
+    }
+    let Some(bv) = bv2nat_argument(terms, *lhs) else {
+        return false;
+    };
+    let (Some(width), Some(endpoint)) = (bounded_bv_width(terms, bv), int_constant(terms, *rhs))
+    else {
+        return false;
+    };
+    endpoint == &((BigInt::one() << width as usize) - BigInt::one())
+}
+
+fn bounded_bv_width(terms: &TermStore, term: TermId) -> Option<u32> {
+    let Sort::BitVec(width) = terms.sort(term) else {
+        return None;
+    };
+    (width.width > 0 && width.width <= MAX_MODULAR_RESIDUE_WIDTH).then_some(width.width)
+}
+
+fn int_constant(terms: &TermStore, term: TermId) -> Option<&BigInt> {
+    match terms.get(term) {
+        TermData::Const(ay_core::Constant::Int(value)) => Some(value),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Schema B: modular add/sub residue
 // ---------------------------------------------------------------------------
 
 /// `(or (= (bv2nat T) BASE) (= (bv2nat T) WRAPPED))` for `T = (bvadd A B)` or
@@ -157,17 +216,23 @@ fn discharges_modular_residue(terms: &TermStore, literal: TermId) -> bool {
         return false;
     };
 
-    let base = if is_sub {
+    let Some(base) = (if is_sub {
         a_form.sub(&b_form)
     } else {
         a_form.add(&b_form)
+    }) else {
+        return false;
     };
-    let modulus = LinearForm::constant(BigInt::one() << width as usize);
+    let Some(modulus) = LinearForm::constant(BigInt::one() << width as usize) else {
+        return false;
+    };
     // bvadd wraps DOWN by one modulus, bvsub wraps UP by one modulus.
-    let wrapped = if is_sub {
+    let Some(wrapped) = (if is_sub {
         base.add(&modulus)
     } else {
         base.sub(&modulus)
+    }) else {
+        return false;
     };
 
     let (Some(form_l), Some(form_r)) = (linear_form(terms, value_l), linear_form(terms, value_r))
@@ -222,7 +287,7 @@ fn bv_add_sub_operands(terms: &TermStore, term: TermId) -> Option<(bool, TermId,
         return None;
     };
     let width = result_sort.width;
-    if width == 0 {
+    if width == 0 || width > MAX_MODULAR_RESIDUE_WIDTH {
         return None;
     }
     // The residue derivation needs both operands at the RESULT width; a
@@ -243,10 +308,14 @@ fn bv2nat_linear_form(terms: &TermStore, bv: TermId) -> Option<LinearForm> {
         // so the literal is usable as an integer only when it is already the
         // canonical residue. A payload outside `[0, 2^width)` declines the lane
         // rather than silently importing a wrong constant.
-        if value.sign() == num_bigint::Sign::Minus || *value >= (BigInt::one() << *width as usize) {
+        if *width == 0
+            || *width > MAX_MODULAR_RESIDUE_WIDTH
+            || value.sign() == num_bigint::Sign::Minus
+            || value.bits() > u64::from(*width)
+        {
             return None;
         }
-        return Some(LinearForm::constant(value.clone()));
+        return LinearForm::constant(value.clone());
     }
     let nat = find_bv2nat(terms, bv)?;
     Some(LinearForm::atom(nat))
@@ -259,7 +328,7 @@ fn find_bv2nat(terms: &TermStore, bv: TermId) -> Option<TermId> {
 }
 
 // ---------------------------------------------------------------------------
-// Schema B: unsigned order bridge
+// Schema C: unsigned order bridge
 // ---------------------------------------------------------------------------
 
 /// A `bv2nat` order fact entailed by a positively-asserted unsigned BV
@@ -331,8 +400,15 @@ fn harvest_premises(
     }
     *budget -= 1;
     if let Some(args) = named_app(terms, term, "and") {
+        if args.len() > *budget {
+            *budget = 0;
+            return;
+        }
         for &arg in args {
             harvest_premises(terms, arg, depth + 1, budget, out);
+            if *budget == 0 {
+                break;
+            }
         }
         return;
     }
@@ -397,9 +473,17 @@ struct LinearForm {
 }
 
 impl LinearForm {
-    fn constant(value: BigInt) -> Self {
-        Self {
+    fn constant(value: BigInt) -> Option<Self> {
+        let form = Self {
             constant: value,
+            terms: BTreeMap::new(),
+        };
+        form.is_bounded().then_some(form)
+    }
+
+    fn zero() -> Self {
+        Self {
+            constant: BigInt::zero(),
             terms: BTreeMap::new(),
         }
     }
@@ -413,15 +497,18 @@ impl LinearForm {
         }
     }
 
-    fn add(&self, other: &Self) -> Self {
+    fn add(&self, other: &Self) -> Option<Self> {
         self.combine(other, false)
     }
 
-    fn sub(&self, other: &Self) -> Self {
+    fn sub(&self, other: &Self) -> Option<Self> {
         self.combine(other, true)
     }
 
-    fn combine(&self, other: &Self, negate_other: bool) -> Self {
+    fn combine(&self, other: &Self, negate_other: bool) -> Option<Self> {
+        if !self.is_bounded() || !other.is_bounded() {
+            return None;
+        }
         let mut result = self.clone();
         if negate_other {
             result.constant -= &other.constant;
@@ -437,26 +524,53 @@ impl LinearForm {
             }
         }
         result.terms.retain(|_, coefficient| !coefficient.is_zero());
-        result
+        result.is_bounded().then_some(result)
     }
 
-    fn scale(&self, factor: &BigInt) -> Self {
+    fn scale(&self, factor: &BigInt) -> Option<Self> {
+        if !self.is_bounded() || !bounded_integer(factor) {
+            return None;
+        }
         if factor.is_zero() {
-            return Self::constant(BigInt::zero());
+            return Some(Self::zero());
         }
-        Self {
-            constant: &self.constant * factor,
-            terms: self
-                .terms
-                .iter()
-                .map(|(term, coefficient)| (*term, coefficient * factor))
-                .collect(),
+        let constant = bounded_product(&self.constant, factor)?;
+        let mut terms = BTreeMap::new();
+        for (term, coefficient) in &self.terms {
+            terms.insert(*term, bounded_product(coefficient, factor)?);
         }
+        let result = Self { constant, terms };
+        result.is_bounded().then_some(result)
     }
 
-    fn negate(&self) -> Self {
+    fn negate(&self) -> Option<Self> {
         self.scale(&(-BigInt::one()))
     }
+
+    fn is_bounded(&self) -> bool {
+        self.terms.len() <= MAX_LINEAR_ATOMS
+            && bounded_integer(&self.constant)
+            && self.terms.values().all(bounded_integer)
+    }
+}
+
+fn bounded_integer(value: &BigInt) -> bool {
+    value.bits() <= MAX_LINEAR_INTEGER_BITS
+}
+
+fn bounded_product(lhs: &BigInt, rhs: &BigInt) -> Option<BigInt> {
+    if !bounded_integer(lhs) || !bounded_integer(rhs) {
+        return None;
+    }
+    if lhs.is_zero() || rhs.is_zero() {
+        return Some(BigInt::zero());
+    }
+    let maximum_bits = lhs.bits().checked_add(rhs.bits())?.saturating_sub(1);
+    if maximum_bits > MAX_LINEAR_INTEGER_BITS {
+        return None;
+    }
+    let product = lhs * rhs;
+    bounded_integer(&product).then_some(product)
 }
 
 /// Normalise an Int-sorted term into a linear form. `+`, `-` and
@@ -464,11 +578,16 @@ impl LinearForm {
 /// the normalisation is always a faithful rewriting (never an approximation).
 fn linear_form(terms: &TermStore, term: TermId) -> Option<LinearForm> {
     let mut budget = MAX_NODES;
-    linear_form_inner(terms, term, &mut budget)
+    linear_form_inner(terms, term, 0, &mut budget)
 }
 
-fn linear_form_inner(terms: &TermStore, term: TermId, budget: &mut usize) -> Option<LinearForm> {
-    if *budget == 0 {
+fn linear_form_inner(
+    terms: &TermStore,
+    term: TermId,
+    depth: usize,
+    budget: &mut usize,
+) -> Option<LinearForm> {
+    if *budget == 0 || depth > MAX_LINEAR_DEPTH {
         return None;
     }
     *budget -= 1;
@@ -476,39 +595,51 @@ fn linear_form_inner(terms: &TermStore, term: TermId, budget: &mut usize) -> Opt
         return None;
     }
     if let TermData::Const(ay_core::Constant::Int(value)) = terms.get(term) {
-        return Some(LinearForm::constant(value.clone()));
+        if !bounded_integer(value) {
+            return None;
+        }
+        return LinearForm::constant(value.clone());
     }
     let TermData::App(Symbol::Named(name), args) = terms.get(term) else {
         return Some(LinearForm::atom(term));
     };
     match name.as_str() {
         "+" => {
-            let mut acc = LinearForm::constant(BigInt::zero());
+            if args.len() > *budget {
+                return None;
+            }
+            let mut acc = LinearForm::zero();
             for &arg in args {
-                acc = acc.add(&linear_form_inner(terms, arg, budget)?);
+                acc = acc.add(&linear_form_inner(terms, arg, depth + 1, budget)?)?;
             }
             Some(acc)
         }
         "-" => match args.as_slice() {
             // SMT-LIB unary minus.
-            [only] => Some(linear_form_inner(terms, *only, budget)?.negate()),
+            [only] => linear_form_inner(terms, *only, depth + 1, budget)?.negate(),
             [first, rest @ ..] => {
-                let mut acc = linear_form_inner(terms, *first, budget)?;
+                if args.len() > *budget {
+                    return None;
+                }
+                let mut acc = linear_form_inner(terms, *first, depth + 1, budget)?;
                 for &arg in rest {
-                    acc = acc.sub(&linear_form_inner(terms, arg, budget)?);
+                    acc = acc.sub(&linear_form_inner(terms, arg, depth + 1, budget)?)?;
                 }
                 Some(acc)
             }
             [] => None,
         },
         "*" => {
+            if args.len() > *budget {
+                return None;
+            }
             // Linear only: at most one non-constant factor.
             let mut coefficient = BigInt::one();
             let mut symbolic: Option<LinearForm> = None;
             for &arg in args {
-                let form = linear_form_inner(terms, arg, budget)?;
+                let form = linear_form_inner(terms, arg, depth + 1, budget)?;
                 if form.terms.is_empty() {
-                    coefficient *= &form.constant;
+                    coefficient = bounded_product(&coefficient, &form.constant)?;
                 } else if symbolic.is_none() {
                     symbolic = Some(form);
                 } else {
@@ -517,10 +648,10 @@ fn linear_form_inner(terms: &TermStore, term: TermId, budget: &mut usize) -> Opt
                     return Some(LinearForm::atom(term));
                 }
             }
-            Some(match symbolic {
+            match symbolic {
                 Some(form) => form.scale(&coefficient),
                 None => LinearForm::constant(coefficient),
-            })
+            }
         }
         _ => Some(LinearForm::atom(term)),
     }

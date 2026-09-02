@@ -5482,12 +5482,12 @@ fn check_ay_param_discovery(ay: &Path) -> AuditCheck {
             if output.status.success()
                 && String::from_utf8_lossy(&output.stdout).contains("Global parameters")
                 && String::from_utf8_lossy(&output.stdout).contains("timeout (unsigned int)")
-                && String::from_utf8_lossy(&output.stdout).lines().count() == 704
+                && String::from_utf8_lossy(&output.stdout).lines().count() == 715
                 && output.stderr.is_empty() =>
         {
             AuditCheck::pass(
                 "z3_param_discovery_smoke",
-                "ay -p exposes the complete Z3 5.0.0 parameter database without stderr noise",
+                "ay -p exposes the complete Z3 5.1.0 parameter database without stderr noise",
             )
             .with_command(command)
         }

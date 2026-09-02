@@ -530,41 +530,34 @@ impl PdkindSolver {
 
     /// Extract step-0 state variable assignments from a model as a blocking cube (#4823).
     fn model_to_state_cube(model: &FxHashMap<String, SmtValue>, ts: &TransitionSystem) -> ChcExpr {
-        let names = ts.state_var_names();
-        let conjuncts: Vec<_> = model
+        let conjuncts: Vec<_> = ts
+            .state_vars()
             .iter()
-            .filter(|(n, _)| names.contains(n.as_str()))
-            .filter_map(|(n, v)| {
-                let sort = match v {
-                    SmtValue::Bool(_) => ChcSort::Bool,
-                    SmtValue::Int(_) | SmtValue::BigInt(_) => ChcSort::Int,
-                    SmtValue::Real(_) => ChcSort::Real,
-                    SmtValue::BitVec(_, w) => ChcSort::BitVec(*w),
-                    SmtValue::Opaque(_)
-                    | SmtValue::ConstArray(_)
-                    | SmtValue::ArrayMap { .. }
-                    | SmtValue::Datatype(..) => return None,
-                };
-                let var = ChcExpr::var(ChcVar::new(n, sort));
-                Some(match v {
-                    SmtValue::Bool(true) => var,
-                    SmtValue::Bool(false) => ChcExpr::not(var),
-                    SmtValue::Int(i) => ChcExpr::eq(var, ChcExpr::int(*i)),
+            .filter_map(|state_var| {
+                let value = model.get(&state_var.name)?;
+                let var = ChcExpr::var(state_var.clone());
+                Some(match (&state_var.sort, value) {
+                    (ChcSort::Bool, SmtValue::Bool(true)) => var,
+                    (ChcSort::Bool, SmtValue::Bool(false)) => ChcExpr::not(var),
+                    (ChcSort::Int, SmtValue::Int(i)) => ChcExpr::eq(var, ChcExpr::int(*i)),
                     // Beyond-i128 witness: exact Horner encoding (never wraps).
-                    SmtValue::BigInt(b) => {
+                    (ChcSort::Int, SmtValue::BigInt(b)) => {
                         ChcExpr::eq(var, ChcExpr::from_bigint(b.as_ref().clone()))
                     }
-                    SmtValue::Real(r) => {
+                    (ChcSort::Real, SmtValue::Real(r)) => {
                         use num_traits::ToPrimitive;
-                        let n = r.numer().to_i64().unwrap_or(0);
-                        let d = r.denom().to_i64().unwrap_or(1);
+                        let n = r.numer().to_i64()?;
+                        let d = r.denom().to_i64()?;
                         ChcExpr::eq(var, ChcExpr::Real(n, d))
                     }
-                    SmtValue::BitVec(bv, w) => ChcExpr::eq(var, ChcExpr::BitVec(*bv, *w)),
-                    SmtValue::Opaque(_)
-                    | SmtValue::ConstArray(_)
-                    | SmtValue::ArrayMap { .. }
-                    | SmtValue::Datatype(..) => return None,
+                    (
+                        ChcSort::BitVec(expected_width),
+                        value @ (SmtValue::BitVec(_, actual_width)
+                        | SmtValue::BigBitVec(_, actual_width)),
+                    ) if expected_width == actual_width => {
+                        ChcExpr::eq(var, value.bitvec_to_chc_expr()?)
+                    }
+                    _ => return None,
                 })
             })
             .collect();

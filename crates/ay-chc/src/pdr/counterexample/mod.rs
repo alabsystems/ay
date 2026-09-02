@@ -5,6 +5,9 @@
 //! Counterexample types for PDR solver.
 
 use crate::clause::ActionId;
+use crate::smt::executor_adapter::{
+    collect_uninterpreted_function_declarations, emit_declare_uninterpreted_function,
+};
 use crate::smt::SmtValue;
 use crate::transition_system::TransitionSystem;
 use crate::{ChcError, ChcExpr, ChcProblem, ChcResult, ChcSort, ChcVar, PredicateId};
@@ -162,7 +165,7 @@ impl Counterexample {
             env: _,
         } = self.build_trace_validity(problem)?;
         let name = format!("trace-validity-depth-{depth}");
-        let smtlib = render_trace_validity_replay_obligation(problem, &name, &obligation_formula);
+        let smtlib = render_trace_validity_replay_obligation(problem, &name, &obligation_formula)?;
         Ok(vec![ChcReplayObligation {
             name,
             kind: ChcReplayObligationKind::TraceValidity,
@@ -491,7 +494,10 @@ fn trace_value_smt(sort: &ChcSort, raw: i64) -> ChcResult<SmtValue> {
                     "cannot encode BitVec({width}) trace assignment value {raw}: out of range"
                 )));
             }
-            Ok(SmtValue::BitVec(value, *width))
+            Ok(SmtValue::bitvec_from_biguint(
+                num_bigint::BigUint::from(value),
+                *width,
+            ))
         }
         ChcSort::Array(_, _) | ChcSort::Uninterpreted(_) | ChcSort::Datatype { .. } => {
             Err(ChcError::Verification(format!(
@@ -505,7 +511,7 @@ fn render_trace_validity_replay_obligation(
     problem: &ChcProblem,
     name: &str,
     formula: &ChcExpr,
-) -> String {
+) -> ChcResult<String> {
     use std::fmt::Write;
 
     let mut vars = BTreeMap::new();
@@ -524,6 +530,10 @@ fn render_trace_validity_replay_obligation(
     );
     let _ = writeln!(out, "(set-logic ALL)");
     out.push('\n');
+    let declarations = collect_uninterpreted_function_declarations(formula)?;
+    for declaration in &declarations {
+        out.push_str(&emit_declare_uninterpreted_function(declaration));
+    }
     for (name, sort) in vars {
         let _ = writeln!(
             out,
@@ -535,7 +545,7 @@ fn render_trace_validity_replay_obligation(
     let _ = writeln!(out, "(assert {})", InvariantModel::expr_to_smtlib(formula));
     let _ = writeln!(out, "(check-sat)");
     let _ = writeln!(out, "(exit)");
-    out
+    Ok(out)
 }
 
 fn problem_query_clause_index(problem: &ChcProblem) -> Option<usize> {

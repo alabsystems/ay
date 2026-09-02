@@ -49,7 +49,14 @@ for spec in "${SPECS[@]}"; do
     arm_files="$arm_files $OUTDIR/$s_bin-$s_mode-$s_tmo.tsv"
 done
 
-todo="$OUTDIR/.todo"
+# PER-RUN todo file. A FIXED `$OUTDIR/.todo` is shared by every harness aimed at
+# the same outdir, so a second run truncating it while a first run's `xargs` is
+# still reading it feeds that `xargs` a spliced line — and the worker is handed a
+# TRUNCATED instance path. Observed 2026-08-31 while restarting this harness over
+# a live one: two rows landed with a path cut at 141 bytes, `ay_exit=1` at 94 ms,
+# 14 fields each, so neither the field-count check nor the per-arm row count
+# noticed. The row LOOKS measured and is not. Keyed by PID so runs cannot collide.
+todo="$OUTDIR/.todo.$$"
 : > "$todo"
 while IFS= read -r f; do
     [ -n "$f" ] || continue
@@ -72,8 +79,17 @@ echo "end:     $(date -u +%Y-%m-%dT%H:%M:%SZ) load $(uptime | sed 's/.*averages:
 bad=0
 for af in $arm_files; do
     got=$(grep -c . "$af" 2>/dev/null || echo 0)
-    echo "arm $(basename "$af"): $got/$total rows"
+    # A row whose instance path does not exist on disk was never measured, no
+    # matter how well formed it looks. Counting rows alone cannot see that.
+    ghosts=0
+    if [ -s "$af" ]; then
+        while IFS= read -r p; do
+            [ -e "$p" ] || ghosts=$((ghosts + 1))
+        done < <(cut -f1 "$af")
+    fi
+    echo "arm $(basename "$af"): $got/$total rows, $ghosts with a nonexistent instance path"
     [ "$got" -eq "$total" ] || bad=1
+    [ "$ghosts" -eq 0 ] || bad=1
 done
 [ "$bad" -eq 0 ] || { echo "INCOMPLETE CENSUS" >&2; exit 2; }
 echo "CENSUS COMPLETE"

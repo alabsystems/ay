@@ -14,6 +14,15 @@ workspace = true
 thiserror = { workspace = true }
 serde = { workspace = true }
 ay-core.workspace = true
+#
+# The external-codegen pin must be an epoch whose OWN external-codegen-ir requirement is a
+# revision on a external-codegen-ir branch. external-codegen 62deb853 required external-codegen-ir
+# 2275429170, which sits on NO branch of the external-codegen-ir remote (that remote has
+# exactly one branch, main, and it does not contain it), so resolving this
+# manifest split the lock across two external-codegen-ir revisions and made the
+# superproject's `fast.dependency-constellation` gate refuse the constellation.
+# external-codegen 56b9dec4 is the revision the Trust superproject itself pins and
+# requires external-codegen-ir 4803c40d — the same revision ay-jit names directly below.
 
 [features]
 

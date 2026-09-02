@@ -95,6 +95,7 @@ impl TrlSolver {
             // of truncating, matching the BitVec arm below.
             SmtValue::Int(n) => i64::try_from(*n).ok(),
             SmtValue::BitVec(v, _) => i64::try_from(*v).ok(),
+            SmtValue::BigBitVec(v, _) => num_traits::ToPrimitive::to_i64(v.as_ref()),
             // Beyond-i128 witnesses never fit i64 (canonical-form invariant);
             // drop fail-closed like the out-of-range Int case above.
             SmtValue::BigInt(_)

@@ -61,8 +61,11 @@ impl SmtContext {
                     ChcExpr::Real(num, denom)
                 }
                 TermData::Const(Constant::BitVec { value, width }) => {
-                    let val = value.to_u128()?;
-                    ChcExpr::BitVec(val, *width)
+                    // Core terms use BigInt storage. Normalize through the
+                    // exact model-value path so even a non-canonical negative
+                    // residue is reconstructed modulo 2^width rather than
+                    // being rejected by `to_biguint`.
+                    SmtValue::bitvec_from_bigint(value.clone(), *width).bitvec_to_chc_expr()?
                 }
                 TermData::Const(Constant::String(_)) => return None,
                 TermData::Var(name, _) => {

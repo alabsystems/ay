@@ -9,8 +9,10 @@
 //! (`MultiPoly`, `Rel`, `MultiConstraint`) and the whole LP/PSD/verify machinery
 //! are copied verbatim here (with slim reps identical to NRA's) so NIA gains the
 //! same certificate-gated UNSAT pre-phase without a risky cross-crate migration.
-//! NRA is left completely untouched. A future cohesion pass should extract the
-//! common audited checker into a shared crate instead of maintaining two copies.
+//! The NIA copy now adds deterministic bounds around translation, search, and
+//! replay; NRA is left completely untouched. A future cohesion pass should
+//! extract the common audited checker into a shared crate instead of maintaining
+//! two copies.
 //!
 //! ## Why a REAL SOS refutation is sound for INTEGER UNSAT
 //!
@@ -58,6 +60,16 @@ use ay_core::term::TermId;
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use num_traits::{One, Signed, Zero};
+
+pub(crate) mod budget;
+mod lp;
+
+use budget::{
+    checked_poly_add, checked_poly_mul, checked_poly_sub, polynomial_fits, rational_fits,
+    SosLpBudget, SosPolynomialBudget, MAX_SOS_ASSERTED_LITERALS, MAX_SOS_LP_CELLS,
+    MAX_SOS_TOTAL_POLY_TERMS,
+};
+use lp::{lp_add, lp_mul, lp_phase1_feasible, lp_sub};
 
 // ============================================================================
 // nia-local slim copies of NRA's MultiPoly / Rel / MultiConstraint.
@@ -146,35 +158,10 @@ impl MultiPoly {
         }
     }
 
-    pub(crate) fn add(&self, other: &Self) -> Self {
-        let mut out = self.clone();
-        for (m, c) in &other.terms {
-            out.add_term(m.clone(), c.clone());
-        }
-        out
-    }
-
     pub(crate) fn neg(&self) -> Self {
         Self {
             terms: self.terms.iter().map(|(m, c)| (m.clone(), -c)).collect(),
         }
-    }
-
-    pub(crate) fn sub(&self, other: &Self) -> Self {
-        self.add(&other.neg())
-    }
-
-    pub(crate) fn mul(&self, other: &Self) -> Self {
-        let mut out = Self::zero();
-        for (ma, ca) in &self.terms {
-            for (mb, cb) in &other.terms {
-                let mut mono = ma.clone();
-                mono.extend_from_slice(mb);
-                mono.sort_unstable();
-                out.add_term(mono, ca * cb);
-            }
-        }
-        out
     }
 
     pub(crate) fn is_zero(&self) -> bool {
@@ -263,6 +250,8 @@ pub(crate) struct SosCertificate {
 /// Why an independent check rejected a certificate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SosError {
+    /// A deterministic checker resource bound was exceeded.
+    ResourceLimit,
     /// The Gram matrix is not square / does not match the basis length.
     GramShape,
     /// The Gram matrix is not symmetric.
@@ -288,6 +277,7 @@ pub(crate) enum SosError {
 impl core::fmt::Display for SosError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let s = match self {
+            SosError::ResourceLimit => "certificate exceeds the bounded SOS checker envelope",
             SosError::GramShape => "Gram matrix shape does not match basis",
             SosError::GramAsymmetric => "Gram matrix is not symmetric",
             SosError::GramNotPsd => "Gram matrix is not positive semidefinite",
@@ -312,24 +302,32 @@ include!("sos/certificate_polynomial.rs");
 /// `≥ 0` and every **zero** pivot sitting on an all-zero remaining row/column
 /// (a zero diagonal with a nonzero off-diagonal forces a `−a² < 0` 2×2 minor,
 /// so it is not PSD).
-#[allow(clippy::needless_range_loop)] // Schur complement: index is the pivot/row/col identity.
+#[cfg(test)]
 pub(crate) fn is_psd(matrix: &[Vec<BigRational>]) -> bool {
+    is_psd_bounded(matrix).unwrap_or(false)
+}
+
+#[allow(clippy::needless_range_loop)] // Schur complement: index is the pivot/row/col identity.
+fn is_psd_bounded(matrix: &[Vec<BigRational>]) -> Result<bool, SosError> {
     let n = matrix.len();
     if matrix.iter().any(|row| row.len() != n) {
-        return false;
+        return Ok(false);
+    }
+    if !matrix.iter().flatten().all(rational_fits) {
+        return Err(SosError::ResourceLimit);
     }
     // Work on a mutable copy of the trailing submatrix.
     let mut m: Vec<Vec<BigRational>> = matrix.to_vec();
     for k in 0..n {
         let pivot = m[k][k].clone();
         if pivot.is_negative() {
-            return false;
+            return Ok(false);
         }
         if pivot.is_zero() {
             // The remaining row/column at k must be entirely zero.
             for i in (k + 1)..n {
                 if !m[k][i].is_zero() || !m[i][k].is_zero() {
-                    return false;
+                    return Ok(false);
                 }
             }
             continue;
@@ -340,9 +338,60 @@ pub(crate) fn is_psd(matrix: &[Vec<BigRational>]) -> bool {
                 continue;
             }
             let factor = &m[i][k] / &pivot;
+            if !rational_fits(&factor) {
+                return Err(SosError::ResourceLimit);
+            }
             for j in (k + 1)..n {
                 let d = &factor * &m[k][j];
+                if !rational_fits(&d) {
+                    return Err(SosError::ResourceLimit);
+                }
                 m[i][j] -= d;
+                if !rational_fits(&m[i][j]) {
+                    return Err(SosError::ResourceLimit);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn certificate_input_fits(certificate: &SosCertificate, constraints: &[MultiConstraint]) -> bool {
+    if certificate.basis.len() > MAX_VARS + 1
+        || certificate.terms.len() > MAX_ATOMS
+        || constraints.len() > MAX_SOS_ASSERTED_LITERALS
+        || !rational_fits(&certificate.rhs)
+        || !certificate.gram.iter().flatten().all(rational_fits)
+        || !certificate
+            .terms
+            .iter()
+            .all(|term| rational_fits(&term.multiplier))
+        || !certificate.basis.iter().all(|monomial| {
+            monomial.len() <= 1 && monomial.windows(2).all(|pair| pair[0] <= pair[1])
+        })
+    {
+        return false;
+    }
+    let Some(total_terms) = constraints.iter().try_fold(0usize, |total, constraint| {
+        total.checked_add(constraint.poly.terms.len())
+    }) else {
+        return false;
+    };
+    if total_terms > MAX_SOS_TOTAL_POLY_TERMS
+        || !constraints
+            .iter()
+            .all(|constraint| polynomial_fits(&constraint.poly, None))
+    {
+        return false;
+    }
+    let mut variables = Vec::new();
+    for constraint in constraints {
+        for variable in constraint.poly.variables() {
+            if !variables.contains(&variable) {
+                variables.push(variable);
+                if variables.len() > MAX_VARS {
+                    return false;
+                }
             }
         }
     }
@@ -366,6 +415,9 @@ impl SosCertificate {
         if self.gram.len() != n || self.gram.iter().any(|r| r.len() != n) {
             return Err(SosError::GramShape);
         }
+        if !certificate_input_fits(self, constraints) {
+            return Err(SosError::ResourceLimit);
+        }
         for i in 0..n {
             for j in 0..n {
                 if self.gram[i][j] != self.gram[j][i] {
@@ -373,24 +425,26 @@ impl SosCertificate {
                 }
             }
         }
-        if !is_psd(&self.gram) {
+        if !is_psd_bounded(&self.gram)? {
             return Err(SosError::GramNotPsd);
         }
         if self.rhs.is_positive() {
             return Err(SosError::PositiveRhs);
         }
 
-        let mut lhs = sigma0_poly(&self.basis, &self.gram);
+        let mut budget = SosPolynomialBudget::default();
+        let mut lhs = sigma0_poly(&self.basis, &self.gram, &mut budget)?;
         let mut has_strict_positive = false;
         for term in &self.terms {
-            let (g, kind) = derive_oriented(term.origin, constraints)?;
+            let (g, kind) = derive_oriented(term.origin, constraints, &mut budget)?;
             if kind.is_inequality() && term.multiplier.is_negative() {
                 return Err(SosError::NegativeMultiplier);
             }
             if kind.is_strict() && term.multiplier.is_positive() {
                 has_strict_positive = true;
             }
-            lhs = lhs.add(&scale(&g, &term.multiplier));
+            let scaled = scale(&g, &term.multiplier, &mut budget)?;
+            lhs = checked_poly_add(&lhs, &scaled, &mut budget).ok_or(SosError::ResourceLimit)?;
         }
 
         if self.rhs.is_zero() && !has_strict_positive {
@@ -398,7 +452,8 @@ impl SosCertificate {
         }
 
         // Identity: lhs - R must be the zero polynomial.
-        let diff = lhs.sub(&MultiPoly::constant(self.rhs.clone()));
+        let diff = checked_poly_sub(&lhs, &MultiPoly::constant(self.rhs.clone()), &mut budget)
+            .ok_or(SosError::ResourceLimit)?;
         if !diff.is_zero() {
             return Err(SosError::IdentityMismatch);
         }
@@ -551,7 +606,7 @@ struct Square {
 /// conjunction `{ constraints }`. Returns a certificate only if it *also passes
 /// the independent checker* ([`SosCertificate::verify`]); otherwise `None`.
 pub(crate) fn search(constraints: &[MultiConstraint], vars: &[TermId]) -> Option<SosCertificate> {
-    if vars.is_empty() || vars.len() > MAX_VARS {
+    if !search_input_fits(constraints, vars) {
         return None;
     }
 
@@ -565,63 +620,7 @@ pub(crate) fn search(constraints: &[MultiConstraint], vars: &[TermId]) -> Option
     // Position of variable v within the basis (index 1..=n).
     let var_pos = |v: TermId| -> usize { vars.iter().position(|&u| u == v).unwrap() + 1 };
 
-    // 1. Orient constraints into nonnegative / equality atoms.
-    let mut atoms: Vec<Atom> = Vec::new();
-    let mut eqs: Vec<EqAtom> = Vec::new();
-    // Linear inequality atoms (degree ≤ 1) eligible for pairwise products.
-    let mut linear_ineqs: Vec<usize> = Vec::new();
-    for (i, c) in constraints.iter().enumerate() {
-        let Some((g, kind)) = orient(c) else {
-            continue; // ≠ atom: not usable.
-        };
-        // Reject anything above degree 2 (cannot participate in a degree-2
-        // identity as a base atom).
-        if poly_degree(&g) > 2 {
-            continue;
-        }
-        match kind {
-            OrientedKind::Eq => eqs.push(EqAtom { index: i, poly: g }),
-            OrientedKind::Ge | OrientedKind::Gt => {
-                if poly_degree(&g) <= 1 {
-                    linear_ineqs.push(atoms.len());
-                }
-                atoms.push(Atom {
-                    origin: CertOrigin::Constraint(i),
-                    kind,
-                    poly: g,
-                });
-            }
-        }
-    }
-
-    // 2. Close the linear inequalities under pairwise products (including
-    //    squares): a product of two nonnegatives is nonnegative, and this is
-    //    what supplies the `−x²` terms that cancel a quadratic lower bound.
-    'outer: for a_idx in 0..linear_ineqs.len() {
-        for b_idx in a_idx..linear_ineqs.len() {
-            if atoms.len() >= MAX_ATOMS {
-                break 'outer;
-            }
-            let ia = linear_ineqs[a_idx];
-            let ib = linear_ineqs[b_idx];
-            let (CertOrigin::Constraint(ci), CertOrigin::Constraint(cj)) =
-                (atoms[ia].origin, atoms[ib].origin)
-            else {
-                continue;
-            };
-            let prod = atoms[ia].poly.mul(&atoms[ib].poly);
-            let kind = if atoms[ia].kind.is_strict() && atoms[ib].kind.is_strict() {
-                OrientedKind::Gt
-            } else {
-                OrientedKind::Ge
-            };
-            atoms.push(Atom {
-                origin: CertOrigin::Product(ci, cj),
-                kind,
-                poly: prod,
-            });
-        }
-    }
+    let (atoms, eqs) = collect_certificate_atoms(constraints)?;
 
     // 3. Dictionary of squares for σ0: x_i², (x_i ± x_j)². All homogeneous
     //    degree-2, so their Gram lives in the `x` block of the basis.
@@ -629,7 +628,7 @@ pub(crate) fn search(constraints: &[MultiConstraint], vars: &[TermId]) -> Option
     for &v in vars {
         let mut form = vec![zero(); basis_len];
         form[var_pos(v)] = one();
-        squares.push(make_square(form, &basis));
+        squares.push(make_square(form, &basis)?);
     }
     for a in 0..vars.len() {
         for b in (a + 1)..vars.len() {
@@ -637,7 +636,7 @@ pub(crate) fn search(constraints: &[MultiConstraint], vars: &[TermId]) -> Option
                 let mut form = vec![zero(); basis_len];
                 form[var_pos(vars[a])] = one();
                 form[var_pos(vars[b])] = sign;
-                squares.push(make_square(form, &basis));
+                squares.push(make_square(form, &basis)?);
             }
         }
     }
@@ -660,8 +659,83 @@ pub(crate) fn search(constraints: &[MultiConstraint], vars: &[TermId]) -> Option
     None
 }
 
+fn search_input_fits(constraints: &[MultiConstraint], vars: &[TermId]) -> bool {
+    if vars.is_empty()
+        || vars.len() > MAX_VARS
+        || constraints.len() > MAX_SOS_ASSERTED_LITERALS
+        || vars
+            .iter()
+            .enumerate()
+            .any(|(index, var)| vars[..index].contains(var))
+    {
+        return false;
+    }
+    let Some(total_terms) = constraints.iter().try_fold(0usize, |total, constraint| {
+        total.checked_add(constraint.poly.terms.len())
+    }) else {
+        return false;
+    };
+    total_terms <= MAX_SOS_TOTAL_POLY_TERMS
+        && constraints
+            .iter()
+            .all(|constraint| polynomial_fits(&constraint.poly, Some(vars)))
+}
+
+fn collect_certificate_atoms(constraints: &[MultiConstraint]) -> Option<(Vec<Atom>, Vec<EqAtom>)> {
+    let mut atoms = Vec::new();
+    let mut eqs = Vec::new();
+    let mut linear_ineqs = Vec::new();
+    for (index, constraint) in constraints.iter().enumerate() {
+        let Some((poly, kind)) = orient(constraint) else {
+            continue;
+        };
+        match kind {
+            OrientedKind::Eq => eqs.push(EqAtom { index, poly }),
+            OrientedKind::Ge | OrientedKind::Gt => {
+                if atoms.len() >= MAX_ATOMS {
+                    return None;
+                }
+                if poly_degree(&poly) <= 1 {
+                    linear_ineqs.push(atoms.len());
+                }
+                atoms.push(Atom {
+                    origin: CertOrigin::Constraint(index),
+                    kind,
+                    poly,
+                });
+            }
+        }
+    }
+
+    let mut budget = SosPolynomialBudget::default();
+    'outer: for (position, &left) in linear_ineqs.iter().enumerate() {
+        for &right in &linear_ineqs[position..] {
+            if atoms.len() >= MAX_ATOMS {
+                break 'outer;
+            }
+            let (CertOrigin::Constraint(left_index), CertOrigin::Constraint(right_index)) =
+                (atoms[left].origin, atoms[right].origin)
+            else {
+                return None;
+            };
+            let poly = checked_poly_mul(&atoms[left].poly, &atoms[right].poly, &mut budget)?;
+            let kind = if atoms[left].kind.is_strict() && atoms[right].kind.is_strict() {
+                OrientedKind::Gt
+            } else {
+                OrientedKind::Ge
+            };
+            atoms.push(Atom {
+                origin: CertOrigin::Product(left_index, right_index),
+                kind,
+                poly,
+            });
+        }
+    }
+    Some((atoms, eqs))
+}
+
 /// Build `q²` for a linear form and package it as a [`Square`].
-fn make_square(form: Vec<BigRational>, basis: &[Vec<TermId>]) -> Square {
+fn make_square(form: Vec<BigRational>, basis: &[Vec<TermId>]) -> Option<Square> {
     // q = Σ_k form[k] · basis[k].
     let mut q = MultiPoly::zero();
     for (k, coeff) in form.iter().enumerate() {
@@ -669,8 +743,9 @@ fn make_square(form: Vec<BigRational>, basis: &[Vec<TermId>]) -> Square {
             q.add_term(basis[k].clone(), coeff.clone());
         }
     }
-    let poly = q.mul(&q);
-    Square { form, poly }
+    let mut budget = SosPolynomialBudget::default();
+    let poly = checked_poly_mul(&q, &q, &mut budget)?;
+    Some(Square { form, poly })
 }
 
 /// Total degree of a polynomial (max monomial length).
@@ -691,7 +766,6 @@ fn intern_mono(monos: &mut Vec<Vec<TermId>>, m: &[TermId]) -> usize {
 /// Assemble and solve the coefficient-matching LP for one template, returning a
 /// certificate on feasibility. `strict_template` selects `R = 0` with the added
 /// row `Σ_{strict atoms} c = 1` (else `R = −1`).
-#[allow(clippy::needless_range_loop)] // Gram reconstruction: multi-array index access.
 fn try_template(
     basis: &[Vec<TermId>],
     squares: &[Square],
@@ -740,28 +814,37 @@ fn try_template(
     }
     let n_rows_ident = monos.len();
     let total_rows = n_rows_ident + n_surplus;
+    let tableau_cols = n_cols.checked_add(total_rows)?.checked_add(1)?;
+    if total_rows.checked_mul(tableau_cols)? > MAX_SOS_LP_CELLS {
+        return None;
+    }
 
     // Build A (total_rows × n_cols) and b.
     let mut a: Vec<Vec<BigRational>> = vec![vec![zero(); n_cols]; total_rows];
     let mut b: Vec<BigRational> = vec![zero(); total_rows];
+    let mut arithmetic_budget = SosLpBudget::default();
 
-    let row_of = |m: &[TermId]| monos.iter().position(|x| x.as_slice() == m).unwrap();
+    let row_of = |m: &[TermId]| monos.iter().position(|x| x.as_slice() == m);
 
     for (sidx, sq) in squares.iter().enumerate() {
         for (m, c) in &sq.poly.terms {
-            a[row_of(m)][col_sq + sidx] += c;
+            let row = row_of(m)?;
+            a[row][col_sq + sidx] = lp_add(&a[row][col_sq + sidx], c, &mut arithmetic_budget)?;
         }
     }
     for (aidx, at) in atoms.iter().enumerate() {
         for (m, c) in &at.poly.terms {
-            a[row_of(m)][col_at + aidx] += c;
+            let row = row_of(m)?;
+            a[row][col_at + aidx] = lp_add(&a[row][col_at + aidx], c, &mut arithmetic_budget)?;
         }
     }
     for (eidx, e) in eqs.iter().enumerate() {
         for (m, c) in &e.poly.terms {
-            let r = row_of(m);
-            a[r][col_eq + 2 * eidx] += c; // λ⁺
-            a[r][col_eq + 2 * eidx + 1] -= c; // λ⁻
+            let r = row_of(m)?;
+            a[r][col_eq + 2 * eidx] = lp_add(&a[r][col_eq + 2 * eidx], c, &mut arithmetic_budget)?; // λ⁺
+            a[r][col_eq + 2 * eidx + 1] =
+                lp_sub(&a[r][col_eq + 2 * eidx + 1], c, &mut arithmetic_budget)?;
+            // λ⁻
         }
     }
     // RHS: constant-monomial equation equals R; all others 0.
@@ -772,16 +855,43 @@ fn try_template(
         let r = n_rows_ident; // last row
         for (aidx, at) in atoms.iter().enumerate() {
             if at.kind.is_strict() {
-                a[r][col_at + aidx] += one();
+                a[r][col_at + aidx] = lp_add(&a[r][col_at + aidx], &one(), &mut arithmetic_budget)?;
             }
         }
-        a[r][col_surplus] -= one();
+        a[r][col_surplus] = lp_sub(&a[r][col_surplus], &one(), &mut arithmetic_budget)?;
         b[r] = one();
     }
 
     let solution = lp_phase1_feasible(a, b, n_cols)?;
+    reconstruct_certificate(
+        basis,
+        squares,
+        atoms,
+        eqs,
+        &solution,
+        col_sq,
+        col_at,
+        col_eq,
+        rhs_const,
+        &mut arithmetic_budget,
+    )
+}
 
-    // Reconstruct the certificate from the LP solution.
+/// Rebuild the exact Gram matrix and constraint multipliers from one feasible
+/// coefficient-matching solution. Every rational operation remains metered.
+#[allow(clippy::needless_range_loop)] // Gram reconstruction: multi-array index access.
+fn reconstruct_certificate(
+    basis: &[Vec<TermId>],
+    squares: &[Square],
+    atoms: &[Atom],
+    eqs: &[EqAtom],
+    solution: &[BigRational],
+    col_sq: usize,
+    col_at: usize,
+    col_eq: usize,
+    rhs: BigRational,
+    budget: &mut SosLpBudget,
+) -> Option<SosCertificate> {
     // Gram = Σ_s s_s · outer(form_s, form_s).
     let basis_len = basis.len();
     let mut gram = vec![vec![zero(); basis_len]; basis_len];
@@ -798,8 +908,9 @@ fn try_template(
                 if sq.form[j].is_zero() {
                     continue;
                 }
-                let d = s * &sq.form[i] * &sq.form[j];
-                gram[i][j] += d;
+                let left = lp_mul(s, &sq.form[i], budget)?;
+                let delta = lp_mul(&left, &sq.form[j], budget)?;
+                gram[i][j] = lp_add(&gram[i][j], &delta, budget)?;
             }
         }
     }
@@ -815,7 +926,11 @@ fn try_template(
         }
     }
     for (eidx, e) in eqs.iter().enumerate() {
-        let net = &solution[col_eq + 2 * eidx] - &solution[col_eq + 2 * eidx + 1];
+        let net = lp_sub(
+            &solution[col_eq + 2 * eidx],
+            &solution[col_eq + 2 * eidx + 1],
+            budget,
+        )?;
         if !net.is_zero() {
             terms.push(CertTerm {
                 origin: CertOrigin::Constraint(e.index),
@@ -828,183 +943,8 @@ fn try_template(
         basis: basis.to_vec(),
         gram,
         terms,
-        rhs: rhs_const,
+        rhs,
     })
-}
-
-// ============================================================================
-// Exact rational Phase-1 simplex (LP feasibility).
-// ============================================================================
-
-/// Decide feasibility of `{ A x = b, x ≥ 0 }` over the rationals and return a
-/// feasible `x` if one exists. Standard two-phase artificial-variable Phase-1
-/// simplex with **Bland's rule** for guaranteed termination; all arithmetic is
-/// exact `BigRational`.
-///
-/// # Cost discipline (#nia-sos-lp-cost)
-///
-/// Every `BigRational` operation here heap-allocates and runs a `BigInt` gcd, so
-/// the two things that decide this routine's wall time are *how many* rational
-/// ops it performs and how many of them are on zeros. Two invariants keep that
-/// count near the algorithmic minimum, and **both are exact algebraic identities,
-/// so the pivot sequence and the returned vector are bit-identical to the naive
-/// formulation**:
-///
-/// 1. **The Phase-1 reduced-cost row is carried, not recomputed.** `d[j]` holds
-///    `rc(j) = c[j] − c_Bᵀ B⁻¹ A_j` and is updated by the same row operation as
-///    the tableau. Recomputing it per pivot (the obvious loop
-///    `for j { for i { if artificial(basis[i]) { rc -= t[i][j] } } }`) costs
-///    `O(m · total)` gcd-reducing subtractions *per pivot* — the same order as the
-///    pivot itself — purely to choose an entering column. Bland's rule reads the
-///    identical values either way, so it selects the identical column.
-/// 2. **Zeros in the pivot row are skipped.** `x − 0·y = x` and `0 / p = 0`, so
-///    the row-update and normalisation loops only touch the nonzero support of
-///    row `l`. Early tableaux are sparse (a column's nonzeros are the monomials
-///    its polynomial actually mentions), and the skipped operations would each
-///    allocate a `BigRational` to add nothing.
-#[allow(clippy::needless_range_loop)] // Tableau pivoting: index into rows/columns is intrinsic.
-fn lp_phase1_feasible(
-    mut a: Vec<Vec<BigRational>>,
-    mut b: Vec<BigRational>,
-    n: usize,
-) -> Option<Vec<BigRational>> {
-    let m = a.len();
-    if m == 0 {
-        return Some(vec![zero(); n]);
-    }
-    // Normalize b ≥ 0.
-    for i in 0..m {
-        if b[i].is_negative() {
-            for j in 0..n {
-                a[i][j] = -&a[i][j];
-            }
-            b[i] = -&b[i];
-        }
-    }
-    // Tableau columns: n structural + m artificials + 1 RHS.
-    let total = n + m;
-    let mut t: Vec<Vec<BigRational>> = vec![vec![zero(); total + 1]; m];
-    for i in 0..m {
-        for j in 0..n {
-            t[i][j] = a[i][j].clone();
-        }
-        t[i][n + i] = one();
-        t[i][total] = b[i].clone();
-    }
-    let mut basis: Vec<usize> = (0..m).map(|i| n + i).collect();
-
-    // cost[k] = 1 for artificial columns, 0 otherwise (minimize Σ artificials).
-    let is_artificial = |k: usize| k >= n;
-
-    // Carried Phase-1 reduced-cost row (invariant 1 above):
-    //   d[j] = cost[j] − Σ_{i : basis[i] artificial} t[i][j].
-    // Every basis slot starts artificial, so the initial sum spans all rows.
-    let mut d: Vec<BigRational> = Vec::with_capacity(total);
-    for j in 0..total {
-        let mut rc = if is_artificial(j) { one() } else { zero() };
-        for i in 0..m {
-            if !t[i][j].is_zero() {
-                rc -= &t[i][j];
-            }
-        }
-        d.push(rc);
-    }
-
-    // Pivot count, reported on the NIA debug channel. It is the number that says
-    // whether this LP is cheap-but-frequent or genuinely degenerate, and it is
-    // what refuted swapping Bland's rule for Dantzig's on the QF_SNIA
-    // symbolic-`mod` family: 22–27 pivots against m = 14 rows is already close to
-    // the floor, so there was no stall for a different entering rule to remove.
-    let mut pivots: usize = 0;
-    loop {
-        // Bland's rule: entering = smallest-index column with negative reduced
-        // cost. `d` already holds those reduced costs.
-        let mut entering = None;
-        for j in 0..total {
-            if d[j].is_negative() {
-                entering = Some(j);
-                break;
-            }
-        }
-        let Some(e) = entering else {
-            if ay_core::debug_channel_active(ay_core::DebugChannel::Nia) {
-                safe_eprintln!("[NIA] SOS LP pivots={pivots} m={m} n={n} total={total}");
-            }
-            break;
-        };
-        pivots += 1;
-
-        // Ratio test with Bland tie-break (smallest leaving basis index).
-        let mut leave: Option<usize> = None;
-        let mut best: Option<BigRational> = None;
-        for i in 0..m {
-            if t[i][e].is_positive() {
-                let ratio = &t[i][total] / &t[i][e];
-                let take = match &best {
-                    None => true,
-                    Some(br) => ratio < *br || (ratio == *br && basis[i] < basis[leave.unwrap()]),
-                };
-                if take {
-                    best = Some(ratio);
-                    leave = Some(i);
-                }
-            }
-        }
-        let l = leave?; // no positive pivot ⇒ unbounded (should not occur in Phase 1)
-
-        // Pivot on (l, e). Normalise row l, then eliminate column e from every
-        // other row AND from the carried cost row `d`.
-        let piv = t[l][e].clone();
-        if !piv.is_one() {
-            for j in 0..=total {
-                // `0 / piv == 0`: skipping avoids an allocating divide.
-                if !t[l][j].is_zero() {
-                    t[l][j] = &t[l][j] / &piv;
-                }
-            }
-        }
-        // Nonzero support of the normalised pivot row (invariant 2 above): every
-        // other index contributes `factor * 0 == 0` to the row update.
-        let nz: Vec<usize> = (0..=total).filter(|&j| !t[l][j].is_zero()).collect();
-        for i in 0..m {
-            if i != l && !t[i][e].is_zero() {
-                let factor = t[i][e].clone();
-                for &j in &nz {
-                    let delta = &factor * &t[l][j];
-                    t[i][j] -= delta;
-                }
-            }
-        }
-        if !d[e].is_zero() {
-            let factor = d[e].clone();
-            for &j in &nz {
-                if j < total {
-                    let delta = &factor * &t[l][j];
-                    d[j] -= delta;
-                }
-            }
-        }
-        basis[l] = e;
-    }
-
-    // Objective = Σ artificial basic values; feasible iff 0.
-    let mut obj = zero();
-    for i in 0..m {
-        if is_artificial(basis[i]) {
-            obj += &t[i][total];
-        }
-    }
-    if !obj.is_zero() {
-        return None;
-    }
-    // Read off structural values.
-    let mut x = vec![zero(); n];
-    for i in 0..m {
-        if basis[i] < n {
-            x[basis[i]] = t[i][total].clone();
-        }
-    }
-    Some(x)
 }
 
 #[cfg(test)]

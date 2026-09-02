@@ -10,7 +10,7 @@
 
 use super::bitvector::infer_bv_width_from_expr;
 use super::ChcParser;
-use crate::{ChcError, ChcExpr, ChcOp, ChcResult, ChcSort};
+use crate::{ChcError, ChcExpr, ChcOp, ChcResult, ChcSort, MAX_BITVECTOR_WIDTH};
 use std::sync::Arc;
 
 impl ChcParser {
@@ -568,13 +568,21 @@ impl ChcParser {
                 let a = args[0].clone();
                 let b = args[1].clone();
                 // Infer width from operands for zero literal construction.
-                let width = infer_bv_width_from_expr(&a)
-                    .or_else(|| infer_bv_width_from_expr(&b))
-                    .ok_or_else(|| {
-                        ChcError::Parse(format!(
+                let a_width = infer_bv_width_from_expr(&a);
+                let b_width = infer_bv_width_from_expr(&b);
+                let width = match (a_width, b_width) {
+                    (Some(a_width), Some(b_width)) if a_width == b_width => a_width,
+                    (Some(a_width), Some(b_width)) => {
+                        return Err(ChcError::Parse(format!(
+                            "'{func}' requires equal-width bitvector operands, got {a_width} and {b_width}"
+                        )));
+                    }
+                    _ => {
+                        return Err(ChcError::Parse(format!(
                             "'{func}' requires bitvector operands with known width"
-                        ))
-                    })?;
+                        )));
+                    }
+                };
                 let zero = ChcExpr::BitVec(0, width);
                 let b_is_zero = ChcExpr::eq(b.clone(), zero);
                 let (default_val, core_op) = match func {
@@ -608,8 +616,29 @@ impl ChcParser {
                         "'concat' requires at least 2 arguments".into(),
                     ));
                 }
-                let args_arc: Vec<Arc<ChcExpr>> = args.into_iter().map(Arc::new).collect();
-                Ok(ChcExpr::Op(ChcOp::BvConcat, args_arc))
+                // `concat` is binary in the internal AST/evaluator. Preserve
+                // the parser's variadic convenience by folding left-to-right,
+                // while bounding the accumulated result width.
+                let mut args = args.into_iter();
+                let mut result = Self::next_checked(&mut args, "concat")?;
+                let mut result_width = infer_bv_width_from_expr(&result).ok_or_else(|| {
+                    ChcError::Parse("'concat' requires bitvector arguments".into())
+                })?;
+                for arg in args {
+                    let arg_width = infer_bv_width_from_expr(&arg).ok_or_else(|| {
+                        ChcError::Parse("'concat' requires bitvector arguments".into())
+                    })?;
+                    result_width = result_width.checked_add(arg_width).ok_or_else(|| {
+                        ChcError::Parse("'concat' result width overflows u32".into())
+                    })?;
+                    if result_width > MAX_BITVECTOR_WIDTH {
+                        return Err(ChcError::Parse(format!(
+                            "'concat' result width {result_width} exceeds the supported maximum {MAX_BITVECTOR_WIDTH}"
+                        )));
+                    }
+                    result = ChcExpr::Op(ChcOp::BvConcat, vec![Arc::new(result), Arc::new(arg)]);
+                }
+                Ok(result)
             }
             _ => {
                 // Check if it's a predicate application

@@ -17,13 +17,20 @@
 //! claim). A `None` or a proof that fails to verify must never change the
 //! reported SAT/UNSAT status — certification is strictly additive.
 
+mod certified_bb;
 mod clique_coloring;
 mod cp_replay;
 mod frustrated_cycle;
+mod handshake_parity;
+mod layered_pebbling;
 mod lp_dual_floor;
+mod odd_cycle_cover;
 
 pub use clique_coloring::certify_opt_lin_clique_coloring;
 pub use frustrated_cycle::certify_opt_lin_frustrated_cycle;
+pub use handshake_parity::certify_opt_lin_handshake_parity;
+pub use layered_pebbling::certify_opt_lin_layered_pebbling;
+pub use odd_cycle_cover::certify_opt_lin_odd_cycle_cover;
 
 use std::time::Instant;
 
@@ -68,6 +75,33 @@ pub fn certify_opt_lin_lp_dual_floor(
 /// deferred only because the name appears in recorded measurements.
 pub fn lp_dual_floor_diagnosis(instance: &PbInstance, optimum: i128) -> String {
     lp_dual_floor::lp_dual_floor_diagnosis(instance, optimum)
+}
+
+/// CERTIFIED LP BRANCH-AND-BOUND: an OPT-LIN optimality proof built from a
+/// LITERAL SPLIT rather than from a structural fact, for the
+/// `ceil(LP*) = optimum - 1` instances no cut and no counting argument reaches.
+///
+/// This is an ENGINE route, not a ninth family: it requires only `>=` rows and a
+/// linear `min:` over plain positive literals. The full derivation, the two
+/// defects it does not inherit from its prototype, and the deterministic COUNT
+/// budgets are on [`certified_bb`].
+///
+/// `None` withholds only the certificate; returned text is untrusted until the
+/// external VeriPB verify-before-claim gate accepts it.
+pub fn certify_opt_lin_certified_bb(
+    instance: &PbInstance,
+    incumbent: &[bool],
+    optimum: i128,
+) -> Option<String> {
+    certified_bb::certify_opt_lin_certified_bb(instance, incumbent, optimum)
+}
+
+/// Reports what [`certify_opt_lin_certified_bb`]'s search concluded, keeping
+/// "this optimum is refuted BY A WITNESS" and "I could not close this tree in
+/// budget" apart in writing. Measurement-only; never called by the certificate
+/// chain.
+pub fn certified_bb_diagnosis(instance: &PbInstance, incumbent: &[bool], optimum: i128) -> String {
+    certified_bb::certified_bb_diagnosis(instance, incumbent, optimum)
 }
 
 /// Solve `instance` via its CNF encoding with DRAT proof logging and, on UNSAT,
@@ -1347,6 +1381,42 @@ pub fn certify_opt_lin_bounds_compact_interruptible(
     String::from_utf8(writer.into_inner()).ok()
 }
 
+/// `true` iff `assignment` is complete for the instance and satisfies every row.
+///
+/// Shared by every STRUCTURAL certifier (`frustrated_cycle`, `odd_cycle_cover`).
+/// It is the only thing standing between a bogus incumbent and a published
+/// `conclusion BOUNDS opt <= obj <= opt`, so it is deliberately independent of
+/// however the solver decided the point was feasible, and it is deliberately in
+/// ONE place: a second copy is a second chance to get the completeness test or
+/// the `Eq` case wrong in a file nobody diffs against the first.
+pub(super) fn incumbent_is_feasible(instance: &PbInstance, assignment: &[bool]) -> bool {
+    if assignment.len() < instance.num_vars as usize {
+        return false;
+    }
+    instance.constraints.iter().all(|constraint| {
+        let mut total: i128 = 0;
+        for term in &constraint.terms {
+            let mut satisfied = true;
+            for lit in &term.lits {
+                let Some(&value) = assignment.get((lit.var as usize).wrapping_sub(1)) else {
+                    return false;
+                };
+                if !(value ^ lit.negated) {
+                    satisfied = false;
+                    break;
+                }
+            }
+            if satisfied {
+                total += term.coeff;
+            }
+        }
+        match constraint.rel {
+            PbRel::Ge => total >= constraint.rhs,
+            PbRel::Eq => total == constraint.rhs,
+        }
+    })
+}
+
 /// Evaluates a linear (single-literal-term) objective under `assignment`
 /// (`assignment[v-1]` is the value of variable `v`). Returns `None` if a literal
 /// references a variable outside the assignment.
@@ -1419,6 +1489,10 @@ pub enum OptLinCertRoute {
     KnapsackCardinality,
     /// The clique-colouring structural floor, whose LP dual is always 0.
     CliqueColoring,
+    /// The equality-handshake parity structural floor (`evencolouring`), whose
+    /// LP dual is always 0 because the fractional edge point is feasible at
+    /// cost 0; the odd handshake total is invisible to the relaxation.
+    HandshakeParity,
     /// A direct Chvátal-Gomory aggregation floor; no refutation needed.
     DirectAggregationFloor,
     /// The exact rational LP dual, un-complemented into instance rows.
@@ -1426,6 +1500,17 @@ pub enum OptLinCertRoute {
     /// The signed-graph frustration-index structural floor, whose LP dual is
     /// always 0 because the half-integral sign point is feasible at cost 0.
     FrustratedCycle,
+    /// The odd-cycle vertex-cover structural floor, whose LP dual is capped at
+    /// `V/2` because the all-half point is feasible, strictly below the optimum.
+    OddCycleCover,
+    /// The layered group-division DAG floor (`linearized_pebbling`), whose LP
+    /// dual is capped strictly below the optimum because the per-group halves
+    /// the LP must carry are re-rounded by DIVISION at every group.
+    LayeredPebbling,
+    /// Certified LP branch-and-bound: a LITERAL split whose leaves close as
+    /// clauses and resolve to the empty clause. The only ENGINE route — it
+    /// needs no structural fact, only `>=` rows and a linear `min:`.
+    CertifiedBb,
     /// Augmented-instance refutation lifted through the compact Sinz encoding.
     BoundsCompact,
     /// Augmented-instance refutation lifted aux-free.
@@ -1436,8 +1521,8 @@ pub enum OptLinCertRoute {
 
 /// SEARCH rungs in the OPT-LIN chain — `bounds_compact`, `bounds` (aux-free)
 /// and `bounds_pb` — i.e. the ones that consult `should_stop` and can therefore
-/// consume a budget. The five floor rungs are pure arithmetic and are NOT
-/// scheduled, so they are not counted here.
+/// consume a budget. The eight floor rungs are pure arithmetic (or count-bounded
+/// structure recovery) and are NOT scheduled, so they are not counted here.
 const OPT_LIN_SEARCH_ROUTES: u32 = 3;
 
 impl OptLinCertRoute {
@@ -1448,9 +1533,13 @@ impl OptLinCertRoute {
             Self::TrivialZeroFloor => "trivial-zero-floor",
             Self::KnapsackCardinality => "knapsack-cardinality",
             Self::CliqueColoring => "clique-coloring",
+            Self::HandshakeParity => "handshake-parity",
             Self::DirectAggregationFloor => "direct-aggregation-floor",
             Self::LpDualFloor => "lp-dual-floor",
             Self::FrustratedCycle => "frustrated-cycle",
+            Self::OddCycleCover => "odd-cycle-cover",
+            Self::LayeredPebbling => "layered-pebbling",
+            Self::CertifiedBb => "certified-bb",
             Self::BoundsCompact => "bounds-compact",
             Self::Bounds => "bounds-auxfree",
             Self::BoundsPbNative => "bounds-pb-native",
@@ -1487,28 +1576,40 @@ impl OptLinCertRoute {
 /// 3. `clique_coloring` — O(1) header pre-gate; the structural family whose LP
 ///    relaxation *and* full level-1 RLT lift are both exactly 0, so no dual
 ///    floor can ever fire on it.
-/// 4. `direct_aggregation_floor` — a short Chvátal-Gomory aggregation, no SAT
+/// 4. `handshake_parity` — O(1) header pre-gate (`|objective| == #constraint`);
+///    the equality-handshake family (`evencolouring`), where summing every row
+///    cancels each edge variable into an even coefficient against an ODD
+///    right-hand-side total, so the slack sum is odd and `obj >= min_v w_v` —
+///    a parity the LP relaxation (exactly 0 at the fractional edge point)
+///    cannot express and one cutting-planes division extracts. Pure single-pass
+///    arithmetic, no search.
+/// 5. `direct_aggregation_floor` — a short Chvátal-Gomory aggregation, no SAT
 ///    refutation needed; certifies covering-tight optima the refutations cannot
 ///    reach in budget.
-/// 5. `lp_dual_floor` — the exact rational LP dual, un-complemented; the only
+/// 6. `lp_dual_floor` — the exact rational LP dual, un-complemented; the only
 ///    route for tight-LP maximisation optima.
-/// 6. `frustrated_cycle` — O(1) header pre-gate; the signed-graph frustration
+/// 7. `frustrated_cycle` — O(1) header pre-gate; the signed-graph frustration
 ///    index, whose LP relaxation is exactly 0 at the half-integral sign point,
-///    so no dual floor can ever fire on it either. LAST of the floor rungs
-///    because it is the only one whose on-family cost is a search rather than a
-///    formula: every cheaper route gets its chance first, and off-family
-///    instances pay three integer comparisons.
-/// 7. `bounds_compact` — augmented refutation with Sinz aux registers (broadest
+///    so no dual floor can ever fire on it either. Late among the floor rungs
+///    because its on-family cost is a search rather than a formula: every
+///    cheaper route gets its chance first, and off-family instances pay three
+///    integer comparisons.
+/// 8. `odd_cycle_cover` — O(1) header pre-gate plus an O(1) first-row probe;
+///    pure minimum vertex cover, certified by disjoint odd-cycle cuts plus a
+///    maximum matching. `ceil(LP*) < optimum` throughout the family, so no
+///    dual floor reaches it. LAST of the floor rungs, for `frustrated_cycle`'s
+///    reason: its on-family cost is a (count-bounded) search.
+/// 9. `bounds_compact` — augmented refutation with Sinz aux registers (broadest
 ///    refutation coverage).
-/// 8. `bounds` — the aux-free lift.
-/// 9. `bounds_pb` — PB-native refutation; last, so it can only ADD certificates
-///    the CNF routes declined.
+/// 10. `bounds` — the aux-free lift.
+/// 11. `bounds_pb` — PB-native refutation; last, so it can only ADD
+///    certificates the CNF routes declined.
 ///
 /// # Budget
 ///
 /// TWO KINDS OF RUNG, AND THEY ARE SCHEDULED DIFFERENTLY.
 ///
-/// Routes 1-6 are pure arithmetic on the instance and the incumbent: they do not
+/// Routes 1-8 are pure arithmetic on the instance and the incumbent: they do not
 /// consult `should_stop`. They are called DIRECTLY, outside the scheduler, and
 /// that is deliberate and load-bearing — a caller whose deadline has already
 /// passed still gets every floor route. Gating them behind a budget that can be
@@ -1516,15 +1617,23 @@ impl OptLinCertRoute {
 /// `floor_routes_still_fire_with_an_already_expired_deadline` is the regression
 /// test.
 ///
-/// Rung 6 (`frustrated_cycle`) is the one whose on-family cost is not a
-/// formula: it separates cycles and solves a packing LP. It is bounded by
-/// deterministic COUNTS (rows, pool, rounds, pivots) rather than by a clock,
-/// precisely so that it can live outside the scheduler without either eating a
-/// budget or making the emitted bytes depend on machine load. Off-family
-/// instances never reach that work: three integer comparisons on the header
-/// decide it.
+/// Rungs 6-8 (`lp_dual_floor`, `frustrated_cycle`, `odd_cycle_cover`) are the
+/// ones whose on-family cost is not a formula: they run a simplex, separate
+/// cycles, or solve a packing (LP, respectively matching). All three are
+/// bounded by deterministic COUNTS (`MAX_DUAL_SOLVE_POLLS` stop polls for the
+/// dual solve; rows, pool, rounds, pivots — and in `odd_cycle_cover` the
+/// Hopcroft-Karp and two-colour phases charge the same relaxation budget)
+/// rather than by a clock, precisely so that they can live outside the
+/// scheduler without either eating a budget or making the emitted bytes depend
+/// on machine load. `lp_dual_floor` learned this the measured way: its budget
+/// used to be a private one-minute WALL deadline taken at rung entry, which is
+/// how a 5 s `--timeout` proof run spent 60-65 s (2026-08-29 definitive
+/// census: `aim-200-2_0-yes1-2`, `knapPI_11_1000_1000_5`,
+/// `mult_diagcomm_..._nbits_16`) and then failed to certify anyway.
+/// Off-family instances never reach that work: cheap structural gates decide
+/// it.
 ///
-/// Routes 7-9 are SEARCH, and they are the ones that can eat a chain. Each gets
+/// Routes 9-11 are SEARCH, and they are the ones that can eat a chain. Each gets
 /// a deadline of its own out of `deadline` via [`CertRouteBudget`]: rung `i` of
 /// `n` remaining gets `remaining / n`, and time an earlier rung did not spend
 /// rolls forward. Passing `deadline: None` keeps the uncapped behaviour.
@@ -1560,7 +1669,7 @@ pub fn certify_opt_lin_any_interruptible(
     deadline: Option<Instant>,
     should_stop: &dyn Fn() -> bool,
 ) -> Option<(String, OptLinCertRoute)> {
-    // RUNGS 1-6: pure arithmetic, NOT scheduled. They never poll `should_stop`,
+    // RUNGS 1-8: pure arithmetic, NOT scheduled. They never poll `should_stop`,
     // so they must not be put behind a budget that can be zero — a caller that
     // reaches certification with its deadline already spent (which is the
     // normal case for the CLI) still gets every one of them.
@@ -1575,6 +1684,10 @@ pub fn certify_opt_lin_any_interruptible(
                 .map(|p| (p, OptLinCertRoute::CliqueColoring))
         })
         .or_else(|| {
+            certify_opt_lin_handshake_parity(instance, incumbent, optimum)
+                .map(|p| (p, OptLinCertRoute::HandshakeParity))
+        })
+        .or_else(|| {
             certify_opt_lin_direct_aggregation_floor(instance, incumbent, optimum)
                 .map(|p| (p, OptLinCertRoute::DirectAggregationFloor))
         })
@@ -1585,12 +1698,31 @@ pub fn certify_opt_lin_any_interruptible(
         .or_else(|| {
             certify_opt_lin_frustrated_cycle(instance, incumbent, optimum)
                 .map(|p| (p, OptLinCertRoute::FrustratedCycle))
+        })
+        .or_else(|| {
+            certify_opt_lin_odd_cycle_cover(instance, incumbent, optimum)
+                .map(|p| (p, OptLinCertRoute::OddCycleCover))
+        })
+        .or_else(|| {
+            certify_opt_lin_layered_pebbling(instance, incumbent, optimum)
+                .map(|p| (p, OptLinCertRoute::LayeredPebbling))
+        })
+        // LAST among the unscheduled rungs, and deliberately so. It is the only
+        // one that opens a SEARCH TREE, so it is much the most expensive — but
+        // its budget is a deterministic COUNT (nodes, depth, LP polls), not the
+        // caller's clock, so it still belongs here rather than in the scheduled
+        // block: a CLI whose deadline is already spent when certification starts
+        // (the normal case) must still get it, and giving it a wall slice would
+        // make its emitted bytes depend on machine load.
+        .or_else(|| {
+            certify_opt_lin_certified_bb(instance, incumbent, optimum)
+                .map(|p| (p, OptLinCertRoute::CertifiedBb))
         });
     if floor.is_some() {
         return floor;
     }
 
-    // RUNGS 7-9: SEARCH, one deadline each. `bounds_pb_native` is last and is
+    // RUNGS 9-11: SEARCH, one deadline each. `bounds_pb_native` is last and is
     // the rung that closes the most misses, so it is precisely the one a shared
     // deadline starves.
     let mut budget = CertRouteBudget::new(deadline, OPT_LIN_SEARCH_ROUTES, should_stop);
@@ -1614,6 +1746,106 @@ pub fn certify_opt_lin_any_interruptible(
             .map(|p| (p, OptLinCertRoute::BoundsPbNative));
     }
     pbp
+}
+
+/// FLOORS AS BOUNDS: the structural floors the CERTIFIERS can prove, computed
+/// BEFORE the search so they can serve as its initial dual bound.
+///
+/// # Why this exists
+///
+/// At the 5 s protocol the odd-cycle family's certificates never fired: the
+/// route runs only AFTER the search proves optimality, which on that family
+/// the search cannot do (`oddrowevencolsquare_dim_022`: search dual 253
+/// against optimum 264 at any budget measured) — while the certifier proves
+/// the exact optimal floor from structure in under a millisecond. Installing
+/// that floor as the search's dual bound inverts the dependency:
+/// `floor == incumbent` upgrades the verdict to OPTIMUM the moment the
+/// incumbent exists, and the certificate chain then runs with the whole
+/// remaining budget — where the same recovery emits the route in microseconds.
+///
+/// # The chain, and why it has TWO rungs today
+///
+/// * `odd_cycle_cover::recovered_floor` — the first certifier family whose
+///   proven floor was NOT already feeding the search. Its soundness argument
+///   (pure integer counting over a fail-closed recovery) is on the function.
+/// * `handshake_parity::recovered_floor` — same bar, same shape: a total
+///   fail-closed recovery and a pure integer-counting bound (`min_v w_v` from
+///   the odd handshake total). On `evencolouring_opt_unit` `nvert_351..501`
+///   the search holds the optimal incumbent `1` within seconds and can prove
+///   nothing at any measured budget; `floor == incumbent` is the whole
+///   verdict.
+/// * `direct-aggregation-floor` is NOT here: its bound is arithmetically the
+///   same `ceil(rhs_sum·cv/cs)` surrogate that
+///   `crate::cdcl::aggregation_objective_lower_bound_from_constraints`
+///   already contributes to `objective_lower_bound_from_constraints`, which
+///   both wiring sites consult first — adding it would recompute an installed
+///   bound.
+/// * `clique-coloring` is NOT here: `crate::optimize::clique_coloring`
+///   already answers that family exactly as a pre-solve shortcut
+///   (`portfolio.rs`), so a floor cannot move a verdict on it.
+/// * `frustrated-cycle` is NOT here YET: its packing columns come from
+///   float-LP separation, and the frustration property of each priced column
+///   is re-established only by the emission's layer-4 replay — below the bar
+///   for a verdict-bearing pre-search floor. Adding it requires an integer
+///   re-verification of every nonzero column first.
+///
+/// # Soundness contract (the caller's, enforced here)
+///
+/// * The floor is a bound on `instance.objective`; a caller optimizing ANY
+///   other objective must get `None` — checked against the passed
+///   `objective`, fail-closed, AFTER the ns-scale recovery gates so the
+///   check's `O(#objective)` cost is only ever paid on-family.
+/// * The returned floor may only ever TIGHTEN a search dual bound
+///   (`max`-combined / published to a monotone-max bus), never replace a
+///   better one — that is the wiring sites' obligation, recorded here because
+///   this is the function they all call.
+/// * A floor from here never skips evidence: the verdict paths it can flip
+///   re-verify the incumbent's feasibility (`optimum_upgrade_guard` /
+///   `sanitize_optimization_incumbent`), and the certificate chain still runs
+///   and emits for the pinned checker exactly as before.
+pub fn recovered_structural_search_floor(
+    instance: &PbInstance,
+    objective: &PbObjective,
+) -> Option<i128> {
+    let floor = odd_cycle_cover::recovered_floor(instance)
+        .or_else(|| handshake_parity::recovered_floor(instance))
+        .or_else(|| layered_pebbling::recovered_floor(instance))?;
+    // The recovery bounded `instance.objective`; refuse any caller whose
+    // search objective is not literally that objective.
+    if instance.objective.as_ref() != Some(objective) {
+        return None;
+    }
+    Some(floor)
+}
+
+/// CONSTRUCTED WITNESS for the layered group-division family: the optimal
+/// incumbent the certifier's own fail-closed recovery can BUILD, for the
+/// members where [`recovered_structural_search_floor`] installs the exact
+/// floor but the search cannot find a matching incumbent within budget.
+///
+/// Returns the witness and its exact objective value (== the recovered
+/// floor). The full construction and soundness argument live on
+/// [`layered_pebbling::constructed_optimum_witness`]; the summary is that
+/// setting exactly `f(r)` variables of each group true meets every row by
+/// the floor recurrence's own definition, and the point is then re-verified
+/// against every ORIGINAL row with its objective recomputed exactly — the
+/// same bar every search incumbent passes. The caller owes the returned
+/// witness no trust: it is a CANDIDATE incumbent like any other, and the
+/// certificate chain plus the pinned external checker re-derive both bounds
+/// before anything is claimed to a user.
+///
+/// The `objective` identity check mirrors [`recovered_structural_search_floor`]:
+/// a caller optimizing any objective other than the instance's own must get
+/// `None`, fail-closed.
+pub fn layered_pebbling_constructed_optimum(
+    instance: &PbInstance,
+    objective: &PbObjective,
+) -> Option<(Vec<bool>, i128)> {
+    let witness = layered_pebbling::constructed_optimum_witness(instance)?;
+    if instance.objective.as_ref() != Some(objective) {
+        return None;
+    }
+    Some(witness)
 }
 
 #[cfg(test)]
@@ -2081,9 +2313,13 @@ mod chain_tests {
             OptLinCertRoute::TrivialZeroFloor,
             OptLinCertRoute::KnapsackCardinality,
             OptLinCertRoute::CliqueColoring,
+            OptLinCertRoute::HandshakeParity,
             OptLinCertRoute::DirectAggregationFloor,
             OptLinCertRoute::LpDualFloor,
             OptLinCertRoute::FrustratedCycle,
+            OptLinCertRoute::OddCycleCover,
+            OptLinCertRoute::LayeredPebbling,
+            OptLinCertRoute::CertifiedBb,
             OptLinCertRoute::BoundsCompact,
             OptLinCertRoute::Bounds,
             OptLinCertRoute::BoundsPbNative,
@@ -2092,9 +2328,16 @@ mod chain_tests {
                 OptLinCertRoute::TrivialZeroFloor
                 | OptLinCertRoute::KnapsackCardinality
                 | OptLinCertRoute::CliqueColoring
+                | OptLinCertRoute::HandshakeParity
                 | OptLinCertRoute::DirectAggregationFloor
                 | OptLinCertRoute::LpDualFloor
-                | OptLinCertRoute::FrustratedCycle => false,
+                | OptLinCertRoute::FrustratedCycle
+                | OptLinCertRoute::OddCycleCover
+                | OptLinCertRoute::LayeredPebbling
+                // Bounded by deterministic COUNTS (nodes, depth, LP polls), not
+                // by the caller's clock: it never polls `should_stop`, so it is
+                // NOT a scheduled rung.
+                | OptLinCertRoute::CertifiedBb => false,
                 OptLinCertRoute::BoundsCompact
                 | OptLinCertRoute::Bounds
                 | OptLinCertRoute::BoundsPbNative => true,

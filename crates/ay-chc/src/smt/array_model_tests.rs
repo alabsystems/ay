@@ -21,7 +21,8 @@ fn test_build_term_values_map_includes_ground_indices_and_unnamed_selects() {
         &std::collections::BTreeMap::new(),
         &bv_term_to_bits,
         0,
-    );
+    )
+    .expect("complete bit mapping must extract");
 
     assert_eq!(term_values.get(&index).map(String::as_str), Some("#x3"));
     assert_eq!(term_values.get(&select).map(String::as_str), Some("#x7"));
@@ -39,13 +40,13 @@ fn test_array_interp_to_smt_value_preserves_symbolic_entries_6289() {
 
     assert_eq!(
         SmtContext::array_interp_to_smt_value(&interp, &bv32, &bv32),
-        SmtValue::ArrayMap {
+        Some(SmtValue::ArrayMap {
             default: Box::new(SmtValue::Opaque("@arr33".to_string())),
             entries: vec![(
                 SmtValue::Opaque("__au_k0".to_string()),
                 SmtValue::Opaque("@arr34".to_string()),
             )],
-        }
+        })
     );
 }
 
@@ -66,12 +67,127 @@ fn test_array_interp_to_smt_value_reverses_newest_first_duplicate_stores() {
 
     assert_eq!(
         SmtContext::array_interp_to_smt_value(&interp, &Sort::Int, &Sort::Int),
-        SmtValue::ArrayMap {
+        Some(SmtValue::ArrayMap {
             default: Box::new(SmtValue::Int(0)),
             entries: vec![
                 (SmtValue::Int(1), SmtValue::Int(10)),
                 (SmtValue::Int(1), SmtValue::Int(20)),
             ],
-        }
+        })
+    );
+}
+
+#[test]
+fn test_build_term_values_map_rejects_incomplete_or_invalid_bv_bits() {
+    let mut terms = TermStore::new();
+    let value = terms.mk_var("wide", Sort::bitvec(129));
+    let complete_bits: Vec<i32> = (1..=129).collect();
+    let mut mappings = HbHashMap::default();
+
+    mappings.insert(value, complete_bits[..128].to_vec());
+    assert!(SmtContext::build_term_values_map(
+        &terms,
+        &None,
+        &vec![false; 129],
+        &std::collections::BTreeMap::new(),
+        &mappings,
+        0,
+    )
+    .is_none());
+
+    mappings.insert(value, complete_bits.clone());
+    assert!(SmtContext::build_term_values_map(
+        &terms,
+        &None,
+        &vec![false; 128],
+        &std::collections::BTreeMap::new(),
+        &mappings,
+        0,
+    )
+    .is_none());
+
+    let mut zero_literal = complete_bits;
+    zero_literal[64] = 0;
+    mappings.insert(value, zero_literal);
+    assert!(SmtContext::build_term_values_map(
+        &terms,
+        &None,
+        &vec![false; 130],
+        &std::collections::BTreeMap::new(),
+        &mappings,
+        1,
+    )
+    .is_none());
+}
+
+#[test]
+fn test_build_term_values_map_preserves_wide_high_bit() {
+    let mut terms = TermStore::new();
+    let value = terms.mk_var("wide", Sort::bitvec(129));
+    let mut mappings = HbHashMap::default();
+    mappings.insert(value, (1..=129).collect());
+    let mut sat_model = vec![false; 129];
+    sat_model[128] = true;
+
+    let term_values = SmtContext::build_term_values_map(
+        &terms,
+        &None,
+        &sat_model,
+        &std::collections::BTreeMap::new(),
+        &mappings,
+        0,
+    )
+    .expect("complete wide bit mapping must extract");
+    let expected = format!("#b1{}", "0".repeat(128));
+    assert_eq!(
+        term_values.get(&value).map(String::as_str),
+        Some(expected.as_str())
+    );
+}
+
+#[test]
+fn test_array_interp_to_smt_value_rejects_unparseable_cells() {
+    let missing_default = ay_arrays::ArrayInterpretation {
+        default: None,
+        stores: vec![],
+        index_sort: Some(Sort::Int),
+        element_sort: Some(Sort::Int),
+    };
+    assert_eq!(
+        SmtContext::array_interp_to_smt_value(&missing_default, &Sort::Int, &Sort::Int),
+        None
+    );
+
+    let invalid_default = ay_arrays::ArrayInterpretation {
+        default: Some("not-an-int".to_string()),
+        stores: vec![],
+        index_sort: Some(Sort::Int),
+        element_sort: Some(Sort::Int),
+    };
+    assert_eq!(
+        SmtContext::array_interp_to_smt_value(&invalid_default, &Sort::Int, &Sort::Int),
+        None
+    );
+
+    let invalid_store = ay_arrays::ArrayInterpretation {
+        default: Some("0".to_string()),
+        stores: vec![("not-an-int".to_string(), "1".to_string())],
+        index_sort: Some(Sort::Int),
+        element_sort: Some(Sort::Int),
+    };
+    assert_eq!(
+        SmtContext::array_interp_to_smt_value(&invalid_store, &Sort::Int, &Sort::Int),
+        None
+    );
+
+    let invalid_element = ay_arrays::ArrayInterpretation {
+        default: Some("0".to_string()),
+        stores: vec![("1".to_string(), "not-an-int".to_string())],
+        index_sort: Some(Sort::Int),
+        element_sort: Some(Sort::Int),
+    };
+    assert_eq!(
+        SmtContext::array_interp_to_smt_value(&invalid_element, &Sort::Int, &Sort::Int),
+        None
     );
 }

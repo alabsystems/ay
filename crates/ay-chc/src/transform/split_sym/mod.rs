@@ -503,7 +503,7 @@ impl SplitSymBackTranslator {
         match value {
             ChcExpr::Bool(b) => Some(crate::smt::SmtValue::Bool(*b)),
             ChcExpr::Int(i) => Some(crate::smt::SmtValue::Int(*i)),
-            ChcExpr::BitVec(v, width) => Some(crate::smt::SmtValue::BitVec(*v, *width)),
+            ChcExpr::BitVec(v, width) => Some(crate::smt::SmtValue::bitvec_from_u128(*v, *width)),
             _ => None,
         }
     }

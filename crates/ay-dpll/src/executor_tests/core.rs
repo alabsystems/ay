@@ -309,6 +309,33 @@ fn test_executor_max_memory_forces_unknown_with_memout() {
 }
 
 #[test]
+fn test_executor_term_memory_limit_is_per_instance_and_forces_unknown() {
+    let commands = parse(
+        "(set-logic QF_UF)\n\
+         (declare-const x Bool)\n\
+         (assert x)\n\
+         (check-sat)\n",
+    )
+    .unwrap();
+
+    let mut bounded = Executor::new();
+    assert_eq!(bounded.term_memory_limit(), None);
+    bounded.set_term_memory_limit(Some(1));
+    assert_eq!(bounded.term_memory_limit(), Some(1));
+    assert_eq!(bounded.execute_all(&commands).unwrap(), vec!["unknown"]);
+    assert_eq!(bounded.unknown_reason(), Some(UnknownReason::MemoryLimit));
+    assert!(bounded.term_memory_exceeded());
+
+    let mut ample = Executor::new();
+    ample.set_term_memory_limit(Some(usize::MAX));
+    assert_eq!(ample.term_memory_limit(), Some(usize::MAX));
+    assert_eq!(ample.execute_all(&commands).unwrap(), vec!["sat"]);
+    assert!(!ample.term_memory_exceeded());
+    ample.set_term_memory_limit(None);
+    assert_eq!(ample.term_memory_limit(), None);
+}
+
+#[test]
 fn test_executor_rlimit_forces_deterministic_resource_limit() {
     // A pigeonhole instance (8 pigeons, 7 holes) is UNSAT and exponentially
     // hard for resolution — preprocessing can't refute it, so the CDCL core

@@ -305,19 +305,28 @@ impl Mbp {
         match (&var.sort, model.get(&var.name)) {
             (ChcSort::Bool, Some(SmtValue::Bool(b))) => Some(ChcExpr::Bool(*b)),
             (ChcSort::Int, Some(SmtValue::Int(n))) => Some(ChcExpr::Int(*n)),
+            (ChcSort::Int, Some(SmtValue::BigInt(n))) => {
+                Some(ChcExpr::from_bigint(n.as_ref().clone()))
+            }
             (ChcSort::Real, Some(SmtValue::Real(r))) => {
                 use num_traits::ToPrimitive;
-                let n = r.numer().to_i64().unwrap_or(0);
-                let d = r.denom().to_i64().unwrap_or(1);
+                let n = r.numer().to_i64()?;
+                let d = r.denom().to_i64()?;
                 Some(ChcExpr::Real(n, d))
             }
-            (ChcSort::BitVec(_), Some(SmtValue::BitVec(v, w))) => Some(ChcExpr::BitVec(*v, *w)),
+            (
+                ChcSort::BitVec(expected_width),
+                Some(
+                    value @ (SmtValue::BitVec(_, actual_width)
+                    | SmtValue::BigBitVec(_, actual_width)),
+                ),
+            ) if expected_width == actual_width => value.bitvec_to_chc_expr(),
             // DT constructor application from model pipeline.
             (ChcSort::Datatype { .. }, Some(SmtValue::Datatype(ctor, fields))) => {
                 let field_exprs: Vec<std::sync::Arc<ChcExpr>> = fields
                     .iter()
-                    .map(|f| std::sync::Arc::new(Self::smt_value_to_expr(f)))
-                    .collect();
+                    .map(|f| Self::smt_value_to_expr(f).map(std::sync::Arc::new))
+                    .collect::<Option<_>>()?;
                 Some(ChcExpr::FuncApp(
                     ctor.clone(),
                     var.sort.clone(),
@@ -374,22 +383,23 @@ impl Mbp {
     }
 
     /// Convert an SmtValue to a ChcExpr (for DT field values in model_value_expr).
-    fn smt_value_to_expr(val: &SmtValue) -> ChcExpr {
-        match val {
+    fn smt_value_to_expr(val: &SmtValue) -> Option<ChcExpr> {
+        Some(match val {
             SmtValue::Bool(b) => ChcExpr::Bool(*b),
             SmtValue::Int(n) => ChcExpr::Int(*n),
+            SmtValue::BigInt(n) => ChcExpr::from_bigint(n.as_ref().clone()),
             SmtValue::Real(r) => {
                 use num_traits::ToPrimitive;
-                let n = r.numer().to_i64().unwrap_or(0);
-                let d = r.denom().to_i64().unwrap_or(1);
+                let n = r.numer().to_i64()?;
+                let d = r.denom().to_i64()?;
                 ChcExpr::Real(n, d)
             }
-            SmtValue::BitVec(v, w) => ChcExpr::BitVec(*v, *w),
+            SmtValue::BitVec(..) | SmtValue::BigBitVec(..) => val.bitvec_to_chc_expr()?,
             SmtValue::Datatype(ctor, fields) => {
                 let field_exprs: Vec<std::sync::Arc<ChcExpr>> = fields
                     .iter()
-                    .map(|f| std::sync::Arc::new(Self::smt_value_to_expr(f)))
-                    .collect();
+                    .map(|f| Self::smt_value_to_expr(f).map(std::sync::Arc::new))
+                    .collect::<Option<_>>()?;
                 // Best-effort sort: no sort info available in SmtValue, so use
                 // Uninterpreted as a placeholder. Callers with sort info
                 // (model_value_expr) use the correct DT sort for the top level.
@@ -399,7 +409,9 @@ impl Mbp {
                     field_exprs,
                 )
             }
-            _ => ChcExpr::Int(0),
-        }
+            SmtValue::Opaque(_) | SmtValue::ConstArray(_) | SmtValue::ArrayMap { .. } => {
+                return None;
+            }
+        })
     }
 }

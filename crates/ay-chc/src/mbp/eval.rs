@@ -319,7 +319,7 @@ impl Mbp {
         match expr {
             ChcExpr::Int(n) => Some(SmtValue::Int(*n)),
             ChcExpr::Bool(b) => Some(SmtValue::Bool(*b)),
-            ChcExpr::BitVec(v, w) => Some(SmtValue::BitVec(*v, *w)),
+            ChcExpr::BitVec(v, w) => Some(SmtValue::bitvec_from_u128(*v, *w)),
             ChcExpr::Var(v) => model.get(&v.name).cloned(),
             ChcExpr::Op(_, _) => {
                 if let Some(n) = self.eval_arith(expr, model) {
@@ -331,7 +331,10 @@ impl Mbp {
                 if let Some((v, w)) = self.eval_bv(expr, model) {
                     return Some(SmtValue::BitVec(v, w));
                 }
-                None
+                // The legacy MBP-local evaluator intentionally stops at 128
+                // bits.  The canonical evaluator supplies exact BigUint-backed
+                // results for wide, fully concrete BV expressions.
+                crate::expr::evaluate_expr(expr, model)
             }
             // DT selector, constructor, or tester via FuncApp.
             ChcExpr::FuncApp(name, sort, args) => {
@@ -388,7 +391,20 @@ impl Mbp {
     pub(super) fn cmp_smt_values(a: &SmtValue, b: &SmtValue) -> std::cmp::Ordering {
         match (a, b) {
             (SmtValue::Int(x), SmtValue::Int(y)) => x.cmp(y),
-            (SmtValue::BitVec(x, _), SmtValue::BitVec(y, _)) => x.cmp(y),
+            (
+                lhs @ (SmtValue::BitVec(..) | SmtValue::BigBitVec(..)),
+                rhs @ (SmtValue::BitVec(..) | SmtValue::BigBitVec(..)),
+            ) => {
+                let Some((lhs_value, lhs_width)) = lhs.bitvec_to_biguint() else {
+                    return std::cmp::Ordering::Equal;
+                };
+                let Some((rhs_value, rhs_width)) = rhs.bitvec_to_biguint() else {
+                    return std::cmp::Ordering::Equal;
+                };
+                lhs_width
+                    .cmp(&rhs_width)
+                    .then_with(|| lhs_value.cmp(&rhs_value))
+            }
             (SmtValue::Bool(x), SmtValue::Bool(y)) => x.cmp(y),
             // Heterogeneous: arbitrary but deterministic ordering
             _ => std::cmp::Ordering::Equal,

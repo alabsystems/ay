@@ -228,6 +228,42 @@ fn test_compliance_qf_aufbv_unsat() {
     assert_result(&out, "unsat", UnknownPolicy::Reject, "QF_AUFBV unsat");
 }
 
+// ---- QF_AUFBVLIA (array-free scalar subset) ------------------------------
+
+#[test]
+fn test_compliance_qf_aufbvlia_sat() {
+    let out = run_ay_stdin(
+        "(set-logic QF_AUFBVLIA)
+(declare-fun f ((_ BitVec 8)) (_ BitVec 8))
+(declare-const b (_ BitVec 8))
+(declare-const i Int)
+(assert (= (f b) #xFF))
+(assert (> i 0))
+(check-sat)
+(exit)
+",
+    );
+    assert_result(&out, "sat", UnknownPolicy::Reject, "QF_AUFBVLIA sat");
+}
+
+#[test]
+fn test_compliance_qf_aufbvlia_unsat() {
+    let out = run_ay_stdin(
+        "(set-logic QF_AUFBVLIA)
+(declare-fun f ((_ BitVec 8)) (_ BitVec 8))
+(declare-const x (_ BitVec 8))
+(declare-const y (_ BitVec 8))
+(declare-const i Int)
+(assert (= x y))
+(assert (distinct (f x) (f y)))
+(assert (= i 3))
+(check-sat)
+(exit)
+",
+    );
+    assert_result(&out, "unsat", UnknownPolicy::Reject, "QF_AUFBVLIA unsat");
+}
+
 // ---- QF_UFBV -------------------------------------------------------------
 
 #[test]
@@ -258,6 +294,42 @@ fn test_compliance_qf_ufbv_unsat() {
 ",
     );
     assert_result(&out, "unsat", UnknownPolicy::Reject, "QF_UFBV unsat");
+}
+
+// ---- QF_UFBVLIA ----------------------------------------------------------
+
+#[test]
+fn test_compliance_qf_ufbvlia_sat() {
+    let out = run_ay_stdin(
+        "(set-logic QF_UFBVLIA)
+(declare-fun f ((_ BitVec 8)) (_ BitVec 8))
+(declare-const b (_ BitVec 8))
+(declare-const i Int)
+(assert (= (f b) b))
+(assert (> i 0))
+(check-sat)
+(exit)
+",
+    );
+    assert_result(&out, "sat", UnknownPolicy::Reject, "QF_UFBVLIA sat");
+}
+
+#[test]
+fn test_compliance_qf_ufbvlia_unsat() {
+    let out = run_ay_stdin(
+        "(set-logic QF_UFBVLIA)
+(declare-fun f ((_ BitVec 8)) (_ BitVec 8))
+(declare-const x (_ BitVec 8))
+(declare-const y (_ BitVec 8))
+(declare-const i Int)
+(assert (= x y))
+(assert (distinct (f x) (f y)))
+(assert (= i 3))
+(check-sat)
+(exit)
+",
+    );
+    assert_result(&out, "unsat", UnknownPolicy::Reject, "QF_UFBVLIA unsat");
 }
 
 // ---- QF_UFLIA ------------------------------------------------------------

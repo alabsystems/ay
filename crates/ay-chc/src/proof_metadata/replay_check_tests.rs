@@ -112,8 +112,8 @@ fn checked_replay_admits_small_safe_pdr_proof_end_to_end() {
         r#"(set-logic HORN)
 (declare-fun Inv (Int) Bool)
 (assert (forall ((x Int)) (=> (= x 0) (Inv x))))
-(assert (forall ((x Int) (xp Int)) (=> (and (Inv x) (< x 5) (= xp (+ x 1))) (Inv xp))))
-(assert (forall ((x Int)) (=> (and (Inv x) (> x 10)) false)))
+(assert (forall ((x Int) (xp Int)) (=> (and (Inv x) (= xp (+ x 1))) (Inv xp))))
+(assert (forall ((x Int)) (=> (and (Inv x) (< x 0)) false)))
 (check-sat)
 "#,
     );
@@ -222,6 +222,34 @@ fn checked_replay_admits_bmc_acyclic_exhaustion_safe() {
         .as_deref(),
         Some("unsat"),
         "the depth-exhaustion query must independently re-check UNSAT"
+    );
+}
+
+#[test]
+fn acyclic_replay_obligation_declares_scalar_uf() {
+    let problem = parse_problem(
+        r#"(set-logic HORN)
+(declare-fun f (Int) Int)
+(declare-fun P (Int) Bool)
+(assert (forall ((x Int)) (=> (= (f x) 0) (P x))))
+(assert (forall ((x Int)) (=> (and (P x) (distinct (f x) 0)) false)))
+(check-sat)
+"#,
+    );
+
+    let obligations = acyclic_exhaustion_replay_obligations(&problem)
+        .expect("acyclic UF fixture should produce a replay obligation");
+    assert_eq!(obligations.len(), 1);
+    let script = &obligations[0].smtlib;
+    let declaration = script
+        .find("(declare-fun f (Int) Int)")
+        .expect("replay script must reconstruct f's declaration");
+    let use_site = script
+        .find("(f ")
+        .expect("expanded reachability formula must use f");
+    assert!(
+        declaration < use_site,
+        "f must be declared before the expanded replay formula: {script}"
     );
 }
 

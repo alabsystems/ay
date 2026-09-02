@@ -176,12 +176,12 @@ struct ArrayVarData {
     prop_upward: bool,
 }
 
-/// Invertible undo record for one `merge_array_var_data` call. Records the
-/// merge target and the pre-merge lengths of its three append-only vecs plus
-/// its `prop_upward` flag, so the merge can be reversed by truncation.
+/// Invertible `merge_array_var_data` undo: the target's prior existence,
+/// vector lengths, and `prop_upward` state restore or remove it exactly.
 #[derive(Debug, Clone, Copy)]
 struct ArrayVarMergeUndo {
     target: TermId,
+    target_existed: bool,
     stores_len: u32,
     selects_len: u32,
     parent_stores_len: u32,

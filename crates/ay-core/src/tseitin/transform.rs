@@ -27,7 +27,7 @@ impl Tseitin<'_> {
             term_to_var: self.term_to_var,
             var_to_term: self.var_to_term,
             root: root_lit,
-            num_vars: self.next_var - 1,
+            num_vars: self.next_var.saturating_sub(1),
             proof_annotations: self.proof_annotations,
         }
     }
@@ -55,7 +55,7 @@ impl Tseitin<'_> {
             term_to_var: self.term_to_var,
             var_to_term: self.var_to_term,
             root,
-            num_vars: self.next_var - 1,
+            num_vars: self.next_var.saturating_sub(1),
             proof_annotations: self.proof_annotations,
         }
     }
@@ -115,15 +115,17 @@ impl Tseitin<'_> {
     #[must_use = "Tseitin encoding result must be used"]
     pub fn encode_assertion(&mut self, term_id: TermId) -> TseitinEncodedAssertion {
         let root_lit = self.encode(term_id, true);
-        let clause_start = self.clauses_extracted;
-        let def_clauses = self.clauses[clause_start..].to_vec();
+        let clause_start = self.clauses_extracted.min(self.clauses.len());
+        // Iterator skip instead of `[clause_start..]`: the marker's `<= len`
+        // invariant is not locally provable (trust L0 slice bounds).
+        let def_clauses: Vec<CnfClause> = self.clauses.iter().skip(clause_start).cloned().collect();
         let def_proof_annotations = self.proof_annotations.as_ref().map(|annotations| {
             debug_assert_eq!(
                 annotations.len(),
                 self.clauses.len(),
                 "proof annotations must stay aligned with generated clauses"
             );
-            annotations[clause_start..].to_vec()
+            annotations.iter().skip(clause_start).cloned().collect()
         });
         self.clauses_extracted = self.clauses.len();
         TseitinEncodedAssertion {
@@ -147,13 +149,15 @@ impl Tseitin<'_> {
         Option<Vec<Option<ClausificationProof>>>,
     ) {
         let root_lit = self.encode(term_id, true);
-        let start = self.clauses_extracted;
         let end = self.clauses.len();
-        let def_clauses = self.clauses[start..end].to_vec();
+        let start = self.clauses_extracted.min(end);
+        // `end` is `self.clauses.len()`, so skipping to `start` is exactly
+        // `[start..end]`; iterator form carries no slice bounds obligation.
+        let def_clauses: Vec<CnfClause> = self.clauses.iter().skip(start).cloned().collect();
         let def_proofs = self
             .proof_annotations
             .as_ref()
-            .map(|proofs| proofs[start..end].to_vec());
+            .map(|proofs| proofs.iter().take(end).skip(start).cloned().collect());
         self.clauses_extracted = end;
         (
             TseitinEncodedAssertion {
@@ -184,7 +188,8 @@ impl Tseitin<'_> {
     /// or since construction if never called.
     #[must_use = "take_new_clauses advances the extraction marker; ignoring the return value will drop clauses"]
     pub fn take_new_clauses(&mut self) -> Vec<CnfClause> {
-        let new_clauses = self.clauses[self.clauses_extracted..].to_vec();
+        let start = self.clauses_extracted.min(self.clauses.len());
+        let new_clauses: Vec<CnfClause> = self.clauses.iter().skip(start).cloned().collect();
         self.clauses_extracted = self.clauses.len();
         new_clauses
     }
@@ -206,7 +211,7 @@ impl Tseitin<'_> {
 
     /// Get the current number of variables
     pub fn num_vars(&self) -> u32 {
-        self.next_var - 1
+        self.next_var.saturating_sub(1)
     }
 
     /// Advance `next_var` so that freshly allocated Tseitin variables will

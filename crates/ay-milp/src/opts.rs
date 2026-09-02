@@ -863,6 +863,22 @@ pub struct SolveOpts {
     /// the caller's model frame yields `tree_cert: None` and the verdict is
     /// unaffected. `0` disables capture entirely.
     pub tree_cert_leaves: usize,
+    /// Skip the whole-tree emission self-verify at the end of tree-certificate
+    /// finalization (default `false`: keep it).
+    ///
+    /// Finalization verifies each leaf's Farkas evidence TWICE: once at
+    /// derivation, against the leaf's own box, and again in a whole-tree
+    /// `verify(model)` pass before the certificate is handed out. That second
+    /// pass is pure defense-in-depth: it re-checks evidence every leaf already
+    /// carried through its own exact check, so a consumer that independently
+    /// re-verifies the emitted certificate (the ny in-process backend runs
+    /// [`crate::MilpInfeasibilityCertificate::verify`] against its own model
+    /// before it mints any verdict) can opt out of the duplicate pass. The
+    /// emitted certificate is byte-identical either way, and the pass costs
+    /// ~3% of a successful finalize (0% of a failed one; see
+    /// the development design notes). A caller with no
+    /// downstream checker leaves this off and stays fail-closed.
+    pub skip_finalize_reverify: bool,
     /// Diagnostic warm start: a whitespace `col value` file whose integer
     /// columns are pinned and completed exactly before the search starts.
     /// Verified feasible before use; a bad seed is discarded, never believed.
@@ -905,6 +921,7 @@ impl Default for SolveOpts {
             structure_routing: true,
             memory_budget: Some(2 << 30), // 2 GiB
             tree_cert_leaves: 256,
+            skip_finalize_reverify: false,
             seed_solution_file: None,
             range_logical_triangular_crash: false,
             chain_distress_probe_iters: None,
@@ -1005,6 +1022,16 @@ impl SolveOpts {
     #[must_use]
     pub fn with_tree_cert_leaves(mut self, leaves: usize) -> Self {
         self.tree_cert_leaves = leaves;
+        self
+    }
+
+    /// Skip the tree-certificate emission self-verify
+    /// (`--skip-finalize-reverify`; see
+    /// [`SolveOpts::skip_finalize_reverify`]). Opt-in, for callers that
+    /// independently re-verify the emitted certificate.
+    #[must_use]
+    pub fn with_skip_finalize_reverify(mut self, skip: bool) -> Self {
+        self.skip_finalize_reverify = skip;
         self
     }
 

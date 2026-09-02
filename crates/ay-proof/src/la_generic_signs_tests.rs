@@ -4,7 +4,9 @@
 
 use num_rational::Rational64;
 
-use super::resolve_printed_la_generic_coefficients;
+use super::{
+    printed_la_generic_unit_implication_is_supported, resolve_printed_la_generic_coefficients,
+};
 
 fn r(n: i64, d: i64) -> Rational64 {
     Rational64::new(n, d)
@@ -109,4 +111,36 @@ fn opaque_application_is_one_variable() {
     let out = resolve_printed_la_generic_coefficients(&atoms, &existing, &magnitudes);
     // a_eq must be +1 (so -2*(f0) cancels +2*(f0)); ineq magnitude 2.
     assert_eq!(out, vec![r(1, 1), r(2, 1)]);
+}
+
+#[test]
+fn authored_linear_cancellation_implication_is_supported() {
+    assert!(printed_la_generic_unit_implication_is_supported(
+        "(< (+ I W (- W)) 0)",
+        "(< I 0)",
+    ));
+}
+
+#[test]
+fn authored_computed_coefficient_implication_is_rejected() {
+    assert!(!printed_la_generic_unit_implication_is_supported(
+        "(< (* (+ 1 1) x) 0)",
+        "(< (* 2 x) 0)",
+    ));
+}
+
+#[test]
+fn authored_unary_plus_implication_is_rejected() {
+    assert!(!printed_la_generic_unit_implication_is_supported(
+        "(< (+ x) 0)",
+        "(< (+ x) 0)",
+    ));
+}
+
+#[test]
+fn authored_non_implication_is_rejected() {
+    assert!(!printed_la_generic_unit_implication_is_supported(
+        "(< x 0)",
+        "(< (+ x 1) 0)",
+    ));
 }

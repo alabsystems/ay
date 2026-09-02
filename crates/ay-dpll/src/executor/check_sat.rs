@@ -32,7 +32,7 @@ use crate::ematching::contains_quantifier;
 use crate::executor::exact_exists_bounds::ExactExistsDecision;
 use crate::executor_types::{Result, SolveResult, StatValue, UnknownOrigin, UnknownReason};
 use crate::features::StaticFeatures;
-use crate::logic_detection::LogicCategory;
+use crate::logic_detection::{LogicCategory, FAIL_CLOSED_COMBINED};
 
 use super::{EXECUTOR_STACK_RED_ZONE, EXECUTOR_STACK_SIZE};
 
@@ -677,10 +677,25 @@ impl Executor {
             }
         }
 
-        let (_, pre_quantifier_features) = self.detect_logic_category(&self.ctx.assertions);
+        let (pre_quantifier_category, pre_quantifier_features) =
+            self.detect_logic_category(&self.ctx.assertions);
+        let named_bv_lia_logic = self.declares_named_bv_lia_combination();
         self.last_statistics
             .set_int("smt.bv_lia_bridge.pre_quantifier_runs", 0);
-        if pre_quantifier_features.has_bv_int_conversion {
+        // The named combined logics are admitted only by their closed
+        // live-content validator. Make that decision authoritative before the
+        // exact-source bridge or quantifier preprocessing can rewrite away an
+        // out-of-slice feature and accidentally route the residue.
+        if named_bv_lia_logic && pre_quantifier_category == LogicCategory::Other {
+            self.ctx.assertions = scope_tracked_assertions;
+            self.last_statistics
+                .set_string("solver.logic_category", "Other");
+            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            return Ok(SolveResult::Unknown);
+        }
+        let route_admitted =
+            !named_bv_lia_logic || pre_quantifier_category == LogicCategory::QfBvLia;
+        if route_admitted && (named_bv_lia_logic || pre_quantifier_features.has_bv_int_conversion) {
             self.last_statistics
                 .set_int("smt.bv_lia_bridge.pre_quantifier_runs", 1);
             let bridge_result = self.solve_bv_lia_bridge()?;
@@ -2309,6 +2324,25 @@ impl Executor {
             self.clear_finite_enum_proof_state();
             return Ok(SolveResult::Unknown);
         }
+        // Public W7 admission boundary. Run before every exact semantic
+        // pre-solver and constructive projection shortcut so none can decide a
+        // formula whose authored feature set the named combined-logic
+        // validator rejected. Optimization/soft roots are outside the first
+        // certified satisfiability-only slice and therefore decline too.
+        if self.named_bv_lia_authored_slice_declined(&solve_roots) {
+            self.last_statistics = crate::executor_types::Statistics::default();
+            self.last_statistics.num_assertions = self.ctx.assertions.len() as u64;
+            self.last_statistics
+                .set_int("smt.bv_lia_bridge.pre_quantifier_runs", 0);
+            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            self.last_result = Some(SolveResult::Unknown);
+            self.last_model = None;
+            self.last_proof = None;
+            self.clear_finite_enum_proof_state();
+            self.last_statistics
+                .set_string("solver.logic_category", "Other");
+            return Ok(SolveResult::Unknown);
+        }
         self.last_model_validated = false;
         self.last_validation_stats = None;
         self.clear_quantified_sat_authority();
@@ -3207,10 +3241,13 @@ impl Executor {
             return true;
         }
 
-        // Two memory ceilings are honored here, the single inner-loop
+        // Three memory ceilings are honored here, the single inner-loop
         // checkpoint reused by every theory loop:
         //  * `self.memory_limit`: the per-solver limit set via
         //    `Solver::set_memory_limit` (live footprint; peak RSS only as fallback).
+        //  * `self.term_memory_limit`: this executor's own capacity-aware
+        //    `TermStore` memory accounting. Unlike RSS, concurrent sibling
+        //    executors cannot spend one another's allowance.
         //  * `ay_sys::process_memory_exceeded()`: the process-wide ceiling set
         //    once from `main()` (`set_process_memory_limit`). It consults the
         //    exact live-heap counter (instant, no syscall) plus the live OS
@@ -3218,12 +3255,20 @@ impl Executor {
         //    `Unknown(MemoryLimit)` here — before the OS OOM-killer — instead of the
         //    check-sat boundary. Soundness-neutral: it can only drive Unknown,
         //    never a wrong SAT/UNSAT.
-        if crate::memory::memory_exceeded(self.memory_limit) || ay_sys::process_memory_exceeded() {
+        let term_memory_exceeded = self.term_memory_exceeded();
+        if term_memory_exceeded
+            || crate::memory::memory_exceeded(self.memory_limit)
+            || ay_sys::process_memory_exceeded()
+        {
             self.record_unknown_from_origin(UnknownOrigin::MemoryBudget);
             self.last_result = Some(SolveResult::Unknown);
             self.record_unknown_diagnostic(
                 UnknownReason::MemoryLimit,
-                "process memory ceiling exceeded while the active solve phase was running",
+                if term_memory_exceeded {
+                    "executor term-store memory ceiling exceeded while the active solve phase was running"
+                } else {
+                    "process memory ceiling exceeded while the active solve phase was running"
+                },
             );
             return true;
         }
@@ -3303,7 +3348,7 @@ impl Executor {
             // session. That leak was unreachable while the guard above made this
             // loop dead code; re-enabling the loop makes it reachable, so it is
             // fixed in the same change rather than left as a new latent bug.
-            result = match self.check_sat_internal() {
+            result = match self.check_sat_internal_with_authored_roots(Some(&cegar_snapshot)) {
                 Ok(next) => next,
                 Err(err) => {
                     self.ctx.assertions = cegar_snapshot;
@@ -3422,6 +3467,7 @@ impl Executor {
         self.clear_preprocessing_proof_records();
         self.last_proof_rebuild_originals.clear();
         self.last_proof_raw_original_assertions.clear();
+        self.last_proof_expanded_let_sources.clear();
         self.last_statistics = crate::executor_types::Statistics::default();
         self.last_statistics.num_assertions = self.ctx.assertions.len() as u64;
 
@@ -3487,6 +3533,22 @@ impl Executor {
 
     /// Internal check-sat that also stores the model.
     pub(super) fn check_sat_internal(&mut self) -> Result<SolveResult> {
+        self.check_sat_internal_with_authored_roots(None)
+    }
+
+    /// Internal check-sat with an explicit immutable authored-root window.
+    ///
+    /// The assertions in `ctx` remain the actual solve obligation. The
+    /// optional window controls only model-completion and independent-gate
+    /// provenance. CEGAR uses this distinction when it solves
+    /// `user assertions + generated theory lemmas`: the lemmas must constrain
+    /// the search, but they must never become authored observations that mint a
+    /// model certificate the final user-only publication window cannot
+    /// reauthenticate.
+    fn check_sat_internal_with_authored_roots(
+        &mut self,
+        authored_roots: Option<&[TermId]>,
+    ) -> Result<SolveResult> {
         if self.prepare_check_sat_internal_state() {
             return Ok(SolveResult::Unknown);
         }
@@ -3521,6 +3583,20 @@ impl Executor {
                 UnknownReason::UnsupportedArithmetic,
                 "symbolic SMT-LIB integer exponentiation is accepted and typed but has no sound decision procedure",
             );
+            return Ok(SolveResult::Unknown);
+        }
+
+        // QF_UFBVLIA/QF_AUFBVLIA are accepted only through their dedicated
+        // closed live-content validator. Authenticate the immutable public
+        // window before even the empty-hard-assertion shortcut: objectives and
+        // soft constraints remain semantic roots, and later preprocessing,
+        // ground folding, difference logic, or named-core redirection can erase
+        // an out-of-slice construct before ordinary theory dispatch sees it.
+        if self.named_bv_lia_authored_slice_declined(&self.ctx.assertions) {
+            self.last_model = None;
+            self.last_statistics
+                .set_string("solver.logic_category", "Other");
+            self.last_unknown_reason = Some(UnknownReason::Incomplete);
             return Ok(SolveResult::Unknown);
         }
 
@@ -3561,9 +3637,11 @@ impl Executor {
         // preprocessed equivalent. That can only degrade `Sat` to `Unknown`; it
         // cannot manufacture a wrong answer. Nested probe/retry solves replace
         // this slot temporarily and restore the outer roots on return.
+        let authored_assertions =
+            authored_roots.map_or_else(|| scope_tracked_assertions.clone(), <[TermId]>::to_vec);
         let saved_independent_gate_authored = self
             .independent_gate_authored_assertions
-            .replace(scope_tracked_assertions.clone());
+            .replace(authored_assertions.clone());
 
         // (#selfcert-authored) The fail-closed `--self-check` SAT gate, its
         // model-completion support, and strict proof checking retain their
@@ -3573,7 +3651,7 @@ impl Executor {
         // self-check premise window to the outer verdict.
         let saved_self_check_authored = if self.self_check {
             self.self_check_authored_assertions
-                .replace(scope_tracked_assertions.clone())
+                .replace(authored_assertions)
         } else {
             self.self_check_authored_assertions.take()
         };
@@ -4797,10 +4875,7 @@ impl Executor {
                 // `UnsupportedLogic` error — recognizing the logic (no parse-time
                 // rejection) while staying sound. (#combined-bv-arith)
                 let declared = self.ctx.logic().unwrap_or("");
-                let recognized_unsupported_combination = matches!(
-                    declared,
-                    "QF_BVLRA" | "QF_AUFBVLIA" | "QF_UFBVLIA" | "QF_AUFBVLIRA"
-                );
+                let recognized_unsupported_combination = FAIL_CLOSED_COMBINED.contains(&declared);
                 if recognized_unsupported_combination
                     || (features.has_fpa && self.ctx.datatype_iter().next().is_some())
                 {

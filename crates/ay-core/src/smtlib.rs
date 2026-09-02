@@ -10,6 +10,10 @@
 //!
 //! Author: Andrew Yates <andrewyates.name@gmail.com>
 
+/// Capacity-hint clamp for output buffers sized from caller-controlled input
+/// lengths; longer outputs just grow past the hint.
+const MAX_PREALLOC_BYTES: usize = 1024 * 1024;
+
 /// Quote a symbol if it cannot be written as a simple (unquoted) SMT-LIB symbol.
 ///
 /// Returns the symbol wrapped in `|...|` if any of the following hold:
@@ -92,6 +96,16 @@ pub fn quote_symbol(name: &str) -> String {
         "set-info",
         "set-logic",
         "set-option",
+        // Alethe proof-language reserved words. Quoting these is also valid
+        // SMT-LIB, and prevents proof variables from being tokenized as
+        // structural syntax by external checkers such as Carcara.
+        "choice",
+        "lambda",
+        "cl",
+        "assume",
+        "step",
+        "anchor",
+        "declare-rare-rule",
     ];
 
     let needs_quoting = name.is_empty()
@@ -102,7 +116,8 @@ pub fn quote_symbol(name: &str) -> String {
     if needs_quoting {
         // Z3 5.0.0 accepts `\|` and `\\` inside quoted symbols. Escaping is
         // lossless; underscore substitution conflates distinct user symbols.
-        let mut quoted = String::with_capacity(name.len() + 2);
+        let mut quoted =
+            String::with_capacity(name.len().saturating_add(2).min(MAX_PREALLOC_BYTES));
         quoted.push('|');
         for character in name.chars() {
             if matches!(character, '|' | '\\') {
@@ -191,14 +206,16 @@ pub(crate) fn is_symbol_char(c: char) -> bool {
 /// ```
 pub fn escape_string_contents(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
-    let mut result = String::with_capacity(s.len());
-    for (i, &c) in chars.iter().enumerate() {
+    let mut result = String::with_capacity(s.len().min(MAX_PREALLOC_BYTES));
+    let mut rest: &[char] = &chars;
+    while let Some((&c, tail)) = rest.split_first() {
+        rest = tail;
         match c {
             '"' => result.push_str("\"\""),
             // A backslash the reader would absorb into a `\u` escape must be
             // written as an escape itself, or the printed literal denotes a
             // different (shorter) string than the value being printed.
-            '\\' if parse_unicode_escape(&chars, i + 1).is_some() => {
+            '\\' if parse_unicode_escape(tail).is_some() => {
                 result.push_str("\\u{5c}");
             }
             c if ('\u{20}'..='\u{7e}').contains(&c) => result.push(c),
@@ -292,15 +309,17 @@ impl std::error::Error for StringDecodeError {}
 /// ```
 pub fn unescape_string_contents(s: &str) -> Result<String, StringDecodeError> {
     let chars: Vec<char> = s.chars().collect();
-    let mut result = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
+    let mut result = String::with_capacity(s.len().min(MAX_PREALLOC_BYTES));
+    let mut rest: &[char] = &chars;
+    while let Some((&c, tail)) = rest.split_first() {
         if c == '"' {
             // SMT-LIB 2.6: `""` inside string contents = literal `"`. A stray
             // quote should not occur in well-formed input; pass it through.
             result.push('"');
-            i += if chars.get(i + 1) == Some(&'"') { 2 } else { 1 };
+            rest = match tail.split_first() {
+                Some((&'"', after_pair)) => after_pair,
+                _ => tail,
+            };
         } else if c == '\\' {
             // SMT-LIB 2.6: a backslash is a LITERAL character EXCEPT in the two
             // unicode escapes. It is NOT a C-style escape. Collapsing `\\` ->
@@ -308,8 +327,8 @@ pub fn unescape_string_contents(s: &str) -> Result<String, StringDecodeError> {
             // (correctly) reads `"a\\b"` as FOUR characters, while the old
             // behaviour read THREE, flipping every str.len- (and membership-)
             // sensitive verdict on any backslash-bearing literal.
-            match parse_unicode_escape(&chars, i + 1) {
-                Some((code, next)) => {
+            match parse_unicode_escape(tail) {
+                Some((code, after_escape)) => {
                     // In-alphabet by construction, so the only value `char`
                     // cannot represent is a surrogate. Fail closed rather than
                     // substituting a replacement character or dropping it:
@@ -317,29 +336,29 @@ pub fn unescape_string_contents(s: &str) -> Result<String, StringDecodeError> {
                     let ch =
                         char::from_u32(code).ok_or(StringDecodeError::SurrogateCodePoint(code))?;
                     result.push(ch);
-                    i = next;
+                    rest = after_escape;
                 }
                 None => {
                     // Not an escape: the backslash is literal and the following
                     // characters are decoded normally on later iterations.
                     result.push('\\');
-                    i += 1;
+                    rest = tail;
                 }
             }
         } else {
             result.push(c);
-            i += 1;
+            rest = tail;
         }
     }
     Ok(result)
 }
 
-/// Try to parse an SMT-LIB 2.6 unicode escape whose `u` sits at `start` (i.e.
-/// the index just after the backslash).
+/// Try to parse an SMT-LIB 2.6 unicode escape at the start of
+/// `after_backslash` (the characters just after the backslash).
 ///
-/// Returns the denoted code point and the index just past the escape, or `None`
-/// if the text at `start` is not an escape — in which case NOTHING is consumed
-/// and the backslash is an ordinary character.
+/// Returns the denoted code point and the characters remaining past the
+/// escape, or `None` if the text is not an escape — in which case NOTHING is
+/// consumed and the backslash is an ordinary character.
 ///
 /// SMT-LIB 2.6 defines exactly two forms:
 /// - `\udddd` — EXACTLY 4 hex digits
@@ -357,18 +376,19 @@ pub fn unescape_string_contents(s: &str) -> Result<String, StringDecodeError> {
 ///    reports 1 where z3 reports 9, 10 and 5 respectively.
 /// 2. Consuming input before discovering the escape is malformed silently DROPS
 ///    those characters (`\u{}` decoded to `\u`, losing the braces), again
-///    shortening the string. Returning an index means failure consumes nothing.
-fn parse_unicode_escape(chars: &[char], start: usize) -> Option<(u32, usize)> {
-    if chars.get(start) != Some(&'u') {
+///    shortening the string. Returning the remainder means failure consumes
+///    nothing.
+fn parse_unicode_escape(after_backslash: &[char]) -> Option<(u32, &[char])> {
+    let Some((&'u', after_u)) = after_backslash.split_first() else {
         return None;
-    }
-    let after_u = start + 1;
+    };
 
-    if chars.get(after_u) == Some(&'{') {
+    if let Some((&'{', digits)) = after_u.split_first() {
         let mut hex = String::with_capacity(5);
-        let mut j = after_u + 1;
+        let mut rest = digits;
         loop {
-            let &c = chars.get(j)?; // end of input before `}` — not an escape
+            let (&c, tail) = rest.split_first()?; // end of input before `}` — not an escape
+            rest = tail;
             if c == '}' {
                 break;
             }
@@ -377,7 +397,6 @@ fn parse_unicode_escape(chars: &[char], start: usize) -> Option<(u32, usize)> {
                 return None;
             }
             hex.push(c);
-            j += 1;
         }
         if hex.is_empty() {
             return None; // `\u{}` is not an escape
@@ -386,24 +405,26 @@ fn parse_unicode_escape(chars: &[char], start: usize) -> Option<(u32, usize)> {
         if code > SMTLIB_MAX_CODE_POINT {
             return None; // outside the alphabet: not an escape
         }
-        Some((code, j + 1)) // skip the closing `}`
+        Some((code, rest)) // `rest` is already past the closing `}`
     } else {
         // `\udddd` — exactly 4 hex digits. The maximum such value is 0xFFFF,
         // which is inside the alphabet, so the range check cannot fail here;
         // it is kept so the two branches enforce one identical contract.
         let mut hex = String::with_capacity(4);
-        for k in 0..4 {
-            let &c = chars.get(after_u + k)?;
+        let mut rest = after_u;
+        for _ in 0..4 {
+            let (&c, tail) = rest.split_first()?;
             if !c.is_ascii_hexdigit() {
                 return None;
             }
             hex.push(c);
+            rest = tail;
         }
         let code = u32::from_str_radix(&hex, 16).ok()?;
         if code > SMTLIB_MAX_CODE_POINT {
             return None;
         }
-        Some((code, after_u + 4))
+        Some((code, rest))
     }
 }
 

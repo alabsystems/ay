@@ -120,6 +120,16 @@ fn unsupported_to_fp_real_reports_unknown_result_in_stats_json() {
 /// Guards the capability that made the original #9842 inputs stale: fp.rem on
 /// Float64 is fully supported (commit 143b360e4d) and must answer sat, not
 /// unknown, through the CLI.
+///
+/// The Float64 fp.rem bit-blast genuinely needs ~2.9 GB peak RSS (measured
+/// 2026-08-31 at 84dd28671; it was ~5.8 GB when this test was written, so the
+/// encoding has only gotten cheaper). Since 772e10121 every ay binary arms a
+/// kernel-held memory budget defaulting to phys/16, which on machines under
+/// ~47 GB of RAM sits BELOW that footprint and turns this solve into
+/// `unknown (:reason-unknown "memout")` in ~400 ms. Pin the documented
+/// `GOVERN_AY_MB` knob to the 8 GiB figure that phys/16 yields on the 128 GB
+/// dev boxes where this lane has always been green, so the capability
+/// assertion does not depend on the host's RAM size.
 #[test]
 #[timeout(30_000)]
 fn fp_rem_float64_is_supported_and_reports_sat_on_cli() {
@@ -134,6 +144,7 @@ fn fp_rem_float64_is_supported_and_reports_sat_on_cli() {
     );
 
     let output = Command::new(ay_path)
+        .env("GOVERN_AY_MB", "8192")
         .arg(&input)
         .output()
         .expect("spawn ay");

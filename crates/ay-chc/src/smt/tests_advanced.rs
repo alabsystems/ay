@@ -742,13 +742,11 @@ fn test_check_sat_returns_unknown_when_global_term_memory_exceeded() {
 
     let mut ctx = SmtContext::new();
     let result = ctx.check_sat(&expr);
-    // The internal DPLL(T) returns Unknown due to term memory pressure,
-    // but the executor fallback (check_sat outer wrapper) routes the query
-    // through ay-dpll's Executor which uses a separate resource pool and
-    // can solve trivial QF_LIA queries. Accept either Unknown or Sat.
+    // Both the internal loop and its executor fallback share the process-wide
+    // publication envelope. A sibling/global trip must survive postprocessing.
     assert!(
-        matches!(result, SmtResult::Unknown | SmtResult::Sat(_)),
-        "expected Unknown or Sat (via executor fallback), got {result:?}"
+        matches!(result, SmtResult::Unknown),
+        "expected Unknown when global term memory is exceeded, got {result:?}"
     );
 }
 
@@ -845,6 +843,95 @@ fn test_incremental_returns_unknown_when_global_term_memory_exceeded() {
         matches!(result, IncrementalCheckResult::Unknown),
         "expected incremental Unknown when global memory budget is exceeded, got {result:?}"
     );
+}
+
+#[test]
+fn incremental_two_hop_query_cannot_escape_parent_deadline() {
+    let x = ChcVar::new("incremental_deadline_x", ChcSort::Int);
+    let background = ChcExpr::gt(ChcExpr::var(x.clone()), ChcExpr::int(10));
+    let assumption = ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(5));
+
+    let mut smt = SmtContext::new();
+    smt.set_global_solve_deadline(Some(ay_core::time::Instant::now()));
+    let mut incremental = IncrementalQueryContext::new();
+    incremental.assert_background(&background, &mut smt);
+    incremental.finalize_background(&smt);
+
+    let result = incremental.check_sat_incremental(
+        &[assumption],
+        &mut smt,
+        Some(std::time::Duration::from_secs(5)),
+    );
+    assert!(matches!(result, IncrementalCheckResult::Unknown));
+    assert!(matches!(
+        incremental.check_sat_fresh_query(
+            &[ChcExpr::lt(
+                ChcExpr::var(ChcVar::new("incremental_deadline_x", ChcSort::Int)),
+                ChcExpr::int(5),
+            )],
+            &smt,
+            Some(std::time::Duration::from_secs(5)),
+        ),
+        IncrementalCheckResult::Unknown
+    ));
+}
+
+#[test]
+fn incremental_two_hop_query_cannot_escape_parent_term_store_limit() {
+    let x = ChcVar::new("incremental_term_limit_x", ChcSort::Int);
+    let background = ChcExpr::gt(ChcExpr::var(x.clone()), ChcExpr::int(10));
+    let assumption = ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(5));
+
+    let mut smt = SmtContext::new();
+    let exact_live_baseline = smt.terms.true_memory_bytes();
+    smt.set_term_memory_budget(Some(exact_live_baseline));
+    assert!(!smt.term_memory_exceeded());
+    let mut incremental = IncrementalQueryContext::new();
+    incremental.assert_background(&background, &mut smt);
+    incremental.finalize_background(&smt);
+
+    let result = incremental.check_sat_incremental(
+        &[assumption],
+        &mut smt,
+        Some(std::time::Duration::from_secs(5)),
+    );
+    assert!(matches!(result, IncrementalCheckResult::Unknown));
+    assert!(matches!(
+        incremental.check_sat_fresh_query(
+            &[ChcExpr::lt(
+                ChcExpr::var(ChcVar::new("incremental_term_limit_x", ChcSort::Int)),
+                ChcExpr::int(5),
+            )],
+            &smt,
+            Some(std::time::Duration::from_secs(5)),
+        ),
+        IncrementalCheckResult::Unknown
+    ));
+}
+
+#[test]
+fn incremental_fresh_query_decides_under_a_live_parent_envelope() {
+    let x = ChcVar::new("incremental_fresh_live_x", ChcSort::Int);
+    let background = ChcExpr::gt(ChcExpr::var(x.clone()), ChcExpr::int(10));
+    let assumption = ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(5));
+
+    let mut parent = SmtContext::new();
+    parent.set_term_memory_budget(Some(usize::MAX));
+    parent.set_global_solve_deadline(Some(
+        ay_core::time::Instant::now() + std::time::Duration::from_secs(5),
+    ));
+    let mut incremental = IncrementalQueryContext::new();
+    incremental.assert_background(&background, &mut parent);
+    incremental.finalize_background(&parent);
+
+    assert!(matches!(
+        incremental.check_sat_fresh_query(
+            &[assumption],
+            &parent,
+            Some(std::time::Duration::from_secs(5)),
+        ),
+        IncrementalCheckResult::Unsat
+    ));
 }
 
 /// Regression test for #2926: verify that Farkas conflicts are collected
@@ -1288,6 +1375,31 @@ fn test_incremental_modular_arithmetic_model_validity() {
 // =========================================================================
 
 #[test]
+fn test_check_sat_exact_term_memory_landing_rejects_sub_refresh_growth() {
+    let mut ctx = SmtContext::new();
+    let exact_baseline = ctx.terms.true_memory_bytes();
+    ctx.set_term_memory_budget(Some(exact_baseline));
+    assert!(!ctx.exact_term_memory_exceeded());
+
+    let conjuncts: Vec<ChcExpr> = (0..64)
+        .map(|index| {
+            ChcExpr::eq(
+                ChcExpr::var(ChcVar::new(
+                    format!("exact_smt_landing_{index}"),
+                    ChcSort::Int,
+                )),
+                ChcExpr::int(index),
+            )
+        })
+        .collect();
+    let query = ChcExpr::and_all(conjuncts);
+    let result = ctx.check_sat(&query);
+
+    assert!(ctx.exact_term_memory_exceeded());
+    assert!(matches!(result, SmtResult::Unknown));
+}
+
+#[test]
 fn test_convert_expr_per_engine_memory_budget_enforcement() {
     // Set a very small per-engine memory budget (256 bytes) so that
     // even a moderate expression exceeds it during convert_expr.
@@ -1324,6 +1436,26 @@ fn test_per_engine_memory_budget_small_expression_succeeds() {
         matches!(result, SmtResult::Sat(_)),
         "Small expression with generous budget should be SAT, got {result:?}"
     );
+}
+
+#[test]
+fn test_executor_fallback_entrypoint_honors_tiny_term_memory_budget() {
+    let mut ctx = SmtContext::new();
+    ctx.set_term_memory_budget(Some(1));
+    assert!(
+        ctx.term_memory_exceeded(),
+        "the fixture must start beyond its deliberately tiny ceiling"
+    );
+
+    let x = ChcVar::new("fallback_budget_x", ChcSort::Int);
+    let contradiction = ChcExpr::and(
+        ChcExpr::gt(ChcExpr::var(x.clone()), ChcExpr::int(5)),
+        ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(3)),
+    );
+    assert!(matches!(
+        ctx.check_sat_with_executor_fallback(&contradiction),
+        SmtResult::Unknown
+    ));
 }
 
 #[test]

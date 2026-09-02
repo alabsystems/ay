@@ -60,17 +60,18 @@ const DECISION_FRONTEND_TIMEOUT_RESERVE_MS: u64 = 500;
 // a proof, and never one proof into a different one. Nothing here can widen what
 // AY claims: `s OPTIMUM FOUND` in proof mode is still only reported after a
 // proof has been assembled and committed.
-const OPT_CERT_NATIVE_SLICE_DIV: u32 = 6;
-const OPT_CERT_NATIVE_SLICE_DIV_HUGE: u32 = 12;
-const OPT_CERT_NATIVE_CEIL_DIV: u32 = 3;
-const OPT_CERT_NATIVE_CEIL_DIV_HUGE: u32 = 6;
-const OPT_CERT_IMPROVE_GRACE_DIV: u32 = 12;
-const OPT_CERT_IMPROVE_GRACE_MAX_MS: u64 = 30_000;
-const OPT_CERT_CERTIFY_RESERVE_DIV: u32 = 8;
-const OPT_CERT_CERTIFY_RESERVE_MIN_MS: u64 = 10_000;
-const OPT_CERT_CERTIFY_RESERVE_MAX_MS: u64 = 300_000;
-const OPT_CERT_HUGE_MIN_VARS: u32 = 900_000;
-const OPT_CERT_HUGE_MIN_CONSTRAINTS: usize = 1_000_000;
+// THE CONSTANTS ARE NOT DEFINED HERE EITHER. They, the split they size, and the
+// reserve behind it live in `ay_pb::proof` (module `opt_budget`) with the chain
+// they feed. This file used to carry its own copy of all eleven plus
+// `CertOptBudgetSplit`, `compute_cert_opt_budget_split`, `certify_reserve`,
+// `native_cap_expired` and `extend_native_deadline` — and the competition binary
+// carried the same again, which is how the two drifted apart unnoticed.
+// `certify_reserve` is deliberately NOT imported here any more: the portfolio's
+// certification reserve is applied inside `ay_pb::opt_fallback`, with the search
+// it reserves against, so neither frontend can compute a different one.
+use ay_pb::proof::{
+    compute_cert_opt_budget_split, extend_native_deadline, native_cap_expired, CertOptBudgetPolicy,
+};
 // The certificate chain's per-route budget is NOT configured here. It lives
 // with the chain, in `ay_pb::proof::certify_opt_lin_any_interruptible`, so
 // every caller inherits it and there is no per-site copy to drift. This file
@@ -142,6 +143,9 @@ pub(crate) fn run_z3_compat(
         file,
         timeout,
         proof: None,
+        // Read from `argv` by the governor before this parser exists; see
+        // `ay_sys::govern::CLI_BUDGET_FLAG`.
+        memory_mb: None,
         stats: false,
         stats_json: false,
         native: false,
@@ -215,6 +219,11 @@ fn run_with_writer<W: Write>(cmd: &PbCommand, writer: W) -> Result<PbStatus> {
             file,
             timeout,
             proof,
+            // Consumed by `ay_sys::govern` straight from `argv` before `main`
+            // parses anything, because the bound has to be armed before the
+            // first allocation. Binding it here would be a second, later, and
+            // therefore WRONG source of truth.
+            memory_mb: _,
             stats,
             stats_json,
             native,
@@ -712,7 +721,7 @@ fn solve_opb<W: Write>(
                 out,
             )?;
             return solve_optimization_with_proof(
-                instance,
+                instance_arc,
                 objective,
                 proof_path,
                 timeout_dur,
@@ -1623,101 +1632,6 @@ fn try_drat_lift_certified_unsat(
     })))
 }
 
-/// How the certified-optimization budget is split between the native
-/// proof-logging CDCL and the out-of-band certification stage behind it.
-struct CertOptBudgetSplit {
-    /// Initial wall-clock deadline for the native proof-logging slice.
-    /// `None` = uncapped (no timeout, or the split does not apply).
-    native_deadline: Option<std::time::Instant>,
-    /// Ceiling the improvement grace may extend `native_deadline` to.
-    native_hard_limit: Option<std::time::Instant>,
-    /// Extension granted on each VERIFIED strictly-improving incumbent.
-    improve_grace: std::time::Duration,
-}
-
-/// Decides whether the certified-optimization budget split applies and sizes the
-/// native slice. Eligibility: a timeout exists (an unbounded run keeps today's
-/// unbounded-native semantics) and the objective is single-literal linear — the
-/// OPT-LIN certification helpers' whole domain, so on anything else the reserve
-/// would buy nothing and only take time away from the search.
-fn compute_cert_opt_budget_split(
-    instance: &PbInstance,
-    objective: &ay_pb::PbObjective,
-    timeout_dur: Option<std::time::Duration>,
-    start: std::time::Instant,
-) -> CertOptBudgetSplit {
-    let uncapped = CertOptBudgetSplit {
-        native_deadline: None,
-        native_hard_limit: None,
-        improve_grace: std::time::Duration::ZERO,
-    };
-    let Some(timeout) = timeout_dur else {
-        return uncapped;
-    };
-    if !objective.terms.iter().all(|term| term.lits.len() == 1) {
-        return uncapped;
-    }
-
-    let now = std::time::Instant::now();
-    let remaining = timeout.saturating_sub(start.elapsed());
-    let huge = instance.num_vars >= OPT_CERT_HUGE_MIN_VARS
-        || instance.constraints.len() >= OPT_CERT_HUGE_MIN_CONSTRAINTS;
-    let (slice_div, ceil_div) = if huge {
-        (
-            OPT_CERT_NATIVE_SLICE_DIV_HUGE,
-            OPT_CERT_NATIVE_CEIL_DIV_HUGE,
-        )
-    } else {
-        (OPT_CERT_NATIVE_SLICE_DIV, OPT_CERT_NATIVE_CEIL_DIV)
-    };
-    CertOptBudgetSplit {
-        native_deadline: Some(now + remaining / slice_div),
-        native_hard_limit: Some(now + remaining / ceil_div),
-        improve_grace: (remaining / OPT_CERT_IMPROVE_GRACE_DIV).min(
-            std::time::Duration::from_millis(OPT_CERT_IMPROVE_GRACE_MAX_MS),
-        ),
-    }
-}
-
-fn native_cap_expired(deadline: &std::cell::Cell<Option<std::time::Instant>>) -> bool {
-    deadline
-        .get()
-        .is_some_and(|dl| std::time::Instant::now() >= dl)
-}
-
-/// Extends the native slice after a verified incumbent improvement: monotone,
-/// clamped at the hard ceiling, no-op when uncapped or grace-free.
-fn extend_native_deadline(
-    deadline: &std::cell::Cell<Option<std::time::Instant>>,
-    split: &CertOptBudgetSplit,
-) {
-    let (Some(current), Some(hard)) = (deadline.get(), split.native_hard_limit) else {
-        return;
-    };
-    if split.improve_grace.is_zero() {
-        return;
-    }
-    let extended = (std::time::Instant::now() + split.improve_grace).min(hard);
-    if extended > current {
-        deadline.set(Some(extended));
-    }
-}
-
-/// Reserve kept for the out-of-band certification stage after the fallback
-/// portfolio: `remaining/8` clamped to `[10s, 300s]`, never more than half of
-/// what is left. Without it the portfolio runs to the caller's deadline and the
-/// certification behind it gets nothing at all.
-fn certify_reserve(remaining: std::time::Duration) -> std::time::Duration {
-    (remaining / OPT_CERT_CERTIFY_RESERVE_DIV)
-        .max(std::time::Duration::from_millis(
-            OPT_CERT_CERTIFY_RESERVE_MIN_MS,
-        ))
-        .min(std::time::Duration::from_millis(
-            OPT_CERT_CERTIFY_RESERVE_MAX_MS,
-        ))
-        .min(remaining / 2)
-}
-
 /// Streams a verified strictly-improving incumbent (`o` line + cache) exactly
 /// like the plain optimization path; shared by the native phase and the
 /// portfolio fallback behind it so the improvement bar stays monotone across the
@@ -1777,7 +1691,7 @@ fn stream_verified_improvement<W: Write>(
 /// `temp_proof_path` before calling this (we overwrite that temp file).
 #[allow(clippy::too_many_arguments)]
 fn try_opt_lin_cert_fallback(
-    instance: &PbInstance,
+    instance_arc: &Arc<PbInstance>,
     objective: &ay_pb::PbObjective,
     proof_path: &Path,
     temp_proof_path: &Path,
@@ -1787,87 +1701,30 @@ fn try_opt_lin_cert_fallback(
     best_solution: &Mutex<Option<PbExactSolution>>,
     on_improve: &mut dyn FnMut(i128, &[bool]),
 ) -> Result<Option<PbSolveOutcome>> {
-    // The OPT-LIN-CERT helpers only handle single-literal (linear) objective terms.
-    if objective.terms.iter().any(|term| term.lits.len() != 1) {
-        return Ok(None);
-    }
-
-    // Run the portfolio to (try to) prove the exact optimum + incumbent, but
-    // STOP IT SHORT of the caller's deadline: the certification stage behind it
-    // needs a slice, and it used to be handed the deadline the portfolio had
-    // already run to. The stop closure below still runs to the FULL timeout
-    // (absolute deadlines), so time the portfolio does not use rolls into
-    // certification rather than being lost.
-    let portfolio_timeout = timeout_dur.map(|timeout| {
-        let remaining = timeout.saturating_sub(start.elapsed());
-        timeout.saturating_sub(certify_reserve(remaining))
-    });
-    //
-    // THE IMPROVEMENTS ARE THE CALLER'S, NOT A STUB'S. This used to pass
-    // `|_, _| {}`, so every feasible incumbent this portfolio found was dropped
-    // on the floor: when certification then declined, the CLI had nothing cached
-    // and reported `s UNKNOWN` for an instance it had a verified model for.
-    // Measured on the census's 74-instance sample: the CLI emitted 0
-    // `s SATISFIABLE` in proof mode and 71 `s UNKNOWN`, against 37 / 25 for the
-    // competition binary, which threads its streaming callback through here.
-    // The callback is the plain optimization path's own — it re-verifies each
-    // model and only advances the bar on a VERIFIED construction — so this
-    // publishes answers AY already has, and can never publish one it does not.
-    let portfolio_result = portfolio::solve_optimization_portfolio_with_timings(
-        instance,
+    // ALL the policy — which search runs, which candidate is admitted, which
+    // certificate rung fires — is in `ay_pb::opt_fallback`, shared verbatim with
+    // `crates/ay-pb/src/bin/ay.rs`. What is left here is this frontend's I/O.
+    // See that module's header for why there is no second copy any more.
+    let outcome = ay_pb::opt_fallback::run_opt_lin_cert_fallback(
+        instance_arc,
         objective,
-        portfolio_timeout,
+        timeout_dur,
         start,
         term_flag,
+        best_solution,
         on_improve,
     );
-    let portfolio_solution = portfolio_result.solution;
 
-    let should_stop =
-        || term_flag.load(Ordering::SeqCst) || timeout_dur.is_some_and(|d| start.elapsed() >= d);
+    let (pbp, route, solution, portfolio_timings) = match outcome {
+        ay_pb::opt_fallback::OptLinCertFallback::Declined { .. } => return Ok(None),
+        ay_pb::opt_fallback::OptLinCertFallback::Certified {
+            pbp,
+            route,
+            solution,
+            timings,
+        } => (pbp, route, solution, timings),
+    };
 
-    // Only a proven optimum is certifiable (BOUNDS V V). CANDIDATE WIDENING,
-    // matching the competition binary: take the portfolio's own `OptimumFound`
-    // when it has one, otherwise ask the checked optimum-upgrade gate whether a
-    // merely-feasible result is in fact optimal. Either way this is only a
-    // CANDIDATE — every certificate route below re-derives both bounds itself
-    // and declines rather than trust it — so widening cannot weaken anything.
-    let candidate = if portfolio_solution.status == PbStatus::OptimumFound {
-        portfolio_solution
-    } else {
-        let upgraded =
-            portfolio::finalize_optimum_verdict(portfolio_solution, instance, objective, &|| {
-                should_stop()
-            });
-        if upgraded.status != PbStatus::OptimumFound {
-            return Ok(None);
-        }
-        upgraded
-    };
-    let Some(optimum) = candidate.objective else {
-        return Ok(None);
-    };
-    let incumbent = candidate.assignment;
-    if incumbent.len() != instance.num_vars as usize {
-        return Ok(None);
-    }
-
-    // THE WHOLE CHAIN, cheapest-first — the single library definition shared with
-    // the competition binary (`ay_pb::proof::certify_opt_lin_any_interruptible`).
-    // This call site used to name only `bounds_compact` and `bounds`: it had
-    // forked the ladder when it had two rungs, and the six emitters added since
-    // were wired into `crates/ay-pb/src/bin/ay.rs` and nowhere else. Every rung
-    // re-verifies the incumbent itself and returns `None` rather than a doubtful
-    // proof; VeriPB re-checks whatever comes back.
-    let Some((pbp, route)) = ay_pb::proof::certify_opt_lin_any_interruptible(
-        instance,
-        &incumbent,
-        optimum,
-        timeout_dur.map(|timeout| start + timeout),
-        &should_stop,
-    ) else {
-        return Ok(None);
-    };
     if ay_core::misc_cli_flags().cert_debug {
         eprintln!("c opt-lin-cert route: {} (fallback)", route.as_str());
     }
@@ -1877,11 +1734,6 @@ fn try_opt_lin_cert_fallback(
     commit_or_remove_proof(proof_path, temp_proof_path, true)?;
 
     // Cache the exact incumbent so downstream reporting can surface it.
-    let solution = PbSolution {
-        status: PbStatus::OptimumFound,
-        assignment: incumbent,
-        objective: Some(optimum),
-    };
     cache_exact_solution(
         best_solution,
         exact_solution_from_result(&solution, objective),
@@ -1890,7 +1742,7 @@ fn try_opt_lin_cert_fallback(
     Ok(Some(PbSolveOutcome {
         solution,
         pb_native_code_helper_applications: 0,
-        portfolio_timings: Some(portfolio_result.timings),
+        portfolio_timings,
     }))
 }
 
@@ -1960,7 +1812,7 @@ fn commit_certified_known_optimum(
 
 /// Solves a linear optimization PB instance with native CDCL proof logging.
 fn solve_optimization_with_proof<W: Write>(
-    instance: &PbInstance,
+    instance_arc: &Arc<PbInstance>,
     objective: &ay_pb::PbObjective,
     proof_path: &Path,
     timeout_dur: Option<std::time::Duration>,
@@ -1970,11 +1822,23 @@ fn solve_optimization_with_proof<W: Write>(
     out: &mut PbOutputWriter<W>,
     best_solution: &Mutex<Option<PbExactSolution>>,
 ) -> Result<PbSolveOutcome> {
+    // Borrowed view for the body; the `Arc` is needed only by the fallback's
+    // parallel primal search, which shares the read-only instance with workers.
+    let instance: &PbInstance = instance_arc;
     let temp_proof_path = prepare_proof_temp(proof_path)?;
     // Reserve the certificate stage a budget BEFORE the search starts. Without
     // this the native slice below is the whole timeout and everything after it
     // runs with `B - B = 0`.
-    let split = compute_cert_opt_budget_split(instance, objective, timeout_dur, start);
+    // The shipped CLI exposes neither `--no-opt-cert-portfolio` nor
+    // `--cert-native-cap-ms`, so it asks for the shipped default policy. The
+    // competition binary passes its own flags through the same one function.
+    let split = compute_cert_opt_budget_split(
+        instance,
+        objective,
+        timeout_dur,
+        start,
+        CertOptBudgetPolicy::default(),
+    );
     let native_deadline = std::cell::Cell::new(split.native_deadline);
     let result = (|| {
         let proof_file = File::create(&temp_proof_path)
@@ -2094,7 +1958,7 @@ fn solve_optimization_with_proof<W: Write>(
                 );
             };
             if let Some(outcome) = try_opt_lin_cert_fallback(
-                instance,
+                instance_arc,
                 objective,
                 proof_path,
                 &temp_proof_path,

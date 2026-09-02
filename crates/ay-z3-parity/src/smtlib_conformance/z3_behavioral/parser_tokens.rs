@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Semantic witnesses for structural Z3 5.0.0 SMT parser tokens.
+//! Semantic witnesses for structural Z3 5.1.0 SMT parser tokens.
 //!
 //! Structural tokens use a clean contradiction against a satisfiable baseline.
 //! Attribute tokens additionally query the authored assertion and compare

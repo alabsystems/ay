@@ -49,12 +49,18 @@ impl Mbp {
                 default,
                 mut entries,
             } => {
-                if let Some((_, existing)) = entries
-                    .iter_mut()
-                    .find(|(existing_idx, _)| *existing_idx == idx)
-                {
-                    *existing = val;
-                } else {
+                let mut replaced = false;
+                for (existing_idx, existing) in &mut entries {
+                    match crate::expr::smt_values_equal(existing_idx, &idx)? {
+                        true => {
+                            *existing = val.clone();
+                            replaced = true;
+                            break;
+                        }
+                        false => {}
+                    }
+                }
+                if !replaced {
                     entries.push((idx, val));
                 }
                 Some(SmtValue::ArrayMap { default, entries })
@@ -75,24 +81,38 @@ impl Mbp {
 
         // Check entries in lhs that differ from rhs at the same index.
         for (idx_val, lhs_val) in &lhs_entries {
-            let rhs_val_at_idx = rhs_entries
-                .iter()
-                .find(|(k, _)| k == idx_val)
-                .map(|(_, v)| v)
-                .unwrap_or(&rhs_default);
-            if lhs_val != rhs_val_at_idx {
+            let mut rhs_val_at_idx = &rhs_default;
+            for (key, value) in rhs_entries.iter().rev() {
+                match crate::expr::smt_values_equal(key, idx_val)? {
+                    true => {
+                        rhs_val_at_idx = value;
+                        break;
+                    }
+                    false => {}
+                }
+            }
+            if !crate::expr::smt_values_equal(lhs_val, rhs_val_at_idx)? {
                 return Self::smt_value_to_index_expr(idx_val, idx_sort);
             }
         }
         // Check entries in rhs not in lhs (compare against lhs default).
         for (idx_val, rhs_val) in &rhs_entries {
-            let in_lhs = lhs_entries.iter().any(|(k, _)| k == idx_val);
-            if !in_lhs && *rhs_val != lhs_default {
+            let mut in_lhs = false;
+            for (key, _) in lhs_entries.iter().rev() {
+                match crate::expr::smt_values_equal(key, idx_val)? {
+                    true => {
+                        in_lhs = true;
+                        break;
+                    }
+                    false => {}
+                }
+            }
+            if !in_lhs && !crate::expr::smt_values_equal(rhs_val, &lhs_default)? {
                 return Self::smt_value_to_index_expr(idx_val, idx_sort);
             }
         }
         // Defaults differ and no entry shadows it — use index 0.
-        if lhs_default != rhs_default {
+        if !crate::expr::smt_values_equal(&lhs_default, &rhs_default)? {
             return Some(match idx_sort {
                 ChcSort::Int => ChcExpr::Int(0),
                 ChcSort::BitVec(w) => ChcExpr::BitVec(0, *w),
@@ -116,12 +136,15 @@ impl Mbp {
     /// Convert an SmtValue to a ChcExpr for use as an array index.
     pub(in crate::mbp) fn smt_value_to_index_expr(
         val: &SmtValue,
-        _sort: &ChcSort,
+        sort: &ChcSort,
     ) -> Option<ChcExpr> {
-        match val {
-            SmtValue::Int(n) => Some(ChcExpr::Int(*n)),
-            SmtValue::BitVec(v, w) => Some(ChcExpr::BitVec(*v, *w)),
-            SmtValue::Bool(b) => Some(ChcExpr::Bool(*b)),
+        match (val, sort) {
+            (SmtValue::Int(n), ChcSort::Int) => Some(ChcExpr::Int(*n)),
+            (
+                value @ (SmtValue::BitVec(_, actual_width) | SmtValue::BigBitVec(_, actual_width)),
+                ChcSort::BitVec(expected_width),
+            ) if actual_width == expected_width => value.bitvec_to_chc_expr(),
+            (SmtValue::Bool(b), ChcSort::Bool) => Some(ChcExpr::Bool(*b)),
             _ => None,
         }
     }

@@ -43,13 +43,18 @@ impl AlethePrinter<'_> {
             out.push_str(&term_str);
             return;
         }
-        if let Some(term_str) = self
-            .term_overrides
-            .and_then(|overrides| overrides.get(&term_id))
-        {
-            self.charge(term_str.len() as u64);
-            out.push_str(term_str);
-            return;
+        // An authored override whose `Assume` rows are all unused belongs only
+        // at those leaves. Every other occurrence must expose the canonical
+        // term, including steps printed before the unused assume itself.
+        if !self.assume_only_override_terms.borrow().contains(&term_id) {
+            if let Some(term_str) = self
+                .term_overrides
+                .and_then(|overrides| overrides.get(&term_id))
+            {
+                self.charge(term_str.len() as u64);
+                out.push_str(term_str);
+                return;
+            }
         }
         if let Some(cached) = self.format_cache.borrow().get(&term_id) {
             // A cache hit still copies the rendered bytes; on proofs whose
@@ -100,6 +105,10 @@ impl AlethePrinter<'_> {
         if self.terms.sort(*value) != &array_sort.element_sort {
             return None;
         }
-        Some(format!("((as const {sort}) {})", self.format_term(*value)))
+        Some(format!(
+            "((as const {}) {})",
+            format_sort_alethe(sort),
+            self.format_term(*value)
+        ))
     }
 }

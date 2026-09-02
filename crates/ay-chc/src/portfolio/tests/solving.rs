@@ -3,6 +3,28 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+fn bounded_parallel_test_config(
+    engine_count: usize,
+    parallel_timeout: Duration,
+) -> PortfolioConfig {
+    PortfolioConfig {
+        external_cancellation: None,
+        engines: (0..engine_count)
+            .map(|_| EngineConfig::Pdr(PdrConfig::default()))
+            .collect(),
+        parallel: true,
+        timeout: None,
+        parallel_timeout: Some(parallel_timeout),
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: true,
+    }
+}
 
 #[test]
 fn test_sequential_portfolio_enforces_per_engine_timeout() {
@@ -93,6 +115,853 @@ fn test_default_portfolio_includes_pdr_splits_variants() {
         saw_pdr_without_splits,
         "Default portfolio missing PDR without negated equality splits"
     );
+}
+
+#[test]
+#[timeout(5000)]
+fn parallel_winner_reaps_delayed_loser_before_return() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let problem = create_safe_problem();
+    let predicate = problem.predicates()[0].id;
+    let x = ChcVar::new("x", ChcSort::Int);
+    let mut winning_model = InvariantModel::new();
+    winning_model.set(
+        predicate,
+        PredicateInterpretation::new(
+            vec![x.clone()],
+            ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(10)),
+        ),
+    );
+    let config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![
+            EngineConfig::Pdr(PdrConfig::default()),
+            EngineConfig::Bmc(BmcConfig::default()),
+        ],
+        parallel: true,
+        timeout: None,
+        parallel_timeout: Some(Duration::from_secs(2)),
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: true,
+    };
+    let loser_started = Arc::new(AtomicBool::new(false));
+    let loser_alive = Arc::new(AtomicBool::new(false));
+    let loser_saw_cancel = Arc::new(AtomicBool::new(false));
+    let observed_started = loser_started.clone();
+    let observed_alive = loser_alive.clone();
+    let observed_cancel = loser_saw_cancel.clone();
+    let solver = PortfolioSolver::new(problem, config)
+        .with_sequential_test_engine(move |idx, cancellation| {
+            if idx == 0 {
+                while !observed_started.load(Ordering::SeqCst) {
+                    thread::yield_now();
+                }
+                EngineResult::Unified(PortfolioResult::Safe(winning_model.clone()), "TEST_WINNER")
+            } else {
+                observed_alive.store(true, Ordering::SeqCst);
+                observed_started.store(true, Ordering::SeqCst);
+                while !cancellation.is_cancelled() {
+                    thread::yield_now();
+                }
+                observed_cancel.store(true, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(100));
+                observed_alive.store(false, Ordering::SeqCst);
+                EngineResult::Unified(PortfolioResult::Unknown, "TEST_LOSER")
+            }
+        })
+        .with_sequential_test_publish_delay(Duration::from_millis(50));
+
+    let result = solver.solve_parallel();
+
+    assert!(matches!(result, PortfolioResult::Safe(_)));
+    assert!(loser_saw_cancel.load(Ordering::SeqCst));
+    assert!(
+        !loser_alive.load(Ordering::SeqCst),
+        "the accepted winner must not return while a delayed losing worker remains alive"
+    );
+}
+
+#[test]
+#[timeout(5000)]
+fn parallel_timeout_worker_cancellation_does_not_poison_grace_validation() {
+    let problem = create_safe_problem();
+    let predicate = problem.predicates()[0].id;
+    let x = ChcVar::new("x", ChcSort::Int);
+    let mut safe_model = InvariantModel::new();
+    safe_model.set(
+        predicate,
+        PredicateInterpretation::new(
+            vec![x.clone()],
+            ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(10)),
+        ),
+    );
+    let config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![
+            EngineConfig::Pdr(PdrConfig::default()),
+            EngineConfig::Bmc(BmcConfig::default()),
+        ],
+        parallel: true,
+        timeout: None,
+        parallel_timeout: Some(Duration::from_millis(200)),
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: true,
+    };
+    let solver = PortfolioSolver::new(problem, config)
+        .with_sequential_test_engine(move |idx, cancellation| {
+            if idx == 0 {
+                EngineResult::Unified(PortfolioResult::Safe(safe_model.clone()), "TEST_GRACE_SAFE")
+            } else {
+                while !cancellation.is_cancelled() {
+                    thread::yield_now();
+                }
+                EngineResult::Unified(PortfolioResult::Unknown, "TEST_GRACE_UNKNOWN")
+            }
+        })
+        // The candidate is complete before timeout, but its publication loses
+        // the timeout race. Grace may recover it by its completion timestamp.
+        .with_sequential_test_publish_delay(Duration::from_millis(300));
+
+    let result = solver.solve_parallel();
+
+    assert!(
+        matches!(result, PortfolioResult::Safe(_)),
+        "scheduler-local timeout cancellation must not make a queued valid candidate fail validation"
+    );
+}
+
+#[test]
+#[timeout(5000)]
+fn parallel_timeout_rejects_postdeadline_completion_during_grace() {
+    let problem = create_safe_problem();
+    let predicate = problem.predicates()[0].id;
+    let x = ChcVar::new("x", ChcSort::Int);
+    let mut safe_model = InvariantModel::new();
+    safe_model.set(
+        predicate,
+        PredicateInterpretation::new(
+            vec![x.clone()],
+            ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(10)),
+        ),
+    );
+    let config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![
+            EngineConfig::Pdr(PdrConfig::default()),
+            EngineConfig::Bmc(BmcConfig::default()),
+        ],
+        parallel: true,
+        timeout: None,
+        parallel_timeout: Some(Duration::from_millis(20)),
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: true,
+    };
+    let solver = PortfolioSolver::new(problem, config).with_sequential_test_engine(
+        move |idx, cancellation| {
+            while !cancellation.is_cancelled() {
+                thread::yield_now();
+            }
+            if idx == 0 {
+                EngineResult::Unified(PortfolioResult::Safe(safe_model.clone()), "TEST_LATE_SAFE")
+            } else {
+                EngineResult::Unified(PortfolioResult::Unknown, "TEST_LATE_UNKNOWN")
+            }
+        },
+    );
+
+    assert!(matches!(solver.solve_parallel(), PortfolioResult::Unknown));
+}
+
+#[test]
+#[timeout(5000)]
+fn parallel_report_does_not_count_a_rejected_candidate_as_completed() {
+    let config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![
+            EngineConfig::Pdr(PdrConfig::default()),
+            EngineConfig::Bmc(BmcConfig::default()),
+        ],
+        parallel: true,
+        timeout: None,
+        parallel_timeout: Some(Duration::from_secs(2)),
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: true,
+    };
+    let solver = PortfolioSolver::new(create_safe_problem(), config).with_sequential_test_engine(
+        |idx, _cancellation| {
+            if idx == 0 {
+                // Missing the required predicate interpretation, so mandatory
+                // Safe validation rejects this raw definitive candidate.
+                EngineResult::Unified(
+                    PortfolioResult::Safe(InvariantModel::new()),
+                    "TEST_REJECTED_SAFE",
+                )
+            } else {
+                EngineResult::Unified(PortfolioResult::Unknown, "TEST_UNKNOWN")
+            }
+        },
+    );
+
+    let mut report = BudgetReport::new();
+    let result = solver.solve_parallel_with_report(&mut report);
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert_eq!(report.completed_count(), 0);
+    assert_eq!(report.entries.len(), 2);
+    assert_eq!(report.entries[0].index, 0);
+    assert_eq!(report.entries[0].stop_reason, EngineStopReason::Unknown);
+}
+
+#[test]
+#[timeout(5000)]
+fn bounded_parallel_queue_runs_every_engine_without_exceeding_capacity() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let launched = Arc::new(Mutex::new(Vec::new()));
+    let observed_active = active.clone();
+    let observed_peak = peak.clone();
+    let observed_launched = launched.clone();
+    let solver = PortfolioSolver::new(
+        create_safe_problem(),
+        bounded_parallel_test_config(5, Duration::from_secs(2)),
+    )
+    .with_parallel_worker_limit(2)
+    .with_sequential_test_engine(move |idx, _cancellation| {
+        observed_launched.lock().unwrap().push(idx);
+        let now_active = observed_active.fetch_add(1, Ordering::SeqCst) + 1;
+        observed_peak.fetch_max(now_active, Ordering::SeqCst);
+        if idx < 2 {
+            let rendezvous_deadline = ay_core::time::Instant::now() + Duration::from_secs(1);
+            while observed_active.load(Ordering::SeqCst) < 2
+                && ay_core::time::Instant::now() < rendezvous_deadline
+            {
+                thread::yield_now();
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+        observed_active.fetch_sub(1, Ordering::SeqCst);
+        EngineResult::Unified(PortfolioResult::Unknown, "TEST_BOUNDED_QUEUE")
+    });
+
+    let mut report = BudgetReport::new();
+    let result = solver.solve_parallel_with_report(&mut report);
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert_eq!(peak.load(Ordering::SeqCst), 2);
+    let mut launched = launched.lock().unwrap().clone();
+    launched.sort_unstable();
+    assert_eq!(launched, vec![0, 1, 2, 3, 4]);
+    assert_eq!(report.entries.len(), 5);
+    assert_eq!(
+        report
+            .entries
+            .iter()
+            .map(|entry| entry.index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4]
+    );
+    assert!(report
+        .entries
+        .iter()
+        .all(|entry| entry.stop_reason == EngineStopReason::Unknown));
+}
+
+#[test]
+#[timeout(5000)]
+fn bounded_parallel_tail_winner_cancels_active_and_skips_queued_engine() {
+    let problem = create_safe_problem();
+    let predicate = problem.predicates()[0].id;
+    let x = ChcVar::new("bounded_tail_x", ChcSort::Int);
+    let mut winning_model = InvariantModel::new();
+    winning_model.set(
+        predicate,
+        PredicateInterpretation::new(
+            vec![x.clone()],
+            ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(10)),
+        ),
+    );
+
+    let sibling_started = Arc::new(AtomicBool::new(false));
+    let sibling_alive = Arc::new(AtomicBool::new(false));
+    let sibling_cancelled = Arc::new(AtomicBool::new(false));
+    let launched = Arc::new(Mutex::new(Vec::new()));
+    let observed_started = sibling_started.clone();
+    let observed_alive = sibling_alive.clone();
+    let observed_cancelled = sibling_cancelled.clone();
+    let observed_launched = launched.clone();
+    let solver = PortfolioSolver::new(
+        problem,
+        bounded_parallel_test_config(4, Duration::from_secs(2)),
+    )
+    .with_parallel_worker_limit(2)
+    .with_sequential_test_engine(move |idx, cancellation| {
+        observed_launched.lock().unwrap().push(idx);
+        match idx {
+            0 => {
+                while !observed_started.load(Ordering::SeqCst) {
+                    thread::yield_now();
+                }
+                EngineResult::Unified(PortfolioResult::Unknown, "TEST_QUEUE_PREFIX")
+            }
+            1 => {
+                observed_alive.store(true, Ordering::SeqCst);
+                observed_started.store(true, Ordering::SeqCst);
+                while !cancellation.is_cancelled() {
+                    thread::yield_now();
+                }
+                observed_cancelled.store(true, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(50));
+                observed_alive.store(false, Ordering::SeqCst);
+                EngineResult::Unified(PortfolioResult::Unknown, "TEST_QUEUE_SIBLING")
+            }
+            2 => EngineResult::Unified(
+                PortfolioResult::Safe(winning_model.clone()),
+                "TEST_QUEUE_WINNER",
+            ),
+            _ => EngineResult::Unified(PortfolioResult::Unknown, "TEST_MUST_STAY_QUEUED"),
+        }
+    });
+
+    let mut report = BudgetReport::new();
+    let result = solver.solve_parallel_with_report(&mut report);
+
+    assert!(matches!(result, PortfolioResult::Safe(_)));
+    assert!(sibling_cancelled.load(Ordering::SeqCst));
+    assert!(!sibling_alive.load(Ordering::SeqCst));
+    let mut launched = launched.lock().unwrap().clone();
+    launched.sort_unstable();
+    assert_eq!(launched, vec![0, 1, 2]);
+    assert_eq!(report.entries.len(), 4);
+    assert_eq!(report.entries[2].stop_reason, EngineStopReason::Completed);
+    assert_eq!(report.entries[3].stop_reason, EngineStopReason::NotStarted);
+    assert_eq!(report.entries[3].budget_allocated, Duration::ZERO);
+    assert_eq!(report.entries[3].elapsed, Duration::ZERO);
+}
+
+#[test]
+#[timeout(5000)]
+fn bounded_parallel_lane_timeouts_release_slots_for_every_engine() {
+    let launched = Arc::new(Mutex::new(Vec::new()));
+    let observed_launched = launched.clone();
+    let solver = PortfolioSolver::new(
+        create_safe_problem(),
+        bounded_parallel_test_config(3, Duration::from_millis(600)),
+    )
+    .with_parallel_worker_limit(1)
+    .with_sequential_test_engine(move |idx, cancellation| {
+        observed_launched.lock().unwrap().push(idx);
+        while !cancellation.is_cancelled() {
+            thread::yield_now();
+        }
+        EngineResult::Unified(PortfolioResult::Unknown, "TEST_QUEUE_TIMEOUT")
+    });
+
+    let mut report = BudgetReport::new();
+    let solve_start = ay_core::time::Instant::now();
+    let result = solver.solve_parallel_with_report(&mut report);
+    let solve_elapsed = solve_start.elapsed();
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert!(
+        solve_elapsed < Duration::from_millis(1800),
+        "closed worker senders must end timeout grace promptly: {solve_elapsed:?}"
+    );
+    assert_eq!(*launched.lock().unwrap(), vec![0, 1, 2]);
+    assert_eq!(report.entries.len(), 3);
+    assert!(report
+        .entries
+        .iter()
+        .all(|entry| entry.stop_reason == EngineStopReason::Timeout));
+    for entry in &report.entries {
+        assert!(entry.budget_allocated > Duration::ZERO);
+        assert!(entry.elapsed > Duration::ZERO);
+    }
+}
+
+#[test]
+#[timeout(5000)]
+fn bounded_parallel_lane_timeout_reaches_tail_winner() {
+    let problem = create_safe_problem();
+    let predicate = problem.predicates()[0].id;
+    let x = ChcVar::new("bounded_budget_tail_x", ChcSort::Int);
+    let mut winning_model = InvariantModel::new();
+    winning_model.set(
+        predicate,
+        PredicateInterpretation::new(
+            vec![x.clone()],
+            ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(10)),
+        ),
+    );
+    let launched = Arc::new(Mutex::new(Vec::new()));
+    let observed_launched = launched.clone();
+    let solver = PortfolioSolver::new(
+        problem,
+        bounded_parallel_test_config(3, Duration::from_millis(300)),
+    )
+    .with_parallel_worker_limit(1)
+    .with_sequential_test_engine(move |idx, cancellation| {
+        observed_launched.lock().unwrap().push(idx);
+        match idx {
+            0 => {
+                while !cancellation.is_cancelled() {
+                    thread::yield_now();
+                }
+                EngineResult::Unified(PortfolioResult::Unknown, "TEST_LANE_TIMEOUT")
+            }
+            1 => EngineResult::Unified(
+                PortfolioResult::Safe(winning_model.clone()),
+                "TEST_BUDGETED_TAIL_WINNER",
+            ),
+            _ => EngineResult::Unified(PortfolioResult::Unknown, "TEST_MUST_STAY_QUEUED"),
+        }
+    });
+
+    let mut report = BudgetReport::new();
+    let result = solver.solve_parallel_with_report(&mut report);
+
+    assert!(matches!(result, PortfolioResult::Safe(_)));
+    assert_eq!(*launched.lock().unwrap(), vec![0, 1]);
+    assert_eq!(report.entries.len(), 3);
+    assert_eq!(report.entries[0].stop_reason, EngineStopReason::Timeout);
+    assert_eq!(report.entries[1].stop_reason, EngineStopReason::Completed);
+    assert_eq!(report.entries[2].stop_reason, EngineStopReason::NotStarted);
+    assert!(report.entries[0].budget_allocated > Duration::ZERO);
+    assert!(report.entries[1].budget_allocated > Duration::ZERO);
+    assert_eq!(report.entries[2].budget_allocated, Duration::ZERO);
+}
+
+#[test]
+#[timeout(5000)]
+fn bounded_parallel_fixed_probe_reclaims_slot_for_tail_winner() {
+    let problem = create_safe_problem();
+    let predicate = problem.predicates()[0].id;
+    let x = ChcVar::new("fixed_probe_tail_x", ChcSort::Int);
+    let mut winning_model = InvariantModel::new();
+    winning_model.set(
+        predicate,
+        PredicateInterpretation::new(
+            vec![x.clone()],
+            ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(10)),
+        ),
+    );
+
+    let launched = Arc::new(Mutex::new(Vec::new()));
+    let observed_launched = launched.clone();
+    let mut config = bounded_parallel_test_config(0, Duration::from_millis(600));
+    config.engines = vec![
+        EngineConfig::Bmc(BmcConfig::default()),
+        EngineConfig::Pdr(PdrConfig::default()),
+    ];
+    config.engine_budgets.insert(
+        EngineType::Bmc,
+        BudgetPolicy::Fixed(Duration::from_millis(20)),
+    );
+    let solver = PortfolioSolver::new(problem, config)
+        .with_parallel_worker_limit(1)
+        .with_sequential_test_engine(move |idx, cancellation| {
+            observed_launched.lock().unwrap().push(idx);
+            if idx == 0 {
+                while !cancellation.is_cancelled() {
+                    thread::yield_now();
+                }
+                EngineResult::Unified(PortfolioResult::Unknown, "TEST_FIXED_PROBE")
+            } else {
+                EngineResult::Unified(
+                    PortfolioResult::Safe(winning_model.clone()),
+                    "TEST_FIXED_PROBE_TAIL_WINNER",
+                )
+            }
+        });
+
+    let mut report = BudgetReport::new();
+    let result = solver.solve_parallel_with_report(&mut report);
+
+    assert!(matches!(result, PortfolioResult::Safe(_)));
+    assert_eq!(*launched.lock().unwrap(), vec![0, 1]);
+    assert_eq!(report.entries.len(), 2);
+    assert_eq!(report.entries[0].engine, EngineType::Bmc);
+    assert_eq!(
+        report.entries[0].budget_allocated,
+        Duration::from_millis(20)
+    );
+    assert_eq!(report.entries[0].stop_reason, EngineStopReason::Timeout);
+    assert_eq!(report.entries[1].engine, EngineType::Pdr);
+    assert_eq!(report.entries[1].stop_reason, EngineStopReason::Completed);
+}
+
+#[test]
+#[timeout(5000)]
+fn bounded_parallel_zero_fixed_budget_skips_only_that_engine() {
+    let launched = Arc::new(Mutex::new(Vec::new()));
+    let observed_launched = launched.clone();
+    let mut config = bounded_parallel_test_config(0, Duration::from_secs(1));
+    config.engines = vec![
+        EngineConfig::Bmc(BmcConfig::default()),
+        EngineConfig::Pdr(PdrConfig::default()),
+    ];
+    config
+        .engine_budgets
+        .insert(EngineType::Bmc, BudgetPolicy::Fixed(Duration::ZERO));
+    let solver = PortfolioSolver::new(create_safe_problem(), config)
+        .with_parallel_worker_limit(1)
+        .with_sequential_test_engine(move |idx, _cancellation| {
+            observed_launched.lock().unwrap().push(idx);
+            EngineResult::Unified(PortfolioResult::Unknown, "TEST_ZERO_FIXED_PARALLEL")
+        });
+
+    let mut report = BudgetReport::new();
+    let result = solver.solve_parallel_with_report(&mut report);
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert_eq!(*launched.lock().unwrap(), vec![1]);
+    assert_eq!(report.entries.len(), 2);
+    assert_eq!(report.entries[0].index, 0);
+    assert_eq!(report.entries[0].budget_allocated, Duration::ZERO);
+    assert_eq!(report.entries[0].stop_reason, EngineStopReason::NotStarted);
+    assert_eq!(report.entries[1].index, 1);
+    assert_eq!(report.entries[1].stop_reason, EngineStopReason::Unknown);
+}
+
+#[test]
+#[timeout(5000)]
+fn bounded_parallel_external_cancellation_skips_queued_engines() {
+    let parent = crate::CancellationToken::new();
+    let mut config = bounded_parallel_test_config(3, Duration::from_secs(2));
+    config.external_cancellation = Some(parent.clone());
+    let launched = Arc::new(Mutex::new(Vec::new()));
+    let observed_launched = launched.clone();
+    let worker_parent = parent.clone();
+    let solver = PortfolioSolver::new(create_safe_problem(), config)
+        .with_parallel_worker_limit(1)
+        .with_sequential_test_engine(move |idx, cancellation| {
+            observed_launched.lock().unwrap().push(idx);
+            worker_parent.cancel();
+            while !cancellation.is_cancelled() {
+                thread::yield_now();
+            }
+            EngineResult::Unified(PortfolioResult::Unknown, "TEST_EXTERNAL_CANCEL")
+        });
+
+    let mut report = BudgetReport::new();
+    let result = solver.solve_parallel_with_report(&mut report);
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert_eq!(*launched.lock().unwrap(), vec![0]);
+    assert_eq!(report.entries.len(), 3);
+    assert_eq!(report.entries[0].stop_reason, EngineStopReason::Unknown);
+    assert!(report.entries[1..]
+        .iter()
+        .all(|entry| entry.stop_reason == EngineStopReason::NotStarted));
+}
+
+#[test]
+#[timeout(5000)]
+fn bounded_parallel_uses_earlier_construction_deadline_for_lane_budgets() {
+    let solver = PortfolioSolver::new_with_solve_limits(
+        create_safe_problem(),
+        bounded_parallel_test_config(3, Duration::from_secs(20)),
+        Some(ay_core::time::Instant::now() + Duration::from_secs(3)),
+    )
+    .with_parallel_worker_limit(1)
+    .with_sequential_test_engine(|_idx, _cancellation| {
+        EngineResult::Unified(PortfolioResult::Unknown, "TEST_CONSTRUCTION_DEADLINE")
+    });
+
+    let mut report = BudgetReport::new();
+    let result = solver.solve_parallel_with_report(&mut report);
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert_eq!(report.entries.len(), 3);
+    assert!(report.entries.iter().all(|entry| {
+        entry.budget_allocated > Duration::ZERO && entry.budget_allocated < Duration::from_secs(2)
+    }));
+}
+
+#[test]
+fn bounded_parallel_expired_deadline_never_invokes_engine_body() {
+    let invoked = Arc::new(AtomicBool::new(false));
+    let observed_invoked = invoked.clone();
+    let solver = PortfolioSolver::new_with_solve_limits(
+        create_safe_problem(),
+        bounded_parallel_test_config(2, Duration::from_secs(1)),
+        Some(ay_core::time::Instant::now()),
+    )
+    .with_parallel_worker_limit(1)
+    .with_sequential_test_engine(move |_idx, _cancellation| {
+        observed_invoked.store(true, Ordering::SeqCst);
+        EngineResult::Unified(PortfolioResult::Unknown, "TEST_MUST_NOT_RUN")
+    });
+
+    let mut report = BudgetReport::new();
+    let result = solver.solve_parallel_with_report(&mut report);
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert!(!invoked.load(Ordering::SeqCst));
+    assert_eq!(report.entries.len(), 2);
+    assert!(report
+        .entries
+        .iter()
+        .all(|entry| entry.stop_reason == EngineStopReason::NotStarted));
+}
+
+struct ParallelPrepareDelayGuard;
+
+impl ParallelPrepareDelayGuard {
+    fn for_engine(index: usize, delay: Duration) -> Self {
+        PARALLEL_TEST_PREPARE_DELAY.with(|configured| configured.set(Some((index, delay))));
+        Self
+    }
+}
+
+impl Drop for ParallelPrepareDelayGuard {
+    fn drop(&mut self) {
+        PARALLEL_TEST_PREPARE_DELAY.with(|configured| configured.set(None));
+    }
+}
+
+#[test]
+fn bounded_parallel_lane_admission_timeout_does_not_strand_tail() {
+    let _prepare_delay = ParallelPrepareDelayGuard::for_engine(0, Duration::from_millis(100));
+    let launched = Arc::new(Mutex::new(Vec::new()));
+    let observed_launched = launched.clone();
+    let mut config = bounded_parallel_test_config(0, Duration::from_secs(1));
+    config.engines = vec![
+        EngineConfig::Pdr(PdrConfig::default()),
+        EngineConfig::Bmc(BmcConfig::default()),
+        EngineConfig::Kind(KindConfig::default()),
+    ];
+    config.engine_budgets.insert(
+        EngineType::Pdr,
+        BudgetPolicy::Fixed(Duration::from_millis(50)),
+    );
+    let solver = PortfolioSolver::new(create_safe_problem(), config)
+        .with_parallel_worker_limit(1)
+        .with_sequential_test_engine(move |idx, _cancellation| {
+            observed_launched.lock().unwrap().push(idx);
+            EngineResult::Unified(PortfolioResult::Unknown, "TEST_ADMISSION_TAIL")
+        });
+
+    let mut report = BudgetReport::new();
+    let result = solver.solve_parallel_with_report(&mut report);
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert_eq!(*launched.lock().unwrap(), vec![1, 2]);
+    assert_eq!(report.entries.len(), 3);
+    assert_eq!(report.entries[0].stop_reason, EngineStopReason::Timeout);
+    assert_eq!(
+        report.entries[0].budget_allocated,
+        Duration::from_millis(50)
+    );
+    assert!(report.entries[1..]
+        .iter()
+        .all(|entry| entry.stop_reason == EngineStopReason::Unknown));
+}
+
+#[test]
+fn parallel_fixed_policy_is_a_live_lane_allocation() {
+    let mut config = bounded_parallel_test_config(3, Duration::from_millis(300));
+    config.engines = vec![
+        EngineConfig::Pdr(PdrConfig::default()),
+        EngineConfig::Bmc(BmcConfig::default()),
+        EngineConfig::Kind(KindConfig::default()),
+    ];
+    config.engine_budgets.insert(
+        EngineType::Pdr,
+        BudgetPolicy::Fixed(Duration::from_millis(30)),
+    );
+
+    let budgets = PortfolioSolver::parallel_engine_budgets(Duration::from_millis(300), &config, 1);
+
+    assert_eq!(budgets[0], Duration::from_millis(30));
+    assert_eq!(budgets[1], Duration::from_millis(100));
+    assert_eq!(budgets[2], Duration::from_millis(100));
+}
+
+#[test]
+fn parallel_default_budgets_account_for_overlapping_worker_capacity() {
+    let full_width = bounded_parallel_test_config(4, Duration::from_millis(400));
+    assert_eq!(
+        PortfolioSolver::parallel_engine_budgets(Duration::from_millis(400), &full_width, 4,),
+        vec![Duration::from_millis(400); 4],
+        "a one-wave portfolio must retain the full wall budget per concurrent lane"
+    );
+
+    let three_waves = bounded_parallel_test_config(5, Duration::from_millis(600));
+    assert_eq!(
+        PortfolioSolver::parallel_engine_budgets(Duration::from_millis(600), &three_waves, 2,),
+        vec![Duration::from_millis(200); 5],
+        "five engines at capacity two require three reserved waves"
+    );
+
+    let floor_limited = bounded_parallel_test_config(21, Duration::from_millis(100));
+    assert_eq!(
+        PortfolioSolver::parallel_engine_budgets(Duration::from_millis(100), &floor_limited, 1,),
+        vec![Duration::from_millis(5); 21],
+        "bounded waves must preserve the documented default 5% floor"
+    );
+}
+
+#[test]
+fn public_budget_report_keeps_active_and_disabled_indices_distinct() {
+    let mut config = bounded_parallel_test_config(0, Duration::from_secs(1));
+    config.engines = vec![
+        EngineConfig::Pdr(PdrConfig::default()),
+        EngineConfig::Bmc(BmcConfig::default()),
+    ];
+    config
+        .engine_budgets
+        .insert(EngineType::Pdr, BudgetPolicy::Disabled);
+    let solver = PortfolioSolver::new(create_safe_problem(), config)
+        .with_deterministic_sequential_schedule(None)
+        .with_sequential_test_engine(|_idx, _cancellation| {
+            EngineResult::Unified(PortfolioResult::Unknown, "TEST_ACTIVE_REPORT")
+        });
+
+    let (result, report) = solver.solve_with_budget_report();
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert_eq!(report.entries.len(), 2);
+    assert_eq!(report.entries[0].index, 0);
+    assert_eq!(report.entries[0].engine, EngineType::Bmc);
+    assert_eq!(report.entries[0].stop_reason, EngineStopReason::Unknown);
+    assert_eq!(report.entries[1].index, 1);
+    assert_eq!(report.entries[1].engine, EngineType::Pdr);
+    assert_eq!(report.entries[1].stop_reason, EngineStopReason::Disabled);
+}
+
+#[test]
+fn public_budget_report_lists_all_disabled_engine_types() {
+    let mut config = bounded_parallel_test_config(0, Duration::from_secs(1));
+    config.engines = vec![
+        EngineConfig::Pdr(PdrConfig::default()),
+        EngineConfig::Bmc(BmcConfig::default()),
+    ];
+    config
+        .engine_budgets
+        .insert(EngineType::Pdr, BudgetPolicy::Disabled);
+    config
+        .engine_budgets
+        .insert(EngineType::Bmc, BudgetPolicy::Disabled);
+    let solver = PortfolioSolver::new(create_safe_problem(), config);
+
+    let (result, report) = solver.solve_with_budget_report();
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert_eq!(report.entries.len(), 2);
+    assert_eq!(
+        report
+            .entries
+            .iter()
+            .map(|entry| entry.index)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert!(report.entries.iter().all(|entry| {
+        entry.stop_reason == EngineStopReason::Disabled
+            && entry.budget_allocated == Duration::ZERO
+            && entry.elapsed == Duration::ZERO
+    }));
+}
+
+#[test]
+fn public_budget_report_marks_active_engines_not_started_at_expired_boundary() {
+    let solver = PortfolioSolver::new_with_solve_limits(
+        create_safe_problem(),
+        bounded_parallel_test_config(2, Duration::from_secs(1)),
+        Some(ay_core::time::Instant::now()),
+    );
+
+    let (result, report) = solver.solve_with_budget_report();
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert_eq!(report.entries.len(), 2);
+    assert!(report.entries.iter().all(|entry| {
+        entry.stop_reason == EngineStopReason::NotStarted
+            && entry.budget_allocated == Duration::ZERO
+            && entry.elapsed == Duration::ZERO
+    }));
+}
+
+#[test]
+fn public_budget_report_marks_active_engines_not_started_on_trivial_result() {
+    let solver = PortfolioSolver::new(
+        ChcProblem::new(),
+        bounded_parallel_test_config(2, Duration::from_secs(1)),
+    );
+
+    let (result, report) = solver.solve_with_budget_report();
+
+    assert!(matches!(result, PortfolioResult::Safe(_)));
+    assert_eq!(report.entries.len(), 2);
+    assert!(report.entries.iter().all(|entry| {
+        entry.stop_reason == EngineStopReason::NotStarted
+            && entry.budget_allocated == Duration::ZERO
+            && entry.elapsed == Duration::ZERO
+    }));
+}
+
+#[test]
+#[timeout(5000)]
+fn bounded_parallel_wrapper_panic_releases_slot_for_tail_winner() {
+    let problem = create_safe_problem();
+    let predicate = problem.predicates()[0].id;
+    let x = ChcVar::new("bounded_panic_x", ChcSort::Int);
+    let mut winning_model = InvariantModel::new();
+    winning_model.set(
+        predicate,
+        PredicateInterpretation::new(
+            vec![x.clone()],
+            ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(10)),
+        ),
+    );
+    let launched = Arc::new(Mutex::new(Vec::new()));
+    let observed_launched = launched.clone();
+    let solver = PortfolioSolver::new(
+        problem,
+        bounded_parallel_test_config(2, Duration::from_secs(2)),
+    )
+    .with_parallel_worker_limit(1)
+    .with_sequential_test_engine(move |idx, _cancellation| {
+        observed_launched.lock().unwrap().push(idx);
+        if idx == 0 {
+            std::panic::panic_any("intentional bounded-queue wrapper panic");
+        }
+        EngineResult::Unified(
+            PortfolioResult::Safe(winning_model.clone()),
+            "TEST_PANIC_TAIL_WINNER",
+        )
+    });
+
+    let mut report = BudgetReport::new();
+    assert!(matches!(
+        solver.solve_parallel_with_report(&mut report),
+        PortfolioResult::Safe(_)
+    ));
+    assert_eq!(*launched.lock().unwrap(), vec![0, 1]);
+    assert_eq!(report.entries[0].stop_reason, EngineStopReason::Unknown);
+    assert_eq!(report.entries[1].stop_reason, EngineStopReason::Completed);
+}
+
+#[test]
+fn explicit_term_memory_budget_is_divided_by_live_worker_capacity() {
+    let mut config = bounded_parallel_test_config(5, Duration::from_secs(1));
+    config.memory_budget = Some(300);
+    assert_eq!(config.per_engine_term_budget(3), Some(100));
+    assert_eq!(config.per_engine_term_budget(1), Some(300));
 }
 
 #[test]
@@ -577,6 +1446,465 @@ fn test_budget_for_engine_eleven_engines_no_starvation() {
         budgets[0] <= Duration::from_millis(5_600),
         "Engine 0/11 should get ~5.45s (60/11), got {:.2}s",
         budgets[0].as_secs_f64()
+    );
+}
+
+#[test]
+fn deterministic_schedule_reports_exact_policy_aware_allocations() {
+    use std::sync::{Arc, Mutex};
+
+    let total = Duration::from_secs(90);
+    let config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![
+            EngineConfig::Bmc(BmcConfig::default()),
+            EngineConfig::Pdr(PdrConfig::default()),
+            EngineConfig::Kind(KindConfig::default()),
+        ],
+        parallel: false,
+        timeout: Some(total),
+        parallel_timeout: None,
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: [
+            (EngineType::Bmc, BudgetPolicy::MinPercent(50)),
+            (
+                EngineType::Pdr,
+                BudgetPolicy::Fixed(Duration::from_secs(40)),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        memory_budget: None,
+        strict_proofs: false,
+    };
+    let launch_order = Arc::new(Mutex::new(Vec::new()));
+    let observed_order = launch_order.clone();
+    let solver = PortfolioSolver::new(create_safe_problem(), config)
+        .with_deterministic_sequential_schedule(None)
+        .with_sequential_test_engine(move |idx, _cancellation| {
+            observed_order.lock().unwrap().push(idx);
+            EngineResult::Unified(PortfolioResult::Unknown, "TEST_UNKNOWN")
+        });
+
+    let planned = PortfolioSolver::deterministic_engine_budgets(total, &solver.config);
+    assert_eq!(
+        planned,
+        vec![
+            Duration::from_secs(45),
+            Duration::from_secs(40),
+            Duration::from_secs(5),
+        ],
+        "the ordered cap must honor both policies and reserve the exact remainder deterministically"
+    );
+
+    let mut report = BudgetReport::new();
+    let result = solver.solve_sequential_with_report(&mut report);
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert_eq!(*launch_order.lock().unwrap(), vec![0, 1, 2]);
+    assert_eq!(report.entries.len(), 3);
+    assert_eq!(report.entries[0].budget_allocated, planned[0]);
+    assert_eq!(report.entries[1].budget_allocated, planned[1]);
+    assert_eq!(report.entries[2].budget_allocated, planned[2]);
+    assert!(report
+        .entries
+        .iter()
+        .all(|entry| entry.stop_reason == EngineStopReason::Unknown));
+}
+
+#[test]
+fn zero_fixed_budget_skips_only_that_sequential_engine() {
+    let problem = create_safe_problem();
+    let predicate = problem.predicates()[0].id;
+    let x = ChcVar::new("zero_fixed_tail_x", ChcSort::Int);
+    let mut winning_model = InvariantModel::new();
+    winning_model.set(
+        predicate,
+        PredicateInterpretation::new(
+            vec![x.clone()],
+            ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(10)),
+        ),
+    );
+
+    let mut config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![
+            EngineConfig::Bmc(BmcConfig::default()),
+            EngineConfig::Pdr(PdrConfig::default()),
+        ],
+        parallel: false,
+        timeout: Some(Duration::from_secs(1)),
+        parallel_timeout: None,
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: false,
+    };
+    config
+        .engine_budgets
+        .insert(EngineType::Bmc, BudgetPolicy::Fixed(Duration::ZERO));
+    let launched = Arc::new(Mutex::new(Vec::new()));
+    let observed_launched = launched.clone();
+    let solver = PortfolioSolver::new(problem, config).with_sequential_test_engine(
+        move |idx, _cancellation| {
+            observed_launched.lock().unwrap().push(idx);
+            EngineResult::Unified(
+                PortfolioResult::Safe(winning_model.clone()),
+                "TEST_ZERO_FIXED_TAIL_WINNER",
+            )
+        },
+    );
+
+    let mut report = BudgetReport::new();
+    let result = solver.solve_sequential_with_report(&mut report);
+
+    assert!(matches!(result, PortfolioResult::Safe(_)));
+    assert_eq!(*launched.lock().unwrap(), vec![1]);
+    assert_eq!(report.entries.len(), 2);
+    assert_eq!(report.entries[0].index, 0);
+    assert_eq!(report.entries[0].budget_allocated, Duration::ZERO);
+    assert_eq!(report.entries[0].stop_reason, EngineStopReason::NotStarted);
+    assert_eq!(report.entries[1].index, 1);
+    assert_eq!(report.entries[1].stop_reason, EngineStopReason::Completed);
+}
+
+#[test]
+fn deterministic_completion_deadline_is_half_open() {
+    let before = ay_core::time::Instant::now();
+    let deadline = before + Duration::from_millis(10);
+
+    assert!(PortfolioSolver::deterministic_completion_within_budget(
+        before, deadline
+    ));
+    assert!(!PortfolioSolver::deterministic_completion_within_budget(
+        deadline, deadline
+    ));
+    assert!(!PortfolioSolver::deterministic_completion_within_budget(
+        deadline + Duration::from_nanos(1),
+        deadline,
+    ));
+}
+
+#[test]
+fn deterministic_expired_global_deadline_rejects_before_every_pre_engine_path() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![EngineConfig::Pdr(PdrConfig::default())],
+        parallel: false,
+        timeout: Some(Duration::from_secs(1)),
+        parallel_timeout: None,
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: false,
+    };
+    let launched = Arc::new(AtomicBool::new(false));
+    let observed_launch = launched.clone();
+    let solver = PortfolioSolver::new(create_safe_problem(), config)
+        .with_deterministic_sequential_schedule(Some(ay_core::time::Instant::now()))
+        .with_sequential_test_engine(move |_idx, _cancellation| {
+            observed_launch.store(true, Ordering::SeqCst);
+            EngineResult::Unified(
+                PortfolioResult::Safe(InvariantModel::new()),
+                "TEST_MUST_NOT_LAUNCH",
+            )
+        });
+
+    let result = solver.solve();
+    let (reported_result, report) = solver.solve_with_budget_report();
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert!(matches!(reported_result, PortfolioResult::Unknown));
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(report.entries[0].index, 0);
+    assert_eq!(report.entries[0].engine, EngineType::Pdr);
+    assert_eq!(report.entries[0].stop_reason, EngineStopReason::NotStarted);
+    assert_eq!(report.entries[0].budget_allocated, Duration::ZERO);
+    assert_eq!(report.entries[0].elapsed, Duration::ZERO);
+    assert!(
+        !launched.load(Ordering::SeqCst),
+        "an expired outer deadline must be checked before trivial/prepass/engine dispatch"
+    );
+}
+
+#[test]
+fn constructor_preprocessing_fails_closed_before_engine_dispatch() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let parent = crate::CancellationToken::new();
+    parent.cancel();
+    let config = PortfolioConfig {
+        external_cancellation: Some(parent),
+        engines: vec![EngineConfig::Pdr(PdrConfig::default())],
+        parallel: false,
+        timeout: Some(Duration::from_secs(1)),
+        parallel_timeout: None,
+        verbose: false,
+        enable_preprocessing: true,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: false,
+    };
+    let launched = Arc::new(AtomicBool::new(false));
+    let observed_launch = launched.clone();
+    let solver = PortfolioSolver::new_with_solve_limits(
+        create_safe_problem(),
+        config,
+        Some(ay_core::time::Instant::now() + Duration::from_secs(1)),
+    )
+    .with_sequential_test_engine(move |_idx, _cancellation| {
+        observed_launch.store(true, Ordering::SeqCst);
+        EngineResult::Unified(PortfolioResult::Unknown, "TEST_MUST_NOT_LAUNCH")
+    });
+
+    let (result, report) = solver.solve_with_budget_report();
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(report.entries[0].index, 0);
+    assert_eq!(report.entries[0].engine, EngineType::Pdr);
+    assert_eq!(report.entries[0].stop_reason, EngineStopReason::NotStarted);
+    assert_eq!(report.entries[0].budget_allocated, Duration::ZERO);
+    assert_eq!(report.entries[0].elapsed, Duration::ZERO);
+    assert!(!launched.load(Ordering::SeqCst));
+}
+
+#[test]
+fn expired_constructor_deadline_seals_portfolio_as_unknown() {
+    let config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![EngineConfig::Pdr(PdrConfig::default())],
+        parallel: false,
+        timeout: Some(Duration::from_secs(1)),
+        parallel_timeout: None,
+        verbose: false,
+        enable_preprocessing: true,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: false,
+    };
+    let solver = PortfolioSolver::new_with_solve_limits(
+        create_safe_problem(),
+        config,
+        Some(ay_core::time::Instant::now()),
+    );
+
+    assert!(matches!(solver.solve(), PortfolioResult::Unknown));
+}
+
+#[test]
+fn expired_from_summary_deadline_seals_portfolio_before_dispatch() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let summary = PreprocessSummary::build(create_safe_problem(), false);
+    let config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![EngineConfig::Pdr(PdrConfig::default())],
+        parallel: false,
+        timeout: Some(Duration::from_secs(20)),
+        parallel_timeout: None,
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: false,
+    };
+    let launched = Arc::new(AtomicBool::new(false));
+    let observed_launch = launched.clone();
+    let solver = PortfolioSolver::from_summary_with_solve_limits(
+        summary,
+        config,
+        Some(ay_core::time::Instant::now()),
+    )
+    .with_sequential_test_engine(move |_idx, _cancellation| {
+        observed_launch.store(true, Ordering::SeqCst);
+        EngineResult::Unified(PortfolioResult::Unknown, "TEST_MUST_NOT_LAUNCH")
+    });
+
+    let (result, report) = solver.solve_with_budget_report();
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(report.entries[0].stop_reason, EngineStopReason::NotStarted);
+    assert!(!launched.load(Ordering::SeqCst));
+}
+
+#[test]
+#[timeout(2000)]
+fn deterministic_timeout_recovers_predeadline_completion_delayed_before_publish() {
+    let config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![EngineConfig::Pdr(PdrConfig::default())],
+        parallel: false,
+        timeout: Some(Duration::from_millis(100)),
+        parallel_timeout: None,
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: false,
+    };
+    let solver = PortfolioSolver::new(create_safe_problem(), config)
+        .with_deterministic_sequential_schedule(None)
+        .with_sequential_test_engine(|_idx, _cancellation| {
+            EngineResult::Unified(PortfolioResult::Unknown, "TEST_PREDEADLINE")
+        })
+        .with_sequential_test_publish_delay(Duration::from_millis(150));
+
+    let mut report = BudgetReport::new();
+    let result = solver.solve_sequential_with_report(&mut report);
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(
+        report.entries[0].stop_reason,
+        EngineStopReason::Unknown,
+        "a pre-deadline completion must not become Timeout solely because publication was delayed"
+    );
+}
+
+#[test]
+#[timeout(2000)]
+fn deterministic_timeout_reaps_before_starting_successor() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let config = PortfolioConfig {
+        external_cancellation: None,
+        engines: vec![
+            EngineConfig::Pdr(PdrConfig::default()),
+            EngineConfig::Bmc(BmcConfig::default()),
+        ],
+        parallel: false,
+        timeout: Some(Duration::from_millis(300)),
+        parallel_timeout: None,
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: false,
+    };
+    let launches = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let cancellation_seen = Arc::new(AtomicBool::new(false));
+    let observed_launches = launches.clone();
+    let observed_active = active.clone();
+    let observed_max_active = max_active.clone();
+    let observed_cancellation = cancellation_seen.clone();
+    let solver = PortfolioSolver::new(create_safe_problem(), config)
+        .with_deterministic_sequential_schedule(None)
+        .with_sequential_test_engine(move |idx, cancellation| {
+            observed_launches[idx].fetch_add(1, Ordering::SeqCst);
+            let now_active = observed_active.fetch_add(1, Ordering::SeqCst) + 1;
+            observed_max_active.fetch_max(now_active, Ordering::SeqCst);
+
+            if idx == 0 {
+                // Deliberately ignore cancellation and produce a definitive
+                // result after the exact 150ms share. The scheduler must
+                // reject it, synchronously reap this worker, and only then
+                // start engine 1 with the remaining whole-run time.
+                thread::sleep(Duration::from_millis(200));
+                observed_cancellation.store(cancellation.is_cancelled(), Ordering::SeqCst);
+            }
+
+            observed_active.fetch_sub(1, Ordering::SeqCst);
+            if idx == 0 {
+                EngineResult::Unified(
+                    PortfolioResult::Safe(InvariantModel::new()),
+                    "TEST_LATE_SAFE",
+                )
+            } else {
+                EngineResult::Unified(PortfolioResult::Unknown, "TEST_SUCCESSOR")
+            }
+        });
+
+    let mut report = BudgetReport::new();
+    let started = ay_core::time::Instant::now();
+    let result = solver.solve_sequential_with_report(&mut report);
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(result, PortfolioResult::Unknown),
+        "a result produced after the deterministic boundary must not be accepted"
+    );
+    assert_eq!(report.entries.len(), 2);
+    assert_eq!(report.entries[0].index, 0);
+    assert_eq!(
+        report.entries[0].budget_allocated,
+        Duration::from_millis(150)
+    );
+    assert_eq!(report.entries[0].stop_reason, EngineStopReason::Timeout);
+    assert!(report.entries[0].elapsed >= Duration::from_millis(195));
+    assert_eq!(launches[0].load(Ordering::SeqCst), 1);
+    assert!(
+        elapsed >= Duration::from_millis(195),
+        "deterministic solve returned before the timed-out worker was synchronously reaped: {elapsed:?}"
+    );
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert!(cancellation_seen.load(Ordering::SeqCst));
+    assert_eq!(
+        launches[1].load(Ordering::SeqCst),
+        1,
+        "the deterministic scheduler should use remaining whole-run time after reaping"
+    );
+
+    assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    assert_eq!(report.entries.len(), 2);
+    assert_eq!(report.entries[1].index, 1);
+    assert_eq!(report.entries[1].stop_reason, EngineStopReason::Unknown);
+    assert!(report.entries[1].budget_allocated > Duration::ZERO);
+}
+
+#[test]
+#[timeout(2000)]
+fn unbounded_sequential_engine_observes_external_cancellation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let parent = crate::CancellationToken::new();
+    let config = PortfolioConfig {
+        external_cancellation: Some(parent.clone()),
+        engines: vec![EngineConfig::Pdr(PdrConfig::default())],
+        parallel: false,
+        timeout: None,
+        parallel_timeout: None,
+        verbose: false,
+        enable_preprocessing: false,
+        engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+        memory_budget: None,
+        strict_proofs: false,
+    };
+    let observed = Arc::new(AtomicBool::new(false));
+    let worker_observed = observed.clone();
+    let solver = PortfolioSolver::new(create_safe_problem(), config).with_sequential_test_engine(
+        move |_idx, cancellation| {
+            let started = ay_core::time::Instant::now();
+            while started.elapsed() < Duration::from_secs(1) {
+                if cancellation.is_cancelled() {
+                    worker_observed.store(true, Ordering::SeqCst);
+                    break;
+                }
+                thread::yield_now();
+            }
+            EngineResult::Unified(PortfolioResult::Unknown, "TEST_CANCELLED")
+        },
+    );
+
+    let _cancel_guard = parent.cancel_after(Duration::from_millis(20));
+    let result = solver.solve_sequential();
+
+    assert!(matches!(result, PortfolioResult::Unknown));
+    assert!(
+        observed.load(Ordering::SeqCst),
+        "an unbounded sequential engine must receive the external parent token"
     );
 }
 

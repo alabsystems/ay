@@ -1669,21 +1669,14 @@ fn qfufbv_binary_congruence_is_strict_verified() {
 
 /// Assert the shared post-conditions of an exact-IEEE-754 FP refutation.
 ///
-/// The PLAIN-checker call is the load-bearing one, for the same reason as
-/// [`assert_store_permutation_refutation_is_plainly_checked`]:
-/// `artifact.strict_verdict` alone cannot distinguish "the step was CHECKED"
-/// from "the step was TOLERATED", because `strict_verdict_with_deferred_trust`
-/// also returns `Verified` from its rescue arms.
-/// `check_proof_strict_with_datatypes` is the call `mint_unsat_certificate`
-/// makes BEFORE any rescue, and it runs `validate_fp_ground_eval`'s full
-/// re-derivation: the clause's own ground bindings are substituted in, and the
-/// result is evaluated by an independent correctly-rounded exact
-/// integer/rational IEEE-754 kernel over EVERY assignment of the residual
-/// variables.
+/// The native strict-checker call is load-bearing: it runs
+/// `validate_fp_ground_eval`'s full re-derivation, substituting the clause's
+/// own ground bindings and evaluating the residual formula with the independent
+/// correctly-rounded exact integer/rational IEEE-754 kernel. Pinned Carcara
+/// has no floating-point sort grammar, so the textual Alethe boundary must
+/// decline rather than publish an unparseable document; the portable native
+/// bundle remains the independently re-checkable artifact for this theory.
 fn assert_fp_ground_eval_refutation_is_plainly_checked(solver: &Solver) {
-    let artifact = solver
-        .export_last_unsat_artifact()
-        .expect("a certified UNSAT must publish a proof artifact");
     let proof = solver
         .last_proof()
         .expect("a certified UNSAT publishes its proof");
@@ -1693,15 +1686,13 @@ fn assert_fp_ground_eval_refutation_is_plainly_checked(solver: &Solver) {
         .check_proof_strict_with_datatypes(proof)
         .unwrap_or_else(|error| {
             panic!(
-                "the PLAIN strict checker must accept the exact-IEEE-754 \
-                 refutation, got {error}\n{}",
-                artifact.alethe,
+                "the native strict checker must accept the exact-IEEE-754 \
+                 refutation, got {error}",
             )
         });
 
-    // ...and the step it accepted is the exact-evaluation rule. Read the proof
-    // IR, not the printed text: Carcara has no `fp_ground_eval` rule, so the
-    // WIRE name is an honest `hole` while AY's own checker validates the kind.
+    // The step it accepted is the exact-evaluation rule, not a tolerated
+    // generic leaf.
     assert!(
         proof.steps.iter().any(|step| matches!(
             step,
@@ -1710,19 +1701,22 @@ fn assert_fp_ground_eval_refutation_is_plainly_checked(solver: &Solver) {
                 ..
             }
         )),
-        "refutation must contain a checker-validated fp_ground_eval lemma:\n{}",
-        artifact.alethe,
+        "refutation must contain a checker-validated fp_ground_eval lemma",
     );
     assert!(
-        artifact.quality.is_complete(),
-        "proof must have zero trust/hole steps: {}\n{}",
-        artifact.quality,
-        artifact.alethe,
+        ay_proof::terminal_trust_report(proof).is_trust_free(),
+        "the native proof must contain no trust-family step",
     );
-    assert_eq!(
-        artifact.accept_for_consumer(ProofAcceptanceMode::Strict),
-        Ok(()),
+    assert!(
+        solver.export_last_unsat_artifact().is_none(),
+        "an FP proof must not claim a pinned-Carcara Alethe surface",
     );
+    let bundle = solver
+        .export_last_unsat_bundle()
+        .expect("the strict native FP proof must export an offline bundle");
+    let checked = re_check_bundle_strict(&bundle)
+        .expect("the native FP bundle must pass an independent offline replay");
+    assert!(checked.quality.is_complete(), "{}", checked.quality);
 }
 
 /// Regression (#fp-ground-cert): a GROUND floating-point refutation whose only

@@ -23,13 +23,20 @@
 //! Part of #1868 - Adaptive portfolio.
 //! See the development design notes for full design.
 
+mod array_ghost_candidate;
+
 use crate::adaptive_decision_log::DecisionEntry;
-use crate::adaptive_decision_log::DecisionLog;
+use crate::adaptive_decision_log::{AdaptiveSolveReport, DecisionLog};
 use crate::adaptive_prestage_budget::algebraic_prestage_budget;
 #[cfg(test)]
 use crate::adaptive_prestage_budget::{
     ALGEBRAIC_LARGE_ACYCLIC_BUDGET, ALGEBRAIC_POLYNOMIAL_PRESTAGE_BUDGET_CAP,
     ALGEBRAIC_PRESTAGE_BUDGET,
+};
+use crate::adaptive_route_admission::{
+    admit_dt_flatten_fanout, admit_dt_flatten_projection, admit_problem_clone_fanout,
+    scan_predicate_surface, scan_problem_surface, DtFlattenFanoutCaps, DtFlattenProjectionCaps,
+    RouteAdmissionFailure, RouteSurfaceCaps, RouteSurfaceStats,
 };
 use crate::chc_statistics::ChcStatistics;
 use crate::classifier::{ProblemClass, ProblemClassifier, ProblemFeatures};
@@ -40,7 +47,9 @@ use crate::pdr::{InvariantModel, PdrConfig, PdrResult, PdrSolver, PredicateInter
 use crate::portfolio::features::ChcFeatureExtractor;
 use crate::portfolio::selector::EngineSelector;
 use crate::portfolio::types::{BudgetPolicy, EngineType};
-use crate::portfolio::{PortfolioConfig, PortfolioResult, PortfolioSolver, PreprocessSummary};
+use crate::portfolio::{
+    EngineConfig, PortfolioConfig, PortfolioResult, PortfolioSolver, PreprocessSummary,
+};
 use crate::smt::SmtResult;
 use crate::synthesis::StructuralSynthesizer;
 use crate::transform::{
@@ -67,6 +76,35 @@ use std::time::Duration;
 /// already checks `is_zero()` in every budget-related branch (lines 561,
 /// 947, 961, 988, 1034) and treats zero as "no deadline".
 const DEFAULT_SOLVE_BUDGET: Duration = Duration::ZERO;
+
+/// Public reproducibility switch requested by embedding model checkers.
+///
+/// The typed builder remains authoritative when explicitly called after
+/// [`AdaptiveConfig::default`]; this environment variable only selects the
+/// default mode. Accepted true values are `1`, `true`, `yes`, and `on`
+/// (ASCII case-insensitive).
+const DETERMINISTIC_EXECUTION_ENV: &str = "AY_DETERMINISTIC";
+
+fn deterministic_execution_requested() -> bool {
+    std::env::var_os(DETERMINISTIC_EXECUTION_ENV)
+        .is_some_and(|value| deterministic_execution_value(&value))
+}
+
+fn deterministic_execution_value(value: &std::ffi::OsStr) -> bool {
+    matches!(
+        value.to_string_lossy().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Short fallback probes used by timed adaptive portfolios (W4-2B).
+///
+/// These are installed only when they shorten the capacity-aware default
+/// allocation. A short MODEL_CHECKER_CONSUMER row or a narrow machine therefore keeps the
+/// scheduler's fair wave share instead of letting a nominal fixed probe extend
+/// a wave and strand a queued engine.
+const BMC_STAGED_PROBE_BUDGET: Duration = Duration::from_secs(2);
+const KIND_STAGED_PROBE_BUDGET: Duration = Duration::from_secs(3);
 
 /// Stack size for the adaptive solver thread (#6847).
 ///
@@ -106,8 +144,148 @@ const TOP_MODEL_QUERY_CHECK_BUDGET: Duration = Duration::from_millis(500);
 const ARRAY_CONST_KEY_CEGAR_ROUTE_BUDGET: Duration = Duration::from_millis(750);
 const ARRAY_CONST_KEY_CEGAR_ROUTE_MIN_BUDGET: Duration = Duration::from_millis(50);
 const ARRAY_CONST_KEY_CEGAR_ROUTE_VALIDATION_RESERVE: Duration = Duration::from_millis(250);
-const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_CLAUSES: usize = 4096;
+/// Deterministic execution cannot rely on the adaptive array races that follow
+/// the short const-key probe. Give the same single-threaded, original-validated
+/// route a fixed larger share before falling back to the canonical portfolio.
+const DETERMINISTIC_ARRAY_CONST_KEY_CEGAR_ROUTE_BUDGET: Duration = Duration::from_secs(5);
+const DETERMINISTIC_ARRAY_CONST_KEY_CEGAR_ROUTE_VALIDATION_RESERVE: Duration =
+    Duration::from_secs(1);
+/// Deterministic counterpart of the adaptive array-forwarding/exact-acyclic
+/// lane. The MODEL_CHECKER_CONSUMER refcell family needs roughly twelve seconds in a debug
+/// build after forwarding, so keep a fixed margin while still reserving time
+/// for the canonical deterministic portfolio under a thirty-second run.
+///
+/// The synchronous forwarding transform cannot be interrupted mid-pass. Its
+/// elapsed time is nevertheless charged to this cap, and no BMC engine is
+/// launched if the cap has expired when the transform returns.
+const DETERMINISTIC_ARRAY_FORWARDED_ACYCLIC_BMC_ROUTE_BUDGET: Duration = Duration::from_secs(18);
+const DETERMINISTIC_ARRAY_FORWARDED_ACYCLIC_BMC_ROUTE_MIN_BUDGET: Duration =
+    Duration::from_millis(50);
+/// Hard admission envelope for the synchronous forwarding/flattening pass.
+/// The pass is not cooperatively cancellable while it is walking a clause, so
+/// deterministic execution admits it only after a bounded surface scan.
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_CLAUSES: usize = 4_096;
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_PREDICATES: usize = 4_096;
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_PREDICATE_ARITY: usize = 256;
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_DATATYPE_DEFS: usize = 512;
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_DATATYPE_MEMBERS: usize = 16_384;
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_EXPR_NODES_PER_CLAUSE: usize = 200_000;
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_TOTAL_EXPR_NODES: usize = 1_000_000;
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_VARIABLE_OCCURRENCES_PER_CLAUSE: usize = 4_096;
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_BODY_ATOMS_PER_CLAUSE: usize = 1_024;
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_TOTAL_BODY_ATOMS: usize = 65_536;
+/// Output/work caps for the synchronous datatype flattener. A compact shared
+/// metadata DAG can have exponentially many flattened columns, so input node
+/// and depth caps alone are insufficient.
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_PROJECTED_DT_ARITY: usize = 4_096;
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_PROJECTED_DT_ARG_OCCURRENCES: usize = 1_000_000;
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_PROJECTED_DT_TERM_COLUMNS: usize = 1_000_000;
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_PROJECTED_DT_WORK: usize = 2_000_000;
+/// Column-wise ITE distribution and selector/tester fallback clone input
+/// subexpressions. Bound that multiplicative allocation surface independently
+/// of the scalar-column count.
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_PROJECTED_DT_EXPR_CLONE_WORK: usize = 8_000_000;
+/// Aggregate bytes in names synthesized by datatype flattening. This is a
+/// pre-transform upper bound, not a memory-budget claim: String/AST overhead
+/// remains covered by the expression-clone and column caps above.
+const DETERMINISTIC_ARRAY_FORWARDED_MAX_PROJECTED_DT_GENERATED_NAME_BYTES: usize =
+    512 * 1024 * 1024;
+/// Covers fixed fragments and bounded decimal indices in generated component
+/// and wrong-variant-accessor names (`_vN_`, `_disc`, `_unit`, `dtflat_wva_*`).
+const DETERMINISTIC_ARRAY_FORWARDED_DT_GENERATED_NAME_OVERHEAD_PER_NODE: usize = 32;
+const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_CLAUSES: usize = 4_096;
+const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_PREDICATES: usize = 4_096;
+const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_PREDICATE_ARITY: usize = 256;
+const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_DATATYPE_DEFS: usize = 512;
+const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_DATATYPE_MEMBERS: usize = 16_384;
+const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_BODY_ATOMS_PER_CLAUSE: usize = 1_024;
+const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_TOTAL_BODY_ATOMS: usize = 65_536;
+const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_EXPR_NODES_PER_CLAUSE: usize = 200_000;
+const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_TOTAL_EXPR_NODES: usize = 1_000_000;
+const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_VARIABLE_OCCURRENCES_PER_CLAUSE: usize = 4_096;
+/// `collect_const_array_select_indices` stores at most one key per select.
+/// Bounding every select (including symbolic ones) is therefore a conservative
+/// pre-clone upper bound on both key collection and scalarized arity growth.
+const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_SELECT_KEY_OCCURRENCES: usize = 4_096;
+/// Scalarization can revisit/duplicate an input expression once per tracked
+/// key (notably the two-constraint expansion of every store equality). Bound
+/// that multiplicative surface before the synchronous transform starts.
+const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_REWRITE_VISITS: usize = 4_000_000;
+const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_PROJECTED_ARG_OCCURRENCES: usize = 1_000_000;
 const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_TRANSFORMED_ARITY: usize = 256;
+/// Aggregate textual surface admitted before deterministic route clones.
+/// AST node caps alone do not bound a single hostile symbol allocation.
+const DETERMINISTIC_ROUTE_MAX_SURFACE_NAME_BYTES: usize = 8 * 1024 * 1024;
+
+fn array_const_key_surface_caps() -> RouteSurfaceCaps {
+    RouteSurfaceCaps {
+        max_clauses: ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_CLAUSES,
+        max_predicates: ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_PREDICATES,
+        max_predicate_arity: ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_PREDICATE_ARITY,
+        max_actions: ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_CLAUSES,
+        max_datatype_defs: ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_DATATYPE_DEFS,
+        max_datatype_members: ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_DATATYPE_MEMBERS,
+        max_body_atoms_per_clause: ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_BODY_ATOMS_PER_CLAUSE,
+        max_total_body_atoms: ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_TOTAL_BODY_ATOMS,
+        max_expr_nodes_per_clause: ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_EXPR_NODES_PER_CLAUSE,
+        max_total_expr_nodes: ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_TOTAL_EXPR_NODES,
+        max_expr_depth: 256,
+        max_total_sort_nodes: ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_TOTAL_EXPR_NODES,
+        max_sort_depth: 256,
+        max_variable_occurrences_per_clause:
+            ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_VARIABLE_OCCURRENCES_PER_CLAUSE,
+        max_array_selects: ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_SELECT_KEY_OCCURRENCES,
+        max_const_key_rewrite_visits: ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_REWRITE_VISITS,
+        max_total_name_bytes: DETERMINISTIC_ROUTE_MAX_SURFACE_NAME_BYTES,
+    }
+}
+
+pub(crate) fn deterministic_array_forwarded_surface_caps() -> RouteSurfaceCaps {
+    RouteSurfaceCaps {
+        max_clauses: DETERMINISTIC_ARRAY_FORWARDED_MAX_CLAUSES,
+        max_predicates: DETERMINISTIC_ARRAY_FORWARDED_MAX_PREDICATES,
+        max_predicate_arity: DETERMINISTIC_ARRAY_FORWARDED_MAX_PREDICATE_ARITY,
+        max_actions: DETERMINISTIC_ARRAY_FORWARDED_MAX_CLAUSES,
+        max_datatype_defs: DETERMINISTIC_ARRAY_FORWARDED_MAX_DATATYPE_DEFS,
+        max_datatype_members: DETERMINISTIC_ARRAY_FORWARDED_MAX_DATATYPE_MEMBERS,
+        max_body_atoms_per_clause: DETERMINISTIC_ARRAY_FORWARDED_MAX_BODY_ATOMS_PER_CLAUSE,
+        max_total_body_atoms: DETERMINISTIC_ARRAY_FORWARDED_MAX_TOTAL_BODY_ATOMS,
+        max_expr_nodes_per_clause: DETERMINISTIC_ARRAY_FORWARDED_MAX_EXPR_NODES_PER_CLAUSE,
+        max_total_expr_nodes: DETERMINISTIC_ARRAY_FORWARDED_MAX_TOTAL_EXPR_NODES,
+        max_expr_depth: 256,
+        max_total_sort_nodes: DETERMINISTIC_ARRAY_FORWARDED_MAX_TOTAL_EXPR_NODES,
+        max_sort_depth: 256,
+        max_variable_occurrences_per_clause:
+            DETERMINISTIC_ARRAY_FORWARDED_MAX_VARIABLE_OCCURRENCES_PER_CLAUSE,
+        // Forwarding does not multiply predicate arguments by discovered keys;
+        // its expression-node caps already bound select traversal.
+        max_array_selects: DETERMINISTIC_ARRAY_FORWARDED_MAX_TOTAL_EXPR_NODES,
+        // This route never performs constant-key scalarization; its dedicated
+        // datatype projection meter bounds the transform that it does run.
+        max_const_key_rewrite_visits: usize::MAX,
+        max_total_name_bytes: DETERMINISTIC_ROUTE_MAX_SURFACE_NAME_BYTES,
+    }
+}
+
+fn deterministic_array_forwarded_dt_projection_caps() -> DtFlattenProjectionCaps {
+    DtFlattenProjectionCaps {
+        max_predicate_arity: DETERMINISTIC_ARRAY_FORWARDED_MAX_PROJECTED_DT_ARITY,
+        max_total_predicate_arg_occurrences:
+            DETERMINISTIC_ARRAY_FORWARDED_MAX_PROJECTED_DT_ARG_OCCURRENCES,
+        max_total_term_columns: DETERMINISTIC_ARRAY_FORWARDED_MAX_PROJECTED_DT_TERM_COLUMNS,
+        max_expansion_work: DETERMINISTIC_ARRAY_FORWARDED_MAX_PROJECTED_DT_WORK,
+    }
+}
+
+fn deterministic_array_forwarded_dt_fanout_caps() -> DtFlattenFanoutCaps {
+    DtFlattenFanoutCaps {
+        max_expr_clone_work: DETERMINISTIC_ARRAY_FORWARDED_MAX_PROJECTED_DT_EXPR_CLONE_WORK,
+        max_generated_name_bytes:
+            DETERMINISTIC_ARRAY_FORWARDED_MAX_PROJECTED_DT_GENERATED_NAME_BYTES,
+        generated_name_overhead_per_node:
+            DETERMINISTIC_ARRAY_FORWARDED_DT_GENERATED_NAME_OVERHEAD_PER_NODE,
+    }
+}
 /// Early exact preprocessing lane for compiler-generated LIA-array systems.
 ///
 /// Solidity ABI encodings in CHC-COMP commonly collapse from roughly
@@ -149,8 +327,28 @@ const ARRAY_GHOST_PAIR_ROUTE_NOMINAL_BUDGET: Duration = Duration::from_secs(8);
 const ARRAY_GHOST_PAIR_ROUTE_BUDGET_PERCENT: u32 = 30;
 const ARRAY_GHOST_PAIR_ROUTE_BUDGET_CAP: Duration = Duration::from_secs(45);
 const ARRAY_GHOST_PAIR_ROUTE_MIN_BUDGET: Duration = Duration::from_millis(500);
-const ARRAY_GHOST_PAIR_ROUTE_MAX_CLAUSES: usize = 64;
-const ARRAY_GHOST_PAIR_ROUTE_MAX_PREDICATES: usize = 24;
+/// Bounded input envelope for ghost instrumentation and its preprocessing
+/// clone.  The old 24-predicate/64-clause count gate rejected compiler wrapper
+/// graphs before the lane's own compaction pass could reduce them.  These caps
+/// admit the measured MODEL_CHECKER_CONSUMER scale while the node/depth/arity/name limits
+/// bound the actual synchronous work, rather than using declaration count as a
+/// proxy for it.
+const ARRAY_GHOST_PAIR_ROUTE_MAX_CLAUSES: usize = 512;
+const ARRAY_GHOST_PAIR_ROUTE_MAX_PREDICATES: usize = 256;
+const ARRAY_GHOST_PAIR_ROUTE_MAX_INPUT_ARITY: usize = 256;
+/// `GhostPairSpec` admits at most eight slots, each adding an index and value.
+const ARRAY_GHOST_PAIR_ROUTE_MAX_TRANSFORMED_ARITY: usize =
+    ARRAY_GHOST_PAIR_ROUTE_MAX_INPUT_ARITY + 16;
+const ARRAY_GHOST_PAIR_ROUTE_MAX_BODY_ATOMS_PER_CLAUSE: usize = 1_024;
+const ARRAY_GHOST_PAIR_ROUTE_MAX_TOTAL_BODY_ATOMS: usize = 65_536;
+const ARRAY_GHOST_PAIR_ROUTE_MAX_EXPR_NODES_PER_CLAUSE: usize = 200_000;
+const ARRAY_GHOST_PAIR_ROUTE_MAX_TOTAL_EXPR_NODES: usize = 1_000_000;
+const ARRAY_GHOST_PAIR_ROUTE_MAX_VARIABLE_OCCURRENCES_PER_CLAUSE: usize = 4_096;
+const ARRAY_GHOST_PAIR_ROUTE_MAX_SELECTS: usize = 4_096;
+/// At each explicit cloning boundary this route retains the source/raw problem
+/// while constructing one duplicate. This charges that known duplicate; it is
+/// not a claim about a global peak-byte model for all solver internals.
+const ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT: usize = 2;
 /// Preprocessing is used inside the ghost-pair lane only when it removes at
 /// least half of the predicates or clauses.  Otherwise the established raw
 /// ghost solve remains the fallback: reconstructing a nearly identical model
@@ -166,6 +364,71 @@ const ARRAY_GHOST_PAIR_FINALIZE_RECHECK_BUDGET: Duration = Duration::from_secs(2
 const DUAL_CAS_LRA_ARG_COUNT: usize = 9;
 const LIA_FARKAS_ROUTE_BUDGET: Duration = Duration::from_secs(3);
 const LIA_FARKAS_ROUTE_VALIDATION_RESERVE: Duration = Duration::from_millis(750);
+
+fn array_ghost_pair_surface_caps(max_predicate_arity: usize) -> RouteSurfaceCaps {
+    RouteSurfaceCaps {
+        max_clauses: ARRAY_GHOST_PAIR_ROUTE_MAX_CLAUSES,
+        max_predicates: ARRAY_GHOST_PAIR_ROUTE_MAX_PREDICATES,
+        max_predicate_arity,
+        max_actions: ARRAY_GHOST_PAIR_ROUTE_MAX_CLAUSES,
+        // MODEL_CHECKER_CONSUMER emits a reusable datatype prelude even when this route's
+        // active predicate signature is array/scalar-only.  Bound that unused
+        // metadata instead of treating its mere presence as datatype use.
+        max_datatype_defs: DETERMINISTIC_ARRAY_FORWARDED_MAX_DATATYPE_DEFS,
+        max_datatype_members: DETERMINISTIC_ARRAY_FORWARDED_MAX_DATATYPE_MEMBERS,
+        max_body_atoms_per_clause: ARRAY_GHOST_PAIR_ROUTE_MAX_BODY_ATOMS_PER_CLAUSE,
+        max_total_body_atoms: ARRAY_GHOST_PAIR_ROUTE_MAX_TOTAL_BODY_ATOMS,
+        max_expr_nodes_per_clause: ARRAY_GHOST_PAIR_ROUTE_MAX_EXPR_NODES_PER_CLAUSE,
+        max_total_expr_nodes: ARRAY_GHOST_PAIR_ROUTE_MAX_TOTAL_EXPR_NODES,
+        max_expr_depth: 256,
+        max_total_sort_nodes: ARRAY_GHOST_PAIR_ROUTE_MAX_TOTAL_EXPR_NODES,
+        max_sort_depth: 256,
+        max_variable_occurrences_per_clause:
+            ARRAY_GHOST_PAIR_ROUTE_MAX_VARIABLE_OCCURRENCES_PER_CLAUSE,
+        max_array_selects: ARRAY_GHOST_PAIR_ROUTE_MAX_SELECTS,
+        // This lane never performs constant-key scalarization. Its expression
+        // and select caps independently bound the two surfaces it traverses.
+        max_const_key_rewrite_visits: usize::MAX,
+        max_total_name_bytes: DETERMINISTIC_ROUTE_MAX_SURFACE_NAME_BYTES,
+    }
+}
+
+fn array_ghost_pair_clone_caps(max_predicate_arity: usize) -> RouteSurfaceCaps {
+    let caps = array_ghost_pair_surface_caps(max_predicate_arity);
+    RouteSurfaceCaps {
+        max_clauses: caps.max_clauses * ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+        max_predicates: caps.max_predicates * ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+        max_actions: caps.max_actions * ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+        max_datatype_defs: caps.max_datatype_defs * ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+        max_datatype_members: caps.max_datatype_members * ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+        max_total_body_atoms: caps.max_total_body_atoms * ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+        max_total_expr_nodes: caps.max_total_expr_nodes * ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+        max_total_sort_nodes: caps.max_total_sort_nodes * ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+        max_array_selects: caps.max_array_selects * ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+        max_total_name_bytes: caps.max_total_name_bytes * ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+        ..caps
+    }
+}
+
+/// A cap breach in an optional compacted solve shape keeps the already
+/// admitted raw path. Cooperative cancellation or deadline exhaustion cannot
+/// safely start another synchronous engine and therefore remains fail-closed.
+fn array_ghost_pair_preprocessed_surface_admitted(
+    problem: &ChcProblem,
+    cancellation: &crate::CancellationToken,
+    deadline: Instant,
+) -> Result<bool, RouteAdmissionFailure> {
+    match scan_problem_surface(
+        problem,
+        array_ghost_pair_surface_caps(ARRAY_GHOST_PAIR_ROUTE_MAX_TRANSFORMED_ARITY),
+        cancellation,
+        deadline,
+    ) {
+        Ok(_) => Ok(true),
+        Err(RouteAdmissionFailure::Cap(_)) => Ok(false),
+        Err(failure) => Err(failure),
+    }
+}
 
 fn should_prioritize_acyclic_bv_proof_prepass(
     features: &ProblemFeatures,
@@ -387,6 +650,33 @@ impl SolidityArrayDtValidationStatus {
     }
 }
 
+/// Scheduling mode for the adaptive CHC solver.
+///
+/// The production default races portfolio engines in parallel. Embedders that
+/// need reproducible regression measurements can select
+/// [`Self::DeterministicSequential`]: AY then runs only fixed-budget,
+/// single-threaded pre-strategies followed by the canonical engine order, and
+/// divides the remaining budget across those engines in that fixed order,
+/// without a race-to-first-result or winner grace period. Setting
+/// `AY_DETERMINISTIC=1` selects this mode in [`AdaptiveConfig::default`]; the
+/// typed builder can still override it explicitly.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AdaptiveExecutionMode {
+    /// Classification-driven adaptive solving with parallel engine races.
+    #[default]
+    AdaptiveParallel,
+    /// Fixed-order sequential portfolio solving.
+    DeterministicSequential,
+}
+
+/// Built-in short-probe roles for a route's fallback portfolio.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StagedProbeBudgetProfile {
+    CallerOnly,
+    BmcOnly,
+    BmcAndKind,
+}
+
 /// Adaptive portfolio solver configuration.
 #[derive(Debug, Clone)]
 pub struct AdaptiveConfig {
@@ -460,12 +750,17 @@ pub struct AdaptiveConfig {
     pub max_engines: Option<usize>,
     /// Per-portfolio term memory budget in bytes (#8629).
     ///
-    /// When `Some(bytes)`, the portfolio divides this budget equally across
-    /// engines: each engine's `term_memory_budget` is `bytes / engine_count`.
+    /// When `Some(bytes)`, a concrete portfolio divides this budget equally
+    /// across the workers that may be live at once.
+    ///
+    /// This is a term-store budget for one concrete portfolio, not aggregate
+    /// RSS isolation across nested/concurrent portfolios or validation work.
     ///
     /// When `None` (default), per-engine budgets fall back to the global
     /// `TermStore::per_engine_budget()`.
     pub(crate) memory_budget: Option<usize>,
+    /// Portfolio scheduling policy.
+    pub(crate) execution_mode: AdaptiveExecutionMode,
 }
 
 impl Default for AdaptiveConfig {
@@ -484,6 +779,11 @@ impl Default for AdaptiveConfig {
             preferred_engine_order: Vec::new(),
             max_engines: None,
             memory_budget: None,
+            execution_mode: if deterministic_execution_requested() {
+                AdaptiveExecutionMode::DeterministicSequential
+            } else {
+                AdaptiveExecutionMode::default()
+            },
         }
     }
 }
@@ -551,13 +851,13 @@ impl AdaptiveConfig {
 
     /// Builder: set a per-portfolio term memory budget in bytes (#8629).
     ///
-    /// When set, the portfolio divides this budget equally across engines.
-    /// Each engine's `term_memory_budget` is `bytes / engine_count`. This
-    /// enables multiple concurrent solves in a shared process (e.g., model-checker-consumer)
-    /// without OOM.
+    /// When set, each concrete portfolio divides this term-store budget across
+    /// the workers that may be live at once. Nested/concurrent portfolios and
+    /// validation can still allocate separately; callers that need a hard
+    /// process RSS envelope must enforce one outside this API.
     ///
     /// When not set, per-engine budgets fall back to the global process-level
-    /// limit divided by engine count.
+    /// limit divided by concurrent worker capacity.
     ///
     /// ```rust,no_run
     /// use ay_chc::AdaptiveConfig;
@@ -570,6 +870,32 @@ impl AdaptiveConfig {
     pub fn with_memory_budget(mut self, bytes: usize) -> Self {
         self.memory_budget = Some(bytes);
         self
+    }
+
+    /// Configured per-portfolio term-store budget in bytes.
+    #[must_use]
+    pub fn memory_budget(&self) -> Option<usize> {
+        self.memory_budget
+    }
+
+    /// Builder: select the portfolio scheduling policy.
+    ///
+    /// [`AdaptiveExecutionMode::DeterministicSequential`] bypasses adaptive
+    /// classification and parallel races. It runs fixed-budget deterministic
+    /// pre-strategies followed by the canonical portfolio in a fixed order.
+    /// The remaining time budget is split across the remaining engines by the
+    /// sequential scheduler, so one difficult engine cannot consume the
+    /// fallback engines' shares.
+    #[must_use]
+    pub fn with_execution_mode(mut self, mode: AdaptiveExecutionMode) -> Self {
+        self.execution_mode = mode;
+        self
+    }
+
+    /// Selected portfolio scheduling policy.
+    #[must_use]
+    pub fn execution_mode(&self) -> AdaptiveExecutionMode {
+        self.execution_mode
     }
 
     /// Builder: add user-provided lemma hints.
@@ -673,6 +999,12 @@ pub struct AdaptivePortfolio {
     /// Structured decision logger for observability. Active only when
     /// `AY_DECISION_LOG` environment variable is set.
     pub(crate) decision_log: DecisionLog,
+    /// Serializes authoritative invocations on this portfolio instance.
+    ///
+    /// Besides protecting shared progress/statistics state, this binds an
+    /// active observational trace to exactly one invocation. Callers that need
+    /// concurrent solves should construct independent portfolio instances.
+    solve_invocation_lock: Mutex<()>,
     /// Accumulated CHC statistics from all engine runs.
     ///
     /// Updated via [`accumulate_stats`](Self::accumulate_stats) from each PDR
@@ -693,6 +1025,47 @@ pub struct AdaptivePortfolio {
     /// lane's own `cancel_after` never poisons this shared token, while a
     /// `cancel()` on this token propagates into every lane.
     pub(crate) cancellation_token: crate::cancellation::CancellationToken,
+    /// One-shot construction boundary used by embedding entry points that need
+    /// preprocessing to consume the same wall-clock budget as solving.
+    authoritative_context: Option<AuthoritativeSolveContext>,
+    /// A constructor transform crossed cancellation/deadline at a stage
+    /// boundary. Such an invocation remains fail-closed even if a caller later
+    /// resets its parent cancellation token.
+    construction_aborted: bool,
+    /// Cross-thread view of the currently active authoritative deadline. Some
+    /// adaptive routes construct nested portfolios on scoped worker threads,
+    /// where the thread-local SMT deadline is not inherited.
+    active_solve_deadline: Mutex<Option<Instant>>,
+}
+
+#[derive(Clone, Copy)]
+struct AuthoritativeSolveContext {
+    started_at: Instant,
+    deadline: Option<Instant>,
+}
+
+impl AuthoritativeSolveContext {
+    fn new(budget: Duration) -> Self {
+        let started_at = Instant::now();
+        Self {
+            started_at,
+            deadline: (!budget.is_zero()).then_some(started_at + budget),
+        }
+    }
+}
+
+struct ActiveSolveDeadlineGuard<'a> {
+    slot: &'a Mutex<Option<Instant>>,
+    previous: Option<Instant>,
+}
+
+impl Drop for ActiveSolveDeadlineGuard<'_> {
+    fn drop(&mut self) {
+        match self.slot.lock() {
+            Ok(mut slot) => *slot = self.previous,
+            Err(poisoned) => *poisoned.into_inner() = self.previous,
+        }
+    }
 }
 
 impl Drop for AdaptivePortfolio {
@@ -730,7 +1103,56 @@ impl AdaptivePortfolio {
     /// REQUIRES: `problem` is a valid ChcProblem with at least one clause.
     ///
     /// ENSURES: Returns a solver ready to invoke `solve()`.
-    pub fn new(mut problem: ChcProblem, config: AdaptiveConfig) -> Self {
+    pub fn new(problem: ChcProblem, config: AdaptiveConfig) -> Self {
+        Self::new_impl(problem, config, None, None)
+    }
+
+    /// Construct a one-shot portfolio whose configured budget begins before
+    /// constructor preprocessing.
+    ///
+    /// Unlike [`Self::new`], this entry point accounts dead-end pruning and
+    /// array scalarization in the authoritative solve deadline and elapsed
+    /// telemetry. It is intended for embedding facades that construct and solve
+    /// immediately; reusing the returned portfolio preserves the original
+    /// absolute boundary and therefore eventually returns `Unknown`.
+    pub fn new_for_solve(problem: ChcProblem, config: AdaptiveConfig) -> Self {
+        let context = AuthoritativeSolveContext::new(config.time_budget);
+        Self::new_impl(problem, config, Some(context), None)
+    }
+
+    /// Cancellation-aware counterpart of [`Self::new_for_solve`].
+    ///
+    /// The parent is linked before constructor transforms start, so a
+    /// pre-existing or concurrent request stops the preprocessing pipeline at
+    /// its next stage boundary and permanently makes this one-shot invocation
+    /// fail closed.
+    pub fn new_for_solve_with_cancellation(
+        problem: ChcProblem,
+        config: AdaptiveConfig,
+        parent: &crate::cancellation::CancellationToken,
+    ) -> Self {
+        let context = AuthoritativeSolveContext::new(config.time_budget);
+        Self::new_impl(problem, config, Some(context), Some(parent))
+    }
+
+    fn new_impl(
+        mut problem: ChcProblem,
+        config: AdaptiveConfig,
+        authoritative_context: Option<AuthoritativeSolveContext>,
+        cancellation_parent: Option<&crate::cancellation::CancellationToken>,
+    ) -> Self {
+        let mut cancellation_token = crate::cancellation::CancellationToken::new();
+        if let Some(parent) = cancellation_parent {
+            cancellation_token.link_upstream(parent);
+        }
+        let construction_exhausted = || {
+            cancellation_token.is_cancelled()
+                || authoritative_context
+                    .and_then(|context| context.deadline)
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+        };
+        let mut construction_aborted = construction_exhausted();
+
         // Strip provably-dead-end predicates (no path to any query) when — and
         // only when — that removes the sole dependency cycle blocking the
         // complete bounded acyclic-BMC lane. Sound because a predicate that
@@ -741,42 +1163,102 @@ impl AdaptivePortfolio {
         // certificate-discharge check (`solver.problem()`). A no-op for all
         // problems outside the acyclic-modulo-dead-end class (see
         // `strip_dead_end_cycle_predicates`).
-        problem.strip_dead_end_cycle_predicates();
+        if !construction_aborted {
+            problem.strip_dead_end_cycle_predicates();
+            construction_aborted = construction_exhausted();
+        }
 
         // Part of #6047: keep the original (non-scalarized) problem for PDR,
         // which has native array MBP support and doesn't need scalarization.
         // Scalarize a separate copy for engines that need it (Kind, TRL, TPA).
         // This avoids the arity explosion from scalarizing BV-indexed arrays
         // (e.g., model-checker-consumer harnesses go from 68 to 191 params per predicate).
-        let mut scalarized = problem.clone();
-        scalarized.try_scalarize_const_array_selects();
-        let scalarized_problem = if scalarized
-            .predicates()
-            .iter()
-            .zip(problem.predicates().iter())
-            .any(|(s, o)| s.arg_sorts != o.arg_sorts)
-        {
-            // Scalarization changed the problem — keep both versions
-            Some(scalarized)
-        } else {
-            // No change — no Array params to scalarize
+        let scalarized_problem = if construction_aborted {
             None
+        } else {
+            let mut scalarized = problem.clone();
+            scalarized.try_scalarize_const_array_selects();
+            construction_aborted = construction_exhausted();
+            if construction_aborted {
+                None
+            } else if scalarized
+                .predicates()
+                .iter()
+                .zip(problem.predicates().iter())
+                .any(|(s, o)| s.arg_sorts != o.arg_sorts)
+            {
+                // Scalarization changed the problem — keep both versions
+                Some(scalarized)
+            } else {
+                // No change — no Array params to scalarize
+                None
+            }
         };
         let num_predicates = problem.predicates().len() as u64;
         let mut initial_stats = ChcStatistics::default();
-        initial_stats.record_tla_transition_cluster_applications(
-            profile_tla_transition_cluster_applications(&problem),
-        );
+        if !construction_aborted {
+            initial_stats.record_tla_transition_cluster_applications(
+                profile_tla_transition_cluster_applications(&problem),
+            );
+            construction_aborted = construction_exhausted();
+        }
 
         Self {
             problem,
             scalarized_problem,
             config,
             decision_log: DecisionLog::from_env(),
+            solve_invocation_lock: Mutex::new(()),
             accumulated_stats: Mutex::new(initial_stats),
             progress_snapshot: Arc::new(crate::progress::ChcProgressSnapshot::new(num_predicates)),
-            cancellation_token: crate::cancellation::CancellationToken::new(),
+            cancellation_token,
+            authoritative_context,
+            construction_aborted,
+            active_solve_deadline: Mutex::new(None),
         }
+    }
+
+    fn install_active_solve_deadline(
+        &self,
+        deadline: Option<Instant>,
+    ) -> ActiveSolveDeadlineGuard<'_> {
+        let previous = match self.active_solve_deadline.lock() {
+            Ok(mut slot) => std::mem::replace(&mut *slot, deadline),
+            Err(poisoned) => {
+                let mut slot = poisoned.into_inner();
+                std::mem::replace(&mut *slot, deadline)
+            }
+        };
+        ActiveSolveDeadlineGuard {
+            slot: &self.active_solve_deadline,
+            previous,
+        }
+    }
+
+    fn active_solve_deadline(&self) -> Option<Instant> {
+        match self.active_solve_deadline.lock() {
+            Ok(slot) => *slot,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    /// Earliest already-established caller boundary for a specialized
+    /// sub-solve whose own configuration supplies its local budget.
+    ///
+    /// This deliberately excludes `AdaptiveConfig::time_budget`: public
+    /// specialized entry points such as `solve_bmc_only` own a separate typed
+    /// budget, but must still inherit one-shot construction, active adaptive,
+    /// and ambient thread-local boundaries.
+    pub(crate) fn enclosing_subsolve_deadline(&self) -> Option<Instant> {
+        [
+            self.authoritative_context
+                .and_then(|context| context.deadline),
+            self.active_solve_deadline(),
+            crate::smt::current_thread_solve_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Get a clone of the progress snapshot handle for external observers.
@@ -808,6 +1290,23 @@ impl AdaptivePortfolio {
     /// flip Safe/Unsafe. The handle is idempotent and thread-safe.
     pub fn cancellation_handle(&self) -> crate::cancellation::CancellationToken {
         self.cancellation_token.clone()
+    }
+
+    /// Link this portfolio to a caller-owned cancellation token.
+    ///
+    /// Call this builder before starting [`solve`](Self::solve). Cancelling
+    /// `parent` then propagates through the adaptive stage scheduler and every
+    /// concrete engine token, while lane-local timeout cancellation never
+    /// cancels the caller's token. This is useful for wrappers that cannot
+    /// return [`cancellation_handle`](Self::cancellation_handle) before their
+    /// blocking solve begins.
+    #[must_use]
+    pub fn with_cancellation_parent(
+        mut self,
+        parent: &crate::cancellation::CancellationToken,
+    ) -> Self {
+        self.cancellation_token.link_upstream(parent);
+        self
     }
 
     /// Return a snapshot of accumulated CHC statistics.
@@ -959,15 +1458,167 @@ impl AdaptivePortfolio {
         // Wire the external cancellation handle (item 5): a stage that already
         // carries its own token additionally observes the portfolio handle
         // upstream, so an embedding driver's cancel reaches the running PDR
-        // lane. Stages WITHOUT a token are deliberately left untouched — a
-        // token's mere presence changes `has_budget` gating (main loop 5s SMT
-        // cap, stagnation windows) and the `solve_problem` case-split gate,
-        // and the default behavior of those paths must not change. Pure
-        // augmentation: with no external cancel the linked token behaves
-        // identically.
+        // lane. A finite-timeout stage already has budget-aware PDR semantics,
+        // so attaching a child token does not change its `has_budget` gates. An
+        // unbounded stage observes the same handle through the separate external
+        // token, preserving its historical no-token/no-timeout search policy.
         if let Some(token) = &mut pdr.cancellation_token {
             token.link_upstream(&self.cancellation_token);
+        } else if pdr.solve_timeout.is_some() {
+            pdr.cancellation_token = Some(self.cancellation_token.child());
+        } else if pdr.external_cancellation_token.is_none() {
+            pdr.external_cancellation_token = Some(self.cancellation_token.child());
         }
+    }
+
+    fn apply_caller_engine_budgets(&self, config: &mut PortfolioConfig) {
+        for (engine, policy) in &self.config.engine_budgets {
+            config.engine_budgets.insert(*engine, *policy);
+        }
+    }
+
+    /// Fair per-lane allocation before a parallel route installs short caps.
+    fn staged_probe_default_share(
+        config: &PortfolioConfig,
+        authoritative_cap: Option<Duration>,
+    ) -> Option<Duration> {
+        let engine_count = config
+            .engines
+            .iter()
+            .filter(|engine| config.budget_policy(engine.engine_type()) != BudgetPolicy::Disabled)
+            .count();
+        if engine_count == 0 || !config.parallel {
+            return None;
+        }
+
+        let total = match (config.parallel_timeout, authoritative_cap) {
+            (Some(configured), Some(cap)) => configured.min(cap),
+            (Some(configured), None) => configured,
+            (None, Some(cap)) => cap,
+            (None, None) => return None,
+        };
+        if total.is_zero() {
+            return None;
+        }
+
+        let worker_limit = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .clamp(1, engine_count);
+        let allocation_rounds = engine_count.div_ceil(worker_limit);
+        let divisor = u32::try_from(allocation_rounds).unwrap_or(u32::MAX);
+        Some(total / divisor)
+    }
+
+    fn staged_probe_role_is_primary(config: &PortfolioConfig, engine: EngineType) -> bool {
+        if config
+            .engines
+            .iter()
+            .find(|candidate| {
+                config.budget_policy(candidate.engine_type()) != BudgetPolicy::Disabled
+            })
+            .is_some_and(|candidate| candidate.engine_type() == engine)
+        {
+            return true;
+        }
+
+        engine == EngineType::Bmc
+            && config.engines.iter().any(|candidate| {
+                config.budget_policy(candidate.engine_type()) != BudgetPolicy::Disabled
+                    && matches!(
+                        candidate,
+                        EngineConfig::Bmc(bmc) if bmc.acyclic_safe || bmc.time_budget.is_some()
+                    )
+            })
+    }
+
+    fn install_staged_probe_default(
+        config: &mut PortfolioConfig,
+        engine: EngineType,
+        budget: Duration,
+        default_share: Duration,
+    ) {
+        if budget < default_share
+            && !Self::staged_probe_role_is_primary(config, engine)
+            && !config.engine_budgets.contains_key(&engine)
+            && config.engines.iter().any(|candidate| {
+                candidate.engine_type() == engine
+                    && config.budget_policy(candidate.engine_type()) != BudgetPolicy::Disabled
+            })
+        {
+            config
+                .engine_budgets
+                .insert(engine, BudgetPolicy::Fixed(budget));
+        }
+    }
+
+    /// Install route defaults without allowing them to extend a fair wave.
+    ///
+    /// The defaults are performance caps, never admission reservations. They
+    /// are omitted when a short row's capacity-aware fair share is already at
+    /// or below the nominal probe duration. Primary, proof-complete, and
+    /// explicitly budgeted lanes are never converted into probes. Explicit
+    /// caller policies always take precedence over these defaults.
+    pub(crate) fn reconcile_staged_probe_budget_defaults(
+        config: &mut PortfolioConfig,
+        profile: StagedProbeBudgetProfile,
+        caller_budgets: &[(EngineType, BudgetPolicy)],
+        authoritative_cap: Option<Duration>,
+    ) {
+        for (engine, budget) in [
+            (EngineType::Bmc, BMC_STAGED_PROBE_BUDGET),
+            (EngineType::Kind, KIND_STAGED_PROBE_BUDGET),
+        ] {
+            if config.engine_budgets.get(&engine) == Some(&BudgetPolicy::Fixed(budget)) {
+                config.engine_budgets.remove(&engine);
+            }
+        }
+
+        // Resolve explicit caller policies before inspecting the final active
+        // roster. In particular, a disabled leading engine must not conceal
+        // that its successor is now the primary lane.
+        for (engine, policy) in caller_budgets {
+            config.engine_budgets.insert(*engine, *policy);
+        }
+
+        if let Some(default_share) = Self::staged_probe_default_share(config, authoritative_cap) {
+            match profile {
+                StagedProbeBudgetProfile::CallerOnly => {}
+                StagedProbeBudgetProfile::BmcOnly => Self::install_staged_probe_default(
+                    config,
+                    EngineType::Bmc,
+                    BMC_STAGED_PROBE_BUDGET,
+                    default_share,
+                ),
+                StagedProbeBudgetProfile::BmcAndKind => {
+                    Self::install_staged_probe_default(
+                        config,
+                        EngineType::Bmc,
+                        BMC_STAGED_PROBE_BUDGET,
+                        default_share,
+                    );
+                    Self::install_staged_probe_default(
+                        config,
+                        EngineType::Kind,
+                        KIND_STAGED_PROBE_BUDGET,
+                        default_share,
+                    );
+                }
+            }
+        }
+    }
+
+    pub(crate) fn apply_staged_probe_budget_defaults(
+        &self,
+        config: &mut PortfolioConfig,
+        profile: StagedProbeBudgetProfile,
+    ) {
+        Self::reconcile_staged_probe_budget_defaults(
+            config,
+            profile,
+            &self.config.engine_budgets,
+            None,
+        );
     }
 
     /// Apply user hints, providers, budget policies, and engine ordering to a portfolio config.
@@ -978,12 +1629,8 @@ impl AdaptivePortfolio {
         if !self.config.user_hint_providers.0.is_empty() {
             config.set_pdr_user_hint_providers(self.config.user_hint_providers.clone());
         }
-        // Forward per-engine budget policies from AdaptiveConfig (#8418).
-        if !self.config.engine_budgets.is_empty() {
-            for (engine, policy) in &self.config.engine_budgets {
-                config.engine_budgets.insert(*engine, *policy);
-            }
-        }
+        // Caller policies override route defaults (#8418, W4-2B).
+        self.apply_caller_engine_budgets(config);
         // Forward preferred engine order from AdaptiveConfig (#8418).
         if !self.config.preferred_engine_order.is_empty() {
             config.reorder_engines(&self.config.preferred_engine_order);
@@ -1001,13 +1648,33 @@ impl AdaptivePortfolio {
         }
     }
 
-    /// Run a portfolio solver with user hints and budget policies applied.
-    pub(crate) fn run_portfolio(&self, mut config: PortfolioConfig) -> PortfolioResult {
-        self.apply_user_hints_portfolio(&mut config);
-
+    /// Finalize caller ordering/caps before a portfolio is constructed.
+    pub(crate) fn prepare_portfolio_config(
+        &self,
+        config: &mut PortfolioConfig,
+        profile: StagedProbeBudgetProfile,
+    ) {
+        self.apply_user_hints_portfolio(config);
+        // Disabled roles do not consume the caller's active-engine cap. This
+        // is idempotent with the constructor's final policy filter.
+        let _ = config.apply_budget_policies();
         if let Some(max) = self.config.max_engines {
             config.engines.truncate(max);
         }
+        self.apply_staged_probe_budget_defaults(config, profile);
+    }
+
+    /// Run a portfolio solver with user hints and budget policies applied.
+    pub(crate) fn run_portfolio(&self, config: PortfolioConfig) -> PortfolioResult {
+        self.run_portfolio_with_deterministic_deadline(config, None)
+    }
+
+    fn run_portfolio_with_deterministic_deadline(
+        &self,
+        mut config: PortfolioConfig,
+        deterministic_deadline: Option<Instant>,
+    ) -> PortfolioResult {
+        self.prepare_portfolio_config(&mut config, StagedProbeBudgetProfile::BmcAndKind);
 
         // Update live progress snapshot with engine names (#8155).
         if !config.engines.is_empty() {
@@ -1015,7 +1682,49 @@ impl AdaptivePortfolio {
             self.progress_snapshot.set_active_engine(first_engine, 0);
         }
 
-        PortfolioSolver::new(self.problem.clone(), config).solve()
+        self.make_portfolio_solver(config, deterministic_deadline)
+            .solve()
+    }
+
+    fn make_portfolio_solver(
+        &self,
+        config: PortfolioConfig,
+        deterministic_deadline: Option<Instant>,
+    ) -> PortfolioSolver {
+        // Nested portfolio construction must never replace an enclosing
+        // deadline with a later route-local one. Pick the earliest visible
+        // boundary across the explicit deterministic schedule, this thread's
+        // SMT scope, and the cross-thread authoritative invocation.
+        let construction_deadline = [
+            deterministic_deadline,
+            crate::smt::current_thread_solve_deadline(),
+            self.active_solve_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let mut solver = PortfolioSolver::new_with_solve_limits(
+            self.problem.clone(),
+            config,
+            construction_deadline,
+        );
+        // Constructor preprocessing consumes the same absolute row budget.
+        // Reconcile once more against the actual remainder and the constructor's
+        // final roster (after Disabled policies were removed) so a nominal
+        // short probe can never exceed the fair post-preprocessing wave share.
+        let authoritative_cap = construction_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        Self::reconcile_staged_probe_budget_defaults(
+            solver.config_mut_for_budget_reconciliation(),
+            StagedProbeBudgetProfile::BmcAndKind,
+            &self.config.engine_budgets,
+            authoritative_cap,
+        );
+        if self.config.execution_mode == AdaptiveExecutionMode::DeterministicSequential {
+            solver.with_deterministic_sequential_schedule(deterministic_deadline)
+        } else {
+            solver
+        }
     }
 
     #[allow(dead_code)] // Quarantined from default promotion until Real/LRA wrong=0 evidence exists.
@@ -1084,6 +1793,7 @@ impl AdaptivePortfolio {
             PdrConfig {
                 verbose: self.config.verbose,
                 strict_proofs: true,
+                cancellation_token: Some(self.cancellation_token.child()),
                 solve_timeout: Some(Duration::from_secs(30)),
                 disable_array_scalarization: true,
                 ..PdrConfig::default()
@@ -1516,6 +2226,7 @@ impl AdaptivePortfolio {
         let validation_config = PdrConfig {
             verbose: self.config.verbose,
             strict_proofs: true,
+            cancellation_token: Some(self.cancellation_token.child()),
             solve_timeout: Some(validation_budget),
             disable_array_scalarization: true,
             preserve_original_clauses: true,
@@ -1887,6 +2598,33 @@ impl AdaptivePortfolio {
     /// ENSURES: `VerifiedChcResult::Unknown` is returned if:
     ///          - No strategy could determine satisfiability within the budget
     pub fn solve(&self) -> crate::VerifiedChcResult {
+        let _invocation = self.lock_solve_invocation();
+        self.solve_authoritative()
+    }
+
+    fn lock_solve_invocation(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.solve_invocation_lock.lock() {
+            Ok(guard) => guard,
+            // A prior solver panic must not permanently disable this instance;
+            // the guarded value carries no semantic state.
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn solve_authoritative(&self) -> crate::VerifiedChcResult {
+        // Resolve the caller-visible boundary before moving the solve onto its
+        // large-stack worker. Thread-local enclosing deadlines are not
+        // inherited by spawned threads, and starting the configured budget in
+        // the worker would also exclude spawn/join overhead from the public
+        // contract.
+        let deadline = self.solve_deadline();
+        self.solve_authoritative_with_deadline(deadline)
+    }
+
+    fn solve_authoritative_with_deadline(
+        &self,
+        deadline: Option<Instant>,
+    ) -> crate::VerifiedChcResult {
         // Single choke point for the body-`forall` over-approximation. The
         // parser strips a body-position `forall`, which WEAKENS the antecedent:
         // proofs survive a fortiori, but a counterexample may be fabricated by
@@ -1894,18 +2632,49 @@ impl AdaptivePortfolio {
         //
         // The ONLY transition this can cause is `Unsafe -> Unknown`. `Safe` and
         // `Unknown` pass through untouched, so no proof can be gained or lost.
-        let result = self.solve_inner_for_polarity_guard();
+        let result = self.solve_inner_for_polarity_guard(deadline);
+        let guarded = self.apply_quantifier_polarity_guard(result);
+        // Recheck on the caller after joining the worker. A decisive result
+        // finalized just before cancellation/deadline expiry must not cross
+        // the public boundary after it.
+        self.enforce_authoritative_publication_boundary(guarded, deadline)
+    }
+
+    fn enforce_authoritative_publication_boundary(
+        &self,
+        result: crate::VerifiedChcResult,
+        deadline: Option<Instant>,
+    ) -> crate::VerifiedChcResult {
+        if self.budget_exhausted(deadline)
+            && matches!(
+                &result,
+                crate::VerifiedChcResult::Safe(_) | crate::VerifiedChcResult::Unsafe(_)
+            )
+        {
+            crate::VerifiedChcResult::Unknown(crate::engine_result::VerifiedUnknownMarker::new())
+        } else {
+            result
+        }
+    }
+
+    fn apply_quantifier_polarity_guard(
+        &self,
+        result: crate::VerifiedChcResult,
+    ) -> crate::VerifiedChcResult {
         if self.problem.has_stripped_body_forall()
             && matches!(result, crate::VerifiedChcResult::Unsafe(_))
         {
             return crate::VerifiedChcResult::Unknown(
-                crate::engine_result::VerifiedUnknownMarker::new(),
+                crate::engine_result::VerifiedUnknownMarker::overapproximated_refutation(),
             );
         }
         result
     }
 
-    fn solve_inner_for_polarity_guard(&self) -> crate::VerifiedChcResult {
+    fn solve_inner_for_polarity_guard(
+        &self,
+        deadline: Option<Instant>,
+    ) -> crate::VerifiedChcResult {
         // Run on a dedicated thread with a large stack to prevent stack
         // overflow from deep Arc<ChcExpr> recursive Drop (#6847).
         // The adaptive solver runs probe PDR, Kind, and retry engines
@@ -1916,7 +2685,7 @@ impl AdaptivePortfolio {
             match std::thread::Builder::new()
                 .name("ay-adaptive-solver".to_string())
                 .stack_size(ADAPTIVE_SOLVER_STACK_SIZE)
-                .spawn_scoped(scope, || self.solve_with_escalation_retry())
+                .spawn_scoped(scope, || self.solve_with_escalation_retry(deadline))
             {
                 Ok(handle) => match handle.join() {
                     Ok(result) => result,
@@ -1925,7 +2694,7 @@ impl AdaptivePortfolio {
                     Err(payload) => std::panic::resume_unwind(payload),
                 },
                 // Fallback: run on calling thread if spawn fails
-                Err(_) => self.solve_with_escalation_retry(),
+                Err(_) => self.solve_with_escalation_retry(deadline),
             }
         })
     }
@@ -1942,13 +2711,20 @@ impl AdaptivePortfolio {
     ///
     /// Exactly one retry round — this is a straight-line second call, not
     /// recursion, so it cannot loop.
-    fn solve_with_escalation_retry(&self) -> crate::VerifiedChcResult {
+    fn solve_with_escalation_retry(&self, deadline: Option<Instant>) -> crate::VerifiedChcResult {
         let solve_start = Instant::now();
-        let deadline = self.solve_deadline();
+        let _active_deadline = self.install_active_solve_deadline(deadline);
+        // Make the same absolute boundary visible to every SMT context and to
+        // constructor preprocessing performed by nested portfolio routes.
+        let _solve_deadline = crate::smt::ScopedSolveDeadline::new(deadline);
         let (result, evidence) = self.solve_internal(deadline);
         let verified = self.finalize_verified_result_with_deadline(result, evidence, deadline);
+        self.log_adaptive_round("initial", solve_start, &verified);
 
         if !matches!(verified, crate::VerifiedChcResult::Unknown(_)) {
+            return verified;
+        }
+        if self.config.execution_mode == AdaptiveExecutionMode::DeterministicSequential {
             return verified;
         }
         // Unbounded runs have no deadline to escalate against: solve_internal
@@ -1983,139 +2759,121 @@ impl AdaptivePortfolio {
             );
         }
 
+        let retry_start = Instant::now();
         let (result, evidence) = self.solve_internal(deadline);
-        self.finalize_verified_result_with_deadline(result, evidence, deadline)
+        let verified = self.finalize_verified_result_with_deadline(result, evidence, deadline);
+        self.log_adaptive_round("escalation_retry", retry_start, &verified);
+        verified
     }
 
-    /// Solve with budget reporting (#8418).
+    fn log_adaptive_round(
+        &self,
+        round: &'static str,
+        started: Instant,
+        result: &crate::VerifiedChcResult,
+    ) {
+        self.decision_log.log_decision(DecisionEntry {
+            stage: "adaptive_round",
+            gate_result: true,
+            gate_reason: round.to_string(),
+            budget_secs: self.config.time_budget.as_secs_f64(),
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            result: Self::verified_result_to_str(result),
+            lemmas_learned: 0,
+            max_frame: 0,
+        });
+    }
+
+    /// Solve through the authoritative production pipeline and report its
+    /// whole-run wall-clock consumption (#8418).
     ///
-    /// Like [`solve`](Self::solve) but also returns a `BudgetReport` with
-    /// per-engine timing data: how much budget was allocated, how much was
-    /// consumed, and why each engine stopped.
-    ///
-    /// This is the primary API for callers (e.g., model-checker-consumer) that need post-solve
-    /// budget observability to tune engine allocation policies.
+    /// The returned verdict is produced by the exact same [`solve`](Self::solve)
+    /// path, including adaptive routing, validation, quantifier-polarity guards,
+    /// and deterministic-mode selection. `BudgetReport::entries` is currently
+    /// empty: the concrete portfolio can report individual engine timings, but
+    /// the adaptive pipeline also contains specialized proof stages. Reporting
+    /// only the portfolio subset would be incomplete and, historically, this
+    /// method selected a materially different strategy pipeline merely to
+    /// manufacture those entries. AY deliberately reports less telemetry here
+    /// rather than bind an authoritative verdict to a different invocation.
+    /// `total_elapsed` includes constructor preprocessing when this instance
+    /// was created with [`Self::new_for_solve`] or
+    /// [`Self::new_for_solve_with_cancellation`]; instances created with
+    /// [`Self::new`] retain the reusable-constructor contract and start timing
+    /// when this method is invoked.
     ///
     /// # Example
     ///
     /// ```rust,no_run
-    /// use ay_chc::{AdaptiveConfig, AdaptivePortfolio, EngineType, BudgetPolicy, BudgetReport};
+    /// use ay_chc::{AdaptiveConfig, AdaptivePortfolio};
     /// use std::time::Duration;
     ///
     /// # fn example(problem: ay_chc::ChcProblem) {
-    /// let config = AdaptiveConfig::with_budget(Duration::from_secs(120), false)
-    ///     .with_engine_budget(EngineType::Pdr, BudgetPolicy::MinPercent(40))
-    ///     .with_engine_budget(EngineType::Bmc, BudgetPolicy::MinPercent(20));
+    /// let config = AdaptiveConfig::with_budget(Duration::from_secs(120), false);
     /// let solver = AdaptivePortfolio::new(problem, config);
     /// let (result, report) = solver.solve_with_budget_report();
-    /// for entry in &report.entries {
-    ///     eprintln!("{}: {:.1}s / {:.1}s ({:?})",
-    ///         entry.engine.name(),
-    ///         entry.elapsed.as_secs_f64(),
-    ///         entry.budget_allocated.as_secs_f64(),
-    ///         entry.stop_reason);
-    /// }
+    /// eprintln!("{result:?} in {:.1}s", report.total_elapsed.as_secs_f64());
     /// # }
     /// ```
     pub fn solve_with_budget_report(
         &self,
     ) -> (crate::VerifiedChcResult, crate::portfolio::BudgetReport) {
-        std::thread::scope(|scope| {
-            match std::thread::Builder::new()
-                .name("ay-adaptive-solver-report".to_string())
-                .stack_size(ADAPTIVE_SOLVER_STACK_SIZE)
-                .spawn_scoped(scope, || self.solve_with_budget_report_impl())
-            {
-                Ok(handle) => match handle.join() {
-                    Ok(result) => result,
-                    Err(payload) => std::panic::resume_unwind(payload),
-                },
-                Err(_) => {
-                    // Fallback: run on calling thread
-                    self.solve_with_budget_report_impl()
-                }
-            }
-        })
-    }
-
-    fn solve_with_budget_report_impl(
-        &self,
-    ) -> (crate::VerifiedChcResult, crate::portfolio::BudgetReport) {
+        let _invocation = self.lock_solve_invocation();
+        let started = self
+            .authoritative_context
+            .map_or_else(Instant::now, |context| context.started_at);
+        // Resolve once and reuse after report assembly. Recomputing for a
+        // reusable solver would reopen a fresh configured budget.
         let deadline = self.solve_deadline();
-        if self.problem.has_complex_query_only_vacuous_safety_shape() {
-            // w10: attempt a fully validated constant-model Safe before the
-            // #8865 fail-closed Unknown (see try_vacuous_query_only_validated_safe).
-            if let Some(result) = self.try_vacuous_query_only_validated_safe(deadline) {
-                if self.config.verbose {
-                    safe_eprintln!(
-                        "Adaptive: complex query-only problem is syntactically unreachable; \
-                         constant-model completion fully verified on original clauses — Safe"
-                    );
-                }
-                let verified = self.finalize_verified_result_with_deadline(
-                    result,
-                    ValidationEvidence::FullVerification,
-                    deadline,
-                );
-                return (verified, crate::portfolio::BudgetReport::new());
-            }
-            if self.config.verbose {
-                safe_eprintln!(
-                    "Adaptive: complex query-only problem is syntactically unreachable; demoting vacuous Safe proof to Unknown"
-                );
-            }
-            let verified = self.finalize_verified_result_with_deadline(
-                PortfolioResult::Unknown,
-                ValidationEvidence::FullVerification,
-                deadline,
-            );
-            return (verified, crate::portfolio::BudgetReport::new());
-        }
-
-        if let Some(result) = self.try_acyclic_budget_report_prepass(deadline) {
-            return result;
-        }
-
-        let mut config = self.make_default_portfolio_config();
-        self.apply_user_hints_portfolio(&mut config);
-        let solver = PortfolioSolver::new(self.problem.clone(), config);
-        let (result, report) = solver.solve_with_budget_report();
-        let verified = self.finalize_verified_result_with_deadline(
-            result,
-            ValidationEvidence::FullVerification,
-            deadline,
-        );
-        (verified, report)
+        let result = self.solve_authoritative_with_deadline(deadline);
+        let mut report = crate::portfolio::BudgetReport::new();
+        report.total_elapsed = started.elapsed();
+        let result = self.enforce_authoritative_publication_boundary(result, deadline);
+        (result, report)
     }
 
-    fn try_acyclic_budget_report_prepass(
-        &self,
-        deadline: Option<Instant>,
-    ) -> Option<(crate::VerifiedChcResult, crate::portfolio::BudgetReport)> {
-        let features = ProblemClassifier::classify(&self.problem);
-        if features.has_cycles || features.num_predicates <= 1 || !self.problem.has_bv_sorts() {
-            return None;
-        }
-
-        if self.config.verbose {
-            safe_eprintln!(
-                "Adaptive: Budget-report acyclic BMC prepass (preds={}, dag_depth={}, bv=true)",
-                features.num_predicates,
-                features.dag_depth
-            );
-        }
-
-        let (result, evidence) = self.try_acyclic_bmc_probe(&features, deadline)?;
-
-        let verified = self.finalize_verified_result_with_deadline(result, evidence, deadline);
-        if matches!(
-            verified,
-            crate::VerifiedChcResult::Safe(_) | crate::VerifiedChcResult::Unsafe(_)
-        ) {
-            Some((verified, crate::portfolio::BudgetReport::new()))
-        } else {
-            None
-        }
+    /// Solve through the authoritative production pipeline with typed adaptive
+    /// strategy/lane attribution.
+    ///
+    /// This executes the same private authoritative body and invocation lock
+    /// as [`solve`](Self::solve). It neither selects a reporting-only pipeline
+    /// nor performs a diagnostic re-run. Specialized lanes are named directly
+    /// instead of being forced into [`crate::EngineType`]. As with
+    /// [`Self::solve_with_budget_report`], constructor time is included only
+    /// for the controlled one-shot constructors.
+    pub fn solve_with_adaptive_report(&self) -> (crate::VerifiedChcResult, AdaptiveSolveReport) {
+        // Acquire before opening the trace so another report or an ordinary
+        // `solve()` on this same portfolio cannot contribute observations.
+        let _invocation = self.lock_solve_invocation();
+        let trace_session = self.decision_log.begin_trace();
+        let started = self
+            .authoritative_context
+            .map_or_else(Instant::now, |context| context.started_at);
+        // Keep the exact boundary that governed the solve. Calling
+        // `solve_deadline` again after report work would reset the budget for
+        // reusable portfolios.
+        let deadline = self.solve_deadline();
+        let result = self.solve_authoritative_with_deadline(deadline);
+        let elapsed = started.elapsed();
+        self.decision_log.log_decision(DecisionEntry {
+            stage: "authoritative_solve",
+            gate_result: true,
+            gate_reason: "production AdaptivePortfolio::solve invocation".to_string(),
+            budget_secs: self.config.time_budget.as_secs_f64(),
+            elapsed_secs: elapsed.as_secs_f64(),
+            result: Self::verified_result_to_str(&result),
+            lemmas_learned: 0,
+            max_frame: 0,
+        });
+        let strategy_trace = trace_session.finish();
+        let mut report = crate::portfolio::BudgetReport::new();
+        report.total_elapsed = elapsed;
+        let report = AdaptiveSolveReport::new(report, strategy_trace);
+        // Decision logging and trace extraction may block or allocate after
+        // the solve's caller-side gate. Recheck only after the complete report
+        // exists so a decisive verdict cannot cross this public boundary late.
+        let result = self.enforce_authoritative_publication_boundary(result, deadline);
+        (result, report)
     }
 
     /// Panic-safe variant of [`solve`](Self::solve).
@@ -2233,6 +2991,7 @@ impl AdaptivePortfolio {
         let validation_config = PdrConfig {
             verbose: self.config.verbose,
             strict_proofs: true,
+            cancellation_token: Some(self.cancellation_token.child()),
             solve_timeout: Some(validation_budget),
             disable_array_scalarization: true,
             preserve_original_clauses: true,
@@ -2879,7 +3638,7 @@ impl AdaptivePortfolio {
             .with_time_budget(bmc_budget)
             .with_per_depth_timeout(bmc_budget)
             .with_verbose(self.config.verbose)
-            .with_cancellation(bmc_cancel);
+            .with_cancellation(bmc_cancel.clone());
         let bmc_result =
             crate::bmc::BmcSolver::new(summary.transformed_problem.clone(), bmc).solve();
         let bmc_result_name = Self::result_to_str(&bmc_result);
@@ -2889,6 +3648,7 @@ impl AdaptivePortfolio {
                 summary.back_translator.as_ref(),
                 &self.problem,
                 &cex,
+                &bmc_cancel,
             );
             let validation_budget = route_deadline
                 .saturating_duration_since(Instant::now())
@@ -2936,7 +3696,7 @@ impl AdaptivePortfolio {
         let mut pdr = PdrConfig::lia_farkas_profile(self.config.verbose);
         pdr.solve_timeout = Some(pdr_budget);
         pdr.strict_proofs = true;
-        pdr.cancellation_token = Some(pdr_cancel);
+        pdr.cancellation_token = Some(pdr_cancel.clone());
         self.apply_user_hints(&mut pdr);
         let result_with_stats =
             PdrSolver::solve_problem_with_stats(&summary.transformed_problem, pdr);
@@ -2963,6 +3723,7 @@ impl AdaptivePortfolio {
                         summary.back_translator.as_ref(),
                         &self.problem,
                         &cex,
+                        &pdr_cancel,
                     );
                 let validation_budget = route_deadline
                     .saturating_duration_since(Instant::now())
@@ -3012,63 +3773,342 @@ impl AdaptivePortfolio {
         result
     }
 
+    /// Conservative pre-scalarization growth bound. Every distinct collected
+    /// key comes from a select occurrence, so using the total select count can
+    /// over-reject duplicate/symbolic keys but cannot underestimate the clone
+    /// and projection work performed after admission.
+    fn const_key_projected_surface_admission(
+        &self,
+        surface: &RouteSurfaceStats,
+        deadline: Instant,
+    ) -> Result<(), RouteAdmissionFailure> {
+        let key_bound = surface.array_selects;
+        let mut projected_arities = Vec::with_capacity(self.problem.predicates().len());
+        for predicate in self.problem.predicates() {
+            if self.cancellation_token.is_cancelled() {
+                return Err(RouteAdmissionFailure::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(RouteAdmissionFailure::Deadline);
+            }
+            let scalarizable_arrays = predicate
+                .arg_sorts
+                .iter()
+                .filter(|sort| {
+                    matches!(sort,
+                        ChcSort::Array(key, value)
+                            if matches!(key.as_ref(), ChcSort::Int | ChcSort::BitVec(_))
+                                && matches!(value.as_ref(), ChcSort::Bool | ChcSort::Int | ChcSort::Real | ChcSort::BitVec(_)))
+                })
+                .count();
+            let Some(projected_array_args) = scalarizable_arrays.checked_mul(key_bound) else {
+                return Err(RouteAdmissionFailure::Cap(
+                    "projected predicate arity overflow".to_string(),
+                ));
+            };
+            let Some(projected) = predicate
+                .arity()
+                .saturating_sub(scalarizable_arrays)
+                .checked_add(projected_array_args)
+            else {
+                return Err(RouteAdmissionFailure::Cap(
+                    "projected predicate arity overflow".to_string(),
+                ));
+            };
+            if projected > ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_TRANSFORMED_ARITY {
+                return Err(RouteAdmissionFailure::Cap(format!(
+                    "predicate {} projected arity upper bound {projected} > cap {ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_TRANSFORMED_ARITY}",
+                    predicate.id.index()
+                )));
+            }
+            projected_arities.push(projected);
+        }
+
+        let mut projected_occurrences = 0usize;
+        for clause in self.problem.clauses() {
+            if self.cancellation_token.is_cancelled() {
+                return Err(RouteAdmissionFailure::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(RouteAdmissionFailure::Deadline);
+            }
+            for (predicate, _) in &clause.body.predicates {
+                let Some(projected) = projected_arities.get(predicate.index()) else {
+                    return Err(RouteAdmissionFailure::Cap(format!(
+                        "body predicate {} is outside the declaration table",
+                        predicate.index()
+                    )));
+                };
+                let Some(next) = projected_occurrences.checked_add(*projected) else {
+                    return Err(RouteAdmissionFailure::Cap(
+                        "projected predicate argument occurrence overflow".to_string(),
+                    ));
+                };
+                projected_occurrences = next;
+            }
+            if let ClauseHead::Predicate(predicate, _) = &clause.head {
+                let Some(projected) = projected_arities.get(predicate.index()) else {
+                    return Err(RouteAdmissionFailure::Cap(format!(
+                        "head predicate {} is outside the declaration table",
+                        predicate.index()
+                    )));
+                };
+                let Some(next) = projected_occurrences.checked_add(*projected) else {
+                    return Err(RouteAdmissionFailure::Cap(
+                        "projected predicate argument occurrence overflow".to_string(),
+                    ));
+                };
+                projected_occurrences = next;
+            }
+            if projected_occurrences > ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_PROJECTED_ARG_OCCURRENCES {
+                return Err(RouteAdmissionFailure::Cap(format!(
+                    "projected predicate argument occurrences {projected_occurrences} > cap {ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_PROJECTED_ARG_OCCURRENCES}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn try_array_const_key_cegar_route(
         &self,
         deadline: Option<Instant>,
     ) -> Option<PortfolioResult> {
+        self.try_array_const_key_cegar_route_with_budget(
+            deadline,
+            ARRAY_CONST_KEY_CEGAR_ROUTE_BUDGET,
+            ARRAY_CONST_KEY_CEGAR_ROUTE_VALIDATION_RESERVE,
+        )
+    }
+
+    fn try_array_const_key_cegar_route_with_budget(
+        &self,
+        deadline: Option<Instant>,
+        route_budget_cap: Duration,
+        validation_reserve: Duration,
+    ) -> Option<PortfolioResult> {
         let route_start = Instant::now();
-        if !self.problem.has_array_sorts() {
-            return None;
-        }
-        if self.problem.clauses().len() > ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_CLAUSES {
+        let remaining = deadline
+            .map(|boundary| boundary.saturating_duration_since(route_start))
+            .unwrap_or(route_budget_cap);
+        let route_budget = remaining.min(route_budget_cap);
+        let log_attempt = |gate_result, gate_reason: String, result| {
             self.decision_log.log_decision(DecisionEntry {
                 stage: "array_const_key_cegar",
-                gate_result: false,
-                gate_reason: format!(
-                    "clauses {} > cap {}",
-                    self.problem.clauses().len(),
-                    ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_CLAUSES
-                ),
-                budget_secs: 0.0,
+                gate_result,
+                gate_reason,
+                budget_secs: route_budget.as_secs_f64(),
                 elapsed_secs: route_start.elapsed().as_secs_f64(),
-                result: "cap_exceeded",
+                result,
                 lemmas_learned: 0,
                 max_frame: 0,
             });
+        };
+        if self.cancellation_token.is_cancelled() {
+            log_attempt(
+                false,
+                "cancelled before const-key route admission".to_string(),
+                "unknown",
+            );
             return None;
         }
-        let mut scalarized_probe = self.problem.clone();
-        let alias_rewrites =
-            scalarized_probe.rewrite_clause_local_constant_aliases_for_array_scalarization();
-        if !scalarized_probe.has_const_array_scalarization_candidates_allow_symbolic_keys() {
-            self.decision_log.log_decision(DecisionEntry {
-                stage: "array_const_key_cegar",
-                gate_result: false,
-                gate_reason: "no finite constant array keys for scalarizable array sorts"
+        if route_budget < ARRAY_CONST_KEY_CEGAR_ROUTE_MIN_BUDGET {
+            log_attempt(
+                false,
+                "less than the minimum preprocessing-inclusive route budget remained".to_string(),
+                if remaining.is_zero() {
+                    "timeout"
+                } else {
+                    "skipped"
+                },
+            );
+            return None;
+        }
+        let route_deadline = route_start + route_budget;
+        let _route_smt_deadline = crate::smt::ScopedSmtDeadline::install_until(route_deadline);
+        let _term_budget_guard =
+            crate::smt::SmtContext::scoped_thread_term_memory_budget(self.config.memory_budget);
+
+        let surface_caps = array_const_key_surface_caps();
+        match scan_predicate_surface(
+            &self.problem,
+            surface_caps,
+            &self.cancellation_token,
+            route_deadline,
+        ) {
+            Ok(()) => {}
+            Err(RouteAdmissionFailure::Cap(reason)) => {
+                log_attempt(false, reason, "cap_exceeded");
+                return None;
+            }
+            Err(RouteAdmissionFailure::Cancelled) => {
+                log_attempt(
+                    false,
+                    "cancelled during bounded const-key surface admission".to_string(),
+                    "unknown",
+                );
+                return None;
+            }
+            Err(RouteAdmissionFailure::Deadline) => {
+                log_attempt(
+                    false,
+                    "bounded const-key surface admission exhausted the fixed route budget"
+                        .to_string(),
+                    "timeout",
+                );
+                return None;
+            }
+        }
+        let has_array_sorts = self.problem.has_array_sorts();
+        if self.cancellation_token.is_cancelled() || Instant::now() >= route_deadline {
+            log_attempt(
+                false,
+                "array-sort classification reached cancellation/deadline after bounded admission"
                     .to_string(),
-                budget_secs: 0.0,
-                elapsed_secs: route_start.elapsed().as_secs_f64(),
-                result: "not_applicable",
-                lemmas_learned: 0,
-                max_frame: 0,
-            });
+                if self.cancellation_token.is_cancelled() {
+                    "unknown"
+                } else {
+                    "timeout"
+                },
+            );
+            return None;
+        }
+        if !has_array_sorts {
+            return None;
+        }
+        let surface = match scan_problem_surface(
+            &self.problem,
+            surface_caps,
+            &self.cancellation_token,
+            route_deadline,
+        ) {
+            Ok(surface) => surface,
+            Err(RouteAdmissionFailure::Cap(reason)) => {
+                log_attempt(false, reason, "cap_exceeded");
+                return None;
+            }
+            Err(RouteAdmissionFailure::Cancelled) => {
+                log_attempt(
+                    false,
+                    "cancelled during bounded const-key surface admission".to_string(),
+                    "unknown",
+                );
+                return None;
+            }
+            Err(RouteAdmissionFailure::Deadline) => {
+                log_attempt(
+                    false,
+                    "bounded const-key surface admission exhausted the fixed route budget"
+                        .to_string(),
+                    "timeout",
+                );
+                return None;
+            }
+        };
+        if surface.array_selects == 0 {
+            log_attempt(
+                false,
+                "bounded admission found no array select/key occurrences".to_string(),
+                "not_applicable",
+            );
+            return None;
+        }
+        match self.const_key_projected_surface_admission(&surface, route_deadline) {
+            Ok(()) => {}
+            Err(RouteAdmissionFailure::Cap(reason)) => {
+                log_attempt(false, reason, "cap_exceeded");
+                return None;
+            }
+            Err(RouteAdmissionFailure::Cancelled) => {
+                log_attempt(
+                    false,
+                    "cancelled during bounded const-key projection admission".to_string(),
+                    "unknown",
+                );
+                return None;
+            }
+            Err(RouteAdmissionFailure::Deadline) => {
+                log_attempt(
+                    false,
+                    "bounded const-key projection admission exhausted the fixed route budget"
+                        .to_string(),
+                    "timeout",
+                );
+                return None;
+            }
+        }
+        if self.cancellation_token.is_cancelled() || Instant::now() >= route_deadline {
+            log_attempt(
+                false,
+                "const-key admission reached cancellation/deadline before problem clone"
+                    .to_string(),
+                if self.cancellation_token.is_cancelled() {
+                    "unknown"
+                } else {
+                    "timeout"
+                },
+            );
             return None;
         }
 
-        if scalarized_probe
+        let mut scalarized_probe = self.problem.clone();
+        let alias_rewrites =
+            scalarized_probe.rewrite_clause_local_constant_aliases_for_array_scalarization();
+        if self.cancellation_token.is_cancelled() || Instant::now() >= route_deadline {
+            log_attempt(
+                true,
+                "constant-alias preprocessing reached cancellation/deadline".to_string(),
+                if self.cancellation_token.is_cancelled() {
+                    "unknown"
+                } else {
+                    "timeout"
+                },
+            );
+            return None;
+        }
+        let has_scalarization_candidates =
+            scalarized_probe.has_const_array_scalarization_candidates_allow_symbolic_keys();
+        if self.cancellation_token.is_cancelled() || Instant::now() >= route_deadline {
+            log_attempt(
+                true,
+                "constant-key candidate scan reached cancellation/deadline".to_string(),
+                if self.cancellation_token.is_cancelled() {
+                    "unknown"
+                } else {
+                    "timeout"
+                },
+            );
+            return None;
+        }
+        if !has_scalarization_candidates {
+            log_attempt(
+                false,
+                "no finite constant array keys for scalarizable array sorts".to_string(),
+                "not_applicable",
+            );
+            return None;
+        }
+
+        let scalarization_available = scalarized_probe
             .try_scalarize_const_array_selects_allow_symbolic_keys_with_map(&[])
-            .is_none()
-        {
-            self.decision_log.log_decision(DecisionEntry {
-                stage: "array_const_key_cegar",
-                gate_result: false,
-                gate_reason: "finite key collection produced no scalarization map".to_string(),
-                budget_secs: 0.0,
-                elapsed_secs: route_start.elapsed().as_secs_f64(),
-                result: "not_applicable",
-                lemmas_learned: 0,
-                max_frame: 0,
-            });
+            .is_some();
+        if self.cancellation_token.is_cancelled() || Instant::now() >= route_deadline {
+            log_attempt(
+                true,
+                "const-key scalarization reached cancellation/deadline".to_string(),
+                if self.cancellation_token.is_cancelled() {
+                    "unknown"
+                } else {
+                    "timeout"
+                },
+            );
+            return None;
+        }
+        if !scalarization_available {
+            log_attempt(
+                false,
+                "finite key collection produced no scalarization map".to_string(),
+                "not_applicable",
+            );
             return None;
         }
         let original_max_arity = self
@@ -3091,65 +4131,45 @@ impl AdaptivePortfolio {
             .any(|(scalarized, original)| scalarized.arg_sorts != original.arg_sorts);
         drop(scalarized_probe);
         if !signature_changed {
-            self.decision_log.log_decision(DecisionEntry {
-                stage: "array_const_key_cegar",
-                gate_result: false,
-                gate_reason: "constant array keys do not project predicate arguments".to_string(),
-                budget_secs: 0.0,
-                elapsed_secs: route_start.elapsed().as_secs_f64(),
-                result: "not_applicable",
-                lemmas_learned: 0,
-                max_frame: 0,
-            });
+            log_attempt(
+                false,
+                "constant array keys do not project predicate arguments".to_string(),
+                "not_applicable",
+            );
             return None;
         }
         if transformed_max_arity > ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_TRANSFORMED_ARITY {
-            self.decision_log.log_decision(DecisionEntry {
-                stage: "array_const_key_cegar",
-                gate_result: false,
-                gate_reason: format!(
+            log_attempt(
+                false,
+                format!(
                     "transformed_max_arity {transformed_max_arity} > cap {ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_TRANSFORMED_ARITY}"
                 ),
-                budget_secs: 0.0,
-                elapsed_secs: route_start.elapsed().as_secs_f64(),
-                result: "cap_exceeded",
-                lemmas_learned: 0,
-                max_frame: 0,
-            });
+                "cap_exceeded",
+            );
             return None;
         }
 
-        let remaining = self
-            .remaining_budget(deadline)
-            .unwrap_or(ARRAY_CONST_KEY_CEGAR_ROUTE_BUDGET);
-        if remaining < ARRAY_CONST_KEY_CEGAR_ROUTE_MIN_BUDGET {
-            self.decision_log.log_decision(DecisionEntry {
-                stage: "array_const_key_cegar",
-                gate_result: true,
-                gate_reason: "insufficient route budget".to_string(),
-                budget_secs: remaining.as_secs_f64(),
-                elapsed_secs: route_start.elapsed().as_secs_f64(),
-                result: "skipped",
-                lemmas_learned: 0,
-                max_frame: 0,
-            });
+        let remaining = route_deadline.saturating_duration_since(Instant::now());
+        if self.cancellation_token.is_cancelled()
+            || remaining <= validation_reserve
+            || remaining < ARRAY_CONST_KEY_CEGAR_ROUTE_MIN_BUDGET
+        {
+            log_attempt(
+                true,
+                "preprocessing left no solve budget after the validation reserve".to_string(),
+                if self.cancellation_token.is_cancelled() {
+                    "unknown"
+                } else {
+                    "timeout"
+                },
+            );
             return None;
         }
-        let route_budget = remaining.min(ARRAY_CONST_KEY_CEGAR_ROUTE_BUDGET);
-        let (solve_budget, validation_budget) =
-            if route_budget > ARRAY_CONST_KEY_CEGAR_ROUTE_VALIDATION_RESERVE {
-                (
-                    route_budget
-                        .checked_sub(ARRAY_CONST_KEY_CEGAR_ROUTE_VALIDATION_RESERVE)
-                        .unwrap(),
-                    ARRAY_CONST_KEY_CEGAR_ROUTE_VALIDATION_RESERVE,
-                )
-            } else {
-                (route_budget, Duration::ZERO)
-            };
+        let solve_budget = remaining.saturating_sub(validation_reserve);
 
         let mut pdr_config = PdrConfig::production(self.config.verbose);
         pdr_config.solve_timeout = Some(solve_budget);
+        pdr_config.cancellation_token = Some(self.cancellation_token.child());
         pdr_config.strict_proofs = true;
         pdr_config.array_scalarization_keep_const_keys_with_symbolic_accesses = true;
         self.apply_user_hints(&mut pdr_config);
@@ -3159,11 +4179,17 @@ impl AdaptivePortfolio {
         let result_name = Self::pdr_result_to_str(&result_with_stats.result);
         let lemmas_learned = result_with_stats.learned_lemmas.len();
         let max_frame = result_with_stats.stats.max_frame;
+        let validation_budget = route_deadline
+            .saturating_duration_since(Instant::now())
+            .min(validation_reserve);
         let original_validation = match &result_with_stats.result {
-            PdrResult::Safe(model) if !validation_budget.is_zero() => {
+            PdrResult::Safe(model)
+                if !validation_budget.is_zero() && !self.cancellation_token.is_cancelled() =>
+            {
                 let validation_config = PdrConfig {
                     verbose: self.config.verbose,
                     strict_proofs: true,
+                    cancellation_token: Some(self.cancellation_token.child()),
                     solve_timeout: Some(validation_budget),
                     disable_array_scalarization: true,
                     preserve_original_clauses: true,
@@ -3179,18 +4205,33 @@ impl AdaptivePortfolio {
             PdrResult::Safe(_) => false,
             PdrResult::Unsafe(_) | PdrResult::Unknown | PdrResult::NotApplicable => false,
         };
-        let accepted =
-            matches!(result_with_stats.result, PdrResult::Safe(_)) && original_validation;
+        let boundary_open =
+            !self.cancellation_token.is_cancelled() && Instant::now() < route_deadline;
+        let accepted = matches!(result_with_stats.result, PdrResult::Safe(_))
+            && original_validation
+            && boundary_open;
+        let reported_result = match &result_with_stats.result {
+            PdrResult::Safe(_) if accepted => "safe",
+            PdrResult::Safe(_) => "validation_failed",
+            PdrResult::Unsafe(_) => "transformed_unsafe",
+            PdrResult::Unknown => "unknown",
+            PdrResult::NotApplicable => "not_applicable",
+        };
         self.decision_log.log_decision_with_details(
             DecisionEntry {
                 stage: "array_const_key_cegar",
                 gate_result: true,
                 gate_reason: format!(
-                    "finite constant array keys retained despite symbolic accesses; original_max_arity={original_max_arity}; transformed_max_arity={transformed_max_arity}; alias_rewrites={alias_rewrites}; original_validation={original_validation}"
+                    "finite constant array keys retained despite symbolic accesses; original_max_arity={original_max_arity}; transformed_max_arity={transformed_max_arity}; alias_rewrites={alias_rewrites}; original_validation={original_validation}; boundary_open={boundary_open}; evidence={} ",
+                    if accepted {
+                        "strict original-clause invariant validation"
+                    } else {
+                        "none (candidate rejected)"
+                    }
                 ),
                 budget_secs: route_budget.as_secs_f64(),
                 elapsed_secs: route_start.elapsed().as_secs_f64(),
-                result: if accepted { "safe" } else { result_name },
+                result: reported_result,
                 lemmas_learned,
                 max_frame,
             },
@@ -3203,20 +4244,369 @@ impl AdaptivePortfolio {
                 "solve_budget_secs": solve_budget.as_secs_f64(),
                 "validation_budget_secs": validation_budget.as_secs_f64(),
                 "transformed_result": result_name,
+                "surface_total_body_atoms": surface.total_body_atoms,
+                "surface_total_expr_nodes": surface.total_expr_nodes,
+                "surface_total_sort_nodes": surface.total_sort_nodes,
+                "surface_total_name_bytes": surface.total_name_bytes,
+                "surface_datatype_members": surface.datatype_members,
+                "surface_datatype_sort_occurrences": surface.datatype_sort_occurrences,
+                "surface_datatype_metadata_name_bytes": surface.datatype_metadata_name_bytes,
+                "surface_array_selects": surface.array_selects,
+                "projected_const_key_rewrite_visits": surface.projected_const_key_rewrite_visits,
+                "boundary_open": boundary_open,
             }),
         );
 
         match result_with_stats.result {
-            PdrResult::Safe(model) if original_validation => Some(PortfolioResult::Safe(model)),
+            PdrResult::Safe(model)
+                if accepted
+                    && !self.cancellation_token.is_cancelled()
+                    && Instant::now() < route_deadline =>
+            {
+                Some(PortfolioResult::Safe(model))
+            }
             PdrResult::Unsafe(_) | PdrResult::Unknown | PdrResult::NotApplicable => None,
             PdrResult::Safe(_) => None,
         }
     }
 
+    /// Run the bounded cooperative surface scan, including datatype
+    /// declaration metadata that the forwarding transform clones separately.
+    fn deterministic_array_forwarded_admission(
+        &self,
+        deadline: Instant,
+    ) -> Result<RouteSurfaceStats, RouteAdmissionFailure> {
+        let mut surface = scan_problem_surface(
+            &self.problem,
+            deterministic_array_forwarded_surface_caps(),
+            &self.cancellation_token,
+            deadline,
+        )?;
+        let projection = admit_dt_flatten_projection(
+            &self.problem,
+            deterministic_array_forwarded_dt_projection_caps(),
+            &self.cancellation_token,
+            deadline,
+        )?;
+        let fanout = admit_dt_flatten_fanout(
+            &surface,
+            &projection,
+            deterministic_array_forwarded_dt_fanout_caps(),
+        )?;
+        surface.projected_dt_flatten_max_arity = projection.max_predicate_arity;
+        surface.projected_dt_flatten_arg_occurrences = projection.total_predicate_arg_occurrences;
+        surface.projected_dt_flatten_term_columns = projection.total_term_columns;
+        surface.projected_dt_flatten_work = projection.expansion_work;
+        surface.projected_dt_flatten_max_occurrence_width = projection.max_occurrence_width;
+        surface.projected_dt_flatten_expr_clone_work = fanout.expr_clone_work;
+        surface.projected_dt_flatten_generated_name_bytes = fanout.generated_name_bytes;
+        Ok(surface)
+    }
+
+    /// Fixed-budget deterministic entry to the existing forwarding-only,
+    /// exact-acyclic BMC lane.
+    ///
+    /// This route is deliberately narrower than the adaptive dispatch: only
+    /// acyclic linear array systems enter it, and a real forwarding/flattening
+    /// rewrite must occur. [`Self::run_preprocessed_acyclic_bmc_probe`] is the
+    /// acceptance boundary: transformed Unsafe evidence is promoted only
+    /// after its ground derivation is translated and validated on ORIGINAL
+    /// clauses, or after a fresh bounded original-problem replay. Missing or
+    /// stale evidence therefore remains `None`, never `FullVerification`.
+    fn try_deterministic_array_forwarded_acyclic_bmc_route(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Option<(PortfolioResult, ValidationEvidence)> {
+        let route_started = Instant::now();
+        let remaining = deadline
+            .map(|boundary| boundary.saturating_duration_since(route_started))
+            .unwrap_or(DETERMINISTIC_ARRAY_FORWARDED_ACYCLIC_BMC_ROUTE_BUDGET);
+        let route_budget = remaining.min(DETERMINISTIC_ARRAY_FORWARDED_ACYCLIC_BMC_ROUTE_BUDGET);
+        let log_attempt = |gate_result, gate_reason: String, result| {
+            self.decision_log.log_decision(DecisionEntry {
+                stage: "deterministic_array_forwarded_acyclic_bmc",
+                gate_result,
+                gate_reason,
+                budget_secs: route_budget.as_secs_f64(),
+                elapsed_secs: route_started.elapsed().as_secs_f64(),
+                result,
+                lemmas_learned: 0,
+                max_frame: 0,
+            });
+        };
+        if self.cancellation_token.is_cancelled() {
+            log_attempt(
+                false,
+                "cancelled before deterministic forwarding admission".to_string(),
+                "unknown",
+            );
+            return None;
+        }
+        if route_budget < DETERMINISTIC_ARRAY_FORWARDED_ACYCLIC_BMC_ROUTE_MIN_BUDGET {
+            log_attempt(
+                false,
+                "less than the minimum fixed route budget remained".to_string(),
+                if remaining.is_zero() {
+                    "timeout"
+                } else {
+                    "skipped"
+                },
+            );
+            return None;
+        }
+        let route_deadline = route_started + route_budget;
+        let _route_smt_deadline = crate::smt::ScopedSmtDeadline::install_until(route_deadline);
+        let _term_budget_guard =
+            crate::smt::SmtContext::scoped_thread_term_memory_budget(self.config.memory_budget);
+        // Exact ground completion can finish without constructing the SMT
+        // context that normally enforces the configured term-store budget.
+        // Do not let that fast path bypass a budget too small to admit even
+        // the mandatory baseline terms of an engine context.  The temporary
+        // context uses the same thread-local budget inherited by every later
+        // context and is dropped before the bounded surface scan.
+        let baseline_term_store_exceeds_budget = {
+            let context = crate::smt::SmtContext::new();
+            context.term_memory_exceeded()
+        };
+        if baseline_term_store_exceeds_budget {
+            log_attempt(
+                false,
+                "configured term memory budget cannot admit the baseline SMT term store"
+                    .to_string(),
+                "cap_exceeded",
+            );
+            return None;
+        }
+        let surface_caps = deterministic_array_forwarded_surface_caps();
+        match scan_predicate_surface(
+            &self.problem,
+            surface_caps,
+            &self.cancellation_token,
+            route_deadline,
+        ) {
+            Ok(()) => {}
+            Err(RouteAdmissionFailure::Cap(reason)) => {
+                log_attempt(false, reason, "cap_exceeded");
+                return None;
+            }
+            Err(RouteAdmissionFailure::Cancelled) => {
+                log_attempt(
+                    false,
+                    "cancelled during bounded forwarding predicate admission".to_string(),
+                    "unknown",
+                );
+                return None;
+            }
+            Err(RouteAdmissionFailure::Deadline) => {
+                log_attempt(
+                    false,
+                    "bounded forwarding predicate admission exhausted the fixed route budget"
+                        .to_string(),
+                    "timeout",
+                );
+                return None;
+            }
+        }
+        let has_array_sorts = self.problem.has_array_sorts();
+        if self.cancellation_token.is_cancelled() || Instant::now() >= route_deadline {
+            log_attempt(
+                false,
+                "array-sort classification reached cancellation/deadline after bounded forwarding admission"
+                    .to_string(),
+                if self.cancellation_token.is_cancelled() {
+                    "unknown"
+                } else {
+                    "timeout"
+                },
+            );
+            return None;
+        }
+        if !has_array_sorts {
+            return None;
+        }
+        let surface = match self.deterministic_array_forwarded_admission(route_deadline) {
+            Ok(surface) => surface,
+            Err(RouteAdmissionFailure::Cap(reason)) => {
+                log_attempt(false, reason, "cap_exceeded");
+                return None;
+            }
+            Err(RouteAdmissionFailure::Cancelled) => {
+                log_attempt(
+                    false,
+                    "cancelled during bounded forwarding surface admission".to_string(),
+                    "unknown",
+                );
+                return None;
+            }
+            Err(RouteAdmissionFailure::Deadline) => {
+                log_attempt(
+                    false,
+                    "bounded forwarding surface admission exhausted the fixed route budget"
+                        .to_string(),
+                    "timeout",
+                );
+                return None;
+            }
+        };
+
+        let features = ProblemClassifier::classify(&self.problem);
+        if self.cancellation_token.is_cancelled() {
+            log_attempt(
+                false,
+                "cancelled after deterministic forwarding classification".to_string(),
+                "unknown",
+            );
+            return None;
+        }
+        if Instant::now() >= route_deadline {
+            log_attempt(
+                true,
+                "bounded admission/classification exhausted the fixed route budget".to_string(),
+                "timeout",
+            );
+            return None;
+        }
+        let mut feature_rejections = Vec::new();
+        if !features.uses_arrays {
+            feature_rejections.push("classifier did not observe array use");
+        }
+        if features.has_cycles {
+            feature_rejections.push("predicate graph is cyclic");
+        }
+        if !features.is_linear {
+            feature_rejections.push("clauses are non-linear");
+        }
+        if features.num_predicates == 0 {
+            feature_rejections.push("problem has no predicates");
+        }
+        if features.num_queries == 0 {
+            feature_rejections.push("problem has no queries");
+        }
+        if !feature_rejections.is_empty() {
+            log_attempt(
+                false,
+                format!("feature gate rejected: {}", feature_rejections.join(", ")),
+                "not_applicable",
+            );
+            return None;
+        }
+
+        // This transform is synchronous and cannot observe cancellation in
+        // the middle of a pass. Its input has crossed the hard surface caps
+        // above; charge all of its time to the fixed route budget and fail
+        // closed at the next boundary if it overruns. In particular, never
+        // start an engine after an expired transform.
+        let summary = PreprocessSummary::build_array_forwarding_only(
+            self.problem.clone(),
+            self.config.verbose,
+        );
+        if self.cancellation_token.is_cancelled() {
+            log_attempt(
+                true,
+                "cancelled after the synchronous forwarding transform".to_string(),
+                "unknown",
+            );
+            return None;
+        }
+        if Instant::now() >= route_deadline {
+            log_attempt(
+                true,
+                "synchronous forwarding transform exhausted the fixed route budget".to_string(),
+                "timeout",
+            );
+            return None;
+        }
+        if summary.transform_memory.is_identity_grade() {
+            log_attempt(
+                false,
+                "forwarding/flattening produced an identity-grade summary".to_string(),
+                "not_applicable",
+            );
+            return None;
+        }
+
+        let bmc_budget = route_deadline.saturating_duration_since(Instant::now());
+        if bmc_budget < DETERMINISTIC_ARRAY_FORWARDED_ACYCLIC_BMC_ROUTE_MIN_BUDGET {
+            log_attempt(
+                true,
+                "less than the minimum BMC budget remained after forwarding".to_string(),
+                "timeout",
+            );
+            return None;
+        }
+        let result = self.run_preprocessed_acyclic_bmc_probe_until(
+            summary,
+            &features,
+            route_deadline,
+            "deterministic array-forwarded",
+            true,
+            &self.cancellation_token,
+        );
+
+        // A terminal ground-completion step is allowed to finish, but a result
+        // arriving at or after this route's fixed boundary is not accepted by
+        // the deterministic schedule. Falling through is completeness-only.
+        if self.cancellation_token.is_cancelled() {
+            log_attempt(
+                true,
+                "cancelled before the forwarded exact-BMC verdict boundary".to_string(),
+                "unknown",
+            );
+            return None;
+        }
+        if Instant::now() >= route_deadline {
+            log_attempt(
+                true,
+                "forwarded exact BMC completed at or after the fixed route deadline; rejecting late result"
+                    .to_string(),
+                "timeout",
+            );
+            return None;
+        }
+        match result {
+            Some((result, evidence)) => {
+                log_attempt(
+                    true,
+                    format!(
+                        "forwarded exact-acyclic verdict accepted; verdict={}; evidence={evidence:?}; admitted_body_atoms={}; admitted_expr_nodes={}; admitted_sort_nodes={}; admitted_datatype_members={}; admitted_datatype_sort_occurrences={}; admitted_datatype_metadata_name_bytes={}; admitted_name_bytes={}; projected_dt_max_arity={}; projected_dt_arg_occurrences={}; projected_dt_term_columns={}; projected_dt_work={}; projected_dt_max_occurrence_width={}; projected_dt_expr_clone_work={}; projected_dt_generated_name_bytes={}",
+                        Self::result_to_str(&result),
+                        surface.total_body_atoms,
+                        surface.total_expr_nodes,
+                        surface.total_sort_nodes,
+                        surface.datatype_members,
+                        surface.datatype_sort_occurrences,
+                        surface.datatype_metadata_name_bytes,
+                        surface.total_name_bytes,
+                        surface.projected_dt_flatten_max_arity,
+                        surface.projected_dt_flatten_arg_occurrences,
+                        surface.projected_dt_flatten_term_columns,
+                        surface.projected_dt_flatten_work,
+                        surface.projected_dt_flatten_max_occurrence_width,
+                        surface.projected_dt_flatten_expr_clone_work,
+                        surface.projected_dt_flatten_generated_name_bytes
+                    ),
+                    Self::result_to_str(&result),
+                );
+                if self.cancellation_token.is_cancelled() || Instant::now() >= route_deadline {
+                    return None;
+                }
+                Some((result, evidence))
+            }
+            None => {
+                log_attempt(
+                    true,
+                    "forwarded exact BMC produced no original-validated verdict".to_string(),
+                    "unknown",
+                );
+                None
+            }
+        }
+    }
+
     /// FORALL-ARR ghost-pair lane (agenda #16, Eldarica `-arrayQuans:n` idea).
     ///
-    /// Instruments every `(Array Int V)` predicate argument with `n` ghost
-    /// `(idx, val)` scalar pairs (n=1 first, then n=2), runs PDR on the
+    /// Instruments every `(Array K V)` predicate argument with `n` typed ghost
+    /// pairs (n=1 first, then n=2), for `K = Int | BitVec(1..=64)`, and runs PDR on the
     /// transformed problem to discover a QUANTIFIER-FREE invariant over the
     /// ghosts, and certifies the denoted quantified original invariant
     /// `forall i. I'(args, i, select(arr, i))` on the ORIGINAL clauses via
@@ -3236,29 +4626,9 @@ impl AdaptivePortfolio {
         if std::env::var_os(ARRAY_GHOST_PAIR_DISABLE_ENV).is_some() {
             return None;
         }
-        if !self.problem.has_array_sorts() || self.problem.has_datatype_sorts() {
+        if !self.problem.has_array_sorts() || self.problem.uses_datatype_features() {
             return None;
         }
-        if self.problem.clauses().len() > ARRAY_GHOST_PAIR_ROUTE_MAX_CLAUSES
-            || self.problem.predicates().len() > ARRAY_GHOST_PAIR_ROUTE_MAX_PREDICATES
-        {
-            return None;
-        }
-        if GhostPairSpec::analyze(&self.problem, 1).is_empty() {
-            return None;
-        }
-        // Quantified array invariants only pay off when the program indexes
-        // arrays symbolically; constant-key problems are the const-key CEGAR
-        // route's territory (it runs before this lane).
-        let has_symbolic_index = self.problem.clauses().iter().any(|clause| {
-            crate::transform::array_ghost_pairs::collect_index_terms(clause, 4)
-                .iter()
-                .any(|term| !matches!(term, ChcExpr::Int(_)))
-        });
-        if !has_symbolic_index {
-            return None;
-        }
-
         let route_budget = self.scaled_probe_budget(
             deadline,
             ARRAY_GHOST_PAIR_ROUTE_NOMINAL_BUDGET,
@@ -3279,6 +4649,78 @@ impl AdaptivePortfolio {
             return None;
         }
         let route_deadline = route_start + route_budget;
+        let _route_smt_deadline = crate::smt::ScopedSmtDeadline::install_until(route_deadline);
+        let _term_budget_guard =
+            crate::smt::SmtContext::scoped_thread_term_memory_budget(self.config.memory_budget);
+
+        let log_admission_failure = |failure: RouteAdmissionFailure, shape: &str| {
+            let (gate_reason, result) = match failure {
+                RouteAdmissionFailure::Cap(reason) => (
+                    format!("{shape} surface rejected: {reason}"),
+                    "cap_exceeded",
+                ),
+                RouteAdmissionFailure::Cancelled => (
+                    format!("cancelled during bounded {shape} surface admission"),
+                    "unknown",
+                ),
+                RouteAdmissionFailure::Deadline => (
+                    format!("bounded {shape} surface admission exhausted the route budget"),
+                    "timeout",
+                ),
+            };
+            self.decision_log.log_decision(DecisionEntry {
+                stage: "array_ghost_pairs",
+                gate_result: false,
+                gate_reason,
+                budget_secs: route_budget.as_secs_f64(),
+                elapsed_secs: route_start.elapsed().as_secs_f64(),
+                result,
+                lemmas_learned: 0,
+                max_frame: 0,
+            });
+        };
+
+        if let Err(failure) = admit_problem_clone_fanout(
+            &self.problem,
+            array_ghost_pair_clone_caps(ARRAY_GHOST_PAIR_ROUTE_MAX_INPUT_ARITY),
+            ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+            &self.cancellation_token,
+            route_deadline,
+        ) {
+            log_admission_failure(failure, "source");
+            return None;
+        }
+
+        // Exact ground completion can finish before constructing the SMT
+        // context that normally observes the configured term-store envelope.
+        // Reject a budget that cannot hold even the mandatory context baseline
+        // before cloning or instrumenting the problem.
+        if crate::smt::SmtContext::new().term_memory_exceeded() {
+            log_admission_failure(
+                RouteAdmissionFailure::Cap(
+                    "configured term memory budget cannot admit the baseline SMT term store"
+                        .to_string(),
+                ),
+                "source",
+            );
+            return None;
+        }
+
+        if GhostPairSpec::analyze(&self.problem, 1).is_empty() {
+            return None;
+        }
+        // Quantified array invariants only pay off when the program indexes
+        // arrays symbolically; constant-key problems are the const-key CEGAR
+        // route's territory (it runs before this lane). The full recursive
+        // scan is safe after the admission pass bounded expression depth.
+        let has_symbolic_index = self
+            .problem
+            .clauses()
+            .iter()
+            .any(crate::transform::array_ghost_pairs::clause_has_symbolic_index);
+        if !has_symbolic_index {
+            return None;
+        }
 
         for n in [1usize, 2] {
             let remaining = route_deadline.saturating_duration_since(Instant::now());
@@ -3300,6 +4742,30 @@ impl AdaptivePortfolio {
                 Box::new(ArrayGhostPairTransformer::new(n)).transform(self.problem.clone());
             let raw_ghost_problem = transform_result.problem;
             let ghost_back_translator = transform_result.back_translator;
+            if let Err(failure) = admit_problem_clone_fanout(
+                &raw_ghost_problem,
+                array_ghost_pair_clone_caps(ARRAY_GHOST_PAIR_ROUTE_MAX_TRANSFORMED_ARITY),
+                ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+                &self.cancellation_token,
+                route_deadline,
+            ) {
+                log_admission_failure(failure, "transformed");
+                return None;
+            }
+
+            match self.try_query_anchored_ghost_candidate(
+                &raw_ghost_problem,
+                &spec,
+                n,
+                lane_budget,
+                route_deadline,
+                route_start,
+                route_budget,
+            ) {
+                array_ghost_candidate::CandidateAttempt::Sealed(result) => return Some(result),
+                array_ghost_candidate::CandidateAttempt::Stop => return None,
+                array_ghost_candidate::CandidateAttempt::Miss => {}
+            }
 
             // Compiler-generated CHCs frequently contain long chains of
             // wrapper predicates around the array loop.  Ghosting first is
@@ -3313,11 +4779,36 @@ impl AdaptivePortfolio {
             // raw-ghost PDR path.
             let raw_ghost_predicates = raw_ghost_problem.predicates().len();
             let raw_ghost_clauses = raw_ghost_problem.clauses().len();
-            let preprocess_candidate =
-                PreprocessSummary::build(raw_ghost_problem.clone(), self.config.verbose);
+            let Some(preprocess_candidate) = PreprocessSummary::build_with_limits(
+                raw_ghost_problem.clone(),
+                self.config.verbose,
+                Some(route_deadline),
+                &self.cancellation_token,
+            ) else {
+                log_admission_failure(
+                    if self.cancellation_token.is_cancelled() {
+                        RouteAdmissionFailure::Cancelled
+                    } else {
+                        RouteAdmissionFailure::Deadline
+                    },
+                    "preprocessing",
+                );
+                return None;
+            };
             let preprocessed_predicates =
                 preprocess_candidate.transformed_problem.predicates().len();
             let preprocessed_clauses = preprocess_candidate.transformed_problem.clauses().len();
+            let preprocessed_surface_admitted = match array_ghost_pair_preprocessed_surface_admitted(
+                &preprocess_candidate.transformed_problem,
+                &self.cancellation_token,
+                route_deadline,
+            ) {
+                Ok(admitted) => admitted,
+                Err(failure) => {
+                    log_admission_failure(failure, "preprocessed");
+                    return None;
+                }
+            };
             let predicate_reduction = raw_ghost_predicates
                 >= preprocessed_predicates
                     .max(1)
@@ -3326,8 +4817,9 @@ impl AdaptivePortfolio {
                 >= preprocessed_clauses
                     .max(1)
                     .saturating_mul(ARRAY_GHOST_PAIR_PREPROCESS_REDUCTION_FACTOR);
-            let preprocess_summary =
-                (predicate_reduction || clause_reduction).then_some(preprocess_candidate);
+            let preprocess_summary = (preprocessed_surface_admitted
+                && (predicate_reduction || clause_reduction))
+                .then_some(preprocess_candidate);
             let solve_problem = preprocess_summary
                 .as_ref()
                 .map_or(&raw_ghost_problem, |summary| &summary.transformed_problem);
@@ -3385,18 +4877,17 @@ impl AdaptivePortfolio {
                     // Seal the quantified certificate: the FULL per-rule
                     // discharge on the ORIGINAL clauses is the only way to
                     // construct it (fail-closed on any undischarged clause).
-                    let certify_budget = route_deadline
-                        .saturating_duration_since(Instant::now())
-                        .max(certify_reserve);
+                    let certify_budget = route_deadline.saturating_duration_since(Instant::now());
                     let certify_budget = match self.remaining_budget(deadline) {
                         Some(global_remaining) => certify_budget.min(global_remaining),
                         None => certify_budget,
                     };
-                    let sealed = GhostPairCertificate::certify_and_seal(
+                    let sealed = GhostPairCertificate::certify_and_seal_with_term_memory_limit(
                         &self.problem,
                         spec,
                         raw_ghost_model,
                         Some(certify_budget),
+                        self.config.memory_budget,
                     );
                     self.decision_log.log_decision(DecisionEntry {
                         stage: "array_ghost_pairs",
@@ -3436,6 +4927,7 @@ impl AdaptivePortfolio {
                                 summary.back_translator.as_ref(),
                                 &raw_ghost_problem,
                                 &cex,
+                                &self.cancellation_token,
                             )
                         }
                         None => cex,
@@ -3445,6 +4937,7 @@ impl AdaptivePortfolio {
                             ghost_back_translator.as_ref(),
                             &self.problem,
                             &raw_ghost_cex,
+                            &self.cancellation_token,
                         );
                     let replayed = self
                         .validate_final_unsafe_result(&translated, self.remaining_budget(deadline));
@@ -3722,6 +5215,7 @@ impl AdaptivePortfolio {
         let validation_config = PdrConfig {
             verbose: self.config.verbose,
             strict_proofs: true,
+            cancellation_token: Some(self.cancellation_token.child()),
             solve_timeout: Some(validation_budget),
             disable_array_scalarization: true,
             preserve_original_clauses: true,
@@ -4056,18 +5550,62 @@ impl AdaptivePortfolio {
     }
 
     fn solve_internal(&self, deadline: Option<Instant>) -> (PortfolioResult, ValidationEvidence) {
+        if self.budget_exhausted(deadline) {
+            let result = PortfolioResult::Unknown;
+            self.log_direct_dispatch(
+                "budget_or_cancellation_before_dispatch",
+                Instant::now(),
+                &result,
+            );
+            return (result, ValidationEvidence::FullVerification);
+        }
+
         // Trace mode: single PDR with TLA trace, validated through the
         // same pipeline as normal results. Part of #5811.
         if self.config.trace_mode {
-            return (
-                self.solve_trace_mode(),
-                ValidationEvidence::FullVerification,
-            );
+            let started = Instant::now();
+            let result = self.solve_trace_mode();
+            self.log_direct_dispatch("trace_mode", started, &result);
+            return (result, ValidationEvidence::FullVerification);
+        }
+
+        // Reproducibility mode bypasses the classification-driven staging tree:
+        // several specialized routes contain parallel races. The const-key
+        // array route is an exception: it is single-threaded, has a fixed
+        // budget, and accepts only after strict validation on the unchanged
+        // original clauses. Running it here preserves deterministic execution
+        // without sending BV-indexed arrays through the generic BvToBool /
+        // BvToInt preprocessing that destroys their select-index structure.
+        if self.config.execution_mode == AdaptiveExecutionMode::DeterministicSequential {
+            if let Some(result) = self.try_array_const_key_cegar_route_with_budget(
+                deadline,
+                DETERMINISTIC_ARRAY_CONST_KEY_CEGAR_ROUTE_BUDGET,
+                DETERMINISTIC_ARRAY_CONST_KEY_CEGAR_ROUTE_VALIDATION_RESERVE,
+            ) {
+                return (result, ValidationEvidence::FullVerification);
+            }
+
+            if let Some((result, evidence)) =
+                self.try_deterministic_array_forwarded_acyclic_bmc_route(deadline)
+            {
+                return (result, evidence);
+            }
+
+            // The fixed-order sequential portfolio remains the deterministic
+            // fallback when the bounded array routes are inapplicable or
+            // cannot produce independently validated evidence.
+            let started = Instant::now();
+            let result = self.solve_deterministic_sequential(deadline);
+            self.log_direct_dispatch("deterministic_sequential", started, &result);
+            return (result, ValidationEvidence::FullVerification);
         }
 
         // Skip classification if requested
         if self.config.skip_classification {
-            return (self.solve_default(), ValidationEvidence::FullVerification);
+            let started = Instant::now();
+            let result = self.solve_default(deadline);
+            self.log_direct_dispatch("unclassified_default_portfolio", started, &result);
+            return (result, ValidationEvidence::FullVerification);
         }
 
         // Classify the problem
@@ -4592,6 +6130,19 @@ impl AdaptivePortfolio {
         (result, evidence)
     }
 
+    fn log_direct_dispatch(&self, stage: &'static str, started: Instant, result: &PortfolioResult) {
+        self.decision_log.log_decision(DecisionEntry {
+            stage,
+            gate_result: true,
+            gate_reason: "authoritative direct dispatch".to_string(),
+            budget_secs: self.config.time_budget.as_secs_f64(),
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            result: Self::result_to_str(result),
+            lemmas_learned: 0,
+            max_frame: 0,
+        });
+    }
+
     /// Final verified-result boundary for adaptive solving.
     ///
     /// `solve_internal()` is allowed to use the lighter-weight adaptive
@@ -4611,6 +6162,97 @@ impl AdaptivePortfolio {
         result: PortfolioResult,
         evidence: ValidationEvidence,
         deadline: Option<Instant>,
+    ) -> crate::VerifiedChcResult {
+        self.finalize_verified_result_with_optional_cancellation(result, evidence, deadline, None)
+    }
+
+    pub(crate) fn finalize_verified_result_with_boundary(
+        &self,
+        result: PortfolioResult,
+        evidence: ValidationEvidence,
+        deadline: Option<Instant>,
+        cancellation: &crate::CancellationToken,
+    ) -> crate::VerifiedChcResult {
+        self.finalize_verified_result_with_optional_cancellation(
+            result,
+            evidence,
+            deadline,
+            Some(cancellation),
+        )
+    }
+
+    fn finalize_verified_result_with_optional_cancellation(
+        &self,
+        result: PortfolioResult,
+        evidence: ValidationEvidence,
+        deadline: Option<Instant>,
+        external_cancellation: Option<&crate::CancellationToken>,
+    ) -> crate::VerifiedChcResult {
+        if (self.construction_aborted
+            || self.cancellation_token.is_cancelled()
+            || external_cancellation.is_some_and(crate::CancellationToken::is_cancelled)
+            || deadline.is_some_and(|boundary| Instant::now() >= boundary))
+            && matches!(
+                &result,
+                PortfolioResult::Safe(_) | PortfolioResult::Unsafe(_)
+            )
+        {
+            return crate::VerifiedChcResult::Unknown(
+                crate::engine_result::VerifiedUnknownMarker::new(),
+            );
+        }
+        let finalized = self.finalize_verified_result_candidate(
+            result,
+            evidence,
+            deadline,
+            external_cancellation,
+        );
+        let externally_cancelled = self.cancellation_token.is_cancelled()
+            || external_cancellation.is_some_and(crate::CancellationToken::is_cancelled);
+        let construction_aborted = self.construction_aborted;
+        let deadline_expired = deadline.is_some_and(|boundary| Instant::now() >= boundary);
+        if (construction_aborted || externally_cancelled || deadline_expired)
+            && matches!(
+                &finalized,
+                crate::VerifiedChcResult::Safe(_) | crate::VerifiedChcResult::Unsafe(_)
+            )
+        {
+            self.decision_log.log_decision(DecisionEntry {
+                stage: if construction_aborted {
+                    "constructor_boundary_finalization"
+                } else if externally_cancelled {
+                    "external_cancellation_finalization"
+                } else {
+                    "global_deadline_finalization"
+                },
+                gate_result: false,
+                gate_reason: if construction_aborted {
+                    "constructor preprocessing crossed cancellation/deadline".to_string()
+                } else if externally_cancelled {
+                    "definitive candidate completed after external cancellation was requested"
+                        .to_string()
+                } else {
+                    "definitive candidate completed at or after the whole-run deadline".to_string()
+                },
+                budget_secs: 0.0,
+                elapsed_secs: 0.0,
+                result: "unknown",
+                lemmas_learned: 0,
+                max_frame: 0,
+            });
+            return crate::VerifiedChcResult::Unknown(
+                crate::engine_result::VerifiedUnknownMarker::new(),
+            );
+        }
+        finalized
+    }
+
+    fn finalize_verified_result_candidate(
+        &self,
+        result: PortfolioResult,
+        evidence: ValidationEvidence,
+        deadline: Option<Instant>,
+        external_cancellation: Option<&crate::CancellationToken>,
     ) -> crate::VerifiedChcResult {
         match result {
             PortfolioResult::Safe(model) => {
@@ -4642,10 +6284,7 @@ impl AdaptivePortfolio {
                         "Adaptive: ghost-pair quantified certificate failed the finalize \
                          re-check, demoting to Unknown"
                     );
-                    return crate::VerifiedChcResult::from_validated(
-                        PortfolioResult::Unknown,
-                        ValidationEvidence::FullVerification,
-                    );
+                    return crate::VerifiedChcResult::unknown_candidate_not_admitted();
                 }
 
                 // (#C3 RETIRED, 2026-07-08): the blanket Safe→Unknown demotion for
@@ -4667,10 +6306,7 @@ impl AdaptivePortfolio {
                         model_predicates = model.len(),
                         "Adaptive: rejecting unvalidated preprocessed query-only discharge Safe evidence"
                     );
-                    return crate::VerifiedChcResult::from_validated(
-                        PortfolioResult::Unknown,
-                        evidence,
-                    );
+                    return crate::VerifiedChcResult::unknown_candidate_not_admitted();
                 }
 
                 if let ValidationEvidence::ScalarAcyclicBmcExhaustive { max_depth } = &evidence {
@@ -4705,10 +6341,7 @@ impl AdaptivePortfolio {
                         has_recursive_datatype_sorts = self.problem.has_recursive_datatype_sorts(),
                         "Adaptive: acyclic BMC evidence did not satisfy scalar admission preconditions, demoting to Unknown"
                     );
-                    return crate::VerifiedChcResult::from_validated(
-                        PortfolioResult::Unknown,
-                        ValidationEvidence::FullVerification,
-                    );
+                    return crate::VerifiedChcResult::unknown_candidate_not_admitted();
                 }
 
                 // Item 4 Stage 0 acceptance fixes. Both variants are only
@@ -4740,10 +6373,7 @@ impl AdaptivePortfolio {
                         "Adaptive: double-run acyclic evidence carried by a CYCLIC problem; \
                          demoting to Unknown fail-closed"
                     );
-                    return crate::VerifiedChcResult::from_validated(
-                        PortfolioResult::Unknown,
-                        ValidationEvidence::FullVerification,
-                    );
+                    return crate::VerifiedChcResult::unknown_candidate_not_admitted();
                 }
 
                 if !matches!(
@@ -4763,10 +6393,7 @@ impl AdaptivePortfolio {
                         ?evidence,
                         "Adaptive: final Safe result carried non-original-validation evidence, demoting to Unknown"
                     );
-                    return crate::VerifiedChcResult::from_validated(
-                        PortfolioResult::Unknown,
-                        ValidationEvidence::FullVerification,
-                    );
+                    return crate::VerifiedChcResult::unknown_candidate_not_admitted();
                 }
 
                 if !self.final_safe_model_has_required_interpretations(&model) {
@@ -4779,9 +6406,10 @@ impl AdaptivePortfolio {
                     // criterion — the structural gate alone is pure pessimism.
                     let completion_start = Instant::now();
                     if let Some(completed) = self
-                        .try_complete_final_safe_model_with_constant_interpretations(
+                        .try_complete_final_safe_model_with_constant_interpretations_and_cancellation(
                             &model,
                             self.remaining_budget(deadline),
+                            external_cancellation,
                         )
                     {
                         tracing::info!(
@@ -4827,8 +6455,10 @@ impl AdaptivePortfolio {
                     // unconditionally (and discards the acyclic probe's genuine
                     // `ScalarAcyclicBmcExhaustive` evidence), so the label alone
                     // is not proof. The re-proof on the original problem is.
-                    if self.final_safe_verdict_reproved_on_original(self.remaining_budget(deadline))
-                    {
+                    if self.final_safe_verdict_reproved_on_original_with_cancellation(
+                        self.remaining_budget(deadline),
+                        external_cancellation,
+                    ) {
                         tracing::info!(
                             predicates = self.problem.predicates().len(),
                             model_predicates = model.len(),
@@ -4876,10 +6506,7 @@ impl AdaptivePortfolio {
                         lemmas_learned: 0,
                         max_frame: 0,
                     });
-                    return crate::VerifiedChcResult::from_validated(
-                        PortfolioResult::Unknown,
-                        ValidationEvidence::FullVerification,
-                    );
+                    return crate::VerifiedChcResult::unknown_candidate_not_admitted();
                 }
 
                 crate::VerifiedChcResult::from_validated(PortfolioResult::Safe(model), evidence)
@@ -4893,7 +6520,11 @@ impl AdaptivePortfolio {
                         PortfolioResult::Unsafe(cex),
                         ValidationEvidence::TrivialProblem,
                     )
-                } else if self.validate_final_unsafe_result(&cex, self.remaining_budget(deadline)) {
+                } else if self.validate_final_unsafe_result_with_cancellation(
+                    &cex,
+                    self.remaining_budget(deadline),
+                    external_cancellation,
+                ) {
                     crate::VerifiedChcResult::from_validated(
                         PortfolioResult::Unsafe(cex),
                         ValidationEvidence::CounterexampleVerification,
@@ -4907,10 +6538,11 @@ impl AdaptivePortfolio {
                     tracing::debug!(
                         "Adaptive: final Unsafe result failed verified-result validation, demoting to Unknown"
                     );
-                    crate::VerifiedChcResult::from_validated(
-                        PortfolioResult::Unknown,
-                        ValidationEvidence::CounterexampleVerification,
-                    )
+                    // A candidate Unsafe existed and the final boundary
+                    // refused it. The reason deliberately does not claim why:
+                    // the re-verifier can also fail closed when its residual
+                    // budget is exhausted.
+                    crate::VerifiedChcResult::unknown_candidate_not_admitted()
                 }
             }
             other => crate::VerifiedChcResult::from_validated(other, evidence),
@@ -4969,10 +6601,17 @@ impl AdaptivePortfolio {
     /// Compute the global adaptive deadline once so final validation cannot
     /// reopen a fresh timeout after the route budget has expired.
     pub(crate) fn solve_deadline(&self) -> Option<Instant> {
-        if self.config.time_budget.is_zero() {
+        let configured = if let Some(context) = self.authoritative_context {
+            context.deadline
+        } else if self.config.time_budget.is_zero() {
             None
         } else {
             Some(Instant::now() + self.config.time_budget)
+        };
+        match (configured, crate::smt::current_thread_solve_deadline()) {
+            (Some(configured), Some(enclosing)) => Some(configured.min(enclosing)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
         }
     }
 
@@ -4984,7 +6623,9 @@ impl AdaptivePortfolio {
     /// stage-boundary budget check double as a prompt cancellation point.
     /// Sound: it only skips further work (degrades to Unknown).
     pub(crate) fn budget_exhausted(&self, deadline: Option<Instant>) -> bool {
-        self.cancellation_token.is_cancelled() || deadline.is_some_and(|d| Instant::now() >= d)
+        self.construction_aborted
+            || self.cancellation_token.is_cancelled()
+            || deadline.is_some_and(|d| Instant::now() >= d)
     }
 
     /// Convert a `PortfolioResult` to a decision log result string.
@@ -4997,10 +6638,18 @@ impl AdaptivePortfolio {
         }
     }
 
+    fn verified_result_to_str(result: &crate::VerifiedChcResult) -> &'static str {
+        match result {
+            crate::VerifiedChcResult::Safe(_) => "safe",
+            crate::VerifiedChcResult::Unsafe(_) => "unsafe",
+            crate::VerifiedChcResult::Unknown(_) => "unknown",
+        }
+    }
+
     /// Build a default portfolio config with the standard settings.
     ///
-    /// Used by `solve_with_budget_report()` which bypasses the adaptive
-    /// classification pipeline and runs the portfolio directly.
+    /// Used by deterministic execution after any fixed-budget deterministic
+    /// pre-strategies have returned no definitive result.
     fn make_default_portfolio_config(&self) -> PortfolioConfig {
         let mut config = PortfolioConfig::default();
         config.parallel_timeout = if self.config.time_budget.is_zero() {
@@ -5011,24 +6660,71 @@ impl AdaptivePortfolio {
         config.verbose = self.config.verbose;
         config.strict_proofs = self.config.strict_proofs;
         config.memory_budget = self.config.memory_budget;
-        if let Some(max) = self.config.max_engines {
-            config.engines.truncate(max);
-        }
+        self.apply_execution_mode(&mut config);
+        self.apply_staged_probe_budget_defaults(&mut config, StagedProbeBudgetProfile::BmcAndKind);
         config
     }
 
-    /// Solve using default portfolio (for comparison/fallback).
-    fn solve_default(&self) -> PortfolioResult {
-        let mut config = PortfolioConfig::default();
-        config.parallel_timeout = if self.config.time_budget.is_zero() {
+    /// Apply the adaptive scheduling policy to a concrete portfolio config.
+    fn apply_execution_mode(&self, config: &mut PortfolioConfig) {
+        if self.config.execution_mode != AdaptiveExecutionMode::DeterministicSequential {
+            return;
+        }
+
+        config.parallel = false;
+        config.timeout = if self.config.time_budget.is_zero() {
             None
         } else {
             Some(self.config.time_budget)
         };
-        config.verbose = self.config.verbose;
+        config.parallel_timeout = None;
+    }
 
-        config.strict_proofs = self.config.strict_proofs;
-        self.run_portfolio(config)
+    /// Run the canonical portfolio in a fixed sequential order.
+    fn solve_deterministic_sequential(&self, deadline: Option<Instant>) -> PortfolioResult {
+        let mut config = self.make_default_portfolio_config();
+        if let Some(remaining) = self.remaining_budget(deadline) {
+            config.timeout = Some(remaining);
+        }
+        self.apply_staged_probe_budget_defaults(&mut config, StagedProbeBudgetProfile::BmcAndKind);
+        self.run_portfolio_with_deterministic_deadline(config, deadline)
+    }
+
+    /// Solve using default portfolio (for comparison/fallback).
+    fn solve_default(&self, deadline: Option<Instant>) -> PortfolioResult {
+        let Some(config) = self.default_portfolio_config_for_deadline(deadline) else {
+            return PortfolioResult::Unknown;
+        };
+        self.run_portfolio_with_deterministic_deadline(config, deadline)
+    }
+
+    fn default_portfolio_config_for_deadline(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Option<PortfolioConfig> {
+        let mut config = self.make_default_portfolio_config();
+        let Some(remaining) = self.remaining_budget(deadline) else {
+            return Some(config);
+        };
+        if remaining.is_zero() {
+            return None;
+        }
+
+        if config.parallel {
+            config.parallel_timeout = Some(
+                config
+                    .parallel_timeout
+                    .map_or(remaining, |configured| configured.min(remaining)),
+            );
+        } else {
+            config.timeout = Some(
+                config
+                    .timeout
+                    .map_or(remaining, |configured| configured.min(remaining)),
+            );
+        }
+        self.apply_staged_probe_budget_defaults(&mut config, StagedProbeBudgetProfile::BmcAndKind);
+        Some(config)
     }
 
     /// Build a `PortfolioConfig` with engines ordered by the learned selector.
@@ -5055,18 +6751,25 @@ impl AdaptivePortfolio {
                     .unwrap_or(self.config.time_budget),
             )
         };
-        PortfolioConfig {
+        let mut config = PortfolioConfig {
             external_cancellation: Some(self.cancellation_token.clone()),
             engines: selection.engines,
-            parallel: true,
-            timeout: None,
-            parallel_timeout: portfolio_timeout,
+            parallel: self.config.execution_mode != AdaptiveExecutionMode::DeterministicSequential,
+            timeout: (self.config.execution_mode == AdaptiveExecutionMode::DeterministicSequential)
+                .then_some(portfolio_timeout)
+                .flatten(),
+            parallel_timeout: (self.config.execution_mode
+                != AdaptiveExecutionMode::DeterministicSequential)
+                .then_some(portfolio_timeout)
+                .flatten(),
             verbose: self.config.verbose,
             enable_preprocessing: true,
             engine_budgets: ay_core::kani_compat::DetHashMap::default(),
             memory_budget: self.config.memory_budget,
             strict_proofs: self.config.strict_proofs,
-        }
+        };
+        self.apply_staged_probe_budget_defaults(&mut config, StagedProbeBudgetProfile::BmcAndKind);
+        config
     }
 
     /// Solve using learned feature-based engine selection.
@@ -5089,27 +6792,22 @@ impl AdaptivePortfolio {
     fn solve_trace_mode(&self) -> PortfolioResult {
         let mut pdr_config = PdrConfig::production(self.config.verbose).with_tla_trace_from_env();
         self.apply_user_hints(&mut pdr_config);
-        // Wire cancellation token for budget enforcement.
-        // The timer thread uses park_timeout so it can be woken early
-        // when the solve completes, avoiding orphaned sleeping threads
-        // in library mode (#6231).
-        let timer_handle = if !self.config.time_budget.is_zero() {
+        // Wire cancellation token for budget enforcement. `cancel_after` owns a
+        // guard whose Drop wakes and joins the timer, including during panic
+        // unwinding, so no watchdog can outlive this trace invocation.
+        let timeout_guard = if !self.config.time_budget.is_zero() {
             // Child of the portfolio handle (item 5): the watchdog cancels
             // only this lane; an external cancel also reaches it.
             let token = self.cancellation_token.child();
-            let watchdog = token.clone();
             let budget = self.config.time_budget;
-            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let cancel_flag = cancelled.clone();
-            let handle = std::thread::spawn(move || {
-                std::thread::park_timeout(budget);
-                if !cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
-                    watchdog.cancel();
-                }
-            });
+            let guard = token.cancel_after(budget);
             pdr_config = pdr_config.with_cancellation_token(Some(token));
-            Some((handle, cancelled))
+            Some(guard)
         } else {
+            // An unbounded trace solve still observes the embedding caller's
+            // cancellation handle. There is no lane-local watchdog in this
+            // branch, so the child can only be cancelled by its adaptive parent.
+            pdr_config = pdr_config.with_cancellation_token(Some(self.cancellation_token.child()));
             None
         };
 
@@ -5121,12 +6819,9 @@ impl AdaptivePortfolio {
         self.accumulate_stats(&result_with_stats.stats);
         ay_core::release_trace_file();
 
-        // Cancel the watchdog timer early — solve is done.
-        if let Some((handle, cancelled)) = timer_handle {
-            cancelled.store(true, std::sync::atomic::Ordering::Release);
-            handle.thread().unpark();
-        }
-
+        // The trace engine is done; stop and synchronously reap its watchdog
+        // before entering result validation.
+        drop(timeout_guard);
         let validated = self.validate_adaptive_result(result_with_stats.result);
 
         // Convert PdrResult to PortfolioResult (ChcEngineResult)
@@ -5139,10 +6834,10 @@ impl AdaptivePortfolio {
 
     // Engine methods (solve_entry_exit_only, solve_trivial, try_alternative_engine_budgeted,
     // try_kind, try_synthesis) are in adaptive_engines.rs.
-    // BV strategy methods are in adaptive_bv_strategy.rs.
-    // Multi-pred strategy methods are in adaptive_multi_pred.rs.
-    // Validation methods are in adaptive_validation.rs.
+    // BV, multi-predicate, and validation strategies live in their adaptive_* modules.
 }
+
+mod original_problem_engine_selection;
 
 #[cfg(test)]
 impl AdaptivePortfolio {

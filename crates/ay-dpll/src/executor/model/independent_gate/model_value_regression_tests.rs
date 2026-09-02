@@ -51,6 +51,7 @@ fn get_model_int_prefers_lia_over_stale_euf_term_value() {
         completed_values: DetHashMap::default(),
         dt_ground: DetHashMap::default(),
         dt_pins: DetHashMap::default(),
+        dt_array_field_classes: Vec::new(),
     });
     exec.last_result = Some(SolveResult::Sat);
 

@@ -80,6 +80,7 @@ pub(crate) const SUPPORTED_LOGICS: &[&str] = &[
     "NRA",
     "QF_ABV",
     "QF_AUFBV",
+    "QF_AUFBVLIA",
     "QF_AUFLIA",
     "QF_AUFLIRA",
     "QF_AUFLRA",
@@ -101,6 +102,7 @@ pub(crate) const SUPPORTED_LOGICS: &[&str] = &[
     "QF_SNIA",
     "QF_UF",
     "QF_UFBV",
+    "QF_UFBVLIA",
     "QF_UFLIA",
     "QF_UFLRA",
     "QF_UFNIA",
@@ -214,4 +216,22 @@ pub(crate) fn interactive_banner() -> String {
         env!("AY_BUILD_STAMP"),
         logics_str,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SUPPORTED_LOGICS;
+
+    #[test]
+    fn supported_logics_include_named_bv_lia_combinations() {
+        assert!(SUPPORTED_LOGICS.contains(&"QF_UFBVLIA"));
+        assert!(SUPPORTED_LOGICS.contains(&"QF_AUFBVLIA"));
+    }
+
+    #[test]
+    fn supported_logics_are_sorted_and_unique_before_horn_extension() {
+        let (standard, extension) = SUPPORTED_LOGICS.split_at(SUPPORTED_LOGICS.len() - 1);
+        assert_eq!(extension, ["HORN"]);
+        assert!(standard.windows(2).all(|pair| pair[0] < pair[1]));
+    }
 }

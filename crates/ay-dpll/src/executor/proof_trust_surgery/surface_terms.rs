@@ -41,7 +41,7 @@ pub(super) fn eq_flip_equivalent(terms: &ay_core::TermStore, a: TermId, b: TermI
 /// `None` fail-closed on any binder that could capture (`forall`/`exists`/
 /// `lambda`/`match` under a non-empty environment) so no incorrect
 /// substitution is ever produced.
-pub(super) fn expand_surface_lets(
+pub(in crate::executor) fn expand_surface_lets(
     term: &FrontendTerm,
     env: &std::collections::HashMap<String, FrontendTerm>,
 ) -> Option<FrontendTerm> {

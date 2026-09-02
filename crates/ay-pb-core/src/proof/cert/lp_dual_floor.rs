@@ -45,7 +45,11 @@ fn emit_row_aggregate(
     multipliers: &[i128],
 ) -> Option<ConstraintId> {
     // `linear_rows` preserves VeriPB input order, so normalized row index `r`
-    // is exactly input constraint id `r + 1` here.
+    // is exactly input constraint id `r + 1` here. This `r + 1` is NOT the
+    // historical row-id-shift bug and has been audited as correct (2026-08-29):
+    // `linear_rows` (see `lp_dual_floor/arithmetic.rs`) already splits a
+    // `PbRel::Eq` row into two consecutive rows in VeriPB's own import order,
+    // so the index is post-split. Do not re-file.
     let mut terms = multipliers
         .iter()
         .enumerate()
@@ -138,11 +142,44 @@ fn emit_proof(
     String::from_utf8(writer.into_inner()).ok()
 }
 
+/// Deterministic work cap for the exact dual solve, counted in `should_stop`
+/// POLLS — a COUNT, never a duration, exactly as the other floor rungs' caps
+/// (`odd_cycle_cover::packing::Limits`: "a clock-based cap would make the
+/// emitted bytes depend on machine load"). The LP tiers poll at deterministic
+/// sites only — every `TABLEAU_INIT_POLL_ROWS` rows of tableau init, once per
+/// pivot, and every `PIVOT_POLL_ENTRIES` tableau entries at row granularity
+/// inside a pivot (see `optimize::lp_bound`) — so a poll is a fixed-size chunk
+/// of tableau work and the count at which this cap fires is identical on every
+/// machine.
+///
+/// WHY THIS EXISTS. This rung is a FLOOR rung: it runs outside the
+/// `CertRouteBudget` scheduler so that a caller whose deadline is already
+/// spent (the normal case for the CLI) still gets every floor route. Its
+/// previous private budget was a fresh one-minute WALL deadline taken at rung
+/// entry, which is how a 5 s `--timeout` proof run spent 60+ s here: measured
+/// on the 2026-08-29 definitive census, `aim-200-2_0-yes1-2`,
+/// `knapPI_11_1000_1000_5` and `mult_diagcomm_..._nbits_16` each took 60-65 s
+/// in proof mode at `--timeout 5000` and then FAILED to certify — the minute
+/// bought nothing on exactly the instances that consumed it.
+///
+/// SIZING, from measurement (probe build bfe9acce, PB25 OPT-LIN REACHABLE
+/// sweep, 2026-08-30): the largest poll count of ANY instance this rung
+/// certifies is 2,061 (`lo_14x14_007`; next is 1,479, then <=136), while the
+/// smallest count of the pathological non-certifying instances is 7,047
+/// (`aim-200` at its old 60 s deadline). 4096 is the power of two inside that
+/// measured gap: ~2x headroom over the heaviest certifying member, and it
+/// converts the pathologies' minute into a bounded, machine-independent slice.
+/// Raising it cannot make a proof wrong, only slower; lowering it turns
+/// certificates into declines. The A/B gate for any resizing is proof-sha
+/// equality on the certifying corpus.
+const MAX_DUAL_SOLVE_POLLS: u64 = 4096;
+
 /// Implements the public contract in [`super::certify_opt_lin_lp_dual_floor`].
 ///
 /// There is intentionally no objective-sign gate: maximization and mixed-sign
-/// objectives are valid when the exact LP floor is tight. The fixed one-minute
-/// simplex slice bounds certificate work; timeout declines without affecting the
+/// objectives are valid when the exact LP floor is tight. The dual solve is
+/// bounded by [`MAX_DUAL_SOLVE_POLLS`] — a deterministic work count, never a
+/// wall clock — and an out-of-budget solve declines without affecting the
 /// underlying optimum verdict.
 pub(super) fn certify_opt_lin_lp_dual_floor(
     instance: &PbInstance,
@@ -159,22 +196,47 @@ pub(super) fn certify_opt_lin_lp_dual_floor(
         return None;
     }
     let rows = linear_rows(&instance.constraints).ok()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
     // The claimed optimum is threaded as the dual solve's TARGET and the
     // emitter's denominator cap as its scale budget. Both are quality inputs
     // only: a wrong target or an unusable scale can make the solve stop early or
     // hand back a different dual-feasible point, and the reconstruction below
     // still re-derives every coefficient and refuses anything that does not land
     // exactly on `optimum`.
+    //
+    // The stop predicate is a WORK COUNT, latched once exceeded: every poll is a
+    // deterministic chunk of tableau work, so where this solve stops does not
+    // depend on the machine or its load. (The advisory f64 tier keeps its own
+    // small internal wall budget — pre-existing, fail-closed, and its output is
+    // re-verified exactly — so it is the one place a slow box can still turn a
+    // would-be certificate into a decline; it could turn none into a wrong one.)
+    let polls = std::cell::Cell::new(0u64);
     let raw = crate::optimize::lp_bound::lp_dual_raw_diagnosed(
         objective,
         &instance.constraints,
         instance.num_vars,
         Some(optimum),
         Some(MAX_DUAL_SCALE),
-        &|| std::time::Instant::now() >= deadline,
-    )
-    .ok()?;
+        &|| {
+            let spent = polls.get().saturating_add(1);
+            polls.set(spent);
+            spent > MAX_DUAL_SOLVE_POLLS
+        },
+    );
+    if ay_core::misc_cli_flags().cert_debug {
+        eprintln!(
+            "c [cert/lp-dual-floor] polls={}/{} -> {}",
+            polls.get(),
+            MAX_DUAL_SOLVE_POLLS,
+            match &raw {
+                Ok(r) => format!(
+                    "tier={} converged={} bound={} opt={optimum}",
+                    r.tier, r.converged, r.bound
+                ),
+                Err(decline) => format!("decline({})", decline.label()),
+            }
+        );
+    }
+    let raw = raw.ok()?;
     if raw.bound != optimum {
         return None;
     }
@@ -293,7 +355,65 @@ fn dual_floor_verdict(
 mod tests {
     use super::arithmetic::MAX_DUAL_SCALE;
     use super::dual_floor_verdict;
+    use super::MAX_DUAL_SOLVE_POLLS;
     use crate::optimize::lp_bound::DUAL_DENOMINATOR_LADDER;
+    use crate::types::{PbConstraint, PbInstance, PbLit, PbObjective, PbRel, PbTerm};
+
+    /// End-to-end over the EQUALITY-SPAN lane: a mixed-sign objective pinned
+    /// to a constant by one `=` row (the `mult_diagcomm` shape in miniature)
+    /// must certify `BOUNDS 0 <= obj <= 0` with the objective expressed as an
+    /// exact combination of the equality's two split halves — no simplex tier
+    /// in the loop.
+    #[test]
+    fn equality_span_instance_certifies_end_to_end() {
+        let term = |coeff: i128, var: u32| PbTerm {
+            coeff,
+            lits: vec![PbLit {
+                var,
+                negated: false,
+            }],
+        };
+        let instance = PbInstance {
+            num_vars: 2,
+            num_constraints: 1,
+            constraints: vec![PbConstraint {
+                terms: vec![term(1, 1), term(-1, 2)],
+                rel: PbRel::Eq,
+                rhs: 0,
+            }],
+            objective: Some(PbObjective {
+                terms: vec![term(1, 1), term(-1, 2)],
+            }),
+        };
+        let proof = super::certify_opt_lin_lp_dual_floor(&instance, &[false, false], 0)
+            .expect("the equality-span certificate must emit");
+        assert!(
+            proof.contains("conclusion BOUNDS 0 :"),
+            "equal bounds at the optimum, got:\n{proof}"
+        );
+    }
+
+    /// The poll cap was sized from a measured gap, and this pins BOTH edges so
+    /// a blind resize cannot silently cross either. Probe sweep 2026-08-30
+    /// (PB25 OPT-LIN REACHABLE + the three census pathologies): the heaviest
+    /// instance the rung CERTIFIES spends 2,061 polls (`lo_14x14_007`); the
+    /// cheapest instance that used to burn the old one-minute wall deadline
+    /// WITHOUT certifying spends 7,047 (`aim-200-2_0-yes1-2`). Below the lower
+    /// edge the cap costs measured certificates; at or above the upper edge it
+    /// readmits the 12x `--timeout` overshoot the count exists to close. A
+    /// legitimate move of either edge is a NEW measurement, and the A/B gate
+    /// for it is proof-sha equality on the certifying corpus.
+    #[test]
+    fn dual_solve_poll_cap_sits_inside_the_measured_gap() {
+        assert!(
+            MAX_DUAL_SOLVE_POLLS > 2_061,
+            "cap {MAX_DUAL_SOLVE_POLLS} would decline the heaviest measured certifying member"
+        );
+        assert!(
+            MAX_DUAL_SOLVE_POLLS < 7_047,
+            "cap {MAX_DUAL_SOLVE_POLLS} readmits the cheapest measured pathology"
+        );
+    }
 
     /// The reduction ladder lives in the LP module and the cap that refuses its
     /// output lives here. A rung past the cap would build a plan this emitter is

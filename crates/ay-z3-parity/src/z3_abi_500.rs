@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Isolated runtime probes for the exact Z3 5.0.0 C ABI.
+//! Isolated runtime probes for the exact Z3 5.1.0 C ABI.
 //!
 //! This module is deliberately reached through a hidden child-process mode.
 //! Loading a shared object runs its initializers and calling an ABI with a
@@ -21,9 +21,9 @@ use crate::loader;
 pub(crate) const REQUIRED_SYMBOL_COUNT: usize = 807;
 pub(crate) const REQUIRED_SYMBOL_MANIFEST_SHA256: &str =
     "4259cfc87c0916a96ec5201a060edb286ce1553ac4e8e8cf0747aa310a88ecdb";
-pub(crate) const Z3_500_FULL_VERSION: &str = "Z3 5.0.0.0";
+pub(crate) const Z3_500_FULL_VERSION: &str = "5.1.0.0";
 
-/// Exact public C declarations exposed by the pinned Z3 5.0.0 `z3.h` include
+/// Exact public C declarations exposed by the pinned Z3 5.1.0 `z3.h` include
 /// graph. The canonical signature spelling is produced by Clang's C11 AST
 /// after including the byte-authenticated header set below.
 pub(crate) const PUBLIC_C_DECLARATION_COUNT: usize = 805;
@@ -32,27 +32,27 @@ pub(crate) const AUTHENTICATED_CALLABILITY_COUNT: usize = 217;
 pub(crate) const PUBLIC_C_DECLARATION_MANIFEST_SHA256: &str =
     "d4447ff654fd3b6bc6102d8e4959c5f12fb3b0d643f85bd7c4262167130ba2a0";
 pub(crate) const PUBLIC_C_HEADER_SET_SHA256: &str =
-    "b95c4a5f861e96f9d1704ac148e176d8af9f8f36521dd9b3c88e563e2d11db9b";
+    "dce02f1eb66ed3184226dc62f618992c1e6cfba47bb7c46d8d9fcafb98b15237";
 pub(crate) const AY_COMPAT_WRAPPER_SHA256: &str =
-    "a82e323425593f5ff8305488ab6c80271fd1c9920458b121f9be358430dbbdd8";
+    "ceab54112ea7d0c84f6f9c5b7a7a19ace618fed21e72104947cb4d13f73f70c1";
 pub(crate) const TYPED_C_CALL_SITES_SHA256: &str =
     "3c2dcccda91d56a86ae41e6ba96c77a51d017db0369390943cfe8a6c57e08c41";
 pub(crate) const ADDITIONAL_STOCK_C_PROBE_SHA256: &str =
-    "8b9ae909dc633a25c3e27f5e960e3e4219f1abb948d8ca2aeca13eaaf277e046";
+    "a338f2af1921ced4e4728b8f3d8fac389db61f323ff1ba5c37d38befee520a18";
 pub(crate) const REMAINING_STOCK_C_PROBE_SHA256: &str =
-    "757f1838f48dc9f7272d26fc885d26ba068d43da9d9b696b30a79b6f40ae6415";
+    "00134079cdb1981cad1b3592b2d7123d81747de378bc2e3ee3f2b4a25b5f494b";
 pub(crate) const UNPROBED_REASON_COUNT: usize = 588;
 pub(crate) const UNPROBED_REASON_MANIFEST_SHA256: &str =
     "79b27a812ed9ee96cd0ab63304d785ad5deac9c7c2339ce58599aa15fc8ca1cb";
 
-const PUBLIC_C_DECLARATION_MANIFEST: &str = include_str!("../data/z3-5.0.0-c-declarations.txt");
+const PUBLIC_C_DECLARATION_MANIFEST: &str = include_str!("../data/z3-5.1.0-c-declarations.txt");
 const AY_COMPAT_WRAPPER: &[u8] = include_bytes!("../../ay-ffi/include/ay_z3_compat.h");
 const TYPED_C_CALL_SITES: &[u8] = include_bytes!("../../ay-ffi/tests/z3_500_typed_surface.c");
 const ADDITIONAL_STOCK_C_PROBE: &[u8] =
     include_bytes!("../../ay-ffi/tests/capi_z3_500_additional_consumer.c");
 const REMAINING_STOCK_C_PROBE: &[u8] =
     include_bytes!("../../ay-ffi/tests/capi_z3_500_remaining_consumer.c");
-const UNPROBED_REASON_MANIFEST: &str = include_str!("../data/z3-5.0.0-c-unprobed-reasons.tsv");
+const UNPROBED_REASON_MANIFEST: &str = include_str!("../data/z3-5.1.0-c-unprobed-reasons.tsv");
 
 struct PublicHeader {
     path: &'static str,
@@ -68,7 +68,7 @@ pub(crate) struct StockCProbe {
 }
 
 /// The complete `z3.h` include graph from Z3 commit
-/// `8e3402b215a810a4154eb183a7dfc4e853eb2f52`. Byte identity closes all public
+/// `0b6cdcdbc65da25ef0f73ac9da210574d0f66cf8`. Byte identity closes all public
 /// type, enum, callback, macro, and function-declaration spelling, not only
 /// exported names.
 const PUBLIC_HEADERS: [PublicHeader; 11] = [
@@ -99,8 +99,8 @@ const PUBLIC_HEADERS: [PublicHeader; 11] = [
     PublicHeader {
         path: "z3_algebraic.h",
         bytes: include_bytes!("../../ay-ffi/include/z3_algebraic.h"),
-        size: 7_193,
-        sha256: "7659d6dec25e49e2dd6546a6ca6c05adb27437a989d857af0cbcc7191adb45a6",
+        size: 7_195,
+        sha256: "0ee0722e3147450c0dbacc81c2d41e192313e7f25564262daad41e732fa4dce8",
     },
     PublicHeader {
         path: "z3_polynomial.h",
@@ -123,8 +123,8 @@ const PUBLIC_HEADERS: [PublicHeader; 11] = [
     PublicHeader {
         path: "z3_optimization.h",
         bytes: include_bytes!("../../ay-ffi/include/z3_optimization.h"),
-        size: 13_798,
-        sha256: "3f7dac1bd1696bfff5266f422171e10fae413db7b065549e17934d9212acbcc7",
+        size: 13_856,
+        sha256: "5e7d5ca98b76a6900039f2b39648c074f7cfd33b7c65d28d5770794e69cbd1ae",
     },
     PublicHeader {
         path: "z3_fpa.h",
@@ -141,9 +141,9 @@ const PUBLIC_HEADERS: [PublicHeader; 11] = [
 ];
 
 const MAX_REQUIRED_SYMBOL_INPUT: u64 = 256 * 1024;
-const REQUIRED_SYMBOL_MANIFEST: &str = include_str!("../data/z3-5.0.0-symbols.txt");
+const REQUIRED_SYMBOL_MANIFEST: &str = include_str!("../data/z3-5.1.0-symbols.txt");
 
-/// Z3 5.0.0 declaration-kind values added for finite sets.
+/// Z3 5.1.0 declaration-kind values added for finite sets.
 ///
 /// `EXT` and `MAP_INVERSE` are internal operators without public C
 /// constructors. Their reserved values are nevertheless part of the public
@@ -504,12 +504,12 @@ pub(crate) fn stock_c_probes() -> [StockCProbe; 2] {
         StockCProbe {
             id: "additional",
             source: ADDITIONAL_STOCK_C_PROBE,
-            expected_stdout_trailer: b"exact Z3 5.0.0 additional family probes passed\n",
+            expected_stdout_trailer: b"exact Z3 5.1.0 additional family probes passed\n",
         },
         StockCProbe {
             id: "remaining",
             source: REMAINING_STOCK_C_PROBE,
-            expected_stdout_trailer: b"exact Z3 5.0.0 remaining safe-call probes passed\n",
+            expected_stdout_trailer: b"exact Z3 5.1.0 remaining safe-call probes passed\n",
         },
     ]
 }
@@ -885,7 +885,7 @@ struct Api {
 
 impl Api {
     fn load(library: &loader::Library) -> Result<Self, String> {
-        // SAFETY: every symbol is resolved by its exact Z3 5.0.0 C API name
+        // SAFETY: every symbol is resolved by its exact Z3 5.1.0 C API name
         // and assigned the matching signature from z3_api.h. Calls remain
         // within this child process while `library` is alive.
         unsafe {
@@ -980,7 +980,7 @@ impl Drop for ContextGuard<'_> {
 
 fn run_finite_set_probes(api: &Api) -> Result<BTreeMap<String, String>, String> {
     // SAFETY: every call uses handles created by this exact API/context and
-    // the corresponding Z3 5.0.0 signature. The entire sequence is isolated
+    // the corresponding Z3 5.1.0 signature. The entire sequence is isolated
     // in the guarded probe child.
     let mut observed = unsafe { run_finite_set_probes_unsafe(api, None) }?;
     for (name, _) in SEMANTIC_PROBES {
@@ -1284,7 +1284,7 @@ unsafe fn run_finite_set_probes_unsafe(
             "ast.empty.decl-parameter-kind-0".to_string(),
             parameter_kind.to_string(),
         );
-        // SAFETY: exact Z3 5.0.0 reports parameter zero as a SORT parameter.
+        // SAFETY: exact Z3 5.1.0 reports parameter zero as a SORT parameter.
         // A subject that violates that contract may reject this typed accessor;
         // the guarded child turns such an ABI failure into a failed gate.
         let parameter_sort = require_ptr(

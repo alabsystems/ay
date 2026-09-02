@@ -1670,10 +1670,21 @@ fn resolve_program(program: &OsStr, path: Option<&OsStr>) -> PathBuf {
     }
 
     let path = path.unwrap_or_default();
+    if let Some(found) = scan_path_for_program(requested, path) {
+        return found;
+    }
+    panic!(
+        "could not resolve {} in PATH {:?}",
+        program.display(),
+        path.to_string_lossy()
+    );
+}
+
+fn scan_path_for_program(requested: &Path, path: &OsStr) -> Option<PathBuf> {
     for directory in std::env::split_paths(path) {
         let candidate = directory.join(requested);
         if candidate.is_file() {
-            return absolute_program_path_preserving_final_symlink(&candidate);
+            return Some(absolute_program_path_preserving_final_symlink(&candidate));
         }
         if !std::env::consts::EXE_SUFFIX.is_empty() {
             let candidate = directory.join(format!(
@@ -1682,15 +1693,11 @@ fn resolve_program(program: &OsStr, path: Option<&OsStr>) -> PathBuf {
                 std::env::consts::EXE_SUFFIX
             ));
             if candidate.is_file() {
-                return absolute_program_path_preserving_final_symlink(&candidate);
+                return Some(absolute_program_path_preserving_final_symlink(&candidate));
             }
         }
     }
-    panic!(
-        "could not resolve {} in PATH {:?}",
-        program.display(),
-        path.to_string_lossy()
-    );
+    None
 }
 
 fn resolve_paired_toolchain(workspace: &Path) -> PairedToolchain {
@@ -1701,12 +1708,29 @@ fn resolve_paired_toolchain(workspace: &Path) -> PairedToolchain {
             .map(OsString::as_os_str),
     );
     selection_environment.insert("PATH".into(), normalized_path);
-    let rustc_seed = resolve_program(
-        OsStr::new("rustc"),
-        selection_environment
-            .get(OsStr::new("PATH"))
-            .map(OsString::as_os_str),
-    );
+    // The seed only exists to be asked for its sysroot; the toolchain actually
+    // used is the SYSROOT'S OWN paired rustc+cargo below. On a Trust-only
+    // machine the package manager deliberately exposes no bare `rustc` on PATH
+    // (the branded name is `compiler_consumer`, and the Trust sysroot ships `rustc`/
+    // `cargo` as byte-identical compat entries for exactly this consumer), so
+    // seed from `compiler_consumer` when `rustc` is absent rather than fail a machine
+    // that has a complete toolchain under its real name.
+    let seed_path = selection_environment
+        .get(OsStr::new("PATH"))
+        .map(OsString::as_os_str);
+    let rustc_seed = scan_path_for_program(Path::new("rustc"), seed_path.unwrap_or_default())
+        .or_else(|| {
+            scan_path_for_program(
+                Path::new("compiler_consumer"),
+                seed_path.unwrap_or_default(),
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "could not resolve rustc (or compiler_consumer) in PATH {:?}",
+                seed_path.unwrap_or_default().to_string_lossy()
+            )
+        });
     let sysroot = checked_tool_output(
         &rustc_seed,
         &["--print", "sysroot"],
@@ -2535,10 +2559,18 @@ fn reject_unbound_semantic_cargo_config(path: &Path, parsed: &toml::Value) {
             // rustc invocation (rustflags included), and `incremental` selects
             // codegen caching, not program semantics. Any OTHER `build` key
             // (`target`, `target-dir`, `rustflags`, `rustc`) still fails.
+            // `jobs` joined the pair 2026-08-31: the trust superproject's
+            // committed .cargo/config.toml (a5012b03c) bounds Cargo fanout with
+            // `[build] jobs = 4` on a shared-UMA machine, and cargo's ancestor
+            // discovery hands that file to every ay-inside-trust checkout.
+            // Parallelism selects scheduling, never what the compiler is asked
+            // to build, so it belongs with the cache keys, not the semantic
+            // ones. Any OTHER `build` key (`target`, `target-dir`, `rustflags`,
+            // `rustc`) still fails.
             || (key == "build"
                 && value.as_table().is_some_and(|t| {
                     t.keys()
-                        .all(|k| matches!(k.as_str(), "rustc-wrapper" | "incremental"))
+                        .all(|k| matches!(k.as_str(), "rustc-wrapper" | "incremental" | "jobs"))
                 }));
         assert!(
             nonsemantic,

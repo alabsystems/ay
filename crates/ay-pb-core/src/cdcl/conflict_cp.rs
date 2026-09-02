@@ -80,12 +80,16 @@ impl PbCdclSolver {
 
         let asserting_lit = self.unique_current_level_falsified_literal(&learned);
 
-        let trail_levels: Vec<(u32, u32)> = self
-            .trail
-            .iter()
-            .map(|entry| (entry.lit.unsigned_abs(), entry.level))
-            .collect();
-        let propagator_snapshot: Vec<(PbLit, bool)> = learned
+        // Keyed lookups, matching the main analysis path; `.rev().find(..)` over
+        // the trail is "last entry wins", which forward insertion reproduces.
+        // See `CpConstraint::weaken_conservative` for the measured stall these
+        // linear scans fed.
+        let mut trail_levels: std::collections::BTreeMap<u32, u32> =
+            std::collections::BTreeMap::new();
+        for entry in self.trail.iter() {
+            trail_levels.insert(entry.lit.unsigned_abs(), entry.level);
+        }
+        let propagator_snapshot: std::collections::BTreeMap<PbLit, bool> = learned
             .coefficients()
             .keys()
             .map(|&lit| {
@@ -95,18 +99,11 @@ impl PbCdclSolver {
             })
             .collect();
         learned.weaken_conservative(asserting_lit, |lit| {
-            let is_false = propagator_snapshot
-                .iter()
-                .find(|(l, _)| *l == lit)
-                .map_or(false, |(_, f)| *f);
+            let is_false = propagator_snapshot.get(&lit).copied().unwrap_or(false);
             if !is_false {
                 return None;
             }
-            trail_levels
-                .iter()
-                .rev()
-                .find(|(var, _)| *var == lit.var)
-                .map(|(_, level)| *level)
+            trail_levels.get(&lit.var).copied()
         });
 
         learned.saturate();

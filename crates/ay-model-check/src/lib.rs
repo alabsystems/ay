@@ -605,6 +605,42 @@ pub fn confirm_model(
     model: &dyn ModelView,
     assertions: &[TermId],
 ) -> GateVerdict {
+    confirm_model_with_policy(
+        terms,
+        model,
+        assertions,
+        ResidualPolicy::MaterializeAndReplay,
+    )
+}
+
+/// Re-run the ordinary confirmation scan against a model whose formerly-free
+/// leaves have been completed by the residual witness builder.
+///
+/// This is deliberately the same fresh-evaluator path as [`confirm_model`],
+/// except that residual admission is disabled.  A completed witness therefore
+/// earns `ConfirmedSat` only by making every assertion evaluate to `true`; it
+/// cannot recursively justify a remaining coverage gap with another abstract
+/// extension argument.
+pub(crate) fn confirm_completed_model(
+    terms: &TermStore,
+    model: &dyn ModelView,
+    assertions: &[TermId],
+) -> GateVerdict {
+    confirm_model_with_policy(terms, model, assertions, ResidualPolicy::ReplayOnly)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResidualPolicy {
+    MaterializeAndReplay,
+    ReplayOnly,
+}
+
+fn confirm_model_with_policy(
+    terms: &TermStore,
+    model: &dyn ModelView,
+    assertions: &[TermId],
+    residual_policy: ResidualPolicy,
+) -> GateVerdict {
     let evaluator = Evaluator::new(terms, model);
     // Registry-aware datatype resolver: maps a `Sort::Uninterpreted(name)` that
     // abstracts a declared datatype back to its definition, so the
@@ -689,7 +725,8 @@ pub fn confirm_model(
     // pin probes inside the decision). This maps Sat -> {Sat, Unknown} only:
     // any residue beyond that fragment, any pinned read over the class, or
     // any conflict keeps the fail-closed verdict below.
-    if !non_residual_gap
+    if residual_policy == ResidualPolicy::MaterializeAndReplay
+        && !non_residual_gap
         && residual::free_dt_array_residue_extends(
             terms, model, &evaluator, assertions, &residue, &resolve,
         )

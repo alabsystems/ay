@@ -50,19 +50,22 @@ pub fn recover_single_equality_farkas(
         }
         let alternatives =
             normalized_constraint_alternatives(terms, literal.term, literal.value).ok()?;
+        let mut alternative_iter = alternatives.iter();
         if index == equality_index {
-            if alternatives.len() != 2 {
+            let (Some(oriented), Some(_), None) = (
+                alternative_iter.next(),
+                alternative_iter.next(),
+                alternative_iter.next(),
+            ) else {
                 return None;
-            }
-            equality = Some(alternatives[0].expr.clone());
+            };
+            equality = Some(oriented.expr.clone());
         } else {
-            if alternatives.len() != 1 {
+            let (Some(constraint), None) = (alternative_iter.next(), alternative_iter.next())
+            else {
                 return None;
-            }
-            base.add_scaled(
-                &alternatives[0].expr,
-                &rational64_to_bigrational(coefficient),
-            );
+            };
+            base.add_scaled(&constraint.expr, &rational64_to_bigrational(coefficient));
         }
     }
     let equality = equality?;
@@ -108,7 +111,7 @@ pub fn recover_single_equality_farkas(
     let numerator = magnitude.numer().to_i64()?;
     let denominator = magnitude.denom().to_i64()?;
     let mut recovered = farkas.clone();
-    recovered.coefficients[equality_index] = Rational64::new(numerator, denominator);
+    *recovered.coefficients.get_mut(equality_index)? = Rational64::new(numerator, denominator);
 
     verify_farkas_conflict_lits_full(terms, conflict, &recovered).ok()?;
     Some(recovered)

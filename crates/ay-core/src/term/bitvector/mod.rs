@@ -51,7 +51,9 @@ impl TermStore {
             "BUG: {op_name} expects BitVec args"
         );
         debug_assert!(
-            args.windows(2).all(|w| self.sort(w[0]) == self.sort(w[1])),
+            args.iter()
+                .zip(args.iter().skip(1))
+                .all(|(&a, &b)| self.sort(a) == self.sort(b)),
             "BUG: {op_name} expects same-width BitVec args"
         );
     }
@@ -74,10 +76,10 @@ impl TermStore {
         args: Vec<TermId>,
     ) -> Result<(TermId, TermId, u32, Vec<TermId>), TermId> {
         self.validate_bv_binary_op_args(op_name, &args);
-        if args.len() != 2 {
-            return Err(self.mk_bv_binary_fallback(op_name, args));
-        }
-        let (a, b) = (args[0], args[1]);
+        let (a, b) = match args.as_slice() {
+            &[a, b] => (a, b),
+            _ => return Err(self.mk_bv_binary_fallback(op_name, args)),
+        };
         let Some(width) = self.get_bv_width(a) else {
             return Err(self.mk_bv_binary_fallback(op_name, args));
         };
@@ -113,7 +115,10 @@ impl TermStore {
             return None;
         }
         // Count trailing zeros to get the exponent
-        // For a power of 2, the bit length minus 1 gives the exponent
-        Some((value.bits() - 1) as u32)
+        // For a power of 2, the bit length minus 1 gives the exponent.
+        // `bits() == 0` only for zero, which the sign gate above already
+        // rejected; the checked form keeps that case's documented `None`
+        // verdict local instead of leaning on the BigInt invariant.
+        Some(value.bits().checked_sub(1)? as u32)
     }
 }

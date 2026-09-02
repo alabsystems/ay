@@ -29,6 +29,18 @@
 #
 #   path  mode  budget_ms  status  objective  wall_ms  proof_bytes  proof_lines
 #   proof_sha256  route  checker_exit  checker_verdict  want_verdict  score
+#   load1_start  load1_end
+#
+# LOAD IS PART OF EVERY ROW (columns 15/16), because most of these fields are
+# NOT load-invariant and a census that does not carry its own load cannot be
+# audited after the fact. A previous census was WRONG ON SIX ROWS because it
+# ran at 1-minute load 10-72 while the truth was reachable at load 3-9: AY hit
+# its `--timeout` on a starved box, printed UNKNOWN, and the row was filed as a
+# coverage miss with no record that the box was the cause. `status`, `wall_ms`
+# and every score derived from a budget move with these two numbers; `route`,
+# `proof_bytes`, `proof_sha256` and `objective` do not. Appended at the END so
+# every existing consumer's field positions (the harness splits on f2/f3) are
+# unchanged.
 #
 # where `score` is one of
 #
@@ -84,6 +96,10 @@ trap 'rm -rf "$work"' EXIT
 
 now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
 
+# 1-minute load average, or "-" if it cannot be read. Never fails the arm: a
+# missing load reading is a missing ANNOTATION, not a failed measurement.
+load1() { uptime 2>/dev/null | sed 's/.*averages: //' | awk '{print ($1==""?"-":$1)}'; }
+
 run_arm() {
     WHICH=$1; MODE=$2; TMO=$3
     case "$WHICH" in
@@ -95,6 +111,7 @@ run_arm() {
     sf="$work/stdout"
     rm -f "$pf" "$sf"
 
+    ld0=$(load1)
     t0=$(now_ms)
     if [ "$MODE" = proof ]; then
         "$BIN" pb solve --timeout "$TMO" --proof "$pf" "$F" >"$sf" 2>"$work/stderr"
@@ -103,6 +120,7 @@ run_arm() {
     fi
     ay_exit=$?
     t1=$(now_ms)
+    ld1=$(load1)
     wall=$((t1 - t0))
 
     st=$(grep '^s ' "$sf" | tail -1 | sed 's/^s //')
@@ -150,10 +168,11 @@ run_arm() {
         esac
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$F" "$WHICH-$MODE" "$TMO" "$st" "${obj:--}" "$wall" \
         "$pbytes" "$plines" "$psha" "${route:--}" \
-        "$cexit" "$cverdict" "$want" "$score"
+        "$cexit" "$cverdict" "$want" "$score" \
+        "${ld0:--}" "${ld1:--}"
     rm -f "$pf" "$sf"
 }
 

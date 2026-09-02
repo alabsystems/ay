@@ -321,13 +321,19 @@ fn per_rejection_wall_us(case: &WideOverrideCase, ceiling_us: f64) -> f64 {
     const ITERS: usize = 512;
     const ROUNDS: usize = 9;
     const CLOCK_STRIDE: usize = 64;
-    let _ = case.export(Some(64));
+    // Keep the production emission budget active, but leave enough room for
+    // the admitted surface-override ledger to be copied. A 64-unit budget can
+    // correctly stop a long authored spelling before the structural preflight
+    // runs, which would make this timing ratchet measure the ledger admission
+    // instead of the canonical-term rejection it is meant to cover.
+    const STRUCTURAL_GATE_WORK_BUDGET: u64 = 1_000_000;
+    let _ = case.export(Some(STRUCTURAL_GATE_WORK_BUDGET));
     let mut best = f64::MAX;
     for _ in 0..ROUNDS {
         let started = std::time::Instant::now();
         let mut done = 0usize;
         for _ in 0..ITERS {
-            let _ = std::hint::black_box(case.export(Some(64)));
+            let _ = std::hint::black_box(case.export(Some(STRUCTURAL_GATE_WORK_BUDGET)));
             done += 1;
             if (done == 1 || done.is_multiple_of(CLOCK_STRIDE))
                 && started.elapsed().as_secs_f64() * 1e6 > ceiling_us * done as f64
@@ -465,7 +471,12 @@ fn wrapped_unrenderable_shapes_do_not_render_huge_canonical_terms() {
 
         // Fail closed. A term that is BOTH unrenderable and oversized is a
         // size failure: the size verdict outranks the shape verdict, so the
-        // quiet `Ok(None)` decline is not available here.
+        // quiet `Ok(None)` decline is not available here. The smallest global
+        // emission budget is allowed to stop even earlier: the const-array
+        // source spellings exceed 64 bytes, and cloning that admitted override
+        // ledger is real bounded work. Higher and unlimited budgets must reach
+        // the structural/override gate, which the timing checks below exercise
+        // with a budget large enough not to mask that gate.
         for work_budget in [Some(64u64), Some(1_000_000u64), None] {
             let error = match huge.export(work_budget) {
                 Err(error) => error,
@@ -476,12 +487,23 @@ fn wrapped_unrenderable_shapes_do_not_render_huge_canonical_terms() {
                     document.len()
                 ),
             };
+            let expected_rejection = matches!(
+                &error,
+                AlethePrintError::InvalidSurfaceStep { reason, .. }
+                    if is_bounded_gate_rejection(reason)
+            ) || matches!(
+                (&error, work_budget, shape),
+                (
+                    AlethePrintError::EmissionBudgetExhausted {
+                        budget: 64,
+                        steps_rendered: 0,
+                    },
+                    Some(64),
+                    WideShape::ConstArrayConjunct { .. },
+                )
+            );
             assert!(
-                matches!(
-                    error,
-                    AlethePrintError::InvalidSurfaceStep { ref reason, .. }
-                        if is_bounded_gate_rejection(reason)
-                ),
+                expected_rejection,
                 "{shape:?}, budget {work_budget:?}: {error}"
             );
         }

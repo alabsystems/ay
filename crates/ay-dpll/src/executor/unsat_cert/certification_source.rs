@@ -67,6 +67,20 @@ impl Executor {
     pub(super) fn check_strict_unsat_presentation(
         &self,
     ) -> Result<(), StrictProofPresentationFailure> {
+        // The reconstruction pipeline sets this bit only after deciding that
+        // the retained native proof has no authenticated authored-scope
+        // presentation. Replaying that hidden proof can still establish
+        // internal truth for best-effort and bare self-check solves, but it
+        // must not mint the `StrictProof` presentation token when the caller
+        // explicitly promised an artifact or proof checking. Keep this guard
+        // aligned with the independent-sidecar presentation policy: retention
+        // is a memory knob and must not change a no-artifact verdict merely
+        // because the internally strict proof cannot be rendered.
+        if self.last_unsat_proof_reconstruction_suppressed
+            && self.independent_sidecar_blocked_by_presentation()
+        {
+            return Err(StrictProofPresentationFailure::Missing);
+        }
         self.last_proof.as_ref().map_or_else(
             || Err(StrictProofPresentationFailure::Missing),
             |proof| {

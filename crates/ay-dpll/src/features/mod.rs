@@ -101,6 +101,12 @@ pub(crate) struct StaticFeatures {
     pub has_regex: bool,
     /// Formula contains FloatingPoint-sorted terms
     pub has_fpa: bool,
+    /// Formula contains the SMT-LIB builtin `RoundingMode` carrier.
+    ///
+    /// AY represents this finite FP sort as an uninterpreted sort internally,
+    /// so it must be tracked separately from ordinary EUF carriers whenever a
+    /// closed logic validator excludes floating-point support.
+    pub has_rounding_mode: bool,
     /// Formula contains uninterpreted functions (arity > 0)
     pub has_uf: bool,
     /// Formula contains quantifiers (forall/exists)
@@ -430,7 +436,10 @@ impl StaticFeatures {
                 self.has_uf = true;
                 self.detect_sort_theory(elem);
             }
-            Sort::Uninterpreted(_) => {
+            Sort::Uninterpreted(name) => {
+                if name == "RoundingMode" {
+                    self.has_rounding_mode = true;
+                }
                 // Equality over uninterpreted-sort terms still needs EUF routing.
                 // Without this, mixed Int + uninterpreted-sort equality windows
                 // can be narrowed to pure LIA and lose congruence reasoning.

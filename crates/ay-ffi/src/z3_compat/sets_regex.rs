@@ -956,20 +956,20 @@ pub unsafe extern "C" fn Z3_get_string_length(c: Z3_context, a: Z3_ast) -> c_uin
 // ============================================================================
 
 /// Return a human-readable version string, e.g.
-/// `"AY <ver> (Z3 5.0.0.0 compatible)"`.
+/// `"AY <ver> (Z3 5.1.0.0 compatible)"`.
 ///
 /// Matches `Z3_get_full_version`. The pointer is owned by the library and is
 /// valid for the program lifetime (Z3 convention).
 #[no_mangle]
 pub extern "C" fn Z3_get_full_version() -> *const c_char {
     // Reports the same Z3 API compatibility version as `Z3_get_version`
-    // (5.0.0.0), plus AY's own crate version for provenance. A 'static
+    // (5.1.0.0), plus AY's own crate version for provenance. A 'static
     // NUL-terminated string is valid for the program lifetime, matching Z3's
     // ownership contract.
     concat!(
         "AY ",
         env!("CARGO_PKG_VERSION"),
-        " (Z3 5.0.0.0 compatible)\0"
+        " (Z3 5.1.0.0 compatible)\0"
     )
     .as_ptr()
     .cast::<c_char>()

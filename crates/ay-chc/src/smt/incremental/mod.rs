@@ -49,6 +49,14 @@ pub(crate) enum IncrementalCheckResult {
     Unknown,
 }
 
+fn resources_exhausted(smt: &SmtContext, deadline: ay_core::time::Instant) -> bool {
+    ay_core::time::Instant::now() >= deadline
+        || TermStore::global_memory_exceeded()
+        || smt
+            .term_memory_budget
+            .is_some_and(|limit| smt.terms.true_memory_bytes() > limit)
+}
+
 impl IncrementalQueryContext {
     /// Create a new incremental query context.
     pub(crate) fn new() -> Self {
@@ -98,6 +106,27 @@ impl IncrementalQueryContext {
         smt: &mut SmtContext,
         timeout: Option<std::time::Duration>,
     ) -> IncrementalCheckResult {
+        // One absolute wall covers admission, both solver attempts, and final
+        // publication. The historical ten-second executor default is now the
+        // default for the whole query rather than being renewed before an
+        // unbounded fresh-context fallback.
+        let query_started = ay_core::time::Instant::now();
+        let requested = timeout.unwrap_or(std::time::Duration::from_secs(10));
+        let Some(requested_deadline) = query_started.checked_add(requested) else {
+            return IncrementalCheckResult::Unknown;
+        };
+        let query_deadline = [
+            smt.current_global_deadline(),
+            super::context::current_thread_solve_deadline(),
+            super::deadline::current_smt_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(requested_deadline, |deadline, outer| deadline.min(outer));
+        if resources_exhausted(smt, query_deadline) {
+            return IncrementalCheckResult::Unknown;
+        }
+
         // Global memory budget guard (#8198): if the process has exceeded the
         // global term memory limit, all solving is unreliable — return Unknown.
         if TermStore::global_memory_exceeded() {
@@ -123,6 +152,9 @@ impl IncrementalQueryContext {
             return IncrementalCheckResult::Unknown;
         }
         let combined = ChcExpr::and_all(conjuncts);
+        if resources_exhausted(smt, query_deadline) {
+            return IncrementalCheckResult::Unknown;
+        }
 
         // Expression node count budget guard (#8198): if the combined expression
         // exceeds the conversion budget, solving would produce incorrect partial
@@ -135,24 +167,40 @@ impl IncrementalQueryContext {
         }
 
         // Try executor adapter (full DPLL(T) with theory support).
-        let executor_timeout = timeout.unwrap_or(std::time::Duration::from_secs(10));
         let empty_equalities = FxHashMap::default();
-        let result = super::executor_adapter::check_sat_conjunction_via_executor(
-            &[combined.clone()],
-            &empty_equalities,
-            executor_timeout,
-        );
+        let result =
+            super::executor_adapter::check_sat_conjunction_via_executor_with_resource_limits(
+                &[combined.clone()],
+                &empty_equalities,
+                requested,
+                Some(query_deadline),
+                smt.term_memory_budget,
+            );
+        if resources_exhausted(smt, query_deadline) {
+            return IncrementalCheckResult::Unknown;
+        }
         if !matches!(result, IncrementalCheckResult::Unknown) {
             return result;
         }
 
-        // Fallback: fresh SmtContext.
+        // Fallback: one fresh SmtContext under the SAME already-elapsing wall
+        // and per-instance term-store ceiling as the executor attempt.
         let mut fresh_smt = SmtContext::new();
-        let fresh_result = if let Some(t) = timeout {
-            fresh_smt.check_sat_with_timeout(&combined, t)
-        } else {
-            fresh_smt.check_sat(&combined)
+        fresh_smt.set_term_memory_budget(smt.term_memory_budget);
+        fresh_smt.set_global_solve_deadline(Some(query_deadline));
+        if resources_exhausted(&fresh_smt, query_deadline) {
+            return IncrementalCheckResult::Unknown;
+        }
+        let Some(remaining) = query_deadline.checked_duration_since(ay_core::time::Instant::now())
+        else {
+            return IncrementalCheckResult::Unknown;
         };
+        let fresh_result = fresh_smt.check_sat_with_timeout(&combined, remaining);
+        if resources_exhausted(smt, query_deadline)
+            || resources_exhausted(&fresh_smt, query_deadline)
+        {
+            return IncrementalCheckResult::Unknown;
+        }
         match fresh_result {
             super::types::SmtResult::Sat(model) => IncrementalCheckResult::Sat(model),
             result if result.is_unsat() => IncrementalCheckResult::Unsat,
@@ -164,20 +212,47 @@ impl IncrementalQueryContext {
     pub(crate) fn check_sat_fresh_query(
         &self,
         assumptions: &[ChcExpr],
+        parent_smt: &SmtContext,
         timeout: Option<std::time::Duration>,
     ) -> IncrementalCheckResult {
+        let started = ay_core::time::Instant::now();
+        let requested = timeout.unwrap_or(std::time::Duration::from_secs(10));
+        let Some(requested_deadline) = started.checked_add(requested) else {
+            return IncrementalCheckResult::Unknown;
+        };
+        let deadline = [
+            parent_smt.current_global_deadline(),
+            super::context::current_thread_solve_deadline(),
+            super::deadline::current_smt_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(requested_deadline, |deadline, outer| deadline.min(outer));
+        if resources_exhausted(parent_smt, deadline) {
+            return IncrementalCheckResult::Unknown;
+        }
         let mut conjuncts = self.background_exprs.clone();
         conjuncts.extend(assumptions.iter().cloned());
         if conjuncts.is_empty() {
             return IncrementalCheckResult::Unknown;
         }
         let combined = ChcExpr::and_all(conjuncts);
+        if resources_exhausted(parent_smt, deadline) {
+            return IncrementalCheckResult::Unknown;
+        }
         let mut fresh_smt = SmtContext::new();
-        let fresh_result = if let Some(t) = timeout {
-            fresh_smt.check_sat_with_timeout(&combined, t)
-        } else {
-            fresh_smt.check_sat(&combined)
+        fresh_smt.set_term_memory_budget(parent_smt.term_memory_budget);
+        fresh_smt.set_global_solve_deadline(Some(deadline));
+        if resources_exhausted(&fresh_smt, deadline) {
+            return IncrementalCheckResult::Unknown;
+        }
+        let Some(remaining) = deadline.checked_duration_since(ay_core::time::Instant::now()) else {
+            return IncrementalCheckResult::Unknown;
         };
+        let fresh_result = fresh_smt.check_sat_with_timeout(&combined, remaining);
+        if resources_exhausted(parent_smt, deadline) || resources_exhausted(&fresh_smt, deadline) {
+            return IncrementalCheckResult::Unknown;
+        }
         match fresh_result {
             super::types::SmtResult::Sat(model) => IncrementalCheckResult::Sat(model),
             result if result.is_unsat() => IncrementalCheckResult::Unsat,

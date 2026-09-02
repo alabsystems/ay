@@ -773,7 +773,7 @@ fn case_catalog(productions: &[LanguageCommandProduction]) -> Result<Vec<CaseSpe
         &format!("unsupported\n{COMMAND_MARKER}\n"),
     )?;
 
-    // The exact Z3 5.0.0 overlay deliberately accepts these shapes in
+    // The exact Z3 5.1.0 overlay deliberately accepts these shapes in
     // addition to the normative production.  Keeping them in this closed
     // catalog prevents a standard negative witness from falsely condemning a
     // required replacement behavior.

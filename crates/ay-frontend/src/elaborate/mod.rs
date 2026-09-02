@@ -1957,6 +1957,47 @@ impl Context {
             .collect()
     }
 
+    /// Exact concrete-authored terms only when every retained parsed row is
+    /// still paired with its original authored assertion at the same index.
+    ///
+    /// The row counts and indices are checked before allocating. This is the
+    /// fail-closed proof-export accessor: query-local/transient parsed rows,
+    /// retention gaps, and rows removed by scope or stack truncation cannot be
+    /// mistaken for immutable authored source.
+    #[doc(hidden)]
+    pub fn concrete_authored_assertion_terms_aligned_bounded(
+        &self,
+        max_rows: usize,
+    ) -> Option<Vec<TermId>> {
+        if self.assertions_parsed.len() > max_rows || self.authored_assertions.len() > max_rows {
+            return None;
+        }
+
+        let mut concrete_count = 0usize;
+        for assertion in &self.authored_assertions {
+            let AuthoredAssertion::Concrete { parsed_index, .. } = assertion else {
+                continue;
+            };
+            if *parsed_index != Some(concrete_count) {
+                return None;
+            }
+            concrete_count += 1;
+        }
+        if concrete_count != self.assertions_parsed.len() {
+            return None;
+        }
+
+        Some(
+            self.authored_assertions
+                .iter()
+                .filter_map(|assertion| match assertion {
+                    AuthoredAssertion::Concrete { term, .. } => Some(*term),
+                    AuthoredAssertion::Schematic(_) => None,
+                })
+                .collect(),
+        )
+    }
+
     /// Exact terms whose authored source was literally `false`.
     ///
     /// This compact provenance survives parsed-AST retention being disabled,

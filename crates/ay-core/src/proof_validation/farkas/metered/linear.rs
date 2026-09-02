@@ -115,8 +115,11 @@ impl MeteredLinearExpr {
                 .binary_search_by_key(variable, |(term, _)| *term)
             {
                 Ok(index) => {
-                    let updated = meter.add(&self.coeffs[index].1, &scaled)?;
-                    meter.charge_rational_drop(&self.coeffs[index].1)?;
+                    let Some(entry) = self.coeffs.get(index) else {
+                        return Err(FarkasValidationError::ResourceLimit);
+                    };
+                    let updated = meter.add(&entry.1, &scaled)?;
+                    meter.charge_rational_drop(&entry.1)?;
                     meter.charge_rational_drop(&scaled)?;
                     if updated.is_zero() {
                         let after = index
@@ -128,10 +131,16 @@ impl MeteredLinearExpr {
                             .ok_or(FarkasValidationError::ResourceLimit)?;
                         meter.charge(moves, 0)?;
                         meter.charge_rational_drop(&updated)?;
+                        if index >= self.coeffs.len() {
+                            return Err(FarkasValidationError::ResourceLimit);
+                        }
                         drop(self.coeffs.remove(index));
                     } else {
                         meter.charge(1, 0)?;
-                        self.coeffs[index].1 = updated;
+                        let Some(entry) = self.coeffs.get_mut(index) else {
+                            return Err(FarkasValidationError::ResourceLimit);
+                        };
+                        entry.1 = updated;
                     }
                 }
                 Err(index) => {
@@ -141,6 +150,9 @@ impl MeteredLinearExpr {
                         .and_then(|moves| moves.checked_add(1))
                         .ok_or(FarkasValidationError::ResourceLimit)?;
                     meter.charge(moves, 0)?;
+                    if index > self.coeffs.len() {
+                        return Err(FarkasValidationError::ResourceLimit);
+                    }
                     self.coeffs.insert(index, (*variable, scaled));
                 }
             }
@@ -186,7 +198,10 @@ impl MeteredLinearExpr {
         else {
             return Ok(None);
         };
-        Ok(Some(meter.clone_rational(&self.coeffs[index].1)?))
+        let Some(entry) = self.coeffs.get(index) else {
+            return Ok(None);
+        };
+        Ok(Some(meter.clone_rational(&entry.1)?))
     }
 
     pub(super) fn leading_coefficient<'a>(
@@ -301,8 +316,11 @@ fn parse_quotient(
     args: &[TermId],
     meter: &mut ProgressMeter<'_>,
 ) -> Result<MeteredLinearExpr, FarkasValidationError> {
-    let mut numerator = parse_linear_expr(terms, args[0], meter)?;
-    let denominator = parse_linear_expr(terms, args[1], meter)?;
+    let &[numerator, denominator] = args else {
+        return MeteredLinearExpr::variable(term, meter);
+    };
+    let mut numerator = parse_linear_expr(terms, numerator, meter)?;
+    let denominator = parse_linear_expr(terms, denominator, meter)?;
     if denominator.is_constant() && !denominator.constant.is_zero() {
         let one = meter.rational_from_i64_pair(&Rational64::one())?;
         let inverse = meter.divide(&one, &denominator.constant)?;

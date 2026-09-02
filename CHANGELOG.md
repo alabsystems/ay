@@ -40,29 +40,81 @@ tag list is otherwise read as complete:
 - **`v0.18.0` is not tagged in this tree** even though it was published:
   `bd3a01f15` records that `alabsystems/ay` carries `v0.18.0`, cut from
   `ccc05d91c`.
+- **`v0.19.0` and `v0.20.0` are missing.** The release commits `bd3a01f15`
+  ("release: bump the workspace version to 0.19.0", 2026-08-28) and `28a8b03ee`
+  ("release: bump the workspace to 0.20.0", 2026-08-28) exist and are on `main`;
+  no tag points at either, and the publication ledger records a promoted release
+  row for both revisions. Tagging resumes at `v0.21.0`.
 - **`v0.9.0` is a lightweight tag** — a bare ref with no tag object, unlike
   every other release tag here, which is annotated.
 - `v0.1.1` has no tag, and correctly so: `f0c094e74` states that `0.1.1` was
   internal and `X.Y.0` is the public line.
 
-These are recorded, not repaired. Public tags are minted by `pub promote` from
-a human terminal against `alabsystems/ay`; retro-tagging a dev tree would
-create tags that do not correspond to any published snapshot.
+These are recorded, not repaired. Public tags are minted by `pub promote`
+against `alabsystems/ay` — authorized by the release credential plus an
+explicitly named destination, checked against the registry's release slug;
+retro-tagging a dev tree would create tags that do not correspond to any
+published snapshot.
 
 ## Releases
 
-### 0.19.0 — 2026-08-28 (untagged; current workspace version)
+### 0.23.0 — 2026-08-29 (current workspace version)
 
-Release commit `bd3a01f15`. Not yet tagged in this repository or published.
-The commit records why the bump was needed: `alabsystems/ay` already carries
-`v0.18.0` cut from `ccc05d91c` and tags are immutable, so the next public
-snapshot needs its own version. Because AY pins its siblings by explicit
-version rather than `version.workspace = true`, the bump moved 61
+Tag `v0.23.0` → `bf79cde4e`; release commit `6f66beb8c8` ("release: bump for
+the docs-refresh cut"), with the snapshot cut two `publish` commits later. This
+is the version `[workspace.package]` carries today, and the publication ledger's
+newest `ay` row maps this revision to the current `alabsystems/ay` release.
+
+46 non-merge commits since the 0.22.0 release point (`fix` 11, `feat` 7,
+`census` 6, `docs` 5, then a long singleton tail).
+
+34 non-merge commits have landed on `main` since this snapshot point and are
+not part of any cut snapshot. Among them, and worth knowing when reading the
+rest of this repository: `1e48ffbf36` made the Trust verifying compiler the
+development tree's default with verification on, and `fe36913a09` converted the
+last attribute-spelled contracts to Trust's native clause grammar. Neither
+touches the public snapshot, which publication repins to stock stable Rust.
+
+### 0.22.0 — 2026-08-29
+
+Tag `v0.22.0` → `2e92bf7cd`, which is the release commit itself
+("deps(clean)+release: advance the clean pin to the released 0.7.0 revision and
+bump") — the bump travelled with a dependency pin move rather than standing
+alone.
+
+5 non-merge commits since the 0.21.0 release point (`perf`, `fix`, `feat`,
+`correct`, and the release commit).
+
+### 0.21.0 — 2026-08-28
+
+Tag `v0.21.0` → `243c48d79`; release commit `2228cea86c` ("chore(release):
+0.20.0 -> 0.21.0"), with the snapshot cut two `publish` commits later.
+
+9 non-merge commits since the 0.20.0 release point (`publish` 3, `fix` 3,
+`docs` 2, `chore` 1).
+
+### 0.20.0 — 2026-08-28 (untagged)
+
+Release commit `28a8b03ee` ("release: bump the workspace to 0.20.0"). No tag in
+this repository; the publication ledger records a promoted release row for this
+revision.
+
+17 non-merge commits since the 0.19.0 release point (`fix` 9, `docs` 5, and
+singletons).
+
+### 0.19.0 — 2026-08-28 (untagged)
+
+Release commit `bd3a01f15`. No tag in this repository; the publication ledger
+records a promoted release row for this revision, dated 2026-08-28 — the
+"not yet … published" sentence this entry used to carry was true when written
+and is not now. The commit records why the bump was needed: `alabsystems/ay`
+already carries `v0.18.0` cut from `ccc05d91c` and tags are immutable, so the
+next public snapshot needs its own version. Because AY pins its siblings by
+explicit version rather than `version.workspace = true`, the bump moved 61
 intra-workspace path-dependency requirements along with `[workspace.package]`.
 
 12 non-merge commits since the 0.18.0 snapshot point (`docs` 3, `test` 2,
-`fix` 2, and singletons). A further 13 commits have landed on `main` after the
-bump and are not part of any cut snapshot.
+`fix` 2, and singletons).
 
 ### 0.18.0 — 2026-08-28 (no tag in this repository)
 

@@ -3,14 +3,37 @@
 // Licensed under the Apache License, Version 2.0
 
 use num_bigint::BigInt;
-use num_rational::Rational64;
+use num_rational::{BigRational, Rational64};
 
 use super::proof_farkas::{reconstruct_missing_farkas_coefficients, try_lra_farkas_reconstruction};
-use super::proof_farkas_synthesis::synthesize_mixed_equality_arithmetic_farkas;
+use super::proof_farkas_synthesis::{
+    synthesize_equality_farkas, synthesize_mixed_equality_arithmetic_farkas,
+};
 use super::proof_farkas_validation::{
     certificate_valid_for_blocking_clause, sanitize_farkas_annotations,
 };
-use ay_core::{Proof, ProofStep, Sort, TermStore, TheoryLemmaKind, TheoryLit};
+use ay_core::{Proof, ProofStep, Sort, Symbol, TermStore, TheoryLemmaKind, TheoryLit};
+
+#[test]
+fn equality_recovery_handles_exact_real_constants() {
+    let mut terms = TermStore::new();
+    let value = terms.mk_var("real_value", Sort::Real);
+    let three_halves = terms.mk_rational(BigRational::new(3.into(), 2.into()));
+    let five_halves = terms.mk_rational(BigRational::new(5.into(), 2.into()));
+    // Preserve opposite authored orientations. `mk_eq` may canonicalize both
+    // rows to the same operand order, which would miss the array/Real conflict
+    // this regression is intended to cover.
+    let first = terms.mk_app(Symbol::named("="), [value, three_halves], Sort::Bool);
+    let second = terms.mk_app(Symbol::named("="), [five_halves, value], Sort::Bool);
+    let clause = vec![terms.mk_not_raw(first), terms.mk_not_raw(second)];
+
+    let farkas = synthesize_equality_farkas(&terms, &clause)
+        .expect("distinct exact Real constants require the unit equality certificate");
+    assert_eq!(farkas.coefficients, vec![Rational64::from_integer(1); 2]);
+    let conflict = vec![TheoryLit::new(first, true), TheoryLit::new(second, true)];
+    ay_core::proof_validation::verify_farkas_conflict_lits_full(&terms, &conflict, &farkas)
+        .expect("the synthesized Real certificate must replay exactly");
+}
 
 #[test]
 fn mixed_equality_recovery_handles_scaled_equality() {

@@ -9,6 +9,7 @@
 // #8529: Use deterministic hash maps/sets in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 mod arrays_to_lia;
+mod bounded_bv_lia;
 mod lira;
 
 use crate::combined_solvers::combiner::{
@@ -5066,8 +5067,8 @@ impl Executor {
         &mut self,
         extra_roots: &[TermId],
     ) -> Result<SolveResult> {
-        if self.should_abort_theory_loop() {
-            return Ok(SolveResult::Unknown);
+        if let Some(result) = self.try_solve_via_bounded_bv_lia(extra_roots) {
+            return Ok(result);
         }
 
         let mut roots = self.ctx.assertions.clone();
@@ -5077,16 +5078,10 @@ impl Executor {
         let enumeration_proven_equalities =
             self.collect_enumeration_proven_bv_lia_equalities(&roots)?;
         if !bitblast_proven_bounds.is_empty() {
-            if !extra_roots.is_empty() {
-                self.last_assumption_core = Some(extra_roots.to_vec());
-            }
-            return Ok(SolveResult::unsat());
+            return Ok(self.bv_lia_unsat_candidate(extra_roots));
         }
         if !enumeration_proven_equalities.is_empty() {
-            if !extra_roots.is_empty() {
-                self.last_assumption_core = Some(extra_roots.to_vec());
-            }
-            return Ok(SolveResult::unsat());
+            return Ok(self.bv_lia_unsat_candidate(extra_roots));
         }
         bridge_assertions.extend(bitblast_proven_bounds);
         bridge_assertions.extend(enumeration_proven_equalities);
@@ -5145,10 +5140,7 @@ impl Executor {
         bridge_assertions.extend(int2bv_definitional_assertions);
         if bridge_assertions.is_empty() {
             if self.bv_lia_bridge_relaxation_is_unsat(&roots)? {
-                if !extra_roots.is_empty() {
-                    self.last_assumption_core = Some(extra_roots.to_vec());
-                }
-                return Ok(SolveResult::unsat());
+                return Ok(self.bv_lia_unsat_candidate(extra_roots));
             }
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
             return Ok(SolveResult::Unknown);
@@ -5166,10 +5158,7 @@ impl Executor {
                 return Ok(SolveResult::Unknown);
             }
             if matches!(support_result, Ok(ref result) if result.is_unsat()) {
-                if !extra_roots.is_empty() {
-                    self.last_assumption_core = Some(extra_roots.to_vec());
-                }
-                return Ok(SolveResult::unsat());
+                return Ok(self.bv_lia_unsat_candidate(extra_roots));
             }
         }
 
@@ -5188,7 +5177,7 @@ impl Executor {
         }
 
         match arithmetic_result? {
-            SolveResult::Unsat(_) => Ok(SolveResult::unsat()),
+            SolveResult::Unsat(_) => Ok(self.bv_lia_unsat_candidate(extra_roots)),
             SolveResult::Sat => {
                 // Sound UNSAT promotion via the pure-BV relaxation takes
                 // PRIORITY over any SAT promotion: if the relaxation (which only
@@ -5196,10 +5185,7 @@ impl Executor {
                 // regardless of the AUFLIA SAT verdict. Never promote SAT over a
                 // genuine UNSAT.
                 if self.bv_lia_bridge_relaxation_is_unsat(&roots)? {
-                    if !extra_roots.is_empty() {
-                        self.last_assumption_core = Some(extra_roots.to_vec());
-                    }
-                    return Ok(SolveResult::unsat());
+                    return Ok(self.bv_lia_unsat_candidate(extra_roots));
                 }
                 // STRUCTURAL REALIZABILITY GUARD (#9065 / B2). Promote the
                 // AUFLIA SAT to a real SAT ONLY when BOTH hold:
@@ -5276,10 +5262,7 @@ impl Executor {
             }
             SolveResult::Unknown => {
                 if self.bv_lia_bridge_relaxation_is_unsat(&roots)? {
-                    if !extra_roots.is_empty() {
-                        self.last_assumption_core = Some(extra_roots.to_vec());
-                    }
-                    return Ok(SolveResult::unsat());
+                    return Ok(self.bv_lia_unsat_candidate(extra_roots));
                 }
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 Ok(SolveResult::Unknown)
@@ -5668,6 +5651,8 @@ impl Executor {
             std::mem::take(&mut self.last_proof_rebuild_originals);
         let saved_last_proof_raw_original_assertions =
             std::mem::take(&mut self.last_proof_raw_original_assertions);
+        let saved_last_proof_expanded_let_sources =
+            std::mem::take(&mut self.last_proof_expanded_let_sources);
         let saved_verify_depth = self.post_split_verify_depth;
 
         self.post_split_verify_depth = saved_verify_depth + 1;
@@ -5708,6 +5693,7 @@ impl Executor {
         self.proof_check_ok = saved_proof_check_ok;
         self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
         self.last_proof_raw_original_assertions = saved_last_proof_raw_original_assertions;
+        self.last_proof_expanded_let_sources = saved_last_proof_expanded_let_sources;
 
         match result {
             Ok(result) => matches!(result, Ok(ref r) if r.is_unsat()),
@@ -6668,6 +6654,8 @@ impl Executor {
             std::mem::take(&mut self.last_proof_rebuild_originals);
         let saved_last_proof_raw_original_assertions =
             std::mem::take(&mut self.last_proof_raw_original_assertions);
+        let saved_last_proof_expanded_let_sources =
+            std::mem::take(&mut self.last_proof_expanded_let_sources);
         let saved_quant_expansion_records = std::mem::take(&mut self.quant_expansion_records);
         let saved_consequence_replay_state = self.take_consequence_replay_state();
 
@@ -6721,6 +6709,7 @@ impl Executor {
                 self.proof_check_ok = false;
                 self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
                 self.last_proof_raw_original_assertions = saved_last_proof_raw_original_assertions;
+                self.last_proof_expanded_let_sources = saved_last_proof_expanded_let_sources;
                 self.quant_expansion_records = saved_quant_expansion_records;
                 self.restore_consequence_replay_state(saved_consequence_replay_state);
                 self.proof_problem_assertion_provenance = saved_proof_provenance;
@@ -6755,6 +6744,7 @@ impl Executor {
                 self.proof_check_ok = saved_proof_check_ok;
                 self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
                 self.last_proof_raw_original_assertions = saved_last_proof_raw_original_assertions;
+                self.last_proof_expanded_let_sources = saved_last_proof_expanded_let_sources;
                 self.quant_expansion_records = saved_quant_expansion_records;
                 self.restore_consequence_replay_state(saved_consequence_replay_state);
                 Ok(None)
@@ -6784,6 +6774,7 @@ impl Executor {
                 self.proof_check_ok = saved_proof_check_ok;
                 self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
                 self.last_proof_raw_original_assertions = saved_last_proof_raw_original_assertions;
+                self.last_proof_expanded_let_sources = saved_last_proof_expanded_let_sources;
                 self.quant_expansion_records = saved_quant_expansion_records;
                 self.restore_consequence_replay_state(saved_consequence_replay_state);
                 Err(err)

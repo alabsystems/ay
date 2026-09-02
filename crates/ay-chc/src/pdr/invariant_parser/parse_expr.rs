@@ -549,21 +549,24 @@ impl<'a> InvariantParser<'a> {
                     "indexed bitvector literal requires exactly one width".into(),
                 ));
             }
-            let value = decimal.parse::<u128>().map_err(|_| {
-                ChcError::Parse("indexed bitvector literal value exceeds u128".into())
-            })?;
             let width = parse_bounded_bv_index(&indices[0], "bitvector width")?;
             if width == 0 {
                 return Err(ChcError::Parse(
                     "indexed bitvector literal width must be positive".into(),
                 ));
             }
-            if width < u128::BITS && value >= (1_u128 << width) {
+            let value =
+                num_bigint::BigUint::parse_bytes(decimal.as_bytes(), 10).ok_or_else(|| {
+                    ChcError::Parse(format!(
+                        "invalid indexed bitvector literal value `{decimal}`"
+                    ))
+                })?;
+            if value.bits() > u64::from(width) {
                 return Err(ChcError::Parse(format!(
                     "indexed bitvector literal value {value} does not fit width {width}"
                 )));
             }
-            return Ok(ChcExpr::BitVec(value, width));
+            return ChcExpr::bitvec_from_biguint(&value, width);
         }
 
         let op = match name.as_str() {
@@ -659,13 +662,13 @@ impl<'a> InvariantParser<'a> {
 }
 
 fn parse_bounded_bv_index(text: &str, label: &str) -> ChcResult<u32> {
-    const MAX_BV_INDEX: u32 = 1 << 20;
     let value = text
         .parse::<u32>()
         .map_err(|_| ChcError::Parse(format!("invalid {label}: `{text}`")))?;
-    if value > MAX_BV_INDEX {
+    if value > crate::MAX_BITVECTOR_WIDTH {
         return Err(ChcError::Parse(format!(
-            "{label} {value} exceeds the maximum supported {MAX_BV_INDEX}"
+            "{label} {value} exceeds the maximum supported {}",
+            crate::MAX_BITVECTOR_WIDTH
         )));
     }
     Ok(value)

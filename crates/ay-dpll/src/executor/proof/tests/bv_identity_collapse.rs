@@ -166,7 +166,11 @@ fn test_qf_bv_zero_test_duality_is_strict_checkable() {
     for (body, decl) in cases
         .iter()
         .map(|b| (*b, "(declare-const x (_ BitVec 4))"))
-        .chain(wide_cases.iter().map(|b| (*b, "(declare-const y (_ BitVec 32))")))
+        .chain(
+            wide_cases
+                .iter()
+                .map(|b| (*b, "(declare-const y (_ BitVec 32))")),
+        )
     {
         let input = format!(
             r#"

@@ -201,26 +201,33 @@ pub fn printed_la_generic_certificate_is_valid_bounded(
     let existing =
         ay_core::proof_validation::resolve_equality_coefficient_signs(terms, &conflict, farkas)
             .unwrap_or_else(|| farkas.coefficients.clone());
-    let Some(printed_atoms) = conflict
+    // Replay the complete effective clause literals. Rendering stripped
+    // internal atoms would miss an override keyed on `Not(atom)`, even though
+    // that override is exactly what the emitted clause prints. Each complete
+    // clause literal is negated by Carcara's rule, hence the uniform `false`
+    // truth value passed to the printed-hypothesis reconstruction.
+    let Some(printed_literals) = clause
         .iter()
         .map(|literal| {
             rendered_terms
-                .get(&literal.term)
-                .map(|rendered| (rendered.as_str(), literal.value))
+                .get(literal)
+                .map(|rendered| (rendered.as_str(), false))
         })
         .collect::<Option<Vec<_>>>()
     else {
         return false;
     };
-    if !printed_atoms
-        .iter()
-        .all(|(atom, _)| printed_atom_is_bounded(atom))
-    {
+    if !printed_literals.iter().all(|(literal, _)| {
+        printed_atom_is_bounded(literal)
+            && super::carcara_printed_la_generic_literal_supported(literal)
+    }) {
         return false;
     }
-    let Some(parse_bytes) = printed_atoms
+    let Some(parse_bytes) = printed_literals
         .iter()
-        .try_fold(0usize, |total, (atom, _)| total.checked_add(atom.len()))
+        .try_fold(0usize, |total, (literal, _)| {
+            total.checked_add(literal.len())
+        })
     else {
         return false;
     };
@@ -228,9 +235,9 @@ pub fn printed_la_generic_certificate_is_valid_bounded(
         return false;
     };
     *remaining_parse_bytes = next;
-    let Some(hypotheses) = printed_atoms
+    let Some(hypotheses) = printed_literals
         .iter()
-        .map(|(atom, value)| hypothesis(atom, *value))
+        .map(|(literal, value)| hypothesis(literal, *value))
         .collect::<Option<Vec<_>>>()
     else {
         return false;
@@ -369,8 +376,8 @@ mod tests {
         let eq_one = terms.mk_app(Symbol::named("="), [x, one], Sort::Bool);
         let not_zero = terms.mk_not_raw(eq_zero);
         let not_one = terms.mk_not_raw(eq_one);
-        rendered.insert(eq_zero, crate::format_term_alethe(&terms, eq_zero));
-        rendered.insert(eq_one, crate::format_term_alethe(&terms, eq_one));
+        rendered.insert(not_zero, crate::format_term_alethe(&terms, not_zero));
+        rendered.insert(not_one, crate::format_term_alethe(&terms, not_one));
         let equalities = FarkasAnnotation::from_ints(&[1, 1]);
         let mut insufficient = 9;
         assert!(!printed_la_generic_certificate_is_valid_bounded(
@@ -402,5 +409,153 @@ mod tests {
             &mut parse,
         ));
         assert_eq!(less_than_one_setup_pass, 10);
+    }
+
+    #[test]
+    fn quoted_symbol_delimiters_cannot_alias_distinct_farkas_rows() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("quoted_surface_x", Sort::Int);
+        let zero = terms.mk_int(0.into());
+        let lower = terms.mk_app(Symbol::named("<="), [x, zero], Sort::Bool);
+        let upper = terms.mk_app(Symbol::named(">="), [x, zero], Sort::Bool);
+        let clause = [lower, upper];
+        let farkas = FarkasAnnotation::from_ints(&[1, 1]);
+        let mut rendered = HashMap::default();
+        rendered.insert(lower, "(<= |(| |) |)".to_string());
+        rendered.insert(upper, "(>= |(| |)  |)".to_string());
+        let mut checks = 100;
+        let mut parse_bytes = 1_000_000;
+        assert!(
+            !printed_la_generic_certificate_is_valid_bounded(
+                &terms,
+                &clause,
+                &farkas,
+                &rendered,
+                &mut checks,
+                &mut parse_bytes,
+            ),
+            "quoted-symbol parentheses and whitespace must stay inside their own tokens"
+        );
+    }
+
+    #[test]
+    fn carcara_invalid_quoted_symbol_escapes_cannot_gain_farkas_authority() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("a|b", Sort::Int);
+        let zero = terms.mk_int(0.into());
+        let lower = terms.mk_app(Symbol::named("<="), [x, zero], Sort::Bool);
+        let upper = terms.mk_app(Symbol::named(">="), [x, zero], Sort::Bool);
+        let clause = [lower, upper];
+        let farkas = FarkasAnnotation::from_ints(&[1, 1]);
+        let mut rendered = HashMap::default();
+        rendered.insert(lower, crate::format_term_alethe(&terms, lower));
+        rendered.insert(upper, crate::format_term_alethe(&terms, upper));
+        assert!(
+            rendered.values().all(|literal| literal.contains("\\|")),
+            "the fixture must exercise AY/Z3 quoted-symbol escaping: {rendered:?}"
+        );
+        let mut checks = 100;
+        let mut parse_bytes = 1_000_000;
+        assert!(
+            !printed_la_generic_certificate_is_valid_bounded(
+                &terms,
+                &clause,
+                &farkas,
+                &rendered,
+                &mut checks,
+                &mut parse_bytes,
+            ),
+            "a proof Carcara cannot lex must never receive la_generic authority"
+        );
+    }
+
+    #[test]
+    fn dot_prefixed_symbols_remain_variables_in_exact_farkas_replay() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("dot_surface_x", Sort::Real);
+        let zero = terms.mk_rational(num_rational::BigRational::from_integer(0.into()));
+        let equality = terms.mk_app(Symbol::named("="), [x, zero], Sort::Bool);
+        let bound = terms.mk_app(Symbol::named("<="), [x, zero], Sort::Bool);
+        let not_equality = terms.mk_not_raw(equality);
+        let clause = [not_equality, bound];
+        let farkas = FarkasAnnotation::from_ints(&[1, 1]);
+        let mut rendered = HashMap::default();
+        rendered.insert(not_equality, "(not (= .5 1.5))".to_string());
+        rendered.insert(bound, "(<= .5 0.5)".to_string());
+        let mut checks = 100;
+        let mut parse_bytes = 1_000_000;
+        assert!(
+            !printed_la_generic_certificate_is_valid_bounded(
+                &terms,
+                &clause,
+                &farkas,
+                &rendered,
+                &mut checks,
+                &mut parse_bytes,
+            ),
+            "Carcara lexes `.5` as a symbol, so these two rows are satisfiable"
+        );
+
+        let mut unit_rendered = HashMap::default();
+        unit_rendered.insert(bound, "(<= .5 0.5)".to_string());
+        let mut checks = 10;
+        let mut parse_bytes = 1_000_000;
+        assert!(!printed_la_generic_certificate_is_valid_bounded(
+            &terms,
+            &[bound],
+            &FarkasAnnotation::from_ints(&[1]),
+            &unit_rendered,
+            &mut checks,
+            &mut parse_bytes,
+        ));
+    }
+
+    #[test]
+    fn alethe_reserved_variable_is_quoted_and_bare_override_is_rejected() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("cl", Sort::Int);
+        let zero = terms.mk_int(0.into());
+        let lower = terms.mk_app(Symbol::named("<="), [zero, x], Sort::Bool);
+        let upper = terms.mk_app(Symbol::named("<"), [x, zero], Sort::Bool);
+        let not_lower = terms.mk_not_raw(lower);
+        let not_upper = terms.mk_not_raw(upper);
+        let clause = [not_lower, not_upper];
+        let farkas = FarkasAnnotation::from_ints(&[1, 1]);
+
+        let mut canonical = HashMap::default();
+        for literal in clause {
+            canonical.insert(literal, crate::format_term_alethe(&terms, literal));
+        }
+        assert!(
+            canonical.values().all(|literal| literal.contains("|cl|")),
+            "Alethe-reserved user symbols must be quoted: {canonical:?}"
+        );
+        let mut checks = 100;
+        let mut parse_bytes = 1_000_000;
+        assert!(printed_la_generic_certificate_is_valid_bounded(
+            &terms,
+            &clause,
+            &farkas,
+            &canonical,
+            &mut checks,
+            &mut parse_bytes,
+        ));
+
+        let mut bare = HashMap::default();
+        bare.insert(not_lower, "(not (<= 0 cl))".to_string());
+        bare.insert(not_upper, "(not (< cl 0))".to_string());
+        let mut checks = 100;
+        let mut parse_bytes = 1_000_000;
+        assert!(
+            !printed_la_generic_certificate_is_valid_bounded(
+                &terms,
+                &clause,
+                &farkas,
+                &bare,
+                &mut checks,
+                &mut parse_bytes,
+            ),
+            "bare `cl` tokenizes as Alethe syntax, not a term symbol"
+        );
     }
 }

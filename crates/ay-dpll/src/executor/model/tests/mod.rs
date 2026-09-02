@@ -83,6 +83,7 @@ pub(super) fn empty_model() -> Model {
         completed_values: HashMap::default(),
         dt_ground: HashMap::default(),
         dt_pins: HashMap::default(),
+        dt_array_field_classes: Vec::new(),
     }
 }
 
@@ -133,5 +134,6 @@ pub(super) fn model_with_sat_assignments(assignments: &[(TermId, bool)]) -> Mode
         completed_values: HashMap::default(),
         dt_ground: HashMap::default(),
         dt_pins: HashMap::default(),
+        dt_array_field_classes: Vec::new(),
     }
 }

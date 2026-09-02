@@ -7,14 +7,18 @@
 use crate::solver::eval_constraint;
 use crate::types::{PbConstraint, WboInstance};
 
-/// Verify that all constraints in an instance are satisfied.
-///
-/// This is the incumbent gate used to re-check candidate models against the
-/// original constraints. [`eval_constraint`] uses an exact big-integer fallback
-/// for sums outside `i128`, so extreme coefficients cannot wrap or panic here.
-pub fn verify_all_constraints(constraints: &[PbConstraint], assignment: &[bool]) -> bool {
-    constraints.iter().all(|c| eval_constraint(c, assignment))
-}
+// `verify_all_constraints` carries a native Trust `ensures` clause. A clause is RAW
+// GRAMMAR — cfg-stripping runs after parsing — so it cannot be hidden from a
+// compiler that lacks the extension, and it would make this whole file unreadable
+// to one. It therefore lives alone in a fragment: the verifier reads
+// `eval/vig_core.rs`, everyone else reads `eval/vig_core_stock.rs`, and the two are
+// pinned together by `tests/native_contract_twins.rs`. Both are `include!`d rather
+// than made a submodule so the function keeps this module, its `crate::`
+// re-export and its doc links.
+#[cfg(deductive_verify)]
+include!("eval/vig_core.rs");
+#[cfg(not(deductive_verify))]
+include!("eval/vig_core_stock.rs");
 
 /// The WBO Verified Incumbent Gate (campaign M0: WBO-VIG consolidation): the
 /// SINGLE audited chokepoint deciding whether an assignment is an admissible

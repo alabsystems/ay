@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use crate::bv_util::bv_mask;
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 
 use super::{
@@ -190,11 +191,15 @@ impl ChcExpr {
                 budget.set(remaining - 1);
 
                 Some(match expr {
-                    ChcExpr::Bool(_)
-                    | ChcExpr::Int(_)
-                    | ChcExpr::Real(_, _)
-                    | ChcExpr::BitVec(_, _)
-                    | ChcExpr::Var(_) => expr.clone(),
+                    ChcExpr::Bool(_) | ChcExpr::Int(_) | ChcExpr::Real(_, _) | ChcExpr::Var(_) => {
+                        expr.clone()
+                    }
+                    // SMT-LIB `(_ bvN W)` denotes N modulo 2^W. ChcExpr's
+                    // source-compatible u128 leaf is public, so normalize here
+                    // even when a frontend constructed it directly.
+                    ChcExpr::BitVec(value, width) => {
+                        ChcExpr::BitVec(*value & bv_mask(*width), *width)
+                    }
                     ChcExpr::Op(op, args) => {
                         // First simplify all arguments (memoized on Arc identity)
                         let simplified_args: Vec<Arc<ChcExpr>> = args
@@ -529,10 +534,16 @@ impl ChcExpr {
                                         resimplify(ChcExpr::not(result), budget, depth)
                                     });
                                 }
-                                if let (ChcExpr::BitVec(a, _), ChcExpr::BitVec(b, _)) =
+                                if let (ChcExpr::BitVec(a, wa), ChcExpr::BitVec(b, wb)) =
                                     (simplified_args[0].as_ref(), simplified_args[1].as_ref())
                                 {
-                                    return Some(ChcExpr::Bool((a == b) == is_eq));
+                                    // Ill-sorted mixed-width equality has no
+                                    // SMT-LIB value. Leave it symbolic rather
+                                    // than fabricating a trusted Bool constant.
+                                    if wa == wb {
+                                        let equal = (a & bv_mask(*wa)) == (b & bv_mask(*wb));
+                                        return Some(ChcExpr::Bool(equal == is_eq));
+                                    }
                                 }
                                 if simplified_args[0] == simplified_args[1] {
                                     return Some(ChcExpr::Bool(is_eq));
@@ -790,7 +801,13 @@ impl ChcExpr {
                                 if let (ChcExpr::BitVec(a, wa), ChcExpr::BitVec(b, wb)) =
                                     (simplified_args[0].as_ref(), simplified_args[1].as_ref())
                                 {
-                                    let width = wa + wb;
+                                    let Some(width) = wa.checked_add(*wb) else {
+                                        return Some(if args_changed {
+                                            ChcExpr::Op(*op, simplified_args)
+                                        } else {
+                                            expr.clone()
+                                        });
+                                    };
                                     // Can only fold if result fits in u128
                                     if width <= 128 {
                                         let mask = if width >= 128 {
@@ -798,10 +815,10 @@ impl ChcExpr {
                                         } else {
                                             (1u128 << width) - 1
                                         };
-                                        return Some(ChcExpr::BitVec(
-                                            ((a << wb) | b) & mask,
-                                            width,
-                                        ));
+                                        let a = a & bv_mask(*wa);
+                                        let b = b & bv_mask(*wb);
+                                        let shifted = if *wb == 128 { 0 } else { a << wb };
+                                        return Some(ChcExpr::BitVec((shifted | b) & mask, width));
                                     }
                                     // width > 128: leave as BvConcat tree (can't fit in u128)
                                 }
@@ -812,8 +829,17 @@ impl ChcExpr {
                                 }
                             }
                             ChcOp::BvExtract(hi, lo) if simplified_args.len() == 1 => {
-                                if let ChcExpr::BitVec(v, _w) = simplified_args[0].as_ref() {
-                                    let width = hi - lo + 1;
+                                if let ChcExpr::BitVec(v, input_width) = simplified_args[0].as_ref()
+                                {
+                                    let width =
+                                        hi.checked_sub(*lo).and_then(|width| width.checked_add(1));
+                                    let Some(width) = width.filter(|_| *hi < *input_width) else {
+                                        return Some(if args_changed {
+                                            ChcExpr::Op(*op, simplified_args)
+                                        } else {
+                                            expr.clone()
+                                        });
+                                    };
                                     let mask = if width >= 128 {
                                         u128::MAX
                                     } else {
@@ -855,7 +881,18 @@ impl ChcExpr {
                             }
                             ChcOp::BvZeroExtend(n) if simplified_args.len() == 1 => {
                                 if let ChcExpr::BitVec(v, w) = simplified_args[0].as_ref() {
-                                    return Some(ChcExpr::BitVec(*v, w + n));
+                                    if let Some(new_width) = w.checked_add(*n) {
+                                        let value = *v & bv_mask(*w);
+                                        if new_width <= 128 {
+                                            return Some(ChcExpr::BitVec(value, new_width));
+                                        }
+                                        if let Ok(literal) = ChcExpr::bitvec_from_biguint(
+                                            &num_bigint::BigUint::from(value),
+                                            new_width,
+                                        ) {
+                                            return Some(literal);
+                                        }
+                                    }
                                 }
                                 if args_changed {
                                     ChcExpr::Op(*op, simplified_args)
@@ -865,29 +902,36 @@ impl ChcExpr {
                             }
                             ChcOp::BvSignExtend(n) if simplified_args.len() == 1 => {
                                 if let ChcExpr::BitVec(v, w) = simplified_args[0].as_ref() {
+                                    let normalized = *v & bv_mask(*w);
                                     // Sign-extend: replicate the sign bit
                                     let sign_bit = if *w > 0 && *w <= 128 {
-                                        (v >> (w - 1)) & 1
+                                        (normalized >> (w - 1)) & 1
                                     } else {
                                         0
                                     };
-                                    let new_width = w + n;
-                                    let result = if sign_bit == 1 {
-                                        let upper_mask = if new_width >= 128 {
-                                            u128::MAX
-                                        } else {
-                                            (1u128 << new_width) - 1
-                                        };
-                                        let lower_mask = if *w >= 128 {
-                                            u128::MAX
-                                        } else {
-                                            (1u128 << w) - 1
-                                        };
-                                        (v & lower_mask) | (upper_mask & !lower_mask)
-                                    } else {
-                                        *v
-                                    };
-                                    return Some(ChcExpr::BitVec(result, new_width));
+                                    if let Some(new_width) = w.checked_add(*n) {
+                                        if new_width <= 128 {
+                                            let result = if sign_bit == 1 {
+                                                normalized | (bv_mask(new_width) & !bv_mask(*w))
+                                            } else {
+                                                normalized
+                                            };
+                                            return Some(ChcExpr::BitVec(result, new_width));
+                                        }
+
+                                        use num_bigint::BigUint;
+                                        use num_traits::One;
+                                        let mut result = BigUint::from(normalized);
+                                        if sign_bit == 1 {
+                                            result |= (BigUint::one() << new_width)
+                                                - (BigUint::one() << *w);
+                                        }
+                                        if let Ok(literal) =
+                                            ChcExpr::bitvec_from_biguint(&result, new_width)
+                                        {
+                                            return Some(literal);
+                                        }
+                                    }
                                 }
                                 if args_changed {
                                     ChcExpr::Op(*op, simplified_args)
@@ -897,6 +941,13 @@ impl ChcExpr {
                             }
                             ChcOp::BvNot if simplified_args.len() == 1 => {
                                 if let ChcExpr::BitVec(v, w) = simplified_args[0].as_ref() {
+                                    if *w > 128 {
+                                        return Some(if args_changed {
+                                            ChcExpr::Op(*op, simplified_args)
+                                        } else {
+                                            expr.clone()
+                                        });
+                                    }
                                     let mask = if *w >= 128 {
                                         u128::MAX
                                     } else {
@@ -912,6 +963,13 @@ impl ChcExpr {
                             }
                             ChcOp::BvNeg if simplified_args.len() == 1 => {
                                 if let ChcExpr::BitVec(v, w) = simplified_args[0].as_ref() {
+                                    if *w > 128 {
+                                        return Some(if args_changed {
+                                            ChcExpr::Op(*op, simplified_args)
+                                        } else {
+                                            expr.clone()
+                                        });
+                                    }
                                     let mask = if *w >= 128 {
                                         u128::MAX
                                     } else {
@@ -945,7 +1003,7 @@ impl ChcExpr {
                                     // fast-paths in inductiveness/verification) then
                                     // trust without SMT. Width-mismatched terms stay
                                     // symbolic — fail-closed, matching BvUDiv/BvURem.
-                                    if wa == wb {
+                                    if wa == wb && *wa <= 128 {
                                         let mask = if *wa >= 128 {
                                             u128::MAX
                                         } else {
@@ -975,7 +1033,7 @@ impl ChcExpr {
                                 if let (ChcExpr::BitVec(a, wa), ChcExpr::BitVec(b, wb)) =
                                     (simplified_args[0].as_ref(), simplified_args[1].as_ref())
                                 {
-                                    if wa == wb {
+                                    if wa == wb && *wa <= 128 {
                                         let mask = if *wa >= 128 {
                                             u128::MAX
                                         } else {
@@ -1012,6 +1070,13 @@ impl ChcExpr {
                                 // safe-midpoint `x / 2` class). Sound for all x,
                                 // incl. k = 0 (bvlshr by 0 / bvand with 0).
                                 if let ChcExpr::BitVec(b, wb) = simplified_args[1].as_ref() {
+                                    if simplified_args[0].sort() != ChcSort::BitVec(*wb) {
+                                        return Some(if args_changed {
+                                            ChcExpr::Op(*op, simplified_args)
+                                        } else {
+                                            expr.clone()
+                                        });
+                                    }
                                     let mask = if *wb >= 128 {
                                         u128::MAX
                                     } else {
@@ -1062,26 +1127,26 @@ impl ChcExpr {
                                     // Bool constant would flow into unchecked
                                     // Bool(false)/Bool(true) fast-paths. Stay symbolic.
                                     if wa == wb {
+                                        let a = *a & bv_mask(*wa);
+                                        let b = *b & bv_mask(*wb);
                                         let result = match op {
                                             ChcOp::BvULt => a < b,
                                             ChcOp::BvULe => a <= b,
                                             ChcOp::BvUGt => a > b,
                                             ChcOp::BvUGe => a >= b,
                                             ChcOp::BvSLt => {
-                                                bv_signed_cmp(*a, *b, *wa)
-                                                    == std::cmp::Ordering::Less
+                                                bv_signed_cmp(a, b, *wa) == std::cmp::Ordering::Less
                                             }
                                             ChcOp::BvSLe => {
-                                                bv_signed_cmp(*a, *b, *wa)
+                                                bv_signed_cmp(a, b, *wa)
                                                     != std::cmp::Ordering::Greater
                                             }
                                             ChcOp::BvSGt => {
-                                                bv_signed_cmp(*a, *b, *wa)
+                                                bv_signed_cmp(a, b, *wa)
                                                     == std::cmp::Ordering::Greater
                                             }
                                             ChcOp::BvSGe => {
-                                                bv_signed_cmp(*a, *b, *wa)
-                                                    != std::cmp::Ordering::Less
+                                                bv_signed_cmp(a, b, *wa) != std::cmp::Ordering::Less
                                             }
                                             _ => unreachable!(),
                                         };

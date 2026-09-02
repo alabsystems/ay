@@ -513,7 +513,7 @@ impl Executor {
     ///
     /// Returns `None` if a quantifier is encountered (the firing gate already
     /// excludes this, but the walk fails closed defensively).
-    fn partition_symbol_disjoint(
+    pub(in crate::executor) fn partition_symbol_disjoint(
         &self,
         assertions: &[TermId],
     ) -> Option<(Vec<Vec<TermId>>, Vec<Connector>)> {
@@ -643,7 +643,7 @@ impl Executor {
 
 /// A connecting (uninterpreted) symbol and the index of the component it
 /// belongs to (unique by the disjointness walk).
-struct Connector {
+pub(in crate::executor) struct Connector {
     name: String,
     component: usize,
 }

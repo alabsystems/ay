@@ -619,6 +619,22 @@ impl DenseCp {
             .collect();
         candidates.sort_by_key(|&(_, coeff)| coeff);
 
+        // Incremental `remaining_falsified_sum`, mirroring the sparse
+        // implementation's rewrite exactly (see
+        // `CpConstraint::weaken_conservative` for why the rescan had to go and
+        // why removing it cannot change a decision). Evaluated once per
+        // literal; the only event that moves the sum is an actual removal.
+        let falsified: std::collections::BTreeMap<usize, bool> = self
+            .iter_entries()
+            .map(|(idx, _)| (idx, falsified_fn(index_lit(idx)).is_some()))
+            .collect();
+        let mut falsified_sum_excl_asserting: i128 = self
+            .iter_entries()
+            .filter(|&(idx, _)| idx != asserting_index)
+            .filter(|&(idx, _)| falsified.get(&idx).copied().unwrap_or(false))
+            .map(|(_, c)| c)
+            .sum();
+
         for (lit_idx, coeff) in candidates {
             if coeff >= self.degree {
                 continue;
@@ -633,18 +649,21 @@ impl DenseCp {
             }
             // Sum of remaining falsified coefficients (excluding asserting and
             // the candidate literal being weakened).
-            let remaining_falsified_sum: i128 = self
-                .iter_entries()
-                .filter(|&(idx, _)| idx != asserting_index && idx != lit_idx)
-                .filter(|&(idx, _)| falsified_fn(index_lit(idx)).is_some())
-                .map(|(_, c)| c)
-                .sum();
+            let lit_falsified = falsified.get(&lit_idx).copied().unwrap_or(false);
+            let remaining_falsified_sum: i128 = if lit_falsified {
+                falsified_sum_excl_asserting - coeff
+            } else {
+                falsified_sum_excl_asserting
+            };
             if remaining_falsified_sum >= new_degree {
                 continue;
             }
             // Apply the weakening.
             self.coeffs[lit_idx] = 0;
             self.degree = new_degree;
+            if lit_falsified {
+                falsified_sum_excl_asserting -= coeff;
+            }
             if let Some(out) = removed.as_deref_mut() {
                 out.push(index_lit(lit_idx));
             }

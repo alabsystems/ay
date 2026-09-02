@@ -264,12 +264,21 @@ fn monte_carlo_transition_check(
             }
             ConcreteCheckRange::BitVec { width, count, .. } => {
                 let mut vals = Vec::with_capacity(4);
-                vals.push(SmtValue::BitVec(0, *width));
+                vals.push(SmtValue::bitvec_from_biguint(
+                    num_bigint::BigUint::from(0u8),
+                    *width,
+                ));
                 if *count > 1 {
-                    vals.push(SmtValue::BitVec(1, *width));
+                    vals.push(SmtValue::bitvec_from_biguint(
+                        num_bigint::BigUint::from(1u8),
+                        *width,
+                    ));
                 }
                 if *count > 2 {
-                    vals.push(SmtValue::BitVec(*count - 1, *width));
+                    vals.push(SmtValue::bitvec_from_biguint(
+                        num_bigint::BigUint::from(*count - 1),
+                        *width,
+                    ));
                 }
                 vals
             }
@@ -306,7 +315,10 @@ fn monte_carlo_transition_check(
                     name, width, count, ..
                 } => {
                     let v = u128::from(rng.next()) % count;
-                    (name.clone(), SmtValue::BitVec(v, *width))
+                    (
+                        name.clone(),
+                        SmtValue::bitvec_from_biguint(num_bigint::BigUint::from(v), *width),
+                    )
                 }
             };
             assignment.insert(name, val);

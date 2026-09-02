@@ -7,6 +7,7 @@
 use std::str::FromStr;
 
 use crate::api::types::{Logic, SolverError};
+use crate::api::Solver;
 
 #[test]
 fn test_logic_from_str_all_canonical() {
@@ -30,6 +31,8 @@ fn test_logic_from_str_all_canonical() {
         Logic::QfUfbv,
         Logic::QfAbv,
         Logic::QfAufbv,
+        Logic::QfUfbvlia,
+        Logic::QfAufbvlia,
         Logic::QfUfnia,
         Logic::QfUfnra,
         Logic::QfUfnira,
@@ -42,6 +45,8 @@ fn test_logic_from_str_all_canonical() {
         Logic::QfSeqlia,
         Logic::QfAx,
         Logic::QfDt,
+        Logic::QfAlia,
+        Logic::QfUfdt,
         Logic::QfSnia,
         Logic::Lia,
         Logic::Lra,
@@ -60,6 +65,9 @@ fn test_logic_from_str_all_canonical() {
         Logic::Auflra,
         Logic::Lira,
         Logic::Auflira,
+        Logic::Ufdt,
+        Logic::Ufdtlia,
+        Logic::Ufdtnia,
     ];
     for logic in &all_logics {
         let s = logic.to_string();
@@ -100,4 +108,19 @@ fn test_logic_from_str_unknown() {
         SolverError::UnsupportedLogic(s) => assert_eq!(s, "BOGUS_LOGIC"),
         other => panic!("wrong error variant: {other:?}"),
     }
+}
+
+#[test]
+fn test_named_bv_lia_combinations_are_publicly_constructible() {
+    for logic in [Logic::QfUfbvlia, Logic::QfAufbvlia] {
+        assert!(
+            Solver::try_new(logic).is_ok(),
+            "constructor rejected public logic {}",
+            logic.as_str()
+        );
+    }
+
+    let message = SolverError::UnsupportedLogic("INVALID_LOGIC".to_owned()).to_string();
+    assert!(message.contains("QF_UFBVLIA"));
+    assert!(message.contains("QF_AUFBVLIA"));
 }

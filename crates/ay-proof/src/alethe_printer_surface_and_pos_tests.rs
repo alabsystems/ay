@@ -92,19 +92,19 @@ fn flat_surface_and_pos_uses_first_identical_surface_operand() {
 }
 
 #[test]
-fn flat_surface_and_pos_handles_strings_and_escaped_symbols_in_real_export() {
+fn flat_surface_and_pos_handles_strings_and_standard_quoted_symbols_in_real_export() {
     let mut terms = TermStore::new();
     let s = terms.mk_var("flat_and_string_s", Sort::String);
     let value = terms.mk_string("a)\"b".to_string());
     let equality = terms.mk_app(Symbol::named("="), [s, value], Sort::Bool);
-    let exotic = terms.mk_var("a|b\\c", Sort::Bool);
+    let exotic = terms.mk_var("a b", Sort::Bool);
     let p = terms.mk_var("flat_and_string_p", Sort::Bool);
     let source = raw_and(&mut terms, [exotic, equality, p]);
     let gate = terms.mk_not_raw(source);
     let mut overrides = DetHashMap::default();
     overrides.insert(
         source,
-        r#"(and(= flat_and_string_s "a)""b")|a\|b\\c| flat_and_string_p)"#.to_string(),
+        r#"(and(= flat_and_string_s "a)""b")|a b| flat_and_string_p)"#.to_string(),
     );
     let mut proof = Proof::new();
     proof.add_rule_step(
@@ -123,10 +123,31 @@ fn flat_surface_and_pos_handles_strings_and_escaped_symbols_in_real_export() {
     .expect("shared scanner must preserve exotic surface operands");
     assert!(
         output.contains(
-            r#"(step t0 (cl (not (and(= flat_and_string_s "a)""b")|a\|b\\c| flat_and_string_p)) |a\|b\\c|) :rule and_pos :args (1))"#
+            r#"(step t0 (cl (not (and(= flat_and_string_s "a)""b")|a b| flat_and_string_p)) |a b|) :rule and_pos :args (1))"#
         ),
         "{output}"
     );
+}
+
+#[test]
+fn flat_surface_and_pos_rejects_z3_escaped_symbol_before_publication() {
+    let mut terms = TermStore::new();
+    let escaped = terms.mk_var("a|b\\c", Sort::Bool);
+    let p = terms.mk_var("flat_and_escaped_p", Sort::Bool);
+    let source = raw_and(&mut terms, [escaped, p]);
+    let gate = terms.mk_not_raw(source);
+    let mut proof = Proof::new();
+    proof.add_rule_step(
+        AletheRule::AndPos(0),
+        vec![gate, escaped],
+        Vec::new(),
+        vec![source],
+    );
+
+    assert!(matches!(
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[source], None),
+        Err(AlethePrintError::UnavailableAuthenticatedSurface { .. })
+    ));
 }
 
 #[test]
@@ -481,6 +502,59 @@ fn flat_surface_and_pos_navigates_renested_surface_conjunct() {
         "(step t9.g0 (cl (not (and nav_and_a (and nav_and_b nav_and_c))) (and nav_and_b nav_and_c)) :rule and_pos :args (1))\n\
          (step t9.g1 (cl (not (and nav_and_b nav_and_c)) nav_and_c) :rule and_pos :args (1))\n\
          (step t9 (cl (not (and nav_and_a (and nav_and_b nav_and_c))) nav_and_c) :rule resolution :premises (t9.g0 t9.g1))"
+    );
+}
+
+#[test]
+fn flat_surface_and_pos_bridges_an_exact_normalized_linear_operand() {
+    let mut terms = TermStore::new();
+    let i = terms.mk_var("norm_and_i", Sort::Int);
+    let zero = terms.mk_int(0.into());
+    let selected = terms.mk_app(Symbol::named("<"), [i, zero], Sort::Bool);
+    let guard = terms.mk_var("norm_and_guard", Sort::Bool);
+    let source = raw_and(&mut terms, [selected, guard]);
+    let gate = terms.mk_not_raw(source);
+    let mut overrides = DetHashMap::default();
+    overrides.insert(
+        source,
+        "(and (< (+ norm_and_i norm_and_w (- norm_and_w)) 0) norm_and_guard)".to_string(),
+    );
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let printed = printer
+        .format_step(&and_pos_step(0, gate, selected, source), ProofId(6))
+        .expect("the exact printed linear implication must bridge the projection");
+    assert_eq!(
+        printed,
+        "(step t6.a (cl (not (and (< (+ norm_and_i norm_and_w (- norm_and_w)) 0) norm_and_guard)) (< (+ norm_and_i norm_and_w (- norm_and_w)) 0)) :rule and_pos :args (0))\n\
+         (step t6.n (cl (not (< (+ norm_and_i norm_and_w (- norm_and_w)) 0)) (< norm_and_i 0)) :rule la_generic :args (1 1))\n\
+         (step t6 (cl (not (and (< (+ norm_and_i norm_and_w (- norm_and_w)) 0) norm_and_guard)) (< norm_and_i 0)) :rule resolution :premises (t6.a t6.n))"
+    );
+}
+
+#[test]
+fn flat_surface_and_pos_rejects_a_non_implying_linear_operand() {
+    let mut terms = TermStore::new();
+    let i = terms.mk_var("bad_norm_and_i", Sort::Int);
+    let zero = terms.mk_int(0.into());
+    let selected = terms.mk_app(Symbol::named("<"), [i, zero], Sort::Bool);
+    let guard = terms.mk_var("bad_norm_and_guard", Sort::Bool);
+    let source = raw_and(&mut terms, [selected, guard]);
+    let gate = terms.mk_not_raw(source);
+    let mut overrides = DetHashMap::default();
+    overrides.insert(
+        source,
+        "(and (< (+ bad_norm_and_i bad_norm_and_w) 0) bad_norm_and_guard)".to_string(),
+    );
+    let printer = AlethePrinter::new_with_overrides(&terms, Some(&overrides));
+
+    let error = printer
+        .format_step(&and_pos_step(0, gate, selected, source), ProofId(7))
+        .expect_err("an unbounded extra summand must not be erased by the bridge");
+    assert!(
+        matches!(error, AlethePrintError::InvalidSurfaceStep { ref reason, .. }
+            if reason.contains("absent from its effective source")),
+        "{error}"
     );
 }
 

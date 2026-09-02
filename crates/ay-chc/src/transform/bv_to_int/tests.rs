@@ -2101,3 +2101,14 @@ fn exact_mode_constant_below_2_pow_95_still_transforms() {
         "a two-limb-representable constant must still abstract to Int"
     );
 }
+
+#[test]
+fn concretize_wide_bv_from_beyond_i128_model_integer() {
+    let bits: BigInt = (BigInt::from(1_u8) << 128_usize) + 3_u8;
+    let abstract_value = SmtValue::int_from_bigint(bits.clone());
+    let concrete = concretize_smt_value(&abstract_value, &ChcSort::BitVec(129));
+    assert_eq!(
+        concrete.bitvec_to_biguint(),
+        Some(((num_bigint::BigUint::from(1_u8) << 128) + 3_u8, 129))
+    );
+}

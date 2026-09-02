@@ -455,7 +455,9 @@ fn default_scalar_smt_value(sort: &crate::ChcSort) -> Option<SmtValue> {
         crate::ChcSort::Real => SmtValue::Real(num_rational::BigRational::from_integer(
             num_bigint::BigInt::from(0),
         )),
-        crate::ChcSort::BitVec(w) => SmtValue::BitVec(0, *w),
+        crate::ChcSort::BitVec(w) => {
+            SmtValue::bitvec_from_biguint(num_bigint::BigUint::from(0u8), *w)
+        }
         crate::ChcSort::Array(..)
         | crate::ChcSort::Uninterpreted(_)
         | crate::ChcSort::Datatype { .. } => return None,
@@ -878,7 +880,7 @@ impl SmtContext {
             return SmtResult::Unknown;
         }
         // Per-engine term memory budget guard (#8600).
-        if self.term_memory_exceeded() {
+        if self.exact_term_memory_exceeded() {
             return SmtResult::Unknown;
         }
         // Bit-blast budget gate (fail-closed): refuse the WHOLE query — internal
@@ -947,6 +949,9 @@ impl SmtContext {
                 let propagated_model = FxHashMap::default();
                 let first = self.check_sat_via_executor(expr, &propagated_model, timeout);
                 if !matches!(first, SmtResult::Unknown) {
+                    if self.exact_term_memory_exceeded() {
+                        return SmtResult::Unknown;
+                    }
                     crate::smt::note_solve_progress();
                     return first;
                 }
@@ -1101,6 +1106,9 @@ impl SmtContext {
                     );
                 }
                 if !matches!(fallback, SmtResult::Unknown) {
+                    if self.exact_term_memory_exceeded() {
+                        return SmtResult::Unknown;
+                    }
                     crate::smt::note_solve_progress();
                     return fallback;
                 }
@@ -1117,6 +1125,9 @@ impl SmtContext {
         // A DECIDED (Sat/Unsat) verdict is genuine progress: reset the
         // no-progress streaks so only an UNBROKEN run of missing-var Unknowns
         // can trip the breaker (see `crate::smt::context`).
+        if self.exact_term_memory_exceeded() {
+            return SmtResult::Unknown;
+        }
         if !matches!(result, SmtResult::Unknown) {
             crate::smt::note_solve_progress();
         }
@@ -1134,6 +1145,13 @@ impl SmtContext {
     /// parity discovery, entry value inference) should NOT use this — they
     /// rely on Unknown to signal graceful degradation.
     pub fn check_sat_with_executor_fallback(&mut self, expr: &ChcExpr) -> SmtResult {
+        // This entry point intentionally bypasses `check_sat`, whose ordinary
+        // preflight owns the same check. A verification caller may therefore
+        // reach it directly; never let either the native attempt or its
+        // executor fallback publish across this context's term-store ceiling.
+        if self.exact_term_memory_exceeded() {
+            return SmtResult::Unknown;
+        }
         // No-progress circuit breaker (fail-closed): short-circuit to Unknown
         // once the solve has been observed spinning on the same unassignable
         // evaluable-position free-variable set (see `check_sat`/`sat_or_unknown`).
@@ -1179,6 +1197,9 @@ impl SmtContext {
         } else {
             self.check_sat_internal(expr)
         };
+        if self.exact_term_memory_exceeded() {
+            return SmtResult::Unknown;
+        }
 
         // QF_NIA short-circuit: skip the executor on nonlinear integer
         // multiplication — it cannot decide that fragment and would only burn
@@ -1206,12 +1227,18 @@ impl SmtContext {
                     checksat_trace_level() >= 1,
                 );
                 if !matches!(fallback, SmtResult::Unknown) {
+                    if self.exact_term_memory_exceeded() {
+                        return SmtResult::Unknown;
+                    }
                     crate::smt::note_solve_progress();
                     return fallback;
                 }
             }
         }
 
+        if self.exact_term_memory_exceeded() {
+            return SmtResult::Unknown;
+        }
         if !matches!(result, SmtResult::Unknown) {
             crate::smt::note_solve_progress();
         }

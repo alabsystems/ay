@@ -71,8 +71,8 @@ pub(crate) mod split_sym;
 use crate::{ChcExpr, ChcProblem, ChcSort, Counterexample, InvariantModel};
 
 pub(crate) use array_ghost_pairs::{
-    ghost_pair_replay_obligations, recheck_ghost_pair_certificate, ArrayGhostPairTransformer,
-    GhostPairCertificate, GhostPairSpec,
+    ghost_pair_replay_obligations, recheck_ghost_pair_certificate, try_query_anchored_and_seal,
+    ArrayGhostPairTransformer, GhostPairCertificate, GhostPairSpec,
 };
 pub(crate) use array_store_forwarding::{array_store_forwarding_enabled, ArrayStoreForwarder};
 pub(crate) use bv_to_bool::BvToBoolBitBlaster;
@@ -80,10 +80,17 @@ pub(crate) use bv_to_int::BvToIntAbstractor;
 pub(crate) use clause_inlining::{accept_profile_enabled, ClauseInliner};
 pub(crate) use condense::{condense_enabled, CondenseSuperpass};
 pub(crate) use dead_param_elimination::DeadParamEliminator;
-pub(crate) use dt_flatten::{DtFlattener, DT_FLATTEN_APPROX_OBLIGATION};
+pub(crate) use dt_flatten::DtFlattener;
 pub(crate) use ground_table_read_concretization::GroundTableReadConcretizer;
 pub(crate) use interval_propagation::IntervalPropagator;
 pub(crate) use local_var_elimination::LocalVarEliminator;
+
+/// Maximum number of same-datatype occurrences expanded on one DT-flattening
+/// path. Route admission uses the transform's live value so its projected-work
+/// bound cannot drift below the transform it guards.
+pub(crate) fn dt_flatten_recursion_limit() -> usize {
+    dt_flatten::recursive_dt_flatten_depth()
+}
 pub(crate) use multi_edge_merger::MultiEdgeMerger;
 pub(crate) use node_eliminator::NodeEliminator;
 pub(crate) use pc_split::PcSplitter;

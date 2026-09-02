@@ -56,7 +56,7 @@ impl SmtContext {
     /// Collect BV var=const equalities from the top-level conjunction.
     ///
     /// Matches patterns like `(= bv_var #xABCD)` where `bv_var` has `ChcSort::BitVec(w)`.
-    /// Returns `(value, width)` pairs for direct insertion into `SmtValue::BitVec`.
+    /// Returns `(value, width)` pairs for canonical `SmtValue` construction.
     pub(super) fn collect_bv_var_const_equalities(
         expr: &ChcExpr,
         out: &mut FxHashMap<String, (u128, u32)>,

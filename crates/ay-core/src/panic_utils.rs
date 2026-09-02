@@ -127,9 +127,9 @@ fn contains_bug_marker(reason_lower: &str) -> bool {
         if pos == 0 {
             return true;
         }
-        reason_lower[..pos]
-            .chars()
-            .next_back()
+        reason_lower
+            .get(..pos)
+            .and_then(|prefix| prefix.chars().next_back())
             .is_some_and(|c| !c.is_alphanumeric() && c != '_')
     })
 }

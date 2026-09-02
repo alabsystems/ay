@@ -75,6 +75,7 @@ Usage:
   pb_cert_census_mutate.py <veripb> <out.json> <opb> <pbp> [<opb> <pbp> ...]
 """
 
+import hashlib
 import json
 import os
 import re
@@ -82,6 +83,53 @@ import subprocess
 import sys
 import tempfile
 from collections import OrderedDict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+_BOUND = re.compile(r'BOUNDS\s+(-?\d+)\s*<=\s*obj\s*<=\s*(-?\d+)')
+_LIT = re.compile(r'(~?)x(\d+)')
+
+
+def _bound_from_verdict(verdict):
+    """The single optimum a `s VERIFIED BOUNDS v <= obj <= v` line asserts."""
+    m = _BOUND.search(verdict or "")
+    if not m or m.group(1) != m.group(2):
+        return None
+    return int(m.group(1))
+
+
+def _check_witness(opb, pbp):
+    """(feasible, objective) for the model on the proof's `conclusion` line.
+
+    Uses the census's own independent OPB parser -- deliberately NOT the
+    crate's -- so this adjudication cannot inherit a misreading of the formula
+    from the thing it is adjudicating.
+    """
+    try:
+        from construct_below_floor import parse_opb
+        objective, constraints, _ = parse_opb(opb)
+        tail = ""
+        with open(pbp, errors="replace") as fh:
+            for line in fh:
+                if line.startswith("conclusion BOUNDS"):
+                    tail = line.rpartition(":")[2]
+                    break
+        if not tail:
+            return (False, None)
+        assign = {int(v): (neg != '~') for neg, v in _LIT.findall(tail)}
+
+        def lhs(terms):
+            return sum(c * ((0 if assign.get(v, False) else 1) if neg
+                            else (1 if assign.get(v, False) else 0))
+                       for c, v, neg in terms)
+
+        for terms, op, rhs in constraints:
+            got = lhs(terms)
+            if (op == '>=' and got < rhs) or (op == '=' and got != rhs):
+                return (False, lhs(objective))
+        return (True, lhs(objective))
+    except Exception:                                        # noqa: BLE001
+        return (False, None)
 
 
 def run_checker(veripb, opb, pbp):
@@ -330,16 +378,71 @@ def main():
             # Mutating a proof the checker already refuses proves nothing.
             continue
 
+        # DEDUPE BY CONTENT, NOT BY NAME. Two mutation rules with different
+        # names routinely produce the SAME bytes on a given proof (e.g. a proof
+        # whose only `pol` line is also its last derived row), and a name-keyed
+        # `seen` counts those as two independent must-reject catches. That is
+        # how a battery count in this repo came out 36% high. The key is the
+        # sha256 of the mutant text, so byte-identical mutants are scored once
+        # however many rules generated them.
+        #
+        # A mutant byte-identical to the ORIGINAL is worse than a duplicate: it
+        # is not a mutation at all, the checker rightly ACCEPTS it, and under
+        # `must-reject` it would fire a false stop-the-line. Those are excluded
+        # and counted, never scored.
+        original_digest = hashlib.sha256(
+            ("\n".join(lines) + "\n").encode()).hexdigest()
         seen = set()
         for name, expectation, mlines in mutants(lines):
-            if name in seen:
+            text = "\n".join(mlines) + "\n"
+            digest = hashlib.sha256(text.encode()).hexdigest()
+            if digest == original_digest:
+                stats["noop_mutants_excluded"] = (
+                    stats.get("noop_mutants_excluded", 0) + 1)
                 continue
-            seen.add(name)
+            if digest in seen:
+                stats["duplicate_mutants_excluded"] = (
+                    stats.get("duplicate_mutants_excluded", 0) + 1)
+                continue
+            seen.add(digest)
             mpath = os.path.join(tmp, "m.pbp")
             with open(mpath, "w") as fh:
-                fh.write("\n".join(mlines) + "\n")
+                fh.write(text)
             c, v = run_checker(veripb, opb, mpath)
             acc = accepted(c, v)
+            adjudication = None
+            # ADJUDICATE THE WITNESS FLIPS RATHER THAN ASSUMING THEM.
+            #
+            # `*-witness-literal-flipped` flips one literal of the logged
+            # optimal assignment, on the assumption that this must break the
+            # witness. That assumption is INSTANCE-DEPENDENT and it is false
+            # whenever the flipped variable is free at the optimum: the flip
+            # then yields a DIFFERENT optimal model, the proof stays correct,
+            # and a correct checker accepts it. Measured on
+            # mult_diagcomm_opt_less_teq_nbits_19 (optimum 0), where the
+            # flipped witness is feasible -- 0 of 3325 constraints violated --
+            # at objective 0.
+            #
+            # So when such a mutation is accepted, the expectation is decided
+            # by INDEPENDENTLY evaluating the flipped assignment against the
+            # formula rather than by the mutation's name. Feasible and still at
+            # the claimed bound means the battery wrote a bad mutation and the
+            # checker was right; anything else stays a must-reject failure and
+            # a genuine alarm.
+            if acc and expectation == "reject" and "witness-literal-flipped" in name:
+                verdict_bound = _bound_from_verdict(v)
+                feasible, obj = _check_witness(opb, mpath)
+                if feasible and verdict_bound is not None and obj == verdict_bound:
+                    expectation = "may"
+                    adjudication = (
+                        f"BAD MUTATION, not a checker defect: the flipped "
+                        f"witness is independently feasible at objective {obj}, "
+                        f"which is the bound the checker printed. A different "
+                        f"optimal model is still an optimal model.")
+                else:
+                    adjudication = (
+                        f"GENUINE: flipped witness feasible={feasible} "
+                        f"objective={obj} vs printed bound {verdict_bound}")
             if expectation == "reject":
                 stats["must_reject"] += 1
                 if acc:
@@ -350,11 +453,17 @@ def main():
                 if acc:
                     stats["may_accept_accepted"] += 1
                 ok = True
-            results.append(OrderedDict(
+            rec = OrderedDict(
                 instance=os.path.basename(opb), proof=os.path.basename(pbp),
                 mutation=name, expectation=expectation,
+                mutant_sha256=digest,
                 checker_exit=c, verdict=v or "<no verdict line>",
-                outcome="ACCEPTED" if acc else "REJECTED", ok=ok))
+                outcome="ACCEPTED" if acc else "REJECTED", ok=ok)
+            if adjudication:
+                rec["adjudication"] = adjudication
+                stats["witness_flips_adjudicated"] = (
+                    stats.get("witness_flips_adjudicated", 0) + 1)
+            results.append(rec)
 
     # --- a proof must be bound to ITS OWN instance.
     for i, (opb_a, pbp_a) in enumerate(pairs):

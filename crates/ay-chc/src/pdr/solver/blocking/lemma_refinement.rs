@@ -137,10 +137,19 @@ impl PdrSolver {
                                         ));
                                     }
                                 }
-                                (ChcSort::BitVec(w), Some(SmtValue::BitVec(v, _))) => {
+                                (
+                                    ChcSort::BitVec(w),
+                                    Some(
+                                        value @ (SmtValue::BitVec(_, actual_width)
+                                        | SmtValue::BigBitVec(_, actual_width)),
+                                    ),
+                                ) if w == actual_width => {
                                     // BV var: add sign-bit constraint based on MSB
                                     let msb = if *w > 0 { *w - 1 } else { 0 };
-                                    let sign_bit = (*v >> msb) & 1;
+                                    let Some((bits, _)) = value.bitvec_to_biguint() else {
+                                        continue;
+                                    };
+                                    let sign_bit = u128::from(bits.bit(u64::from(msb)));
                                     let bv_var = ChcExpr::var(cv.clone());
                                     let extract = ChcExpr::Op(
                                         ChcOp::BvExtract(msb, msb),

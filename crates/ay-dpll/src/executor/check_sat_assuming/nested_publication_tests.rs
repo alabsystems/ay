@@ -14,14 +14,15 @@ use std::collections::BTreeSet;
 /// obligations that surfaced this): a public assumption query whose
 /// SAT-level failed-assumption harvest is a MISATTRIBUTED proper subset --
 /// the "wrong-but-AUTHENTIC" input `certify_assumption_core` exists to
-/// reject. Its re-solve of that subset is Unknown, and the Unknown
-/// publication funnel clears `proof_problem_assertion_provenance`; the
-/// deterministic restore-solve that follows then rebuilds provenance from
-/// its own transformed working set (`preserving_authority_from(None)` is
-/// an identity), promoting solver-generated terms to authored authority.
-/// `mint_unsat_certificate` correctly refuses that with
-/// `AssertionEpochMismatch`, and a CORRECT refutation is published as
-/// `unknown` / `SelfCheckRejected`.
+/// reject. Its disposable exact-subset probe is Unknown, so the original
+/// refutation and exact outer authority remain live. The source-presentation
+/// resolver must then align the retained parsed ledger with Context's exact
+/// concrete-authored rows: proof provenance intentionally contains only the
+/// base while the other authored rows are exactly bound assumptions. Treating
+/// that narrower provenance vector as the parsed-row index suppresses the
+/// promised artifact, and a CORRECT refutation is published as `unknown` /
+/// `SelfCheckRejected` even though every reachable source root belongs to the
+/// base-or-assumption strict scope.
 ///
 /// A shape-only assertion would not have caught this: the emitted steps
 /// were always well-formed. Only running the emitter's own artifact

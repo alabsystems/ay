@@ -31,7 +31,7 @@ use ay_core::time::Instant;
 use ay_core::TermStore;
 use std::time::Duration;
 
-use crate::adaptive::AdaptivePortfolio;
+use crate::adaptive::{AdaptivePortfolio, StagedProbeBudgetProfile};
 use crate::adaptive_decision_log::DecisionEntry;
 
 #[derive(Clone)]
@@ -1305,7 +1305,7 @@ impl AdaptivePortfolio {
             return PortfolioResult::Unknown;
         }
 
-        let config = PortfolioConfig {
+        let mut config = PortfolioConfig {
             external_cancellation: Some(self.cancellation_token.clone()),
             engines,
             parallel: true,
@@ -1318,6 +1318,8 @@ impl AdaptivePortfolio {
             memory_budget: self.config.memory_budget,
             strict_proofs: self.config.strict_proofs,
         };
+        self.apply_original_problem_engine_selection(&mut config);
+        self.apply_staged_probe_budget_defaults(&mut config, StagedProbeBudgetProfile::BmcAndKind);
 
         let portfolio_start = Instant::now();
         self.decision_log.log_decision(DecisionEntry {
@@ -2000,6 +2002,8 @@ impl AdaptivePortfolio {
                 );
             }
         }
+        self.apply_original_problem_engine_selection(&mut config);
+        self.apply_staged_probe_budget_defaults(&mut config, StagedProbeBudgetProfile::BmcAndKind);
 
         let portfolio_start = Instant::now();
         let portfolio_result = self.run_portfolio(config);

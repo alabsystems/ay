@@ -33,7 +33,7 @@ use ay_sat::TlaTraceable;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::adaptive::AdaptivePortfolio;
+use crate::adaptive::{AdaptivePortfolio, StagedProbeBudgetProfile};
 
 fn try_budgeted_pdr(
     portfolio: &AdaptivePortfolio,
@@ -2503,7 +2503,8 @@ impl AdaptivePortfolio {
                     "Adaptive: Using array-safe simple loop portfolio (PDR + negated-eq PDR + BMC; array BMC restored after #8745/#8822)"
                 );
             }
-            let config = self.simple_loop_array_portfolio_config(full_budget);
+            let mut config = self.simple_loop_array_portfolio_config(full_budget);
+            self.apply_original_problem_engine_selection(&mut config);
             return (
                 self.run_portfolio(config),
                 ValidationEvidence::FullVerification,
@@ -2639,7 +2640,8 @@ impl AdaptivePortfolio {
             return (result, ValidationEvidence::FullVerification);
         }
 
-        let config = self.simple_loop_portfolio_config(full_budget);
+        let mut config = self.simple_loop_portfolio_config(full_budget);
+        self.apply_original_problem_engine_selection(&mut config);
         (
             self.run_portfolio(config),
             ValidationEvidence::FullVerification,
@@ -2664,7 +2666,7 @@ impl AdaptivePortfolio {
         }
         .with_tla_trace_from_env();
 
-        PortfolioConfig {
+        let mut config = PortfolioConfig {
             external_cancellation: Some(self.cancellation_token.clone()),
             engines: vec![
                 EngineConfig::Tpa(TpaConfig {
@@ -2742,7 +2744,9 @@ impl AdaptivePortfolio {
             engine_budgets: ay_core::kani_compat::DetHashMap::default(),
             memory_budget: self.config.memory_budget,
             strict_proofs: self.config.strict_proofs,
-        }
+        };
+        self.apply_staged_probe_budget_defaults(&mut config, StagedProbeBudgetProfile::BmcOnly);
+        config
     }
 
     /// Build the portfolio config for array-containing simple loops.
@@ -2763,7 +2767,7 @@ impl AdaptivePortfolio {
         }
         .with_tla_trace_from_env();
 
-        PortfolioConfig {
+        let mut config = PortfolioConfig {
             external_cancellation: Some(self.cancellation_token.clone()),
             engines: vec![
                 EngineConfig::Pdr(pdr_config.clone()),
@@ -2792,7 +2796,9 @@ impl AdaptivePortfolio {
             engine_budgets: ay_core::kani_compat::DetHashMap::default(),
             memory_budget: self.config.memory_budget,
             strict_proofs: self.config.strict_proofs,
-        }
+        };
+        self.apply_staged_probe_budget_defaults(&mut config, StagedProbeBudgetProfile::BmcOnly);
+        config
     }
 
     /// Build the portfolio config for pure-Boolean simple loop problems (#5877).
@@ -2815,7 +2821,7 @@ impl AdaptivePortfolio {
         }
         .with_tla_trace_from_env();
 
-        PortfolioConfig {
+        let mut config = PortfolioConfig {
             external_cancellation: Some(self.cancellation_token.clone()),
             engines: vec![
                 EngineConfig::Pdkind(PdkindConfig {
@@ -2847,7 +2853,9 @@ impl AdaptivePortfolio {
             engine_budgets: ay_core::kani_compat::DetHashMap::default(),
             memory_budget: self.config.memory_budget,
             strict_proofs: self.config.strict_proofs,
-        }
+        };
+        self.apply_staged_probe_budget_defaults(&mut config, StagedProbeBudgetProfile::CallerOnly);
+        config
     }
 
     /// Build the portfolio config for BV-native PDR solving (#5877 Wave 3).
@@ -2903,7 +2911,7 @@ impl AdaptivePortfolio {
             ..BmcConfig::default()
         };
 
-        PortfolioConfig {
+        let mut config = PortfolioConfig {
             external_cancellation: Some(self.cancellation_token.clone()),
             engines: vec![
                 EngineConfig::Pdr(pdr_config_val),
@@ -2919,7 +2927,9 @@ impl AdaptivePortfolio {
             engine_budgets: ay_core::kani_compat::DetHashMap::default(),
             memory_budget: self.config.memory_budget,
             strict_proofs: self.config.strict_proofs,
-        }
+        };
+        self.apply_staged_probe_budget_defaults(&mut config, StagedProbeBudgetProfile::CallerOnly);
+        config
     }
 }
 

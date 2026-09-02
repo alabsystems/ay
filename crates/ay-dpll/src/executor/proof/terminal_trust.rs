@@ -37,7 +37,123 @@ fn add_term_with_and_conjuncts(
     }
 }
 
+fn proof_step_clause(proof: &Proof, id: ay_core::ProofId) -> Option<&[TermId]> {
+    match proof.steps.get(id.0 as usize)? {
+        ProofStep::Assume(term) => Some(std::slice::from_ref(term)),
+        ProofStep::Resolution { clause, .. }
+        | ProofStep::TheoryLemma { clause, .. }
+        | ProofStep::Step { clause, .. } => Some(clause),
+        ProofStep::Anchor { .. } => None,
+        _ => None,
+    }
+}
+
 impl Executor {
+    /// Whether one bit-blast theorem is the exact checked wire identity
+    /// `x <u 1 <=> x = 0` handled by `format_bv_ult_one_zero_equiv`.
+    ///
+    /// The printer re-derives this through its bounded pseudo-Boolean template
+    /// (at widths through 64), so it is not an honest-hole wire gap.  Keep the
+    /// publication screen at least as narrow as that formatter and reject any
+    /// surface override on an endpoint the external derivation reads.
+    fn bv_ult_one_zero_equivalence_is_fixed_wire(&self, clause: &[TermId]) -> bool {
+        let [equality] = clause else {
+            return false;
+        };
+        let TermData::App(ay_core::Symbol::Named(operator), operands) =
+            self.ctx.terms.get(*equality)
+        else {
+            return false;
+        };
+        let [left, right] = operands.as_slice() else {
+            return false;
+        };
+        if operator != "=" {
+            return false;
+        }
+        let decode_pair = |ult: TermId, eq_zero: TermId| {
+            let TermData::App(ay_core::Symbol::Named(ult_operator), ult_args) =
+                self.ctx.terms.get(ult)
+            else {
+                return None;
+            };
+            let [subject, one] = ult_args.as_slice() else {
+                return None;
+            };
+            let (subject, one) = (*subject, *one);
+            let Sort::BitVec(bits) = self.ctx.terms.sort(subject) else {
+                return None;
+            };
+            let width = bits.width;
+            if ult_operator != "bvult" || width == 0 || width > 64 {
+                return None;
+            }
+            let TermData::Const(Constant::BitVec {
+                value: one_value,
+                width: one_width,
+            }) = self.ctx.terms.get(one)
+            else {
+                return None;
+            };
+            if *one_width != width || *one_value != 1_u8.into() {
+                return None;
+            }
+            let TermData::App(ay_core::Symbol::Named(eq_operator), eq_args) =
+                self.ctx.terms.get(eq_zero)
+            else {
+                return None;
+            };
+            let [first, second] = eq_args.as_slice() else {
+                return None;
+            };
+            let is_zero = |term| {
+                matches!(
+                    self.ctx.terms.get(term),
+                    TermData::Const(Constant::BitVec {
+                        value: zero_value,
+                        width: zero_width,
+                    }) if *zero_width == width && *zero_value == 0_u8.into()
+                )
+            };
+            // Equality interning is symmetric and TermId-ordered. Recover the
+            // semantic subject/zero roles independently of that storage order.
+            let (zero_subject, zero) = if is_zero(*second) {
+                (*first, *second)
+            } else if is_zero(*first) {
+                (*second, *first)
+            } else {
+                return None;
+            };
+            let zero_subject_matches = zero_subject == subject
+                || matches!(
+                    self.ctx.terms.get(zero_subject),
+                    TermData::App(ay_core::Symbol::Named(gate), gate_args)
+                        if matches!(gate.as_str(), "bvand" | "bvor")
+                            && gate_args.as_slice() == [subject, subject]
+                            && self.ctx.terms.sort(zero_subject) == self.ctx.terms.sort(subject)
+                );
+            if eq_operator != "=" || !zero_subject_matches {
+                return None;
+            }
+            Some([ult, eq_zero, subject, one, zero_subject, zero])
+        };
+        let Some(endpoints) = decode_pair(*left, *right).or_else(|| decode_pair(*right, *left))
+        else {
+            return false;
+        };
+        if self
+            .last_proof_term_overrides
+            .as_ref()
+            .is_some_and(|overrides| {
+                overrides.contains_key(equality)
+                    || endpoints.iter().any(|term| overrides.contains_key(term))
+            })
+        {
+            return false;
+        }
+        ay_proof::recognize_bv_bitblast(&self.ctx.terms, clause)
+    }
+
     /// Whether one internally checked bit-blast theorem is also in the exact
     /// ground-constant subset the Alethe printer expands into
     /// `evaluate`/`equiv_pos2`/`false`/`resolution`.
@@ -278,14 +394,14 @@ impl Executor {
             > 0
     }
 
-    /// Whether the last UNSAT proof references sequence-theory content — any
-    /// `Seq`-sorted subterm anywhere in the emitted proof.
+    /// Whether the last UNSAT proof references syntax the pinned Carcara
+    /// checker cannot parse losslessly.
     ///
-    /// Such a proof is NOT independently checkable and carries no separate
-    /// certificate: carcara (our Alethe checker) hard-rejects the problem at
-    /// parse time (`sort 'Seq' is not defined`), no firewall-Lean lemma exists
-    /// for the sequence theory (the groundable set is datatypes / LIA / EUF /
-    /// arrays-ROW2 / strings), and there is no DRAT lane. AY can still find a
+    /// `Seq`, `FloatingPoint`, and `Char` sorts are not in that checker's sort
+    /// grammar. In addition, SMT-LIB symbols containing `|` or `\` have no
+    /// lossless standard quoted spelling accepted by Carcara (AY/Z3's escape
+    /// extension is rejected). Such a proof is NOT independently checkable
+    /// and carries no separate certificate. AY can still find a
     /// sound *internal* refutation — e.g. a `(seq.nth s 0)` term forced to two
     /// distinct integer constants collapses to a clean `la_generic` +
     /// `resolution` chain with zero `hole`/`trust` steps and no foreign
@@ -301,35 +417,11 @@ impl Executor {
         let Some(proof) = self.retained_unsat_proof_for_policy() else {
             return false;
         };
-        let mut stack: Vec<TermId> = Vec::new();
-        for step in &proof.steps {
-            match step {
-                ProofStep::Assume(t) => stack.push(*t),
-                ProofStep::Resolution { clause, pivot, .. } => {
-                    stack.extend(clause.iter().copied());
-                    stack.push(*pivot);
-                }
-                ProofStep::TheoryLemma { clause, .. } => stack.extend(clause.iter().copied()),
-                ProofStep::Step { clause, args, .. } => {
-                    stack.extend(clause.iter().copied());
-                    stack.extend(args.iter().copied());
-                }
-                ProofStep::Anchor { .. } => {}
-                _ => {}
-            }
-        }
-        let mut visited: ay_core::kani_compat::DetHashSet<TermId> =
-            ay_core::kani_compat::DetHashSet::default();
-        while let Some(id) = stack.pop() {
-            if !visited.insert(id) {
-                continue;
-            }
-            if matches!(self.ctx.terms.sort(id), Sort::Seq(_)) {
-                return true;
-            }
-            stack.extend(self.ctx.terms.children(id));
-        }
-        false
+        !ay_proof::carcara_proof_surface_is_supported(
+            proof,
+            &self.ctx.terms,
+            self.last_proof_term_overrides.as_ref(),
+        )
     }
 
     /// Whether the last UNSAT proof's terminal derivation chain is NOT
@@ -384,22 +476,53 @@ impl Executor {
     /// into `last_proof`. Proof construction uses this so it never has to
     /// overwrite retained query state merely to inspect a candidate.
     pub(super) fn proof_has_known_wire_gap(&self, proof: &Proof) -> bool {
+        // Preflight the complete document before invoking either expensive
+        // arithmetic recognizer. An over-cap proof is an honest wire gap, and
+        // must not spend the local recognizer allowance on its first N steps
+        // merely to discover the (N+1)th candidate later in this scan.
+        let mut poly_simp_budget = ay_proof::ArithPolySimpPromotionBudget::for_proof(proof);
+        if !poly_simp_budget.proof_admitted() {
+            return true;
+        }
         // This is the same effective source-syntax channel handed to the
         // ordinary Alethe exporter. In particular, a `LiaGeneric` Farkas
         // certificate may not gain `la_generic` authority from the internal
         // term DAG while the printer is rendering different text.
-        let term_overrides = self.proof_export_term_overrides();
+        let raw_term_overrides = self.proof_export_term_overrides();
+        if !ay_proof::carcara_proof_surface_is_supported(
+            proof,
+            &self.ctx.terms,
+            raw_term_overrides.as_ref(),
+        ) {
+            return true;
+        }
+        let term_overrides = match ay_proof::effective_wire_term_overrides_for_proof(
+            proof,
+            &self.ctx.terms,
+            raw_term_overrides.as_ref(),
+        ) {
+            Ok(overrides) => overrides,
+            // The exporter runs this same bounded authored-assume planner.
+            // If it cannot prove and confine a source spelling, downstream
+            // wire compatibility is unknown and publication must fail closed.
+            Err(_) => return true,
+        };
         proof.steps.iter().any(|step| match step {
             ProofStep::Assume(term) => {
-                matches!(self.ctx.terms.get(*term), TermData::Let(..))
-                    || term_overrides
-                        .as_ref()
-                        .and_then(|overrides| overrides.get(term))
-                        // Keep this predicate identical to the printer's let
-                        // bridge trigger. `(` is a valid SMT-LIB token
-                        // delimiter, so compact `(let((x true))x)` syntax must
-                        // be screened as well as whitespace-separated syntax.
-                        .is_some_and(|surface| surface.starts_with("(let"))
+                let surface = term_overrides
+                    .as_ref()
+                    .and_then(|overrides| overrides.get(term));
+                match surface {
+                    Some(surface) if surface.starts_with("(let") => {
+                        !ay_proof::certified_let_assume_bridge_is_supported(
+                            &self.ctx.terms,
+                            *term,
+                            surface,
+                            term_overrides.as_ref(),
+                        )
+                    }
+                    _ => matches!(self.ctx.terms.get(*term), TermData::Let(..)),
+                }
             }
             ProofStep::TheoryLemma {
                 clause,
@@ -408,11 +531,59 @@ impl Executor {
                 lia,
                 ..
             } => {
+                let checked_bv_lowering = ay_proof::checked_bv_bitblast_lowering_supported(
+                    &self.ctx.terms,
+                    kind,
+                    clause,
+                    term_overrides.as_ref(),
+                );
+                debug_assert!(
+                    (!self.bv_constant_disequality_is_fixed_wire_evaluate(clause)
+                        && !self.bv_ult_one_zero_equivalence_is_fixed_wire(clause))
+                        || checked_bv_lowering,
+                    "legacy exact BV subsets must stay inside shared printer admission"
+                );
+                if checked_bv_lowering {
+                    return false;
+                }
                 if matches!(
                     kind,
-                    ay_core::TheoryLemmaKind::BvBitBlast
-                        | ay_core::TheoryLemmaKind::BvBitBlastGate { .. }
-                ) && self.bv_constant_disequality_is_fixed_wire_evaluate(clause)
+                    ay_core::TheoryLemmaKind::ArithClauseTautology
+                        | ay_core::TheoryLemmaKind::LiaGeneric
+                ) && ay_proof::theory_lemma_poly_simp_lowering_supported(
+                    &self.ctx.terms,
+                    kind,
+                    lia.as_ref(),
+                    clause,
+                    term_overrides.as_ref(),
+                    &mut poly_simp_budget,
+                ) {
+                    return false;
+                }
+                if matches!(kind, ay_core::TheoryLemmaKind::ArithEqTriangle)
+                    && ay_proof::arith_eq_triangle_lowering_supported(
+                        &self.ctx.terms,
+                        clause,
+                        term_overrides.as_ref(),
+                    )
+                {
+                    return false;
+                }
+                if matches!(kind, ay_core::TheoryLemmaKind::ArithEqImpliesBound)
+                    && ay_proof::arith_eq_implies_bound_lowering_supported(
+                        &self.ctx.terms,
+                        clause,
+                        term_overrides.as_ref(),
+                    )
+                {
+                    return false;
+                }
+                if matches!(kind, ay_core::TheoryLemmaKind::IntBoundsTautology)
+                    && ay_proof::int_bounds_tautology_lowering_supported(
+                        &self.ctx.terms,
+                        clause,
+                        term_overrides.as_ref(),
+                    )
                 {
                     return false;
                 }
@@ -440,8 +611,28 @@ impl Executor {
                 premises,
                 args,
             } => {
+                let trans_surface_gap = matches!(rule, ay_core::AletheRule::Trans)
+                    && premises
+                        .iter()
+                        .map(|premise| proof_step_clause(proof, *premise))
+                        .collect::<Option<Vec<_>>>()
+                        .is_none_or(|premise_clauses| {
+                            !ay_proof::trans_step_surface_is_supported(
+                                &self.ctx.terms,
+                                clause,
+                                &premise_clauses,
+                                term_overrides.as_ref(),
+                            )
+                        });
                 (matches!(rule, ay_core::AletheRule::True | ay_core::AletheRule::False)
                     && !self.bool_constant_step_is_fixed_wire_axiom(rule, clause, premises, args))
+                    || (matches!(rule, ay_core::AletheRule::Evaluate)
+                        && !ay_proof::evaluate_step_lowering_supported(
+                            &self.ctx.terms,
+                            clause,
+                            term_overrides.as_ref(),
+                        ))
+                    || trans_surface_gap
                     || rule.wire_name() == ay_core::UNPROVED_STEP_RULE
             }
             ProofStep::Resolution { .. } | ProofStep::Anchor { .. } => false,

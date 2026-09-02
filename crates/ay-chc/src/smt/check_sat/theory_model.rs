@@ -11,6 +11,7 @@ use ay_arrays::ArraySolver;
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 use ay_core::{Sort, TermId, TermStore};
 use ay_lia::LiaSolver;
+use num_bigint::BigUint;
 use num_traits::One;
 
 // #8529: Use deterministic hash maps in all builds.
@@ -19,11 +20,53 @@ use ay_core::kani_compat::DetHashMap as HbHashMap;
 use super::super::context::SmtContext;
 use super::super::types::SmtValue;
 
+fn extract_bitvec_from_sat_model(
+    bits: &[i32],
+    width: u32,
+    sat_model: &[bool],
+    bv_var_offset: i32,
+) -> Option<SmtValue> {
+    fn assigned_bit(bit_lit: i32, sat_model: &[bool], bv_var_offset: i32) -> Option<bool> {
+        if bit_lit == 0 {
+            return None;
+        }
+        let offset = u32::try_from(bv_var_offset).ok()?;
+        let index = bit_lit.unsigned_abs().checked_add(offset)?.checked_sub(1)? as usize;
+        let assigned = *sat_model.get(index)?;
+        Some(if bit_lit > 0 { assigned } else { !assigned })
+    }
+
+    if width == 0
+        || width > crate::MAX_BITVECTOR_WIDTH
+        || bits.len() != usize::try_from(width).ok()?
+    {
+        return None;
+    }
+
+    if width <= 128 {
+        let mut value = 0u128;
+        for (index, &bit_lit) in bits.iter().enumerate() {
+            if assigned_bit(bit_lit, sat_model, bv_var_offset)? {
+                value |= 1u128 << index;
+            }
+        }
+        return Some(SmtValue::BitVec(value, width));
+    }
+
+    let mut value = BigUint::from(0u8);
+    for (index, &bit_lit) in bits.iter().enumerate() {
+        if assigned_bit(bit_lit, sat_model, bv_var_offset)? {
+            value |= BigUint::from(1u8) << index;
+        }
+    }
+    Some(SmtValue::bitvec_from_biguint(value, width))
+}
+
 /// Result of value extraction from a theory-SAT assignment.
 pub(super) enum ExtractResult {
     /// Values were extracted successfully.
     Values(FxHashMap<String, SmtValue>),
-    /// An integer overflow was encountered; return Unknown.
+    /// Exact extraction failed (overflow or malformed/incomplete model); return Unknown.
     Overflow,
 }
 
@@ -60,17 +103,22 @@ pub(super) fn extract_theory_sat_values(
             .values()
             .any(|&term_id| matches!(terms.sort(term_id), Sort::Array(_)));
     let array_model = if needs_array_model {
-        array_solver.as_mut().map(|arr| {
-            let term_values = SmtContext::build_term_values_map(
-                terms,
-                &lia_model,
-                sat_model,
-                term_to_var,
-                bv_term_to_bits,
-                bv_var_offset,
-            );
-            arr.extract_model(&term_values)
-        })
+        match array_solver.as_mut() {
+            Some(arr) => {
+                let Some(term_values) = SmtContext::build_term_values_map(
+                    terms,
+                    &lia_model,
+                    sat_model,
+                    term_to_var,
+                    bv_term_to_bits,
+                    bv_var_offset,
+                ) else {
+                    return ExtractResult::Overflow;
+                };
+                Some(arr.extract_model(&term_values))
+            }
+            None => return ExtractResult::Overflow,
+        }
     } else {
         None
     };
@@ -122,29 +170,15 @@ pub(super) fn extract_theory_sat_values(
             Sort::BitVec(bv_sort) => {
                 // Extract BV value from SAT model using bit mappings.
                 if let Some(bits) = bv_term_to_bits.get(&term_id) {
-                    let mut bv_val: u128 = 0;
-                    for (i, &bit_lit) in bits.iter().enumerate() {
-                        // Skip bits beyond u128 capacity.
-                        if i >= 128 {
-                            break;
-                        }
-                        // #6090: use u32 arithmetic to avoid i32 overflow.
-                        let abs_lit = bit_lit.unsigned_abs();
-                        let offset_var = abs_lit
-                            .checked_add(bv_var_offset as u32)
-                            .and_then(|v| v.checked_sub(1));
-                        let Some(offset_var) = offset_var else {
-                            continue;
-                        };
-                        let sat_var = ay_sat::Variable::new(offset_var);
-                        if let Some(&val) = sat_model.get(sat_var.index()) {
-                            let bit_val = if bit_lit > 0 { val } else { !val };
-                            if bit_val {
-                                bv_val |= 1u128 << i;
-                            }
-                        }
-                    }
-                    values.insert(name.to_owned(), SmtValue::BitVec(bv_val, bv_sort.width));
+                    let Some(value) = extract_bitvec_from_sat_model(
+                        bits,
+                        bv_sort.width,
+                        sat_model,
+                        bv_var_offset,
+                    ) else {
+                        return ExtractResult::Overflow;
+                    };
+                    values.insert(name.to_owned(), value);
                 }
             }
             Sort::Real => {
@@ -154,21 +188,77 @@ pub(super) fn extract_theory_sat_values(
                 }
             }
             Sort::Array(arr_sort) if has_array_ops => {
-                if let Some(interp) = array_model
+                let Some(interp) = array_model
                     .as_ref()
                     .and_then(|model| model.array_values.get(&term_id))
-                {
-                    let smt_val = SmtContext::array_interp_to_smt_value(
-                        interp,
-                        &arr_sort.element_sort,
-                        &arr_sort.index_sort,
-                    );
-                    values.insert(name.to_owned(), smt_val);
-                }
+                else {
+                    return ExtractResult::Overflow;
+                };
+                let Some(smt_val) = SmtContext::array_interp_to_smt_value(
+                    interp,
+                    &arr_sort.element_sort,
+                    &arr_sort.index_sort,
+                ) else {
+                    return ExtractResult::Overflow;
+                };
+                values.insert(name.to_owned(), smt_val);
             }
             _ => {}
         }
     }
 
     ExtractResult::Values(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theory_model_extraction_preserves_bit_128() {
+        let bits: Vec<i32> = (1..=129).collect();
+        let mut sat_model = vec![false; 129];
+        sat_model[128] = true;
+        assert_eq!(
+            extract_bitvec_from_sat_model(&bits, 129, &sat_model, 0),
+            Some(SmtValue::bitvec_from_biguint(
+                BigUint::from(1u8) << 128,
+                129
+            ))
+        );
+    }
+
+    #[test]
+    fn theory_model_extraction_keeps_u128_fast_path() {
+        let bits: Vec<i32> = (1..=128).collect();
+        let sat_model = vec![true; 128];
+        assert_eq!(
+            extract_bitvec_from_sat_model(&bits, 128, &sat_model, 0),
+            Some(SmtValue::BitVec(u128::MAX, 128))
+        );
+    }
+
+    #[test]
+    fn theory_model_extraction_rejects_missing_or_unassigned_bits() {
+        let bits: Vec<i32> = (1..=128).collect();
+        let sat_model = vec![false; 128];
+        assert_eq!(
+            extract_bitvec_from_sat_model(&bits, 129, &sat_model, 0),
+            None
+        );
+
+        let bits: Vec<i32> = (1..=129).collect();
+        assert_eq!(
+            extract_bitvec_from_sat_model(&bits, 129, &sat_model, 0),
+            None
+        );
+
+        let mut bits: Vec<i32> = (1..=129).collect();
+        bits[17] = 0;
+        let sat_model = vec![false; 129];
+        assert_eq!(
+            extract_bitvec_from_sat_model(&bits, 129, &sat_model, 0),
+            None
+        );
+    }
 }

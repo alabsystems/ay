@@ -2077,3 +2077,101 @@ fn value_head(s: &str) -> &str {
         .unwrap_or(t.len());
     &t[..end]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn executor_for(declarations: &str) -> Executor {
+        let commands = ay_frontend::parse(declarations).expect("valid fixture declarations");
+        let mut executor = Executor::new();
+        executor
+            .execute_all(&commands)
+            .expect("fixture declarations execute");
+        executor
+    }
+
+    /// Drive [`AsgBuilder::gen_value`] on an EMPTY assignment: no class, no
+    /// commitment, no pin. That is exactly the state a free class reaches the
+    /// generator in, and it isolates the value ENUMERATION from every repair
+    /// and reconciliation rule around it.
+    fn generated(executor: &Executor, sort_name: &str, k: u64) -> Option<String> {
+        let model = Model::empty();
+        let dtm = ay_dt::DtModel::default();
+        let class_sort = HashMap::default();
+        let commits = HashMap::default();
+        let ruled_out = HashMap::default();
+        let sel_apps = HashMap::default();
+        let builder = AsgBuilder {
+            exec: executor,
+            model: &model,
+            dtm: &dtm,
+            class_sort: &class_sort,
+            commits: &commits,
+            ruled_out: &ruled_out,
+            sel_apps: &sel_apps,
+            memo: HashMap::default(),
+            fields_memo: HashMap::default(),
+            ctor_memo: HashMap::default(),
+            in_progress: HashSet::default(),
+            used_by_sort: HashMap::default(),
+            avoid: HashMap::default(),
+            pins: HashMap::default(),
+            pin_source: HashMap::default(),
+            sticky: HashMap::default(),
+            separation_attempts: HashMap::default(),
+            demoted: HashSet::default(),
+            poisoned: HashSet::default(),
+        };
+        builder
+            .gen_value(sort_name, k, &[], DT_VALUE_DEPTH)
+            .map(|(_ctor, _parts, value)| value)
+    }
+
+    fn generated_run(executor: &Executor, sort_name: &str, upto: u64) -> Vec<String> {
+        (0..upto)
+            .map_while(|k| generated(executor, sort_name, k))
+            .collect()
+    }
+
+    /// An uninterpreted field is NOT a pump — its inhabitants belong to the
+    /// theory model, not to this enumeration. Pinned because the generator's
+    /// notion of "a field I can enumerate" is exactly what a widening change
+    /// would be tempted to relax, and relaxing it here would mint datatype
+    /// values over sorts whose inhabitants the theory has not committed to.
+    #[test]
+    fn a_constructor_with_only_uninterpreted_fields_generates_nothing() {
+        let executor = executor_for(
+            r#"
+            (set-logic ALL)
+            (declare-sort FMap 0)
+            (declare-sort Key 0)
+            (declare-datatype Opaque
+                ((Opaque (opaque_entries FMap) (opaque_key Key))))
+        "#,
+        );
+        assert_eq!(
+            generated(&executor, "Opaque", 0),
+            None,
+            "an uninterpreted field is not a pump — its inhabitants belong to the theory model"
+        );
+    }
+
+    /// The Bool fallback's enumeration, value for value and in order, and the
+    /// fact that it TERMINATES: a Bool-only datatype is genuinely finite, so
+    /// running out is correct behaviour rather than a generator giving up.
+    #[test]
+    fn the_bool_pump_enumeration_is_exact_and_terminates() {
+        let executor = executor_for(
+            r#"
+            (set-logic ALL)
+            (declare-datatype Opt ((onone) (osome (osome_value Bool))))
+        "#,
+        );
+        assert_eq!(
+            generated_run(&executor, "Opt", 8),
+            vec!["onone", "(osome true)", "(osome false)"],
+            "nullary first, then the two Bool values, then exhausted"
+        );
+    }
+}

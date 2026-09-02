@@ -495,6 +495,28 @@ impl TreeCapture {
         deadline: Option<Instant>,
         rim_slice: Option<Duration>,
     ) -> Option<MilpInfeasibilityCertificate> {
+        self.finalize_inner(model, deadline, rim_slice, false)
+    }
+
+    /// The finalize body, with the emission self-verify made an explicit flag
+    /// ([`crate::SolveOpts::skip_finalize_reverify`] threads it through the
+    /// terminal call site in `bab/search_finalize.rs`; every other path keeps
+    /// the default). `skip_reverify` removes only a CHECK — the emitted
+    /// certificate is byte-identical either way — and every leaf's Farkas
+    /// evidence is still exact-verified against its own box during derivation,
+    /// so an emitted certificate is always a valid one; the skipped pass is
+    /// pure defense-in-depth for callers that do not run their own independent
+    /// verification (the ny in-process backend re-runs
+    /// [`MilpInfeasibilityCertificate::verify`] against its own model before it
+    /// mints any verdict). DEFAULT keeps the self-verify, so a caller with no
+    /// downstream checker stays fail-closed.
+    pub(crate) fn finalize_inner(
+        self,
+        model: &Model,
+        deadline: Option<Instant>,
+        rim_slice: Option<Duration>,
+        skip_reverify: bool,
+    ) -> Option<MilpInfeasibilityCertificate> {
         if !self.active || self.nodes.is_empty() {
             return None;
         }
@@ -535,12 +557,29 @@ impl TreeCapture {
             self.leaf_cap,
             &budget,
         );
+        let derive_secs = t0.elapsed().as_secs_f64();
+        let cert = root.map(|root| MilpInfeasibilityCertificate { root });
+        // Emission is fail-closed: unless the caller opts out (it independently
+        // re-verifies — see `SolveOpts::skip_finalize_reverify`), the
+        // certificate must convince the same exact checker the consumer will
+        // run, or it does not ship. This whole-tree pass re-checks evidence
+        // every leaf already verified against its own box at derivation, so
+        // skipping it removes only a duplicate CHECK, never changes what is
+        // certified.
+        let reverify_t0 = Instant::now();
+        let verified = match &cert {
+            Some(cert) if !skip_reverify => cert.verify(model).is_ok(),
+            _ => true,
+        };
+        let reverify_secs = reverify_t0.elapsed().as_secs_f64();
         if crate::debug_flags::milp_debug_flags().trace {
             use std::sync::atomic::Ordering::Relaxed;
             eprintln!(
-                "--trace FINALIZE {} in {:.2}s: leaves={} float_ok={} float_status={} float_verify={} exact_ok={} exact_fail={}",
-                if root.is_some() { "ok" } else { "FAILED" },
-                t0.elapsed().as_secs_f64(),
+                "--trace FINALIZE {} derive={:.2}s reverify={:.2}s (skip={}): leaves={} float_ok={} float_status={} float_verify={} exact_ok={} exact_fail={}",
+                if cert.is_some() && verified { "ok" } else { "FAILED" },
+                derive_secs,
+                reverify_secs,
+                skip_reverify,
                 leaves_used,
                 fstats::FLOAT_OK.load(Relaxed),
                 fstats::FLOAT_STATUS.load(Relaxed),
@@ -558,11 +597,9 @@ impl TreeCapture {
                 budget.compaction_spent.get().as_secs_f64(),
             );
         }
-        let cert = MilpInfeasibilityCertificate { root: root? };
-        // Emission is fail-closed: the certificate must convince the same
-        // independent checker the consumer will run, or it does not ship.
-        cert.verify(model).ok()?;
-        Some(cert)
+        // A derivation failure (`None`) or a self-verify that did not pass
+        // both fail closed: no certificate ships.
+        verified.then_some(cert).flatten()
     }
 }
 
@@ -2408,5 +2445,64 @@ mod tests {
             b.compaction_slice(0).is_none(),
             "an exhausted allowance closes the lane even on a run of wins"
         );
+    }
+}
+
+#[cfg(test)]
+mod reverify_gate_tests {
+    use super::*;
+
+    /// Record the split skeleton for the single-binary hand-built model: binary
+    /// `x` with rows `x >= 1/4` and `x <= 3/4` (LP point 1/2, no 0/1 point).
+    /// The root splits `x` at 0; both branches (`x <= 0`, `x >= 1`) fathom
+    /// empty. Built fresh per call because `finalize_inner` consumes `self`.
+    fn recorded_capture() -> (Model, TreeCapture) {
+        let mut m = Model::new();
+        let x = m.add_binary_col();
+        m.add_row(0.25, f64::INFINITY, &[(x, 1.0)]);
+        m.add_row(f64::NEG_INFINITY, 0.75, &[(x, 1.0)]);
+        let mut cap = TreeCapture::new(256);
+        let root = cap.root();
+        let (lo, hi) = cap.split(root, x.index(), 0.0);
+        cap.close(lo);
+        cap.close(hi);
+        (m, cap)
+    }
+
+    /// The `SolveOpts::skip_finalize_reverify` gate removes only a re-CHECK:
+    /// the emitted certificate is byte-identical whether the emission
+    /// self-verify runs or not, and it passes
+    /// [`MilpInfeasibilityCertificate::verify`] either way. The skip path does
+    /// NOT re-verify inside finalize, so this test runs the exact same
+    /// independent check the ny consumer runs — explicitly — to prove the
+    /// emitted evidence is still valid. This is the soundness anchor for the
+    /// gate: skipping the pass never ships an unverifiable certificate.
+    #[test]
+    fn skip_reverify_emits_identical_verifying_certificate() {
+        // Emission self-verify ON (the default behavior of every caller that
+        // does not opt out).
+        let (m, cap) = recorded_capture();
+        let with = cap
+            .finalize_inner(&m, None, None, false)
+            .expect("reverify ON must emit a certificate");
+        with.verify(&m).expect("the ON-path certificate verifies");
+
+        // Emission self-verify OFF (the independently-re-verifying consumer's
+        // opt-out path).
+        let (m2, cap2) = recorded_capture();
+        let without = cap2
+            .finalize_inner(&m2, None, None, true)
+            .expect("reverify OFF must still emit a certificate");
+
+        // The skipped pass is a CHECK, not a mutation: identical certificate.
+        assert_eq!(
+            with, without,
+            "skipping the self-verify must not change the emitted certificate"
+        );
+        // And it is a VALID certificate even though finalize did not re-check
+        // it — run the consumer's independent verification here to prove it.
+        without
+            .verify(&m2)
+            .expect("the skip-path certificate must still verify independently");
     }
 }

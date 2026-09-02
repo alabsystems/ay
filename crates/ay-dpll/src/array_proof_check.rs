@@ -59,6 +59,7 @@
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::{Constant, Proof, ProofId, ProofStep, Sort, TermData, TermId, TermStore};
 
+use crate::api::proofs::TrustClauseDischargeControls;
 use crate::api::{FuncDecl, Logic, Solver, Term};
 
 /// Verdict for a single proof step examined by the array checker.
@@ -206,6 +207,28 @@ pub fn check_array_proof(proof: &Proof, terms: &TermStore) -> ArrayProofReport {
 /// of the negations of the literals, which we assert into a fresh `QF_AX`
 /// solver and require to be UNSAT.
 pub fn check_array_clause(terms: &TermStore, clause: &[TermId]) -> ArrayStepVerdict {
+    check_array_clause_impl(terms, clause, None)
+}
+
+pub(crate) fn check_array_clause_with_controls(
+    terms: &TermStore,
+    clause: &[TermId],
+    controls: &TrustClauseDischargeControls,
+) -> ArrayStepVerdict {
+    check_array_clause_impl(terms, clause, Some(controls))
+}
+
+fn check_array_clause_impl(
+    terms: &TermStore,
+    clause: &[TermId],
+    controls: Option<&TrustClauseDischargeControls>,
+) -> ArrayStepVerdict {
+    let controlled_deadline = controls.map(TrustClauseDischargeControls::nested_deadline);
+    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+        if !controls.live_until(terms, deadline) {
+            return resource_unchecked();
+        }
+    }
     if clause.is_empty() {
         return ArrayStepVerdict::Unchecked {
             reason: "array lemma clause is empty; nothing to discharge".to_string(),
@@ -215,9 +238,19 @@ pub fn check_array_clause(terms: &TermStore, clause: &[TermId]) -> ArrayStepVerd
     // A single-element clause may itself be an `(or ...)` term: flatten it so we
     // negate the actual disjunction rather than a structurally-nested literal.
     let literals = flatten_clause(terms, clause);
+    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+        if !controls.live_until(terms, deadline) {
+            return resource_unchecked();
+        }
+    }
 
     let mut solver = Solver::new(Logic::QfAx);
-    let mut translator = Translator::new();
+    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+        if !controls.start_native_solver(&mut solver, deadline) {
+            return resource_unchecked();
+        }
+    }
+    let mut translator = Translator::new(controls.zip(controlled_deadline));
 
     // Assert the negation of each literal of the clause. `¬(l1 ∨ ... ∨ ln)` is
     // `¬l1 ∧ ... ∧ ¬ln`.
@@ -240,9 +273,21 @@ pub fn check_array_clause(terms: &TermStore, clause: &[TermId]) -> ArrayStepVerd
         }
         let negated = solver.not(translated);
         solver.assert_term(negated);
+        if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+            if !controls.native_solver_live(&solver, deadline) {
+                return resource_unchecked();
+            }
+        }
     }
 
-    let result = solver.check_sat_internal_query();
+    let result = if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+        let Some(result) = controls.check_native_solver_until(&mut solver, deadline) else {
+            return resource_unchecked();
+        };
+        result
+    } else {
+        solver.check_sat_internal_query()
+    };
     if result.is_unsat() {
         ArrayStepVerdict::Valid
     } else if result.is_sat() {
@@ -257,6 +302,12 @@ pub fn check_array_clause(terms: &TermStore, clause: &[TermId]) -> ArrayStepVerd
         ArrayStepVerdict::Unchecked {
             reason: "discharge returned Unknown; cannot certify the clause".to_string(),
         }
+    }
+}
+
+fn resource_unchecked() -> ArrayStepVerdict {
+    ArrayStepVerdict::Unchecked {
+        reason: "proof-discharge resource envelope expired or was exceeded".to_string(),
     }
 }
 
@@ -280,21 +331,24 @@ fn solver_is_bool(solver: &Solver, term: Term) -> bool {
 /// Translates terms from a proof's [`TermStore`] into a fresh [`Solver`],
 /// preserving sub-term sharing so semantically-equal sub-terms map to identical
 /// solver terms (required for a sound discharge).
-struct Translator {
+struct Translator<'a> {
     /// Memo of proof `TermId` -> translated solver `Term`.
     memo: HashMap<TermId, Term>,
     /// Declared uninterpreted function symbols, keyed by `(name, arg_sorts, ret)`.
     funcs: HashMap<(String, Vec<Sort>, Sort), FuncDecl>,
     /// Counter for unique leaf-constant names.
     next_id: u32,
+    /// Mandatory-publication envelope, polled at every recursive node.
+    controls: Option<(&'a TrustClauseDischargeControls, ay_core::time::Instant)>,
 }
 
-impl Translator {
-    fn new() -> Self {
+impl<'a> Translator<'a> {
+    fn new(controls: Option<(&'a TrustClauseDischargeControls, ay_core::time::Instant)>) -> Self {
         Self {
             memo: HashMap::default(),
             funcs: HashMap::default(),
             next_id: 0,
+            controls,
         }
     }
 
@@ -312,10 +366,22 @@ impl Translator {
         terms: &TermStore,
         tid: TermId,
     ) -> Result<Term, String> {
+        if self
+            .controls
+            .is_some_and(|(controls, deadline)| !controls.native_solver_live(solver, deadline))
+        {
+            return Err("proof-discharge resource envelope expired or was exceeded".to_string());
+        }
         if let Some(t) = self.memo.get(&tid) {
             return Ok(*t);
         }
         let result = self.translate_uncached(solver, terms, tid)?;
+        if self
+            .controls
+            .is_some_and(|(controls, deadline)| !controls.native_solver_live(solver, deadline))
+        {
+            return Err("proof-discharge resource envelope expired or was exceeded".to_string());
+        }
         self.memo.insert(tid, result);
         Ok(result)
     }

@@ -149,13 +149,17 @@ impl SmtContext {
         // `timeout = None` still terminate at the solve's deadline instead of
         // spinning forever (e.g. integer-modulo CHC instances, which are not
         // Real-sorted and so escape the LRA iteration cap below).
-        // Prefer the per-context deadline if set, else fall back to the
-        // thread-wide solve deadline installed at the `solve_pdr_proof` entry —
-        // the latter covers fresh portfolio / re-validation contexts that never
-        // get a per-context deadline.
-        let global_deadline = self
-            .current_global_deadline()
-            .or_else(crate::smt::context::current_thread_solve_deadline);
+        // Intersect the per-context wall with the thread-wide solve wall. A
+        // later context deadline must never mask a tighter enclosing solve
+        // deadline (fresh portfolio/re-validation contexts commonly have both).
+        let global_deadline = [
+            self.current_global_deadline(),
+            crate::smt::context::current_thread_solve_deadline(),
+            crate::smt::deadline::current_smt_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         loop {
             let (mut lia, mut array_solver, mut euf_solver, mut lia_needs_cut_replay) =
                 build_theory_solvers(
@@ -164,6 +168,7 @@ impl SmtContext {
                     needs_euf,
                     start,
                     timeout,
+                    global_deadline,
                     &mut lia_reusable_state,
                 );
 

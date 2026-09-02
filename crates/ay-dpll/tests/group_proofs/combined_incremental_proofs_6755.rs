@@ -25,14 +25,16 @@ fn run_unsat_proof(input: &str) -> (String, ProofQuality, Vec<TheoryLemmaKind>) 
         proof_text.contains("(cl)"),
         "expected empty-clause derivation in proof:\n{proof_text}"
     );
-    assert!(
-        !proof_text.contains(":rule hole"),
-        "combined incremental proof should not contain :rule hole:\n{proof_text}"
-    );
-
     let proof = exec
         .last_proof()
         .expect("expected get-proof to populate the last proof object");
+    assert!(
+        !proof_text.contains(":rule hole"),
+        "combined incremental proof should not contain :rule hole:\n{proof_text}\n\
+         native proof: {:#?}",
+        proof.steps
+    );
+
     check_proof(proof, exec.terms()).expect("internal proof checker rejected proof");
     let quality = check_proof_with_quality(proof, exec.terms())
         .expect("proof quality checker rejected proof");

@@ -1025,8 +1025,13 @@ impl TermStore {
     /// check `instance_memory_exceeded(per_engine_budget())` to ensure no
     /// single engine hogs the entire global allocation.
     pub fn per_engine_budget() -> usize {
-        let count = GLOBAL_ENGINE_COUNT.load(Ordering::Relaxed).max(1);
-        GLOBAL_TERM_MEMORY_LIMIT.load(Ordering::Relaxed) / count
+        let limit = GLOBAL_TERM_MEMORY_LIMIT.load(Ordering::Relaxed);
+        // Explicit zero guard (not `.max(1)`) so the divisor is locally
+        // provably nonzero on the dividing path.
+        match GLOBAL_ENGINE_COUNT.load(Ordering::Relaxed) {
+            0 => limit,
+            count => limit / count,
+        }
     }
 
     /// Configure the global TermStore allocation limit.
@@ -1270,9 +1275,11 @@ impl TermStore {
     pub fn find_interned(&self, term: &TermData) -> Option<TermId> {
         let hash = Self::compute_hash(term);
         let ids = self.hash_cons.get(&hash)?;
+        // Interned ids are in-bounds by construction; `get` keeps that bound
+        // local, feeding the existing no-match path.
         ids.iter()
             .copied()
-            .find(|&id| &self.terms[id.index()].term == term)
+            .find(|&id| matches!(self.terms.get(id.index()), Some(entry) if &entry.term == term))
     }
 
     /// Look up an existing function application `App(sym, args)` without
@@ -1404,10 +1411,9 @@ impl TermStore {
     /// simplification or allocating a fresh node.
     pub fn find_eq(&self, lhs: TermId, rhs: TermId) -> Option<TermId> {
         if lhs == rhs {
-            return Some(
-                self.true_term
-                    .expect("TermStore: true_term accessed before initialization"),
-            );
+            // Reflexive equality is the interned `true` constant. A store
+            // without one holds no such term, so the lookup simply misses.
+            return self.true_term;
         }
         let args = if lhs < rhs { [lhs, rhs] } else { [rhs, lhs] };
         self.find_app_named("=", &args)

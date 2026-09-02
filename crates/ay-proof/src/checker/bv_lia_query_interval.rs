@@ -38,14 +38,19 @@
 //! Interval (bound) propagation over the exact source roots:
 //!
 //! * every Int-sorted term is normalised into a linear form
-//!   `constant + sum(coefficient * atom)` over opaque Int atoms — always a
-//!   faithful rewriting, never an approximation, because any node the
-//!   normaliser does not interpret becomes an atom;
+//!   `constant + sum(coefficient * atom)` over opaque Int atoms and unsigned
+//!   views of BV terms — always a faithful rewriting, never an approximation,
+//!   because any node the normaliser does not interpret becomes an atom;
 //! * an atom starts with the bounds its SHAPE entails and nothing else:
 //!   `bv2nat(t)` with `t : BitVec(w)` gives `[0, 2^w - 1]` (the SMT-LIB
 //!   definition of the unsigned conversion), `(mod _ d)` with a positive
 //!   integer literal `d` gives `[0, d - 1]`, `(abs _)` gives `[0, ...)`.
 //!   Everything else starts unbounded;
+//! * `bvult` and `bvule` literals are read as exact order relations between
+//!   unsigned BV views. For each relevant `int2bv_w(e)` view the lane adds the
+//!   universally valid clause
+//!   `e < 0 OR e >= 2^w OR bv2nat(int2bv_w(e)) = e`; no unguarded round-trip is
+//!   ever assumed;
 //! * each source root is split into clauses (disjunctions of literals) by the
 //!   standard polarity rewriting, and the clauses are unit-propagated: when
 //!   every literal of a clause but one is REFUTED by the current bounds, the
@@ -60,7 +65,9 @@
 //! [`super::QueryChecker::has_structural_contradiction`], not a relaxation of
 //! any existing one. Every bound it records is entailed by the source roots:
 //!
-//! * shape bounds are theorems of the SMT-LIB semantics of the operator;
+//! * shape bounds and the guarded `int2bv` clauses are theorems of the SMT-LIB
+//!   semantics of the operators, derived here from the source term and its
+//!   checked width rather than imported from a production solver;
 //! * a literal is assumed only after every sibling disjunct has been shown
 //!   FALSE under already-entailed bounds, which makes the survivor entailed;
 //! * bound tightening is the textbook interval-consistency step over integers,
@@ -84,7 +91,7 @@
 //! that says less than the source. Enlarging a harvest budget is never a fix
 //! for one of these; it only moves the size at which the lane starts lying.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ay_core::{Constant, Sort, Symbol, TermData, TermId};
 use num_bigint::BigInt;
@@ -103,6 +110,9 @@ const MAX_INTERVAL_ROUNDS: usize = 64;
 const MAX_CLAUSES: usize = 100_000;
 /// Maximum literals harvested from one source root.
 const MAX_CLAUSE_LITERALS: usize = 4_096;
+/// Maximum distinct source `int2bv` terms for which this lane derives the
+/// guarded no-wrap theorem. Crossing the cap declines the complete lane.
+const MAX_RESIDUE_SCHEMAS: usize = 4_096;
 /// Maximum distinct atoms in one linear form. A wider form is kept as a single
 /// opaque atom rather than normalised.
 const MAX_FORM_ATOMS: usize = 256;
@@ -111,16 +121,34 @@ const MAX_FORM_ATOMS: usize = 256;
 const MAX_FORM_NODES: u64 = 1_000_000;
 /// Owned-`BigInt` envelope for the retained interval table, in 64-bit limbs.
 const MAX_BOUND_LIMBS: u64 = 1 << 20;
+/// Aggregate atom entries retained by generated residue clauses. This bounds
+/// map/node overhead independently of logical work.
+const MAX_RESIDUE_ATOM_COPIES: usize = 1 << 16;
+/// Aggregate `BigInt` payload retained by generated residue clauses, in 64-bit
+/// limbs. The interval state has a separate envelope above.
+const MAX_RESIDUE_LIMBS: u64 = 1 << 20;
 /// This lane's share of the query's deterministic work budget. It runs before
 /// the finite enumerator, so it must be unable to starve it.
 const MAX_INTERVAL_WORK: u64 = MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA / 8;
 
-/// `constant + sum(coefficient * atom)` over opaque Int atoms. Coefficients are
-/// never zero.
+/// The integer denotation carried by one linear-form atom.
+///
+/// Keeping the unsigned BV view typed is load-bearing: the same BV term may
+/// eventually acquire a signed view, which must never alias this value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum LinearAtom {
+    /// The exact value of an Int-sorted source term.
+    Int(TermId),
+    /// The exact unsigned integer value of a BV-sorted source term.
+    UnsignedBv(TermId),
+}
+
+/// `constant + sum(coefficient * atom)` over exact integer denotations.
+/// Coefficients are never zero.
 #[derive(Clone, Debug, Default)]
 struct LinearForm {
     constant: BigInt,
-    atoms: BTreeMap<TermId, BigInt>,
+    atoms: BTreeMap<LinearAtom, BigInt>,
 }
 
 impl LinearForm {
@@ -133,7 +161,16 @@ impl LinearForm {
 
     fn atom(term: TermId) -> Self {
         let mut atoms = BTreeMap::new();
-        atoms.insert(term, BigInt::one());
+        atoms.insert(LinearAtom::Int(term), BigInt::one());
+        Self {
+            constant: BigInt::zero(),
+            atoms,
+        }
+    }
+
+    fn unsigned_bv_atom(term: TermId) -> Self {
+        let mut atoms = BTreeMap::new();
+        atoms.insert(LinearAtom::UnsignedBv(term), BigInt::one());
         Self {
             constant: BigInt::zero(),
             atoms,
@@ -248,13 +285,13 @@ enum AssumeOutcome {
 
 #[derive(Default)]
 struct IntervalState {
-    bounds: HashMap<TermId, Interval>,
+    bounds: HashMap<LinearAtom, Interval>,
     booleans: HashMap<TermId, bool>,
     bound_limbs: u64,
 }
 
 impl IntervalState {
-    fn interval(&self, atom: TermId) -> Interval {
+    fn interval(&self, atom: LinearAtom) -> Interval {
         self.bounds.get(&atom).cloned().unwrap_or_default()
     }
 }
@@ -372,7 +409,7 @@ struct FormInterval {
     minimum: Option<BigInt>,
     maximum: Option<BigInt>,
     /// `(atom, coefficient, minimum contribution)`, in form order.
-    contributions: Vec<(TermId, BigInt, Option<BigInt>)>,
+    contributions: Vec<(LinearAtom, BigInt, Option<BigInt>)>,
 }
 
 /// The body of a Boolean negation, written either as the native `Not` node or

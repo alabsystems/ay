@@ -34,6 +34,9 @@ use super::{
 };
 use crate::classifier::ProblemClassifier;
 use crate::pdr::{ChcReplayObligation, ChcReplayObligationKind};
+use crate::smt::executor_adapter::{
+    collect_uninterpreted_function_declarations, emit_declare_uninterpreted_function,
+};
 use crate::{
     ChcError, ChcExpr, ChcProblem, ChcResult, ChcSort, ChcVar, ClauseHead, PredicateId,
     VerifiedChcResult,
@@ -540,7 +543,7 @@ pub(crate) fn acyclic_exhaustion_replay_obligations(
         }
         let formula = ChcExpr::and_all(conjuncts);
         let name = format!("clause-{clause_index}-safety-acyclic-exhaustion");
-        let smtlib = render_acyclic_exhaustion_obligation(problem, &name, clause_index, &formula);
+        let smtlib = render_acyclic_exhaustion_obligation(problem, &name, clause_index, &formula)?;
         obligations.push(ChcReplayObligation {
             name,
             kind: ChcReplayObligationKind::Safety,
@@ -646,7 +649,7 @@ fn render_acyclic_exhaustion_obligation(
     name: &str,
     clause_index: usize,
     formula: &ChcExpr,
-) -> String {
+) -> ChcResult<String> {
     use std::fmt::Write;
 
     let mut vars = BTreeMap::new();
@@ -667,6 +670,10 @@ fn render_acyclic_exhaustion_obligation(
     );
     let _ = writeln!(out, "(set-logic ALL)");
     out.push('\n');
+    let declarations = collect_uninterpreted_function_declarations(formula)?;
+    for declaration in &declarations {
+        out.push_str(&emit_declare_uninterpreted_function(declaration));
+    }
     for (var_name, sort) in vars {
         let _ = writeln!(out, "(declare-const {} {})", quote_symbol(&var_name), sort);
     }
@@ -677,7 +684,7 @@ fn render_acyclic_exhaustion_obligation(
     );
     let _ = writeln!(out, "(check-sat)");
     let _ = writeln!(out, "(exit)");
-    out
+    Ok(out)
 }
 
 #[allow(clippy::unwrap_used, clippy::panic)]

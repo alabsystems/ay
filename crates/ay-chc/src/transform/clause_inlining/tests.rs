@@ -213,7 +213,7 @@ fn equal_cardinality_multi_def_rewrite_preserves_exact_clause_alignment() {
     }
     let input_len = problem.clauses().len();
 
-    let (transformed, _, _, traces, output_to_input) =
+    let (transformed, _, _, traces, output_to_input, _) =
         ClauseInliner::new().inline_tracked(&problem);
     assert_eq!(transformed.clauses().len(), input_len);
     assert_eq!(
@@ -639,6 +639,113 @@ fn test_back_translate_complex_head_synthesizes_interpretation() {
         translated.get(&p).is_some(),
         "BUG #5295: back-translator failed to synthesize interpretation for \
          inlined predicate P with complex head arg (x+1)"
+    );
+}
+
+/// A preceding round can prune the final clause mentioning a predicate while
+/// retaining its declaration. Inliner compaction must remember that INPUT
+/// graph orphan and restore a complete interpretation after compacted-ID
+/// remapping, including when another inliner boundary is composed after it.
+/// The completed model is accepted only after verification on the ORIGINAL
+/// (pre-pruning) problem.
+#[test]
+fn absent_input_declaration_reconstructs_false_through_composed_rounds() {
+    use crate::pdr::{PdrConfig, PdrSolver};
+    use crate::transform::condense::ConstantPropagator;
+    use crate::transform::TransformationPipeline;
+    use crate::{InvariantModel, PredicateInterpretation};
+
+    let mut original = ChcProblem::new();
+    // Declare Dead first so compaction reuses its P0 ID for surviving Live.
+    // Back-translation must remap Live before restoring Dead, or the two
+    // interpretations collide.
+    let dead = original.declare_predicate("Dead", vec![ChcSort::Int]);
+    let live = original.declare_predicate("Live", vec![ChcSort::Int]);
+    let x = ChcVar::new("x", ChcSort::Int);
+
+    // Live(0).
+    original.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0))),
+        ClauseHead::Predicate(live, vec![ChcExpr::var(x.clone())]),
+    ));
+    // Keep Live recursive (and therefore explicit across both inliner rounds).
+    original.add_clause(HornClause::new(
+        ClauseBody::predicates_only(vec![(live, vec![ChcExpr::var(x.clone())])]),
+        ClauseHead::Predicate(live, vec![ChcExpr::var(x.clone())]),
+    ));
+    // Constant propagation proves Live's argument is 0, so both `x != 0`
+    // clauses simplify to false. Dead's declaration remains, but no clause in
+    // the first inliner's INPUT graph mentions it.
+    let nonzero = ChcExpr::not(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0)));
+    original.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(live, vec![ChcExpr::var(x.clone())])],
+            Some(nonzero.clone()),
+        ),
+        ClauseHead::Predicate(dead, vec![ChcExpr::var(x.clone())]),
+    ));
+    original.add_clause(HornClause::query(ClauseBody::new(
+        vec![(live, vec![ChcExpr::var(x)])],
+        Some(nonzero),
+    )));
+
+    let result = TransformationPipeline::new()
+        .with(ConstantPropagator::new())
+        .with(ClauseInliner::new())
+        .with(ClauseInliner::new())
+        .transform(original.clone());
+    assert!(
+        result.problem.lookup_predicate("Dead").is_none(),
+        "setup: inliner compaction must remove the graph-orphan declaration"
+    );
+    let transformed_live = result
+        .problem
+        .lookup_predicate("Live")
+        .expect("recursive Live must survive both inliner rounds");
+    assert_eq!(
+        transformed_live.index(),
+        dead.index(),
+        "setup: compacted Live must reuse Dead's old numeric ID"
+    );
+
+    let live_var = ChcVar::new(crate::canonical_var_name(transformed_live, 0), ChcSort::Int);
+    let mut compacted_model = InvariantModel::new();
+    compacted_model.set(
+        transformed_live,
+        PredicateInterpretation::new(
+            vec![live_var.clone()],
+            ChcExpr::eq(ChcExpr::var(live_var), ChcExpr::int(0)),
+        ),
+    );
+
+    let translated = result.back_translator.translate_validity(compacted_model);
+    assert_eq!(
+        translated.len(),
+        original.predicates().len(),
+        "composed back-translation must publish every original declaration"
+    );
+    let dead_interp = translated
+        .get(&dead)
+        .expect("graph-orphan Dead interpretation must be reconstructed");
+    assert!(
+        matches!(&dead_interp.formula, ChcExpr::Bool(false)),
+        "an INPUT graph orphan has the canonical false interpretation"
+    );
+    assert_eq!(dead_interp.vars.len(), 1);
+    assert_eq!(
+        dead_interp.vars[0].name,
+        crate::canonical_var_name(dead, 0),
+        "false completion must retain the declaration's canonical parameters"
+    );
+    assert!(
+        translated.get(&live).is_some(),
+        "compacted Live interpretation must remap back to its original ID"
+    );
+
+    let mut verifier = PdrSolver::new(original, PdrConfig::default());
+    assert!(
+        verifier.verify_model(&translated),
+        "the composed completion must pass strict validation on the original clauses"
     );
 }
 
@@ -1515,7 +1622,7 @@ fn deriv_expansion_corrupted_trace_rejected_by_kernel() {
     )));
 
     let inliner = ClauseInliner::new();
-    let (transformed, inlined_defs, new_to_old, traces, _output_to_input) =
+    let (transformed, inlined_defs, new_to_old, traces, _output_to_input, _) =
         inliner.inline_tracked(&problem);
     assert!(
         !traces.is_empty(),
@@ -1543,6 +1650,7 @@ fn deriv_expansion_corrupted_trace_rejected_by_kernel() {
         composition_traces: traces.clone(),
         output_to_input: None,
         input_problem: None,
+        absent_input_predicates: Vec::new(),
     };
     let honest_witness = honest.translate_invalidity(cex.clone());
     // Expansion must actually reconstruct the Init->Step->Q chain (else the
@@ -1583,6 +1691,7 @@ fn deriv_expansion_corrupted_trace_rejected_by_kernel() {
         composition_traces: corrupt_traces,
         output_to_input: None,
         input_problem: None,
+        absent_input_predicates: Vec::new(),
     };
     let bad_witness = bad.translate_invalidity(cex);
     // The corruption still BUILDS a chain (entries added); the rejection below
@@ -1671,7 +1780,7 @@ fn linking_var_problem() -> ChcProblem {
 fn linking_definitions_are_recorded_for_fresh_head_args() {
     let problem = linking_var_problem();
     let inliner = ClauseInliner::new();
-    let (_, _, _, traces, _) = inliner.inline_tracked(&problem);
+    let (_, _, _, traces, _, _) = inliner.inline_tracked(&problem);
 
     let trace = traces
         .values()
@@ -1960,6 +2069,7 @@ fn uncomposed_ground_boundary_reorders_premises_by_input_predicate() {
         composition_traces: FxHashMap::default(),
         output_to_input: Some(vec![0, 1, 2]),
         input_problem: Some(Arc::new(input.clone())),
+        absent_input_predicates: Vec::new(),
     };
     let translated = translator
         .translate_ground_derivation(&reversed)

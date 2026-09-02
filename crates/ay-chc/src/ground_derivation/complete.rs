@@ -990,7 +990,9 @@ fn value_matches_sort(value: &SmtValue, sort: &ChcSort) -> bool {
         (SmtValue::Bool(_), ChcSort::Bool) => true,
         (SmtValue::Int(_) | SmtValue::BigInt(_), ChcSort::Int | ChcSort::Real) => true,
         (SmtValue::Real(_), ChcSort::Real) => true,
-        (SmtValue::BitVec(_, width), ChcSort::BitVec(expected)) => width == expected,
+        (SmtValue::BitVec(_, width) | SmtValue::BigBitVec(_, width), ChcSort::BitVec(expected)) => {
+            width == expected
+        }
         (SmtValue::ConstArray(default), ChcSort::Array(_, element)) => {
             value_matches_sort(default, element)
         }
@@ -1296,7 +1298,10 @@ fn sort_default_bounded(sort: &ChcSort, fuel: usize) -> Option<SmtValue> {
         ChcSort::Bool => Some(SmtValue::Bool(false)),
         ChcSort::Int => Some(SmtValue::Int(0)),
         ChcSort::Real => Some(SmtValue::Int(0)),
-        ChcSort::BitVec(width) => Some(SmtValue::BitVec(0, *width)),
+        ChcSort::BitVec(width) => Some(SmtValue::bitvec_from_biguint(
+            num_bigint::BigUint::from(0u8),
+            *width,
+        )),
         ChcSort::Array(_, element) => Some(SmtValue::ConstArray(Box::new(sort_default_bounded(
             element,
             fuel - 1,

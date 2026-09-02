@@ -102,7 +102,7 @@ pub struct Invariant {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UnknownReason {
-    /// Solver ran but could not conclude.
+    /// Solver ran but could not conclude, and AY could not attribute a cause.
     Inconclusive,
     /// BMC exhausted its bounded search space (no cex up to the bound).
     BmcExhaustedSearch,
@@ -110,6 +110,12 @@ pub enum UnknownReason {
     BmcBudgetExhausted,
     /// The engine was not applicable to this problem shape.
     NotApplicable,
+    /// A counterexample was found on a deliberately over-approximated problem,
+    /// so it was discarded as inadmissible for the original.
+    OverApproximatedRefutation,
+    /// A candidate `Safe` or `Unsafe` reached AY's fail-closed verified-result
+    /// boundary but was not admitted.
+    CandidateNotAdmitted,
 }
 
 impl From<VerifiedUnknownReason> for UnknownReason {
@@ -119,6 +125,8 @@ impl From<VerifiedUnknownReason> for UnknownReason {
             VerifiedUnknownReason::BmcExhaustedSearch => Self::BmcExhaustedSearch,
             VerifiedUnknownReason::BmcBudgetExhausted => Self::BmcBudgetExhausted,
             VerifiedUnknownReason::NotApplicable => Self::NotApplicable,
+            VerifiedUnknownReason::OverApproximatedRefutation => Self::OverApproximatedRefutation,
+            VerifiedUnknownReason::CandidateNotAdmitted => Self::CandidateNotAdmitted,
             // `VerifiedUnknownReason` is `#[non_exhaustive]`; map unseen
             // future reasons to the safest neutral bucket.
             _ => Self::Inconclusive,

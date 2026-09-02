@@ -162,7 +162,7 @@ fn publish_gate_can_list_native_steps_without_running_heavy_gate() {
         "release_public_crate_metadata\t<native>",
         "repository_health\t<native>",
         "critical_solver_policy\tbash scripts/check_critical_solver_policy.sh",
-        "cargo_check_workspace\tcargo check --workspace",
+        "cargo_check_workspace\tcargo check --locked --workspace",
     ] {
         assert!(stdout.contains(expected), "missing {expected:?}:\n{stdout}");
     }

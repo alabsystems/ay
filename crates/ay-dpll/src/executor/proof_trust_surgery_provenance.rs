@@ -26,7 +26,7 @@ pub(in crate::executor) use planning_budget::{
 };
 
 /// Hard width bound for provenance-driven repair inputs.
-pub(super) const MAX_PROVENANCE_REPAIR_TERMS: usize = 64;
+pub(in crate::executor) const MAX_PROVENANCE_REPAIR_TERMS: usize = 64;
 
 pub(super) struct AuthenticatedProvenanceOr {
     pub(super) orig: TermId,

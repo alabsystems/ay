@@ -221,7 +221,7 @@ impl PdrSolver {
             &self.problem,
             depth_hint,
             budget,
-            self.config.cancellation_token.clone(),
+            self.config.effective_cancellation_token(),
             self.config.verbose,
         ) {
             Some(_verified) => {

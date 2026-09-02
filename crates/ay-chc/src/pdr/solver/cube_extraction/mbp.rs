@@ -218,9 +218,13 @@ impl PdrSolver {
                 let value = match (var.sort.clone(), renamed_model.get(&var.name)) {
                     (ChcSort::Int, Some(SmtValue::Int(n))) => Some(ChcExpr::Int(*n)),
                     (ChcSort::Bool, Some(SmtValue::Bool(b))) => Some(ChcExpr::Bool(*b)),
-                    (ChcSort::BitVec(_), Some(SmtValue::BitVec(v, w))) => {
-                        Some(ChcExpr::BitVec(*v, *w))
-                    }
+                    (
+                        ChcSort::BitVec(expected_width),
+                        Some(
+                            value @ (SmtValue::BitVec(_, actual_width)
+                            | SmtValue::BigBitVec(_, actual_width)),
+                        ),
+                    ) if expected_width == *actual_width => value.bitvec_to_chc_expr(),
                     _ => None,
                 };
                 let Some(value) = value else {
@@ -284,9 +288,15 @@ impl PdrSolver {
                         (ChcSort::Bool, Some(SmtValue::Bool(b))) => {
                             Some(ChcExpr::eq(ChcExpr::var((*var).clone()), ChcExpr::Bool(*b)))
                         }
-                        (ChcSort::BitVec(_), Some(SmtValue::BitVec(v, w))) => Some(ChcExpr::eq(
+                        (
+                            ChcSort::BitVec(expected_width),
+                            Some(
+                                value @ (SmtValue::BitVec(_, actual_width)
+                                | SmtValue::BigBitVec(_, actual_width)),
+                            ),
+                        ) if expected_width == *actual_width => Some(ChcExpr::eq(
                             ChcExpr::var((*var).clone()),
-                            ChcExpr::BitVec(*v, *w),
+                            value.bitvec_to_chc_expr()?,
                         )),
                         _ => None,
                     };

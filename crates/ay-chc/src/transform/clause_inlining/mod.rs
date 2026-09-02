@@ -28,7 +28,7 @@
 //!
 //! Based on Eldarica: `reference/eldarica/src/main/scala/lazabs/horn/preprocessor/ClauseInliner.scala`
 
-use crate::{ChcExpr, ChcProblem, ClauseBody, ClauseHead, HornClause, PredicateId};
+use crate::{ChcExpr, ChcProblem, ClauseBody, ClauseHead, HornClause, Predicate, PredicateId};
 use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -276,6 +276,9 @@ impl ClauseInliner {
     /// a mapping from new (compacted) predicate IDs to original IDs, and the
     /// per-surviving-clause composition traces (keyed by FINAL clause index)
     /// used to expand collapsed derivation entries back onto the input clauses.
+    /// The final component records declarations that were already absent from
+    /// the INPUT clause graph before inlining. Predicate compaction removes
+    /// those declarations, so validity back-translation must restore them.
     fn inline_tracked(
         &self,
         problem: &ChcProblem,
@@ -285,6 +288,7 @@ impl ClauseInliner {
         FxHashMap<PredicateId, PredicateId>,
         FxHashMap<usize, ClauseTrace>,
         Option<Vec<usize>>,
+        Vec<Predicate>,
     ) {
         let mut clauses: Vec<HornClause> = problem.clauses().to_vec();
         let mut inlined_defs: Vec<(PredicateId, HornClause)> = Vec::new();
@@ -328,7 +332,8 @@ impl ClauseInliner {
         // and remap IDs so PDR doesn't waste time on ghost predicates. Rebuilding
         // may prune simplified-false/duplicate clauses, so compaction filters
         // `traces` in lockstep to preserve final output-index alignment.
-        let (new_problem, new_to_old) = self.compact_predicates(problem, &mut clauses, &mut traces);
+        let (new_problem, new_to_old, absent_input_predicates) =
+            self.compact_predicates(problem, &mut clauses, &mut traces);
         debug_assert_eq!(
             traces.len(),
             new_problem.clauses().len(),
@@ -366,17 +371,23 @@ impl ClauseInliner {
             new_to_old,
             composition_traces,
             output_to_input,
+            absent_input_predicates,
         )
     }
 
     /// Build a compacted `ChcProblem` containing only predicates still referenced
-    /// in the remaining clauses. Returns the new problem and a new→old ID mapping.
+    /// in the remaining clauses. Returns the new problem, a new→old ID mapping,
+    /// and declarations absent from the INPUT clause graph.
     fn compact_predicates(
         &self,
         original: &ChcProblem,
         clauses: &mut Vec<HornClause>,
         traces: &mut Vec<ClauseTrace>,
-    ) -> (ChcProblem, FxHashMap<PredicateId, PredicateId>) {
+    ) -> (
+        ChcProblem,
+        FxHashMap<PredicateId, PredicateId>,
+        Vec<Predicate>,
+    ) {
         debug_assert_eq!(
             clauses.len(),
             traces.len(),
@@ -392,6 +403,30 @@ impl ClauseInliner {
                 used.insert(pid);
             }
         }
+
+        // A preceding transform can prune the final clause mentioning a
+        // predicate while retaining its declaration. Such a declaration is
+        // semantically unconstrained in THIS transform's input problem, so a
+        // canonical `false` interpretation is an exact model completion. Keep
+        // the declaration explicitly: compaction below removes it, and it has
+        // no defining clause for the ordinary inlining back-translator to
+        // reconstruct. Earlier back-translators remain free to overwrite this
+        // value, and the composed result is validated on the original problem.
+        let mut input_used: FxHashSet<PredicateId> = FxHashSet::default();
+        for clause in original.clauses() {
+            for (pid, _) in &clause.body.predicates {
+                input_used.insert(*pid);
+            }
+            if let Some(pid) = clause.head.predicate_id() {
+                input_used.insert(pid);
+            }
+        }
+        let absent_input_predicates: Vec<Predicate> = original
+            .predicates()
+            .iter()
+            .filter(|pred| !input_used.contains(&pred.id))
+            .cloned()
+            .collect();
 
         let old_preds = original.predicates();
         let all_used = used.len() == old_preds.len();
@@ -410,7 +445,7 @@ impl ClauseInliner {
                 }
             }
             *traces = retained_traces;
-            return (new_problem, FxHashMap::default());
+            return (new_problem, FxHashMap::default(), absent_input_predicates);
         }
 
         // Build old→new mapping for used predicates (preserving order).
@@ -448,7 +483,7 @@ impl ClauseInliner {
             }
         }
         *traces = retained_traces;
-        (new_problem, new_to_old)
+        (new_problem, new_to_old, absent_input_predicates)
     }
 
     /// Remap predicate IDs in a clause using the given mapping.
@@ -829,8 +864,14 @@ impl ClauseInliner {
 
 impl Transformer for ClauseInliner {
     fn transform(self: Box<Self>, problem: ChcProblem) -> TransformationResult {
-        let (new_problem, inlined_defs, new_to_old, composition_traces, output_to_input) =
-            self.inline_tracked(&problem);
+        let (
+            new_problem,
+            inlined_defs,
+            new_to_old,
+            composition_traces,
+            output_to_input,
+            absent_input_predicates,
+        ) = self.inline_tracked(&problem);
         // The ground back-translator needs the INPUT clauses to rebuild and
         // self-validate the expanded derivation. Capturing the problem is only
         // worth its clone when the feature is on.
@@ -844,6 +885,7 @@ impl Transformer for ClauseInliner {
                 composition_traces,
                 output_to_input,
                 input_problem,
+                absent_input_predicates,
             }),
         }
     }

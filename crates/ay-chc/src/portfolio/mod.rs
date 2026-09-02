@@ -39,6 +39,7 @@ use preprocess::problem_contains_recursive_bv_sorts;
 pub(crate) use preprocess::PreprocessSummary;
 #[cfg(test)]
 use schedule::panic_message;
+#[cfg(test)]
 use types::EngineResult;
 pub use types::{
     BudgetPolicy, BudgetReport, EngineBudgetEntry, EngineConfig, EngineStopReason, EngineType,
@@ -53,6 +54,10 @@ use crate::transform::{
     TransformMemoryReport, TransformationPipeline,
 };
 use crate::{ChcProblem, ChcSort};
+
+#[cfg(test)]
+type SequentialTestEngine =
+    std::sync::Arc<dyn Fn(usize, CancellationToken) -> EngineResult + Send + Sync + 'static>;
 
 /// Portfolio solver for CHC problems
 pub struct PortfolioSolver {
@@ -78,6 +83,34 @@ pub struct PortfolioSolver {
     /// is cancelled or its timeout expires. Fixes #8630: BV-domain
     /// confirmation previously ran without any cancellation mechanism.
     cancellation_token: CancellationToken,
+    /// Use fixed, policy-aware, non-redistributed engine shares and reject
+    /// results that complete at or after their exact deadline. Set only by the
+    /// adaptive solver's opt-in deterministic execution mode.
+    deterministic_sequential_schedule: bool,
+    /// Absolute whole-run deadline supplied by the adaptive layer.
+    ///
+    /// Unlike `PortfolioConfig::timeout`, this deadline is established before
+    /// portfolio preprocessing. Keeping the absolute boundary prevents
+    /// constructor/preprocessing time from silently reopening a fresh full
+    /// engine budget.
+    deterministic_global_deadline: Option<ay_core::time::Instant>,
+    /// Absolute authoritative deadline supplied before constructor
+    /// preprocessing. Unlike the deterministic scheduler field, this applies
+    /// to adaptive/parallel portfolios as a fail-closed construction boundary.
+    construction_deadline: Option<ay_core::time::Instant>,
+    /// Constructor preprocessing observed cancellation/deadline at a stage
+    /// boundary and deliberately returned an identity shell instead of a
+    /// partially transformed solver.
+    construction_aborted: bool,
+    /// Local engine override used only by scheduler unit tests.
+    #[cfg(test)]
+    sequential_test_engine: Option<SequentialTestEngine>,
+    /// Artificial result-publication delay used by deterministic boundary tests.
+    #[cfg(test)]
+    sequential_test_publish_delay: Option<std::time::Duration>,
+    /// Deterministic parallel-worker limit used only by scheduler unit tests.
+    #[cfg(test)]
+    parallel_worker_limit_override: Option<usize>,
 }
 
 impl Drop for PortfolioSolver {
@@ -90,6 +123,47 @@ impl Drop for PortfolioSolver {
 }
 
 impl PortfolioSolver {
+    fn deterministic_deadline_expired(&self) -> bool {
+        self.deterministic_sequential_schedule
+            && self
+                .deterministic_global_deadline
+                .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
+    }
+
+    fn construction_boundary_exhausted(&self) -> bool {
+        self.construction_aborted
+            || self
+                .construction_deadline
+                .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
+    }
+
+    fn enforce_deterministic_deadline(&self, result: PortfolioResult) -> PortfolioResult {
+        if (self.cancellation_token.is_cancelled()
+            || self.construction_boundary_exhausted()
+            || self.deterministic_deadline_expired())
+            && matches!(
+                &result,
+                PortfolioResult::Safe(_) | PortfolioResult::Unsafe(_)
+            )
+        {
+            if self.config.verbose {
+                let reason = if self.cancellation_token.is_cancelled() {
+                    "external cancellation"
+                } else if self.construction_boundary_exhausted() {
+                    "the authoritative construction/solve deadline"
+                } else {
+                    "the deterministic whole-run deadline"
+                };
+                safe_eprintln!(
+                    "Portfolio: definitive candidate crossed {reason}; returning Unknown"
+                );
+            }
+            PortfolioResult::Unknown
+        } else {
+            result
+        }
+    }
+
     fn should_try_algebraic_prepass(&self) -> bool {
         // Algebraic synthesis is fast (<100ms) and should run even with
         // timeouts. It handles polynomial invariants that engines cannot
@@ -97,6 +171,13 @@ impl PortfolioSolver {
 
         #[cfg(test)]
         if schedule::FORCE_SOLVER_THREAD_SPAWN_FAILURE.with(std::cell::Cell::get) {
+            return false;
+        }
+
+        // Deterministic execution promises one fixed canonical engine schedule.
+        // The algebraic prepass owns a separate deadline and can otherwise run
+        // before that schedule without consuming one of its fixed shares.
+        if self.deterministic_sequential_schedule {
             return false;
         }
 
@@ -321,6 +402,16 @@ impl PortfolioSolver {
                 bv_abstracted,
                 transform_memory: TransformMemoryReport::identity(),
                 cancellation_token,
+                deterministic_sequential_schedule: false,
+                deterministic_global_deadline: None,
+                construction_deadline: None,
+                construction_aborted: false,
+                #[cfg(test)]
+                sequential_test_engine: None,
+                #[cfg(test)]
+                sequential_test_publish_delay: None,
+                #[cfg(test)]
+                parallel_worker_limit_override: None,
             }
         }
     }
@@ -367,7 +458,121 @@ impl PortfolioSolver {
             bv_abstracted: summary.bv_abstracted,
             transform_memory: summary.transform_memory,
             cancellation_token,
+            deterministic_sequential_schedule: false,
+            deterministic_global_deadline: None,
+            construction_deadline: None,
+            construction_aborted: false,
+            #[cfg(test)]
+            sequential_test_engine: None,
+            #[cfg(test)]
+            sequential_test_publish_delay: None,
+            #[cfg(test)]
+            parallel_worker_limit_override: None,
         }
+    }
+
+    /// Create from a pre-computed summary without losing an outer solve wall.
+    pub(crate) fn from_summary_with_solve_limits(
+        summary: PreprocessSummary,
+        config: PortfolioConfig,
+        deadline: Option<ay_core::time::Instant>,
+    ) -> Self {
+        let mut solver = Self::from_summary(summary, config);
+        solver.construction_deadline = deadline;
+        solver.construction_aborted = solver.cancellation_token.is_cancelled()
+            || deadline.is_some_and(|limit| ay_core::time::Instant::now() >= limit);
+        solver
+    }
+
+    /// Construct under an already-established authoritative solve boundary.
+    ///
+    /// Standard preprocessing checks cancellation/deadline between every
+    /// transform stage. If it crosses the boundary, construction returns a
+    /// fail-closed identity shell whose solve methods can only return Unknown.
+    pub(crate) fn new_with_solve_limits(
+        problem: ChcProblem,
+        mut config: PortfolioConfig,
+        deadline: Option<ay_core::time::Instant>,
+    ) -> Self {
+        let cancellation = Self::make_cancellation_token(&config);
+        let exhausted = || {
+            cancellation.is_cancelled()
+                || deadline.is_some_and(|limit| ay_core::time::Instant::now() >= limit)
+        };
+
+        if !config.enable_preprocessing {
+            let mut solver = Self::new(problem, config);
+            solver.construction_deadline = deadline;
+            solver.construction_aborted = exhausted();
+            return solver;
+        }
+
+        let fallback_problem = problem.clone();
+        let summary =
+            PreprocessSummary::build_with_limits(problem, config.verbose, deadline, &cancellation);
+        match summary {
+            Some(summary) => Self::from_summary_with_solve_limits(summary, config, deadline),
+            None => {
+                // Never expose a partially transformed problem. The shell keeps
+                // original clauses solely for diagnostics/drop and is sealed by
+                // `construction_aborted` before any pre-engine path can run.
+                config.enable_preprocessing = false;
+                let mut solver = Self::new(fallback_problem, config);
+                solver.construction_deadline = deadline;
+                solver.construction_aborted = true;
+                solver
+            }
+        }
+    }
+
+    /// Mutable config access for adaptive deadline-budget reconciliation.
+    ///
+    /// Constructor preprocessing can consume an authoritative outer deadline,
+    /// so adaptive short-probe defaults must be checked against the actual
+    /// remainder after construction and before any engine is launched.
+    pub(crate) fn config_mut_for_budget_reconciliation(&mut self) -> &mut PortfolioConfig {
+        &mut self.config
+    }
+
+    /// Select a fixed, policy-aware sequential schedule without timeout grace.
+    ///
+    /// A timed-out engine is cancelled and synchronously reaped before this
+    /// solver returns. Because Rust has no bounded thread join, an engine that
+    /// ignores cancellation can block this mode indefinitely; this fail-closed
+    /// behavior prevents overlap with a successor engine or deterministic
+    /// obligation.
+    pub(crate) fn with_deterministic_sequential_schedule(
+        mut self,
+        global_deadline: Option<ay_core::time::Instant>,
+    ) -> Self {
+        self.deterministic_sequential_schedule = true;
+        self.deterministic_global_deadline = global_deadline;
+        if let Some(deadline) = global_deadline {
+            self.config.timeout =
+                Some(deadline.saturating_duration_since(ay_core::time::Instant::now()));
+        }
+        self
+    }
+
+    #[cfg(test)]
+    fn with_sequential_test_engine<F>(mut self, run: F) -> Self
+    where
+        F: Fn(usize, CancellationToken) -> EngineResult + Send + Sync + 'static,
+    {
+        self.sequential_test_engine = Some(std::sync::Arc::new(run));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_sequential_test_publish_delay(mut self, delay: std::time::Duration) -> Self {
+        self.sequential_test_publish_delay = Some(delay);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_parallel_worker_limit(mut self, limit: usize) -> Self {
+        self.parallel_worker_limit_override = Some(limit.max(1));
+        self
     }
 
     /// Solve the CHC problem using the portfolio strategy.
@@ -382,10 +587,16 @@ impl PortfolioSolver {
         if self.config.engines.is_empty() {
             return PortfolioResult::Unknown;
         }
+        if self.cancellation_token.is_cancelled()
+            || self.construction_boundary_exhausted()
+            || self.deterministic_deadline_expired()
+        {
+            return PortfolioResult::Unknown;
+        }
 
         // Check for trivial problems (e.g., all predicates inlined away)
         if let Some(result) = self.try_solve_trivial() {
-            return result;
+            return self.enforce_deterministic_deadline(result);
         }
 
         if ay_core::TermStore::global_memory_exceeded() {
@@ -404,15 +615,47 @@ impl PortfolioSolver {
         // Part of #7170, #5651, #1753.
         if self.should_try_algebraic_prepass() {
             if let Some(result) = self.try_algebraic_prepass() {
-                return result;
+                return self.enforce_deterministic_deadline(result);
             }
         }
 
-        if self.config.parallel && self.config.engines.len() > 1 {
+        let result = if self.config.parallel && self.config.engines.len() > 1 {
             self.solve_parallel()
         } else {
             self.solve_sequential()
+        };
+        self.enforce_deterministic_deadline(result)
+    }
+
+    /// Add zero-cost rows for engine types removed by a disabled policy.
+    fn append_disabled_budget_rows(&self, report: &mut BudgetReport) {
+        let mut disabled_index = self.config.engines.len();
+        for (engine_type, policy) in &self.config.engine_budgets {
+            if matches!(policy, BudgetPolicy::Disabled) {
+                report.entries.push(EngineBudgetEntry {
+                    engine: *engine_type,
+                    index: disabled_index,
+                    budget_allocated: std::time::Duration::ZERO,
+                    elapsed: std::time::Duration::ZERO,
+                    stop_reason: EngineStopReason::Disabled,
+                });
+                disabled_index += 1;
+            }
         }
+    }
+
+    /// Complete an early-exit report for active engines that never launched.
+    fn append_unstarted_active_rows(&self, report: &mut BudgetReport) {
+        for (index, engine) in self.config.engines.iter().enumerate() {
+            report.entries.push(EngineBudgetEntry {
+                engine: engine.engine_type(),
+                index,
+                budget_allocated: std::time::Duration::ZERO,
+                elapsed: std::time::Duration::ZERO,
+                stop_reason: EngineStopReason::NotStarted,
+            });
+        }
+        report.entries.sort_by_key(|entry| entry.index);
     }
 
     /// Solve with budget reporting (#8418).
@@ -426,32 +669,30 @@ impl PortfolioSolver {
     pub fn solve_with_budget_report(&self) -> (PortfolioResult, BudgetReport) {
         let start = ay_core::time::Instant::now();
         let mut report = BudgetReport::new();
+        self.append_disabled_budget_rows(&mut report);
 
         if self.config.engines.is_empty() {
             report.total_elapsed = start.elapsed();
             return (PortfolioResult::Unknown, report);
         }
-
-        // Pre-populate disabled engines in the report.
-        for (engine_type, policy) in &self.config.engine_budgets {
-            if matches!(policy, BudgetPolicy::Disabled) {
-                report.entries.push(EngineBudgetEntry {
-                    engine: *engine_type,
-                    index: 0,
-                    budget_allocated: std::time::Duration::ZERO,
-                    elapsed: std::time::Duration::ZERO,
-                    stop_reason: EngineStopReason::Disabled,
-                });
-            }
+        if self.cancellation_token.is_cancelled()
+            || self.construction_boundary_exhausted()
+            || self.deterministic_deadline_expired()
+        {
+            self.append_unstarted_active_rows(&mut report);
+            report.total_elapsed = start.elapsed();
+            return (PortfolioResult::Unknown, report);
         }
 
         // Check for trivial problems
         if let Some(result) = self.try_solve_trivial() {
+            self.append_unstarted_active_rows(&mut report);
             report.total_elapsed = start.elapsed();
-            return (result, report);
+            return (self.enforce_deterministic_deadline(result), report);
         }
 
         if ay_core::TermStore::global_memory_exceeded() {
+            self.append_unstarted_active_rows(&mut report);
             report.total_elapsed = start.elapsed();
             return (PortfolioResult::Unknown, report);
         }
@@ -459,8 +700,9 @@ impl PortfolioSolver {
         // Algebraic prepass
         if self.should_try_algebraic_prepass() {
             if let Some(result) = self.try_algebraic_prepass() {
+                self.append_unstarted_active_rows(&mut report);
                 report.total_elapsed = start.elapsed();
-                return (result, report);
+                return (self.enforce_deterministic_deadline(result), report);
             }
         }
 
@@ -470,8 +712,9 @@ impl PortfolioSolver {
             self.solve_sequential_with_report(&mut report)
         };
 
+        report.entries.sort_by_key(|entry| entry.index);
         report.total_elapsed = start.elapsed();
-        (result, report)
+        (self.enforce_deterministic_deadline(result), report)
     }
 
     /// Panic-safe variant of [`solve`](Self::solve).

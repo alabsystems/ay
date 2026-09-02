@@ -8,15 +8,7 @@
 //! parametric sorts (`(Array K V)`), and declared datatype sorts.
 
 use super::ChcParser;
-use crate::{ChcError, ChcResult, ChcSort};
-
-/// Upper bound on a declared bitvector width.
-///
-/// The width sizes downstream bit-blasting, the wide-decimal-BV chunk loop
-/// (`encode_wide_decimal_bv`), and `make_all_ones_bv`'s recursion (depth
-/// ~width/128). An adversarial `(_ BitVec 4000000000)` would otherwise OOM or
-/// overflow the stack. ~1M bits is far above any real bitvector.
-pub(super) const MAX_BV_WIDTH: u32 = 1 << 20;
+use crate::{ChcError, ChcResult, ChcSort, MAX_BITVECTOR_WIDTH};
 
 impl ChcParser {
     /// Parse a sort
@@ -44,9 +36,9 @@ impl ChcParser {
                                 .parse_numeral()?
                                 .parse()
                                 .map_err(|_| ChcError::Parse("Invalid bitvector width".into()))?;
-                            if width == 0 || width > MAX_BV_WIDTH {
+                            if width == 0 || width > MAX_BITVECTOR_WIDTH {
                                 return Err(ChcError::Parse(format!(
-                                    "bitvector width {width} is outside the supported range 1..={MAX_BV_WIDTH}"
+                                    "bitvector width {width} is outside the supported range 1..={MAX_BITVECTOR_WIDTH}"
                                 )));
                             }
                             self.skip_whitespace_and_comments();

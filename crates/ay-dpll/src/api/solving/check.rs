@@ -33,17 +33,20 @@ enum NativeQueryBoundary {
 /// One immutable control envelope for a complete native solve/publication
 /// transaction.
 ///
-/// Native APIs have their own timeout/RSS settings, while parsing SMT-LIB into
-/// the same [`Solver`] can configure `:timeout` and `:max-memory` directly on
-/// the executor.  Planning the effective limits once prevents nested executor
-/// checks from renewing the relative timeout before certification, and keeps a
-/// tighter parsed RSS ceiling from being overwritten by the API default.
+/// Native APIs have their own timeout/RSS/term-store settings, while parsing
+/// SMT-LIB into the same [`Solver`] can configure `:timeout` and `:max-memory`
+/// directly on the executor. Planning the effective limits once prevents
+/// nested executor checks from renewing the relative timeout before
+/// certification, keeps a tighter parsed RSS ceiling from being overwritten,
+/// and makes nested executor probes inherit the native term-store envelope.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct NativePublicationControls {
     deadline: Option<Instant>,
     effective_memory_limit: Option<usize>,
+    effective_term_memory_limit: Option<usize>,
     previous_deadline: Option<Instant>,
     previous_memory_limit: Option<usize>,
+    previous_term_memory_limit: Option<usize>,
 }
 
 /// Reject a native operation that may issue more than one decision query while
@@ -230,10 +233,12 @@ impl Solver {
     /// the executor first so every stale artifact is revoked and both views of
     /// the last query remain identical.
     pub(super) fn finish_verified_result(&mut self, result: SolveResult) -> VerifiedSolveResult {
+        let effective_term_limit =
+            Self::earliest_optional(self.executor.term_memory_limit(), self.term_memory_limit);
         let result = if !result.is_unknown()
-            && self
-                .term_memory_limit
-                .is_some_and(|limit| self.terms().instance_memory_exceeded(limit))
+            && (ay_core::TermStore::global_memory_exceeded()
+                || effective_term_limit
+                    .is_some_and(|limit| self.terms().true_memory_bytes() > limit))
         {
             self.executor
                 .publish_unknown_from_origin(crate::UnknownOrigin::MemoryBudget);
@@ -351,8 +356,11 @@ impl Solver {
 
         // Per-instance term memory check (#6563): prevents cross-instance
         // budget interference when multiple solvers run in the same process.
-        if let Some(limit) = self.term_memory_limit {
-            if self.terms().instance_memory_exceeded(limit) {
+        if ay_core::TermStore::global_memory_exceeded() {
+            return Some(self.preflight_unknown(UnknownReason::MemoryLimit));
+        }
+        if let Some(limit) = controls.effective_term_memory_limit {
+            if self.terms().true_memory_bytes() > limit {
                 return Some(self.preflight_unknown(UnknownReason::MemoryLimit));
             }
         }
@@ -391,11 +399,16 @@ impl Solver {
         let previous_memory_limit = self.executor.memory_limit();
         let effective_memory_limit =
             Self::earliest_optional(previous_memory_limit, self.memory_limit);
+        let previous_term_memory_limit = self.executor.term_memory_limit();
+        let effective_term_memory_limit =
+            Self::earliest_optional(previous_term_memory_limit, self.term_memory_limit);
         NativePublicationControls {
             deadline,
             effective_memory_limit,
+            effective_term_memory_limit,
             previous_deadline,
             previous_memory_limit,
+            previous_term_memory_limit,
         }
     }
 
@@ -412,6 +425,8 @@ impl Solver {
         self.executor
             .set_memory_limit(controls.effective_memory_limit);
         self.executor
+            .set_term_memory_limit(controls.effective_term_memory_limit);
+        self.executor
             .set_learned_clause_limit(self.learned_clause_limit);
         self.executor
             .set_clause_db_bytes_limit(self.clause_db_bytes_limit);
@@ -425,6 +440,8 @@ impl Solver {
             .set_solve_controls(None, controls.previous_deadline);
         self.executor
             .set_memory_limit(controls.previous_memory_limit);
+        self.executor
+            .set_term_memory_limit(controls.previous_term_memory_limit);
     }
 
     /// Classify an `Unknown` result that has no reason yet, using executor
@@ -438,8 +455,8 @@ impl Solver {
             UnknownReason::Timeout
         } else if crate::memory::memory_exceeded(controls.effective_memory_limit)
             || ay_sys::process_memory_exceeded()
-            || self
-                .term_memory_limit
+            || controls
+                .effective_term_memory_limit
                 .is_some_and(|limit| self.terms().instance_memory_exceeded(limit))
         {
             UnknownReason::MemoryLimit
@@ -897,6 +914,20 @@ mod finish_verified_result_tests {
     }
 
     #[test]
+    fn control_lifetime_native_term_limit_is_forwarded_to_executor() {
+        let mut solver = Solver::new(Logic::QfUf);
+        solver.set_term_memory_limit(Some(1));
+
+        let controls = solver.native_publication_controls();
+        solver.install_solve_controls(controls);
+
+        assert_eq!(solver.executor.term_memory_limit(), Some(1));
+        solver.restore_solve_controls(controls);
+        assert_eq!(solver.executor.term_memory_limit(), None);
+        solver.set_term_memory_limit(None);
+    }
+
+    #[test]
     fn control_lifetime_native_deadline_uses_earliest_timeout_from_one_origin() {
         let mut solver = Solver::new(Logic::QfUf);
         solver
@@ -1025,6 +1056,49 @@ mod finish_verified_result_tests {
         assert!(solver.executor.take_sat_certificate().is_none());
         assert!(solver.executor.take_unsat_certificate().is_none());
         assert!(solver.model().is_none());
+    }
+
+    #[test]
+    fn control_lifetime_exact_term_census_revokes_native_sat_inside_cache_window() {
+        let mut solver = Solver::new(Logic::QfUf);
+        solver.clear_last_solve_state(true, false);
+        solver.executor.bind_unsat_query_assumptions(&[]);
+        let proposed = solver
+            .executor
+            .check_sat()
+            .expect("empty authored query must solve");
+        assert_eq!(proposed, SolveResult::Sat);
+
+        let exact_limit = solver.terms().true_memory_bytes();
+        assert!(!solver.terms().instance_memory_exceeded(exact_limit));
+        let incremental_before = solver.terms().instance_term_bytes();
+        for index in 0..512 {
+            let _ = solver.executor.ctx.terms.mk_var(
+                format!("exact_landing_padding_{index}"),
+                crate::api::Sort::Bool,
+            );
+            if solver.terms().true_memory_bytes() > exact_limit {
+                break;
+            }
+        }
+        assert!(solver.terms().true_memory_bytes() > exact_limit);
+        assert!(
+            solver
+                .terms()
+                .instance_term_bytes()
+                .saturating_sub(incremental_before)
+                < 64 * 1024,
+            "fixture must stay inside the cached counter's refresh window"
+        );
+        assert!(
+            !solver.terms().instance_memory_exceeded(exact_limit),
+            "cached hot-loop check must remain stale so this pins the exact landing census"
+        );
+
+        solver.set_term_memory_limit(Some(exact_limit));
+        let rejected = solver.finish_verified_result(proposed);
+        assert!(rejected.is_unknown());
+        assert_eq!(solver.unknown_reason(), Some(UnknownReason::MemoryLimit));
     }
 
     #[test]

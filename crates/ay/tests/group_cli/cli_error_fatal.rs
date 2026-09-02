@@ -266,19 +266,21 @@ fn test_cli_file_continues_after_malformed_sexp() {
     eprintln!("AY stdout: {stdout:?}");
     eprintln!("AY exit: {:?}", output.status);
 
-    // The malformed chunk swallows the following `(assert (< x 5))`, so the
-    // fail-closed taint makes the second check-sat answer `unknown` instead
-    // of a wrong `sat` on the constraint-stripped remainder. Both check-sats
-    // still run and answer.
+    // Since c25240fc9 stray-token recovery resyncs AT the next `(` instead of
+    // swallowing through the next balanced group, so the following
+    // `(assert (< x 5))` is preserved and executed (z3 5.1.0 parity: z3 prints
+    // sat / (error ...) / sat, exit 1, on this exact input). Nothing is
+    // dropped, so the fail-closed taint must NOT fire: both check-sats answer
+    // `sat` — the second on the full x>0 ∧ x<5 problem.
     let sat_count = stdout.lines().filter(|l| l.trim() == "sat").count();
     assert_eq!(
-        sat_count, 1,
-        "the first check-sat must answer sat despite the malformed form: {stdout:?}"
+        sat_count, 2,
+        "both check-sats must answer sat: the command after the stray `)` is preserved: {stdout:?}"
     );
     assert_eq!(
         stdout.lines().filter(|l| l.trim() == "unknown").count(),
-        1,
-        "the tainted second check-sat must fail closed to unknown: {stdout:?}"
+        0,
+        "no constraint was dropped, so the taint must not fire: {stdout:?}"
     );
     assert!(
         stdout.contains("(error "),

@@ -43,6 +43,102 @@ impl ChcExpr {
         Self::Int(n.into())
     }
 
+    /// Build an exact bit-vector literal from an arbitrary-precision value.
+    ///
+    /// Values are reduced modulo `2^width`, matching SMT-LIB's `(_ bvN W)`
+    /// literal semantics. Widths through 128 use the compact leaf node; wider
+    /// literals are represented as a most-significant-first tree of at most
+    /// 128-bit `concat` chunks. This keeps [`ChcExpr`] source-compatible while
+    /// giving typed frontends a lossless path for Rust SIMD and pointer-model
+    /// values wider than `u128`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ChcError::InvalidBitVectorWidth`] unless `width` is in
+    /// `1..=`[`crate::MAX_BITVECTOR_WIDTH`]. SMT-LIB does not permit width zero,
+    /// and the upper bound prevents an untrusted typed input from allocating a
+    /// `width / 128`-node literal tree without limit.
+    pub fn bitvec_from_biguint(value: &num_bigint::BigUint, width: u32) -> crate::ChcResult<Self> {
+        use num_traits::{One, ToPrimitive};
+
+        if width == 0 || width > crate::MAX_BITVECTOR_WIDTH {
+            return Err(crate::ChcError::InvalidBitVectorWidth {
+                width,
+                max: crate::MAX_BITVECTOR_WIDTH,
+            });
+        }
+
+        // Discard high limbs before extracting chunks. Besides implementing
+        // the modulo-2^width literal semantics, this bounds all subsequent
+        // work by `width`: callers may otherwise pass a BigUint whose storage
+        // is arbitrarily larger than the declared (and capped) BV width.
+        let width_mask = (num_bigint::BigUint::one() << width) - 1_u8;
+        let reduced = value & &width_mask;
+
+        let mut chunks = Vec::new();
+        let mut remaining = width;
+        while remaining != 0 {
+            let chunk_width = if remaining % 128 == 0 {
+                128
+            } else {
+                remaining % 128
+            };
+            let offset = remaining - chunk_width;
+            let mask = (num_bigint::BigUint::one() << chunk_width) - 1_u8;
+            let chunk = ((&reduced >> offset) & mask).to_u128().ok_or_else(|| {
+                crate::ChcError::Internal(
+                    "masked bit-vector literal chunk did not fit in u128".to_owned(),
+                )
+            })?;
+            chunks.push(Self::BitVec(chunk, chunk_width));
+            remaining = offset;
+        }
+
+        let mut chunks = chunks.into_iter();
+        let first = chunks
+            .next()
+            .ok_or(crate::ChcError::InvalidBitVectorWidth {
+                width,
+                max: crate::MAX_BITVECTOR_WIDTH,
+            })?;
+        Ok(chunks.fold(first, |high, low| {
+            Self::Op(ChcOp::BvConcat, vec![mk_arc(high), mk_arc(low)])
+        }))
+    }
+
+    /// Parse and build an exact unsigned bit-vector literal.
+    ///
+    /// This is the dependency-light entry point for typed frontends whose IR
+    /// stores constants as strings. `radix` must be in `2..=36`; `digits` must
+    /// be an unsigned numeral without a prefix or sign. The parsed value uses
+    /// the same modulo-`2^width` semantics as [`Self::bitvec_from_biguint`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed parse error for an invalid radix/numeral and propagates
+    /// [`crate::ChcError::InvalidBitVectorWidth`] for a width outside the
+    /// supported range.
+    pub fn bitvec_from_str_radix(digits: &str, radix: u32, width: u32) -> crate::ChcResult<Self> {
+        // Check before parsing the numeral so an invalid-width request cannot
+        // amplify work through an arbitrarily large BigUint allocation.
+        if width == 0 || width > crate::MAX_BITVECTOR_WIDTH {
+            return Err(crate::ChcError::InvalidBitVectorWidth {
+                width,
+                max: crate::MAX_BITVECTOR_WIDTH,
+            });
+        }
+        if !(2..=36).contains(&radix) {
+            return Err(crate::ChcError::Parse(format!(
+                "invalid bit-vector literal radix {radix}; expected 2..=36"
+            )));
+        }
+        let value =
+            num_bigint::BigUint::parse_bytes(digits.as_bytes(), radix).ok_or_else(|| {
+                crate::ChcError::Parse(format!("invalid base-{radix} bit-vector literal"))
+            })?;
+        Self::bitvec_from_biguint(&value, width)
+    }
+
     /// Encode a `BigInt` value as a `ChcExpr` (exact for every input).
     ///
     /// Values that fit the widened `Int(i128)` become a plain constant; only

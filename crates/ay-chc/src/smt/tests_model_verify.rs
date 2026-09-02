@@ -833,3 +833,62 @@ fn verify_sat_model_strict_bigint_witness_valid_and_mutated_rejected() {
         "witness - 1 must be rejected Invalid"
     );
 }
+
+/// Regression for the model-checker-consumer 128/129-bit cliff: an exact high bit in an
+/// executor/theory model must survive the SmtValue boundary and validate next
+/// to an Array-sorted equality. A low-128-bit truncation must be rejected.
+#[test]
+fn verify_sat_model_strict_array_and_bv129_high_bit_exact() {
+    use num_bigint::BigUint;
+
+    let array_sort = ChcSort::Array(Box::new(ChcSort::BitVec(32)), Box::new(ChcSort::Bool));
+    let input = ChcVar::new("input", array_sort.clone());
+    let output = ChcVar::new("output", array_sort);
+    let word = ChcVar::new("word", ChcSort::BitVec(129));
+
+    let stored = ChcExpr::store(
+        ChcExpr::var(input.clone()),
+        ChcExpr::BitVec(41, 32),
+        ChcExpr::Bool(true),
+    );
+    let high_bit = ChcExpr::Op(
+        ChcOp::BvConcat,
+        vec![
+            Arc::new(ChcExpr::BitVec(1, 1)),
+            Arc::new(ChcExpr::BitVec(0, 128)),
+        ],
+    );
+    let expr = ChcExpr::and(
+        ChcExpr::eq(ChcExpr::var(output.clone()), stored),
+        ChcExpr::eq(ChcExpr::var(word.clone()), high_bit),
+    );
+
+    let mut model = FxHashMap::default();
+    model.insert(
+        input.name,
+        SmtValue::ConstArray(Box::new(SmtValue::Bool(false))),
+    );
+    model.insert(
+        output.name,
+        SmtValue::ArrayMap {
+            default: Box::new(SmtValue::Bool(false)),
+            entries: vec![(SmtValue::BitVec(41, 32), SmtValue::Bool(true))],
+        },
+    );
+    model.insert(
+        word.name.clone(),
+        SmtValue::bitvec_from_biguint(BigUint::from(1u8) << 128, 129),
+    );
+    assert_eq!(
+        verify_sat_model_strict(&expr, &model),
+        ModelVerifyResult::Valid,
+        "the exact BV129 high-bit witness beside an array equality must validate"
+    );
+
+    model.insert(word.name, SmtValue::BitVec(0, 129));
+    assert_eq!(
+        verify_sat_model_strict(&expr, &model),
+        ModelVerifyResult::Invalid,
+        "a witness truncated to the low 128 bits must be rejected"
+    );
+}

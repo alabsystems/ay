@@ -295,7 +295,10 @@ pub(super) fn enumerate_and_check_generic(
                 name, width, count, ..
             } => {
                 for val in 0..*count {
-                    assignment.insert(name.clone(), SmtValue::BitVec(val, *width));
+                    assignment.insert(
+                        name.clone(),
+                        SmtValue::bitvec_from_biguint(num_bigint::BigUint::from(val), *width),
+                    );
                     if let Some(cex) =
                         enumerate_and_check_generic(ranges, idx + 1, assignment, query)
                     {

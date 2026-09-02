@@ -23,7 +23,7 @@ pub use types::{ChcDtConstructor, ChcDtSelector, ChcExpr, ChcOp, ChcSort, ChcVar
 #[path = "tests/mod.rs"]
 mod expr_tests;
 
-pub(crate) use evaluate::{eval_array_select, eval_int_big, evaluate_expr};
+pub(crate) use evaluate::{eval_array_select, eval_int_big, evaluate_expr, smt_values_equal};
 pub(crate) use methods::ExprFeatures;
 
 #[cfg(test)]

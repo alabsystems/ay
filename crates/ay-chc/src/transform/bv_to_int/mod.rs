@@ -1017,13 +1017,22 @@ fn concretize_witness_entry(
 fn concretize_smt_value(value: &SmtValue, sort: &ChcSort) -> SmtValue {
     match (sort, value) {
         (ChcSort::BitVec(width), SmtValue::Int(n)) => {
-            SmtValue::BitVec(int_to_bitvec_bits(*n, *width), *width)
+            SmtValue::bitvec_from_bigint((*n).into(), *width)
+        }
+        (ChcSort::BitVec(width), SmtValue::BigInt(n)) => {
+            SmtValue::bitvec_from_bigint(n.as_ref().clone(), *width)
         }
         (ChcSort::BitVec(width), SmtValue::BitVec(bits, actual_width)) if width == actual_width => {
-            SmtValue::BitVec(*bits, *width)
+            SmtValue::bitvec_from_u128(*bits, *width)
         }
         (ChcSort::BitVec(width), SmtValue::BitVec(bits, _)) => {
-            SmtValue::BitVec(mask_bitvec_bits(*bits, *width), *width)
+            SmtValue::bitvec_from_u128(mask_bitvec_bits(*bits, *width), *width)
+        }
+        (ChcSort::BitVec(width), value @ SmtValue::BigBitVec(_, _)) => {
+            let (bits, _) = value
+                .bitvec_to_biguint()
+                .unwrap_or_else(|| unreachable!("BigBitVec must expose exact bits"));
+            SmtValue::bitvec_from_biguint(bits, *width)
         }
         (ChcSort::Array(_index_sort, element_sort), SmtValue::ConstArray(default)) => {
             SmtValue::ConstArray(Box::new(concretize_smt_value(
@@ -1047,17 +1056,6 @@ fn concretize_smt_value(value: &SmtValue, sort: &ChcSort) -> SmtValue {
             }
         }
         _ => value.clone(),
-    }
-}
-
-fn int_to_bitvec_bits(value: i128, width: u32) -> u128 {
-    if width >= 128 {
-        // Two's-complement reinterpretation: the standard 128-bit bitvector
-        // encoding of a signed value (bijective, not a truncation).
-        value as u128
-    } else {
-        let modulus = 1i128 << width;
-        (value.rem_euclid(modulus)) as u128
     }
 }
 

@@ -32,6 +32,7 @@ impl Model {
             completed_values: HashMap::default(),
             dt_ground: HashMap::default(),
             dt_pins: HashMap::default(),
+            dt_array_field_classes: Vec::new(),
         }
     }
 

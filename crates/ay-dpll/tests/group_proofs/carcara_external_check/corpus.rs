@@ -138,24 +138,66 @@ fn solve_corpus_with_timeout(content: &str, label: &str) -> CorpusSolve {
 
 #[cfg(test)]
 fn z3_oracle_status(path: &Path, label: &str) -> String {
-    let output = std::process::Command::new("z3")
-        .arg(format!("-T:{PER_BENCHMARK_TIMEOUT_SECS}"))
-        .arg(path)
-        .output()
-        .unwrap_or_else(|e| {
+    let z3 = std::env::var_os("Z3_PATH").unwrap_or_else(|| "z3".into());
+    let mut command = std::process::Command::new(z3);
+    command.arg(format!("-T:{PER_BENCHMARK_TIMEOUT_SECS}"));
+    let output = if label == "regression_false_unsat_cegqi_entailed_inner_forall_witness" {
+        // Z3 4.8.12 accepts constant arrays only under its `ALL` parser
+        // profile. Keep AY's exact AUFLIA regression unchanged, but broaden
+        // only the oracle's syntax profile in memory; `set-logic` does not
+        // change the formula asserted below it. Exact-prefix matching makes a
+        // fixture edit fail closed instead of silently transforming new input.
+        let source = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("{label}: read oracle input: {e}"));
+        let body = source
+            .strip_prefix("(set-logic AUFLIA)\n")
+            .unwrap_or_else(|| panic!("{label}: guarded Z3 logic-profile prefix changed"));
+        let oracle_source = format!("(set-logic ALL)\n{body}");
+        let mut child = command
+            .arg("-in")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{label}: Z3 is required to classify non-proof corpus rows independently: {e}"
+                )
+            });
+        std::io::Write::write_all(
+            child.stdin.as_mut().expect("piped Z3 stdin must exist"),
+            oracle_source.as_bytes(),
+        )
+        .unwrap_or_else(|e| panic!("{label}: write guarded oracle input: {e}"));
+        child
+            .wait_with_output()
+            .unwrap_or_else(|e| panic!("{label}: collect Z3 oracle result: {e}"))
+    } else {
+        command.arg(path).output().unwrap_or_else(|e| {
             panic!("{label}: Z3 is required to classify non-proof corpus rows independently: {e}")
-        });
+        })
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "{label}: Z3 oracle failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "{label}: Z3 oracle failed: status={:?}; stdout={}; stderr={}",
+        output.status.code(),
+        stdout.trim(),
+        stderr.trim(),
     );
-    String::from_utf8_lossy(&output.stdout)
+    let output_lines: Vec<String> = stdout
         .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    assert!(
+        matches!(output_lines.as_slice(), [status] if matches!(status.as_str(), "sat" | "unsat" | "unknown")),
+        "{label}: Z3 oracle must emit exactly one terminal status: {output_lines:?}; stderr={}",
+        stderr.trim(),
+    );
+    output_lines[0].clone()
 }
 
 /// Collect all `*unsat*.smt2` files from `benchmarks/smt/` subdirectories.

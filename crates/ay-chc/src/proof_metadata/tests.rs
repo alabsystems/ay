@@ -2403,3 +2403,48 @@ fn admission_key_changes_with_problem_options_solver_and_transcript() {
         .admission_key_sha256();
     assert_ne!(base, changed_transcript_key);
 }
+
+#[test]
+fn attributed_unknown_reasons_reach_consumers_without_invented_limit_codes() {
+    let problem = parse_problem(
+        r#"(set-logic HORN)
+(declare-fun Inv (Int) Bool)
+(assert (forall ((x Int)) (=> (= x 0) (Inv x))))
+(assert (forall ((x Int)) (=> (and (Inv x) (< x 0)) false)))
+(check-sat)
+"#,
+    );
+
+    for (result, expected_code) in [
+        (
+            VerifiedChcResult::Unknown(
+                crate::engine_result::VerifiedUnknownMarker::overapproximated_refutation(),
+            ),
+            "overapproximated_refutation",
+        ),
+        (
+            VerifiedChcResult::unknown_candidate_not_admitted(),
+            "candidate_not_admitted",
+        ),
+    ] {
+        let run = ChcPdrProofRun::new(problem.clone(), result, "pdr");
+        let evidence = run.consumer_evidence();
+
+        assert_eq!(evidence.verdict_code(), "unknown");
+        assert!(!evidence.accepted_for_consumer());
+        assert_eq!(evidence.unknown_reason_code(), Some(expected_code));
+        assert_eq!(
+            evidence.consumer_rejection_code(),
+            Some(format!("ay_chc_unknown_{expected_code}").as_str())
+        );
+        assert_eq!(evidence.unknown_limit_code(), None);
+        assert_eq!(evidence.unknown_depth_reached(), None);
+        assert_eq!(evidence.unknown_depth_limit(), None);
+
+        let json = evidence.to_json_value();
+        assert_eq!(json["verdict_code"], "unknown");
+        assert_eq!(json["unknown_reason_code"], expected_code);
+        assert!(json["unknown_limit_code"].is_null());
+        assert_eq!(json["accepted_for_consumer"], false);
+    }
+}

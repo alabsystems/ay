@@ -15,17 +15,18 @@ use ay_core::kani_compat::DetHashMap as FxHashMap;
 use std::sync::Arc;
 
 use super::{maybe_grow_expr_stack, ChcExpr, ChcOp, ExprDepthGuard};
-use crate::bv_util::{bv_mask, bv_to_signed};
+use crate::bv_util::bv_mask;
 use crate::smt::SmtValue;
 use eval_bv::{
-    eval_bv_ashr, eval_bv_binop, eval_bv_cmp, eval_bv_signed_div, eval_bv_smod, eval_bv_val,
+    big_bv_modulus, bigint_to_bv, eval_bv_ashr, eval_bv_big_val, eval_bv_binop, eval_bv_cmp,
+    eval_bv_signed_div, eval_bv_signed_rem, eval_bv_smod, eval_bv_val, BvBinOp, BvCmpOp,
 };
 
-pub(crate) use value_ops::{eval_array_select, eval_int_big, eval_real_big};
+pub(crate) use value_ops::{eval_array_select, eval_int_big, eval_real_big, smt_values_equal};
 // Re-export for tests (super::* glob) and internal use.
 #[allow(unused_imports)]
 pub(super) use value_ops::eval_array_store;
-use value_ops::{eval_int_cmp, real_eval_enabled, smt_values_equal};
+use value_ops::{eval_int_cmp, real_eval_enabled};
 
 /// True when both operands are statically integer-sorted.
 ///
@@ -98,6 +99,52 @@ fn eval_datatype_func_app(
     args: &[Arc<ChcExpr>],
     model: &FxHashMap<String, SmtValue>,
 ) -> Option<SmtValue> {
+    // SMT-LIB integer/real conversions are represented as `FuncApp` because
+    // they are named operators rather than `ChcOp` variants.  Interpret only
+    // their exact, well-sorted forms.  This is also needed when one of these
+    // terms is an argument to an observed UF application: finite congruence
+    // validation must compare the concrete argument values without treating
+    // a conversion as an arbitrary UF.
+    if args.len() == 1 && matches!(name, "to_real" | "to_int" | "is_int") {
+        let argument = args[0].as_ref();
+        match (name, sort, argument.sort(), evaluate_expr(argument, model)?) {
+            ("to_real", super::ChcSort::Real, super::ChcSort::Int, SmtValue::Int(value)) => {
+                return Some(SmtValue::Real(num_rational::BigRational::from_integer(
+                    value.into(),
+                )));
+            }
+            ("to_real", super::ChcSort::Real, super::ChcSort::Int, SmtValue::BigInt(value)) => {
+                return Some(SmtValue::Real(num_rational::BigRational::from_integer(
+                    value.as_ref().clone(),
+                )));
+            }
+            // The converter deliberately accepts an already-Real coercion as
+            // identity, so the evaluator mirrors that normalized form.
+            ("to_real", super::ChcSort::Real, super::ChcSort::Real, SmtValue::Real(value)) => {
+                return Some(SmtValue::Real(value));
+            }
+            ("to_int", super::ChcSort::Int, super::ChcSort::Real, SmtValue::Real(value)) => {
+                return Some(SmtValue::int_from_bigint(value.floor().to_integer()));
+            }
+            ("to_int", super::ChcSort::Int, super::ChcSort::Int, SmtValue::Int(value)) => {
+                return Some(SmtValue::Int(value));
+            }
+            ("to_int", super::ChcSort::Int, super::ChcSort::Int, SmtValue::BigInt(value)) => {
+                return Some(SmtValue::BigInt(value));
+            }
+            ("is_int", super::ChcSort::Bool, super::ChcSort::Real, SmtValue::Real(value)) => {
+                return Some(SmtValue::Bool(value.is_integer()));
+            }
+            (
+                "is_int",
+                super::ChcSort::Bool,
+                super::ChcSort::Int,
+                SmtValue::Int(_) | SmtValue::BigInt(_),
+            ) => return Some(SmtValue::Bool(true)),
+            _ => {}
+        }
+    }
+
     if let super::ChcSort::Datatype { constructors, .. } = sort {
         for ctor in constructors.iter() {
             if ctor.name == name && ctor.selectors.len() == args.len() {
@@ -128,6 +175,92 @@ fn eval_datatype_func_app(
     None
 }
 
+/// Private marker carried by models that contain exact values for the finite
+/// set of ordinary-UF applications observed in one executor query.
+///
+/// A marker is required before [`evaluate_expr`] consults the synthetic
+/// application keys below.  Without it, a (programmatically constructed)
+/// source variable whose name happened to equal one of those keys could be
+/// mistaken for a function value in an unrelated model.
+pub(crate) const UF_APPLICATION_MODEL_MARKER_KEY: &str = "\0ay.uf-application-model\0";
+pub(crate) const UF_APPLICATION_MODEL_MARKER_VALUE: &str = "exact-v1";
+
+/// Collision-free-with-SMT-source model key for one exact ordinary-UF term.
+///
+/// The NUL-prefixed key is never emitted as an SMT-LIB identifier.  The
+/// executor paths store values under it only after reading dedicated fresh
+/// aliases or exact post-SAT `get-value` observations. `Debug` is derived
+/// structurally for `ChcExpr`, so equal application ASTs receive the same key
+/// while distinct names/sorts/arguments remain distinct.
+pub(crate) fn uf_application_model_key(expr: &ChcExpr) -> Option<String> {
+    matches!(expr, ChcExpr::FuncApp(..)).then(|| format!("\0ay.uf-application-value:{expr:?}"))
+}
+
+fn scalar_uf_argument_key(value: &SmtValue) -> Option<String> {
+    match value {
+        SmtValue::Bool(value) => Some(format!("b:{value}")),
+        SmtValue::Int(value) => Some(format!("i:{value}")),
+        SmtValue::BigInt(value) => Some(format!("i:{}", value.as_ref())),
+        SmtValue::Real(value) => Some(format!("r:{}/{}", value.numer(), value.denom())),
+        SmtValue::BitVec(value, width) => Some(format!("bv:{width}:{value:x}")),
+        SmtValue::BigBitVec(value, width) => Some(format!("bv:{width}:{}", value.to_str_radix(16))),
+        SmtValue::Opaque(_)
+        | SmtValue::ConstArray(_)
+        | SmtValue::ArrayMap { .. }
+        | SmtValue::Datatype(_, _) => None,
+    }
+}
+
+/// Internal lookup key for a UF application normalized by its concrete scalar
+/// arguments. This lets grounded witness replay evaluate `f(3)` from a solver
+/// observation of a renamed/unrolled term such as `f(rule@2_x)` whose model
+/// value is exactly `3`.
+pub(crate) fn uf_application_concrete_model_key(
+    expr: &ChcExpr,
+    argument_values: &[SmtValue],
+) -> Option<String> {
+    let ChcExpr::FuncApp(name, return_sort, arguments) = expr else {
+        return None;
+    };
+    if arguments.len() != argument_values.len() {
+        return None;
+    }
+    let argument_sorts: Vec<super::ChcSort> = arguments.iter().map(|arg| arg.sort()).collect();
+    let values = argument_values
+        .iter()
+        .map(scalar_uf_argument_key)
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!(
+        "\0ay.uf-concrete-application-value:{:?}",
+        (name, return_sort, argument_sorts, values)
+    ))
+}
+
+fn eval_observed_uf_application(
+    expr: &ChcExpr,
+    model: &FxHashMap<String, SmtValue>,
+) -> Option<SmtValue> {
+    if !matches!(
+        model.get(UF_APPLICATION_MODEL_MARKER_KEY),
+        Some(SmtValue::Opaque(value)) if value == UF_APPLICATION_MODEL_MARKER_VALUE
+    ) {
+        return None;
+    }
+    if let Some(value) = model.get(&uf_application_model_key(expr)?) {
+        return Some(value.clone());
+    }
+    let ChcExpr::FuncApp(_, _, arguments) = expr else {
+        return None;
+    };
+    let argument_values = arguments
+        .iter()
+        .map(|argument| evaluate_expr(argument, model))
+        .collect::<Option<Vec<_>>>()?;
+    model
+        .get(&uf_application_concrete_model_key(expr, &argument_values)?)
+        .cloned()
+}
+
 /// Evaluate a CHC expression to an `SmtValue` under the given model.
 ///
 /// Returns `None` when evaluation is indeterminate (missing variable,
@@ -145,7 +278,7 @@ pub(crate) fn evaluate_expr(
         match expr {
             ChcExpr::Bool(b) => Some(SmtValue::Bool(*b)),
             ChcExpr::Int(n) => Some(SmtValue::Int(*n)),
-            ChcExpr::BitVec(val, width) => Some(SmtValue::BitVec(*val & bv_mask(*width), *width)),
+            ChcExpr::BitVec(val, width) => Some(SmtValue::bitvec_from_u128(*val, *width)),
             // Real literal `num/den` → exact rational. Previously absent, so a
             // bare Real constant evaluated to `None` (Indeterminate); the LRA
             // model verifier could not validate any Real atom (#LRA-Lin gap).
@@ -352,102 +485,120 @@ pub(crate) fn evaluate_expr(
 
             // BV arithmetic
             ChcExpr::Op(ChcOp::BvAdd, args) if args.len() == 2 => {
-                eval_bv_binop(&args[0], &args[1], model, |a, b, m| a.wrapping_add(b) & m)
+                eval_bv_binop(&args[0], &args[1], model, BvBinOp::Add)
             }
             ChcExpr::Op(ChcOp::BvSub, args) if args.len() == 2 => {
-                eval_bv_binop(&args[0], &args[1], model, |a, b, m| a.wrapping_sub(b) & m)
+                eval_bv_binop(&args[0], &args[1], model, BvBinOp::Sub)
             }
             ChcExpr::Op(ChcOp::BvMul, args) if args.len() == 2 => {
-                eval_bv_binop(&args[0], &args[1], model, |a, b, m| a.wrapping_mul(b) & m)
+                eval_bv_binop(&args[0], &args[1], model, BvBinOp::Mul)
             }
             ChcExpr::Op(ChcOp::BvUDiv, args) if args.len() == 2 => {
-                eval_bv_binop(&args[0], &args[1], model, |a, b, m| {
-                    a.checked_div(b).unwrap_or(m)
-                })
+                eval_bv_binop(&args[0], &args[1], model, BvBinOp::UDiv)
             }
-            ChcExpr::Op(ChcOp::BvURem, args) if args.len() == 2 => eval_bv_binop(
-                &args[0],
-                &args[1],
-                model,
-                |a, b, _m| {
-                    if b == 0 {
-                        a
-                    } else {
-                        a % b
-                    }
-                },
-            ),
+            ChcExpr::Op(ChcOp::BvURem, args) if args.len() == 2 => {
+                eval_bv_binop(&args[0], &args[1], model, BvBinOp::URem)
+            }
             ChcExpr::Op(ChcOp::BvSDiv, args) if args.len() == 2 => {
                 eval_bv_signed_div(&args[0], &args[1], model)
             }
             ChcExpr::Op(ChcOp::BvSRem, args) if args.len() == 2 => {
-                let (av, aw) = eval_bv_val(&args[0], model)?;
-                let (bv, bw) = eval_bv_val(&args[1], model)?;
-                if aw != bw {
-                    return None;
-                }
-                if bv == 0 {
-                    return Some(SmtValue::BitVec(av, aw));
-                }
-                let sa = bv_to_signed(av, aw);
-                let sb = bv_to_signed(bv, aw);
-                let r = sa.wrapping_rem(sb);
-                Some(SmtValue::BitVec((r as u128) & bv_mask(aw), aw))
+                eval_bv_signed_rem(&args[0], &args[1], model)
             }
             ChcExpr::Op(ChcOp::BvSMod, args) if args.len() == 2 => {
                 eval_bv_smod(&args[0], &args[1], model)
             }
             ChcExpr::Op(ChcOp::BvNeg, args) if args.len() == 1 => {
-                let (v, w) = eval_bv_val(&args[0], model)?;
-                Some(SmtValue::BitVec((!v).wrapping_add(1) & bv_mask(w), w))
+                if let Some((v, w)) = eval_bv_val(&args[0], model) {
+                    return Some(SmtValue::BitVec((!v).wrapping_add(1) & bv_mask(w), w));
+                }
+                let (v, w) = eval_bv_big_val(&args[0], model)?;
+                let result = if v == num_bigint::BigUint::from(0u8) {
+                    v
+                } else {
+                    big_bv_modulus(w) - v
+                };
+                Some(SmtValue::bitvec_from_biguint(result, w))
             }
 
             // BV bitwise
             ChcExpr::Op(ChcOp::BvAnd, args) if args.len() == 2 => {
-                eval_bv_binop(&args[0], &args[1], model, |a, b, _| a & b)
+                eval_bv_binop(&args[0], &args[1], model, BvBinOp::And)
             }
             ChcExpr::Op(ChcOp::BvOr, args) if args.len() == 2 => {
-                eval_bv_binop(&args[0], &args[1], model, |a, b, _| a | b)
+                eval_bv_binop(&args[0], &args[1], model, BvBinOp::Or)
             }
             ChcExpr::Op(ChcOp::BvXor, args) if args.len() == 2 => {
-                eval_bv_binop(&args[0], &args[1], model, |a, b, _| a ^ b)
+                eval_bv_binop(&args[0], &args[1], model, BvBinOp::Xor)
             }
             ChcExpr::Op(ChcOp::BvNand, args) if args.len() == 2 => {
-                eval_bv_binop(&args[0], &args[1], model, |a, b, m| (!(a & b)) & m)
+                eval_bv_binop(&args[0], &args[1], model, BvBinOp::Nand)
             }
             ChcExpr::Op(ChcOp::BvNor, args) if args.len() == 2 => {
-                eval_bv_binop(&args[0], &args[1], model, |a, b, m| (!(a | b)) & m)
+                eval_bv_binop(&args[0], &args[1], model, BvBinOp::Nor)
             }
             ChcExpr::Op(ChcOp::BvXnor, args) if args.len() == 2 => {
-                eval_bv_binop(&args[0], &args[1], model, |a, b, m| (!(a ^ b)) & m)
+                eval_bv_binop(&args[0], &args[1], model, BvBinOp::Xnor)
             }
             ChcExpr::Op(ChcOp::BvNot, args) if args.len() == 1 => {
-                let (v, w) = eval_bv_val(&args[0], model)?;
-                Some(SmtValue::BitVec((!v) & bv_mask(w), w))
+                if let Some((v, w)) = eval_bv_val(&args[0], model) {
+                    return Some(SmtValue::BitVec((!v) & bv_mask(w), w));
+                }
+                let (v, w) = eval_bv_big_val(&args[0], model)?;
+                Some(SmtValue::bitvec_from_biguint(
+                    (big_bv_modulus(w) - num_bigint::BigUint::from(1u8)) ^ v,
+                    w,
+                ))
             }
 
             // BV shifts
             ChcExpr::Op(ChcOp::BvShl, args) if args.len() == 2 => {
-                let (av, aw) = eval_bv_val(&args[0], model)?;
-                let (bv, bw) = eval_bv_val(&args[1], model)?;
+                if let (Some((av, aw)), Some((bv, bw))) =
+                    (eval_bv_val(&args[0], model), eval_bv_val(&args[1], model))
+                {
+                    if aw != bw {
+                        return None;
+                    }
+                    let result = if bv >= u128::from(aw) {
+                        0
+                    } else {
+                        (av << bv) & bv_mask(aw)
+                    };
+                    return Some(SmtValue::BitVec(result, aw));
+                }
+                let (av, aw) = eval_bv_big_val(&args[0], model)?;
+                let (bv, bw) = eval_bv_big_val(&args[1], model)?;
                 if aw != bw {
                     return None;
                 }
-                let result = if bv >= u128::from(aw) {
-                    0
+                let result = if bv >= num_bigint::BigUint::from(aw) {
+                    num_bigint::BigUint::from(0u8)
                 } else {
-                    (av << bv) & bv_mask(aw)
+                    av << num_traits::ToPrimitive::to_u32(&bv)?
                 };
-                Some(SmtValue::BitVec(result, aw))
+                Some(SmtValue::bitvec_from_biguint(result, aw))
             }
             ChcExpr::Op(ChcOp::BvLShr, args) if args.len() == 2 => {
-                let (av, aw) = eval_bv_val(&args[0], model)?;
-                let (bv, bw) = eval_bv_val(&args[1], model)?;
+                if let (Some((av, aw)), Some((bv, bw))) =
+                    (eval_bv_val(&args[0], model), eval_bv_val(&args[1], model))
+                {
+                    if aw != bw {
+                        return None;
+                    }
+                    let result = if bv >= u128::from(aw) { 0 } else { av >> bv };
+                    return Some(SmtValue::BitVec(result, aw));
+                }
+                let (av, aw) = eval_bv_big_val(&args[0], model)?;
+                let (bv, bw) = eval_bv_big_val(&args[1], model)?;
                 if aw != bw {
                     return None;
                 }
-                let result = if bv >= u128::from(aw) { 0 } else { av >> bv };
-                Some(SmtValue::BitVec(result, aw))
+                let result = if bv >= num_bigint::BigUint::from(aw) {
+                    num_bigint::BigUint::from(0u8)
+                } else {
+                    av >> num_traits::ToPrimitive::to_u32(&bv)?
+                };
+                Some(SmtValue::bitvec_from_biguint(result, aw))
             }
             ChcExpr::Op(ChcOp::BvAShr, args) if args.len() == 2 => {
                 eval_bv_ashr(&args[0], &args[1], model)
@@ -455,44 +606,36 @@ pub(crate) fn evaluate_expr(
 
             // BV unsigned comparisons
             ChcExpr::Op(ChcOp::BvULt, args) if args.len() == 2 => {
-                eval_bv_cmp(&args[0], &args[1], model, |a, b, _| a < b)
+                eval_bv_cmp(&args[0], &args[1], model, BvCmpOp::Ult)
             }
             ChcExpr::Op(ChcOp::BvULe, args) if args.len() == 2 => {
-                eval_bv_cmp(&args[0], &args[1], model, |a, b, _| a <= b)
+                eval_bv_cmp(&args[0], &args[1], model, BvCmpOp::Ule)
             }
             ChcExpr::Op(ChcOp::BvUGt, args) if args.len() == 2 => {
-                eval_bv_cmp(&args[0], &args[1], model, |a, b, _| a > b)
+                eval_bv_cmp(&args[0], &args[1], model, BvCmpOp::Ugt)
             }
             ChcExpr::Op(ChcOp::BvUGe, args) if args.len() == 2 => {
-                eval_bv_cmp(&args[0], &args[1], model, |a, b, _| a >= b)
+                eval_bv_cmp(&args[0], &args[1], model, BvCmpOp::Uge)
             }
 
             // BV signed comparisons
             ChcExpr::Op(ChcOp::BvSLt, args) if args.len() == 2 => {
-                eval_bv_cmp(&args[0], &args[1], model, |a, b, w| {
-                    bv_to_signed(a, w) < bv_to_signed(b, w)
-                })
+                eval_bv_cmp(&args[0], &args[1], model, BvCmpOp::Slt)
             }
             ChcExpr::Op(ChcOp::BvSLe, args) if args.len() == 2 => {
-                eval_bv_cmp(&args[0], &args[1], model, |a, b, w| {
-                    bv_to_signed(a, w) <= bv_to_signed(b, w)
-                })
+                eval_bv_cmp(&args[0], &args[1], model, BvCmpOp::Sle)
             }
             ChcExpr::Op(ChcOp::BvSGt, args) if args.len() == 2 => {
-                eval_bv_cmp(&args[0], &args[1], model, |a, b, w| {
-                    bv_to_signed(a, w) > bv_to_signed(b, w)
-                })
+                eval_bv_cmp(&args[0], &args[1], model, BvCmpOp::Sgt)
             }
             ChcExpr::Op(ChcOp::BvSGe, args) if args.len() == 2 => {
-                eval_bv_cmp(&args[0], &args[1], model, |a, b, w| {
-                    bv_to_signed(a, w) >= bv_to_signed(b, w)
-                })
+                eval_bv_cmp(&args[0], &args[1], model, BvCmpOp::Sge)
             }
 
             // BV comp (1-bit equality)
             ChcExpr::Op(ChcOp::BvComp, args) if args.len() == 2 => {
-                let (av, aw) = eval_bv_val(&args[0], model)?;
-                let (bv, bw) = eval_bv_val(&args[1], model)?;
+                let (av, aw) = eval_bv_big_val(&args[0], model)?;
+                let (bv, bw) = eval_bv_big_val(&args[1], model)?;
                 if aw != bw {
                     return None;
                 }
@@ -501,90 +644,150 @@ pub(crate) fn evaluate_expr(
 
             // BV concat
             ChcExpr::Op(ChcOp::BvConcat, args) if args.len() == 2 => {
-                let (av, aw) = eval_bv_val(&args[0], model)?;
-                let (bv, bw) = eval_bv_val(&args[1], model)?;
-                let new_w = aw + bw;
-                if new_w > 128 {
+                let lhs = evaluate_expr(&args[0], model)?;
+                let rhs = evaluate_expr(&args[1], model)?;
+                if let (SmtValue::BitVec(av, aw), SmtValue::BitVec(bv, bw)) = (&lhs, &rhs) {
+                    if *aw == 0 || *bw == 0 {
+                        return None;
+                    }
+                    let new_w = aw.checked_add(*bw)?;
+                    if new_w <= 128 {
+                        // `bw == 128` can only pair with a zero-width lhs in
+                        // this branch; its normalized payload is zero.
+                        let av = *av & bv_mask(*aw);
+                        let bv = *bv & bv_mask(*bw);
+                        let shifted = if *bw == 128 { 0 } else { av << *bw };
+                        let result = shifted | bv;
+                        return Some(SmtValue::BitVec(result & bv_mask(new_w), new_w));
+                    }
+                }
+                let (av, aw) = lhs.bitvec_to_biguint()?;
+                let (bv, bw) = rhs.bitvec_to_biguint()?;
+                if aw == 0 || bw == 0 {
                     return None;
                 }
-                let result = (av << bw) | bv;
-                Some(SmtValue::BitVec(result & bv_mask(new_w), new_w))
+                let new_w = aw.checked_add(bw)?;
+                if new_w == 0 || new_w > crate::MAX_BITVECTOR_WIDTH {
+                    return None;
+                }
+                Some(SmtValue::bitvec_from_biguint((av << bw) | bv, new_w))
             }
 
             // BV extract
             ChcExpr::Op(ChcOp::BvExtract(hi, lo), args) if args.len() == 1 => {
-                let (v, _w) = eval_bv_val(&args[0], model)?;
-                let new_w = hi - lo + 1;
-                let result = (v >> lo) & bv_mask(new_w);
-                Some(SmtValue::BitVec(result, new_w))
+                let (v, width) = eval_bv_big_val(&args[0], model)?;
+                if hi < lo || *hi >= width {
+                    return None;
+                }
+                let new_w = hi.checked_sub(*lo)?.checked_add(1)?;
+                Some(SmtValue::bitvec_from_biguint(v >> *lo, new_w))
             }
 
             // BV zero_extend
             ChcExpr::Op(ChcOp::BvZeroExtend(n), args) if args.len() == 1 => {
-                let (v, w) = eval_bv_val(&args[0], model)?;
-                let new_w = w + n;
-                if new_w > 128 {
+                let (v, w) = eval_bv_big_val(&args[0], model)?;
+                let new_w = w.checked_add(*n)?;
+                if new_w > crate::MAX_BITVECTOR_WIDTH {
                     return None;
                 }
-                Some(SmtValue::BitVec(v, new_w))
+                Some(SmtValue::bitvec_from_biguint(v, new_w))
             }
 
             // BV sign_extend
             ChcExpr::Op(ChcOp::BvSignExtend(n), args) if args.len() == 1 => {
-                let (v, w) = eval_bv_val(&args[0], model)?;
-                let new_w = w + n;
-                if new_w > 128 {
+                use num_bigint::BigUint;
+
+                let (mut v, w) = eval_bv_big_val(&args[0], model)?;
+                let new_w = w.checked_add(*n)?;
+                if new_w > crate::MAX_BITVECTOR_WIDTH {
                     return None;
                 }
-                let signed = bv_to_signed(v, w);
-                Some(SmtValue::BitVec((signed as u128) & bv_mask(new_w), new_w))
+                let sign_is_set =
+                    w != 0 && ((&v >> (w - 1)) & BigUint::from(1u8)) == BigUint::from(1u8);
+                if sign_is_set && new_w > w {
+                    v |= (BigUint::from(1u8) << new_w) - (BigUint::from(1u8) << w);
+                }
+                Some(SmtValue::bitvec_from_biguint(v, new_w))
             }
 
             // BV rotate
             ChcExpr::Op(ChcOp::BvRotateLeft(n), args) if args.len() == 1 => {
-                let (v, w) = eval_bv_val(&args[0], model)?;
+                if let Some((v, w)) = eval_bv_val(&args[0], model) {
+                    if w == 0 {
+                        return Some(SmtValue::BitVec(0, w));
+                    }
+                    let rot = n % w;
+                    if rot == 0 {
+                        return Some(SmtValue::BitVec(v, w));
+                    }
+                    let result = ((v << rot) | (v >> (w - rot))) & bv_mask(w);
+                    return Some(SmtValue::BitVec(result, w));
+                }
+                let (v, w) = eval_bv_big_val(&args[0], model)?;
                 if w == 0 {
-                    return Some(SmtValue::BitVec(0, w));
+                    return Some(SmtValue::bitvec_from_biguint(v, w));
                 }
                 let rot = n % w;
-                let result = ((v << rot) | (v >> (w - rot))) & bv_mask(w);
-                Some(SmtValue::BitVec(result, w))
+                if rot == 0 {
+                    return Some(SmtValue::bitvec_from_biguint(v, w));
+                }
+                let result = (&v << rot) | (v >> (w - rot));
+                Some(SmtValue::bitvec_from_biguint(result, w))
             }
             ChcExpr::Op(ChcOp::BvRotateRight(n), args) if args.len() == 1 => {
-                let (v, w) = eval_bv_val(&args[0], model)?;
+                if let Some((v, w)) = eval_bv_val(&args[0], model) {
+                    if w == 0 {
+                        return Some(SmtValue::BitVec(0, w));
+                    }
+                    let rot = n % w;
+                    if rot == 0 {
+                        return Some(SmtValue::BitVec(v, w));
+                    }
+                    let result = ((v >> rot) | (v << (w - rot))) & bv_mask(w);
+                    return Some(SmtValue::BitVec(result, w));
+                }
+                let (v, w) = eval_bv_big_val(&args[0], model)?;
                 if w == 0 {
-                    return Some(SmtValue::BitVec(0, w));
+                    return Some(SmtValue::bitvec_from_biguint(v, w));
                 }
                 let rot = n % w;
-                let result = ((v >> rot) | (v << (w - rot))) & bv_mask(w);
-                Some(SmtValue::BitVec(result, w))
+                if rot == 0 {
+                    return Some(SmtValue::bitvec_from_biguint(v, w));
+                }
+                let result = (&v >> rot) | (v << (w - rot));
+                Some(SmtValue::bitvec_from_biguint(result, w))
             }
 
             // BV repeat
             ChcExpr::Op(ChcOp::BvRepeat(n), args) if args.len() == 1 => {
-                let (v, w) = eval_bv_val(&args[0], model)?;
-                let new_w = w * n;
-                if new_w > 128 {
+                let (v, w) = eval_bv_big_val(&args[0], model)?;
+                let new_w = w.checked_mul(*n)?;
+                if *n == 0 || new_w == 0 || new_w > crate::MAX_BITVECTOR_WIDTH {
                     return None;
                 }
-                let mut result = 0u128;
-                for i in 0..*n {
-                    result |= v << (i * w);
+                let mut result = num_bigint::BigUint::from(0u8);
+                for _ in 0..*n {
+                    result = (result << w) | &v;
                 }
-                Some(SmtValue::BitVec(result & bv_mask(new_w), new_w))
+                Some(SmtValue::bitvec_from_biguint(result, new_w))
             }
 
             // BV/Int conversions
             ChcExpr::Op(ChcOp::Bv2Nat, args) if args.len() == 1 => {
-                let (v, _w) = eval_bv_val(&args[0], model)?;
-                // i128-lockstep: fail-closed for bv values beyond i128 range.
-                i128::try_from(v).ok().map(SmtValue::Int)
+                let (v, _w) = eval_bv_big_val(&args[0], model)?;
+                Some(SmtValue::int_from_bigint(num_bigint::BigInt::from(v)))
             }
             ChcExpr::Op(ChcOp::Int2Bv(w), args) if args.len() == 1 => {
-                match evaluate_expr(&args[0], model)? {
-                    SmtValue::Int(n) => Some(SmtValue::BitVec((n as u128) & bv_mask(*w), *w)),
-                    _ => None,
+                if *w == 0 || *w > crate::MAX_BITVECTOR_WIDTH {
+                    return None;
                 }
+                if let Some(SmtValue::Int(n)) = evaluate_expr(&args[0], model) {
+                    if *w <= 128 {
+                        return Some(SmtValue::BitVec((n as u128) & bv_mask(*w), *w));
+                    }
+                }
+                let value = eval_int_big(&args[0], model)?;
+                Some(SmtValue::bitvec_from_biguint(bigint_to_bv(value, *w), *w))
             }
 
             // Array select: select(arr, idx) → look up idx in array value
@@ -608,7 +811,8 @@ pub(crate) fn evaluate_expr(
                 Some(SmtValue::ConstArray(Box::new(v)))
             }
 
-            ChcExpr::FuncApp(name, sort, args) => eval_datatype_func_app(name, sort, args, model),
+            ChcExpr::FuncApp(name, sort, args) => eval_datatype_func_app(name, sort, args, model)
+                .or_else(|| eval_observed_uf_application(expr, model)),
 
             // Predicates, functions, etc. - cannot evaluate
             _ => None,

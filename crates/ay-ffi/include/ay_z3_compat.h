@@ -1,22 +1,22 @@
 // Copyright 2026 Andrew Yates
 // Licensed under the Apache License, Version 2.0
 //
-// AY compatibility include for the exact Z3 5.0.0 C surface.
+// AY compatibility include for the exact Z3 5.1.0 C surface.
 //
 // `z3.h` and every header it includes are byte-for-byte copies from Z3 commit
-// 8e3402b215a810a4154eb183a7dfc4e853eb2f52.  Existing AY users may keep this
+// 0b6cdcdbc65da25ef0f73ac9da210574d0f66cf8.  Existing AY users may keep this
 // include name; stock Z3 C consumers can include `z3.h` directly.
 
 #pragma once
 
 #include "z3.h"
 
-#define AY_Z3_COMPAT_REFERENCE_VERSION "5.0.0"
+#define AY_Z3_COMPAT_REFERENCE_VERSION "5.1.0"
 #define AY_Z3_COMPAT_REFERENCE_COMMIT \
-    "8e3402b215a810a4154eb183a7dfc4e853eb2f52"
+    "0b6cdcdbc65da25ef0f73ac9da210574d0f66cf8"
 
 // AY extensions. These names are deliberately outside the authenticated
-// 805-declaration Z3 5.0.0 C inventory and are not evidence of Z3 parity.
+// 805-declaration Z3 5.1.0 C inventory and are not evidence of Z3 parity.
 #ifdef __cplusplus
 extern "C" {
 #endif

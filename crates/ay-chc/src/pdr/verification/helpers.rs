@@ -180,6 +180,32 @@ impl PdrSolver {
                 Some(v) => v,
                 None => continue, // Skip if evaluation fails
             };
+
+            // A transformed BV-to-Int model may carry this predicate argument
+            // as Int/BigInt. Reconstruct it modulo the declared BV width before
+            // the generic scalar match below; never emit an Int-sorted literal
+            // on the right-hand side of a BV equality.
+            if let ChcSort::BitVec(expected_width) = &canon_var.sort {
+                let literal = match &value {
+                    SmtValue::Int(n) => SmtValue::bitvec_from_bigint((*n).into(), *expected_width)
+                        .bitvec_to_chc_expr(),
+                    SmtValue::BigInt(n) => {
+                        SmtValue::bitvec_from_bigint(n.as_ref().clone(), *expected_width)
+                            .bitvec_to_chc_expr()
+                    }
+                    value @ (SmtValue::BitVec(_, actual_width)
+                    | SmtValue::BigBitVec(_, actual_width))
+                        if actual_width == expected_width =>
+                    {
+                        value.bitvec_to_chc_expr()
+                    }
+                    _ => None,
+                };
+                if let Some(literal) = literal {
+                    conjuncts.push(ChcExpr::eq(ChcExpr::var(canon_var.clone()), literal));
+                }
+                continue;
+            }
             match value {
                 SmtValue::Int(n) => {
                     conjuncts.push(ChcExpr::eq(
@@ -203,19 +229,14 @@ impl PdrSolver {
                 }
                 SmtValue::Real(r) => {
                     use num_traits::ToPrimitive;
-                    let n = r.numer().to_i64().unwrap_or(0);
-                    let d = r.denom().to_i64().unwrap_or(1);
+                    let n = r.numer().to_i64()?;
+                    let d = r.denom().to_i64()?;
                     conjuncts.push(ChcExpr::eq(
                         ChcExpr::var(canon_var.clone()),
                         ChcExpr::Real(n, d),
                     ));
                 }
-                SmtValue::BitVec(val, width) => {
-                    conjuncts.push(ChcExpr::eq(
-                        ChcExpr::var(canon_var.clone()),
-                        ChcExpr::BitVec(val, width),
-                    ));
-                }
+                SmtValue::BitVec(..) | SmtValue::BigBitVec(..) => {}
                 // #6047: For array values, generate select-based constraints from the model.
                 SmtValue::ConstArray(_) | SmtValue::ArrayMap { .. } => {
                     if let Some(select_conjuncts) =

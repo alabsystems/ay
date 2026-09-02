@@ -98,7 +98,7 @@ impl SmtContext {
             propagated_model.insert(name.clone(), SmtValue::Int(*value));
         }
         for (name, (value, width)) in &propagated_bv_equalities {
-            propagated_model.insert(name.clone(), SmtValue::BitVec(*value, *width));
+            propagated_model.insert(name.clone(), SmtValue::bitvec_from_u128(*value, *width));
         }
 
         // Check if simplified to a constant.

@@ -12,6 +12,13 @@ use num_traits::{One, Signed, Zero};
 use thiserror::Error;
 
 use crate::{Constant, FarkasAnnotation, Symbol, TermData, TermId, TermStore, TheoryLit};
+
+/// Conflict-length bound for Farkas scratch vectors. Conflicts and their
+/// annotations are producer-controlled, so capacity hints sized by them are
+/// clamped to this (growth past the hint is normal); the one exact-length
+/// allocation (`resolve_equality_coefficient_signs`'s choice vector) fails
+/// closed at it instead.
+const MAX_FARKAS_CONFLICT_LITERALS: usize = 1 << 16;
 mod recovery;
 pub use recovery::recover_single_equality_farkas;
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -172,12 +179,12 @@ pub fn verify_farkas_signed_shape(
     let negative: Vec<_> = farkas
         .coefficients
         .iter()
+        .zip(conflict.iter())
         .enumerate()
-        .filter(|(idx, c)| {
-            **c < Rational64::from(0)
-                && conflict_positive_equality(terms, &conflict[*idx]).is_none()
+        .filter(|(_, (c, lit))| {
+            **c < Rational64::from(0) && conflict_positive_equality(terms, lit).is_none()
         })
-        .map(|(idx, coeff)| (idx, *coeff))
+        .map(|(idx, (coeff, _))| (idx, *coeff))
         .collect();
     if !negative.is_empty() {
         return Err(FarkasValidationError::NegativeCoefficients { negative });
@@ -451,10 +458,23 @@ impl PreparedFarkas {
         diseq_idx: usize,
         branch: usize,
     ) -> Vec<Vec<NormalizedConstraint>> {
-        let mut branch_alternatives = self.alternatives.clone();
-        let fixed = branch_alternatives[diseq_idx][branch].clone();
-        branch_alternatives[diseq_idx] = vec![fixed];
-        branch_alternatives
+        // The disequality row carries exactly its two strict branches by
+        // construction (`prepare_farkas_combination`); destructuring keeps
+        // that bound local instead of indexing on it.
+        self.alternatives
+            .iter()
+            .enumerate()
+            .map(|(idx, alts)| match alts.as_slice() {
+                [first, second] if idx == diseq_idx => {
+                    vec![if branch == 0 {
+                        first.clone()
+                    } else {
+                        second.clone()
+                    }]
+                }
+                _ => alts.clone(),
+            })
+            .collect()
     }
 }
 
@@ -494,10 +514,11 @@ fn prepare_farkas_combination(
         .map(rational64_to_bigrational)
         .collect();
 
-    let mut alternatives: Vec<Vec<NormalizedConstraint>> = Vec::with_capacity(conflict.len());
+    let mut alternatives: Vec<Vec<NormalizedConstraint>> =
+        Vec::with_capacity(conflict.len().min(MAX_FARKAS_CONFLICT_LITERALS));
     let mut disequality_indices: Vec<usize> = Vec::new();
-    for (idx, lit) in conflict.iter().enumerate() {
-        if lambdas[idx].is_zero() {
+    for (idx, (lit, lambda)) in conflict.iter().zip(lambdas.iter()).enumerate() {
+        if lambda.is_zero() {
             // Zero-weight literal: contributes nothing to the combination,
             // so its shape (incl. non-arithmetic context literals appended
             // by shared-reason augmentation) must not fail validation.
@@ -649,10 +670,10 @@ fn conflict_positive_equality(terms: &TermStore, lit: &TheoryLit) -> Option<(Ter
         value = !value;
     }
     if let TermData::App(Symbol::Named(name), args) = terms.get(term) {
-        if args.len() == 2 {
+        if let &[a, b] = args.as_slice() {
             let asserts_equality = (name == "=" && value) || (name == "distinct" && !value);
             if asserts_equality {
-                return Some((args[0], args[1]));
+                return Some((a, b));
             }
         }
     }
@@ -741,9 +762,9 @@ fn build_congruence_closure(terms: &TermStore, conflict: &[TheoryLit]) -> TermUn
     // like `f(g(a)) ≡ f(g(b))` once `g(a) ≡ g(b)` is established).
     loop {
         let mut changed = false;
-        for i in 0..apps.len() {
-            for j in (i + 1)..apps.len() {
-                let (a, b) = (apps[i], apps[j]);
+        let mut tail = apps.as_slice();
+        while let &[a, ref rest @ ..] = tail {
+            for &b in rest {
                 if uf.find(a) == uf.find(b) {
                     continue;
                 }
@@ -752,6 +773,7 @@ fn build_congruence_closure(terms: &TermStore, conflict: &[TheoryLit]) -> TermUn
                     changed = true;
                 }
             }
+            tail = rest;
         }
         if !changed {
             break;
@@ -793,10 +815,11 @@ fn disequality_difference(
         term = *inner;
     }
     let (lhs, rhs) = match terms.get(term) {
-        TermData::App(Symbol::Named(name), args)
-            if (name == "=" || name == "distinct") && args.len() == 2 =>
-        {
-            (args[0], args[1])
+        TermData::App(Symbol::Named(name), args) if name == "=" || name == "distinct" => {
+            match args.as_slice() {
+                &[lhs, rhs] => (lhs, rhs),
+                _ => return Err(FarkasValidationError::NonArithmeticLiteral { term }),
+            }
         }
         _ => return Err(FarkasValidationError::NonArithmeticLiteral { term }),
     };
@@ -844,11 +867,19 @@ fn farkas_combination_contradicts(
     } else {
         // Too many combinations — try only the first alternative for each
         // literal (fast path).  If that succeeds, accept the certificate.
+        // Every branch carries one scaled row and strict flag per candidate,
+        // at least two of each by construction (`build_scaled_plan` folds
+        // single-candidate positions into `base`); destructuring keeps that
+        // bound local instead of indexing on it.
         let mut sum = plan.base.clone();
         let mut strict = plan.base_strict;
         for branch in &plan.branches {
-            sum.add_expr(&branch.scaled[0]);
-            strict = strict || branch.strict[0];
+            if let ([first, ..], [first_strict, ..]) =
+                (branch.scaled.as_slice(), branch.strict.as_slice())
+            {
+                sum.add_expr(first);
+                strict = strict || *first_strict;
+            }
         }
         if is_contradiction(&sum, strict) {
             return true;
@@ -856,19 +887,31 @@ fn farkas_combination_contradicts(
         // Try the second alternative for each equality literal one at a time.
         // `sum` already holds the all-first combination, so each variant is one
         // row swapped out and one swapped in — not a rebuild from scratch.
-        for flipped in 0..plan.branches.len() {
-            let branch = &plan.branches[flipped];
-            sum.sub_expr(&branch.scaled[0]);
-            sum.add_expr(&branch.scaled[1]);
+        for (flipped, branch) in plan.branches.iter().enumerate() {
+            let [first, second, ..] = branch.scaled.as_slice() else {
+                continue;
+            };
+            sum.sub_expr(first);
+            sum.add_expr(second);
             let strict2 = plan.base_strict
                 || plan
                     .branches
                     .iter()
                     .enumerate()
-                    .any(|(i, b)| b.strict[usize::from(i == flipped)]);
+                    .any(|(i, b)| match b.strict.as_slice() {
+                        [s0, s1, ..] => {
+                            if i == flipped {
+                                *s1
+                            } else {
+                                *s0
+                            }
+                        }
+                        [s0] => *s0,
+                        [] => false,
+                    });
             let hit = is_contradiction(&sum, strict2);
-            sum.sub_expr(&branch.scaled[1]);
-            sum.add_expr(&branch.scaled[0]);
+            sum.sub_expr(second);
+            sum.add_expr(first);
             if hit {
                 return true;
             }
@@ -912,13 +955,20 @@ fn equality_elimination_contradicts(
         if lambda.is_zero() {
             continue;
         }
-        if alts.len() >= 2 {
-            // Equality literal (two non-strict orientations): sign-free
-            // multiplier, so only the expression's span matters.
-            equalities.push(alts[0].expr.clone());
-        } else {
-            base.add_scaled(&alts[0].expr, lambda);
-            strict = strict || alts[0].strict;
+        // `split_first` instead of slice patterns: the arity discrimination
+        // stays total without the index projections whose bounds the L0
+        // prover loses.
+        match alts.split_first() {
+            Some((first, rest)) if !rest.is_empty() => {
+                // Equality literal (two non-strict orientations): sign-free
+                // multiplier, so only the expression's span matters.
+                equalities.push(first.expr.clone());
+            }
+            Some((only, _)) => {
+                base.add_scaled(&only.expr, lambda);
+                strict = strict || only.strict;
+            }
+            None => {}
         }
     }
 
@@ -927,15 +977,16 @@ fn equality_elimination_contradicts(
     let mut pivots: Vec<(TermId, LinearExpr)> = Vec::new();
     for mut row in equalities {
         for (v, p) in &pivots {
-            if let Some(c) = row.coeffs.get(v).cloned() {
-                let factor = -c / &p.coeffs[v];
+            if let (Some(c), Some(pivot_coeff)) = (row.coeffs.get(v).cloned(), p.coeffs.get(v)) {
+                let factor = -c / pivot_coeff;
                 row.add_scaled(p, &factor);
             }
         }
-        if let Some((&v, _)) = row.coeffs.iter().next() {
+        if let Some((&v, head_coeff)) = row.coeffs.iter().next() {
+            let head_coeff = head_coeff.clone();
             for (_, p) in pivots.iter_mut() {
                 if let Some(c) = p.coeffs.get(&v).cloned() {
-                    let factor = -c / &row.coeffs[&v];
+                    let factor = -c / &head_coeff;
                     p.add_scaled(&row, &factor);
                 }
             }
@@ -947,8 +998,8 @@ fn equality_elimination_contradicts(
     }
 
     for (v, p) in &pivots {
-        if let Some(c) = base.coeffs.get(v).cloned() {
-            let factor = -c / &p.coeffs[v];
+        if let (Some(c), Some(pivot_coeff)) = (base.coeffs.get(v).cloned(), p.coeffs.get(v)) {
+            let factor = -c / pivot_coeff;
             base.add_scaled(p, &factor);
         }
     }
@@ -964,7 +1015,9 @@ fn farkas_diagnostics(
     let mut sum = LinearExpr::zero();
     let mut strict = false;
     for (alts, lambda) in alternatives.iter().zip(lambdas.iter()) {
-        let alt = &alts[0];
+        let Some(alt) = alts.first() else {
+            continue;
+        };
         sum.add_scaled(&alt.expr, lambda);
         strict = strict || (!lambda.is_zero() && alt.strict);
     }
@@ -1000,20 +1053,23 @@ pub(crate) fn parse_linear_expr(terms: &TermStore, term: TermId) -> LinearExpr {
                 }
                 result
             }
-            "-" if args.len() == 1 => {
-                let mut result = parse_linear_expr(terms, args[0]);
-                result.negate();
-                result
-            }
-            "-" if args.len() >= 2 => {
-                let mut result = parse_linear_expr(terms, args[0]);
-                for &arg in &args[1..] {
-                    let mut sub = parse_linear_expr(terms, arg);
-                    sub.negate();
-                    result.add_scaled(&sub, &BigRational::one());
+            "-" => match args.as_slice() {
+                &[only] => {
+                    let mut result = parse_linear_expr(terms, only);
+                    result.negate();
+                    result
                 }
-                result
-            }
+                [first, rest @ ..] => {
+                    let mut result = parse_linear_expr(terms, *first);
+                    for &arg in rest {
+                        let mut sub = parse_linear_expr(terms, arg);
+                        sub.negate();
+                        result.add_scaled(&sub, &BigRational::one());
+                    }
+                    result
+                }
+                [] => LinearExpr::var(term),
+            },
             "*" => {
                 let mut const_part = BigRational::one();
                 let mut non_const: Option<LinearExpr> = None;
@@ -1037,17 +1093,20 @@ pub(crate) fn parse_linear_expr(terms: &TermStore, term: TermId) -> LinearExpr {
                     None => LinearExpr::constant(const_part),
                 }
             }
-            "/" if args.len() == 2 => {
-                let mut numerator = parse_linear_expr(terms, args[0]);
-                let denominator = parse_linear_expr(terms, args[1]);
-                if denominator.is_constant() && !denominator.constant.is_zero() {
-                    let inv = BigRational::one() / denominator.constant;
-                    numerator.scale(&inv);
-                    numerator
-                } else {
-                    LinearExpr::var(term)
+            "/" => match args.as_slice() {
+                &[num, den] => {
+                    let mut numerator = parse_linear_expr(terms, num);
+                    let denominator = parse_linear_expr(terms, den);
+                    if denominator.is_constant() && !denominator.constant.is_zero() {
+                        let inv = BigRational::one() / denominator.constant;
+                        numerator.scale(&inv);
+                        numerator
+                    } else {
+                        LinearExpr::var(term)
+                    }
                 }
-            }
+                _ => LinearExpr::var(term),
+            },
             _ => LinearExpr::var(term),
         },
         TermData::App(_, _) => LinearExpr::var(term),
@@ -1066,9 +1125,10 @@ fn normalized_constraint_alternatives(
     }
 
     let (pred, lhs, rhs) = match terms.get(term) {
-        TermData::App(Symbol::Named(name), args) if args.len() == 2 => {
-            (name.as_str(), args[0], args[1])
-        }
+        TermData::App(Symbol::Named(name), args) => match args.as_slice() {
+            &[lhs, rhs] => (name.as_str(), lhs, rhs),
+            _ => return Err(FarkasValidationError::NonArithmeticLiteral { term }),
+        },
         _ => return Err(FarkasValidationError::NonArithmeticLiteral { term }),
     };
 
@@ -1249,9 +1309,10 @@ pub fn resolve_equality_coefficient_signs(
         .map(rational64_to_bigrational)
         .collect();
 
-    let mut alternatives: Vec<Vec<NormalizedConstraint>> = Vec::with_capacity(conflict.len());
-    for (idx, lit) in conflict.iter().enumerate() {
-        if lambdas[idx].is_zero() {
+    let mut alternatives: Vec<Vec<NormalizedConstraint>> =
+        Vec::with_capacity(conflict.len().min(MAX_FARKAS_CONFLICT_LITERALS));
+    for (lit, lambda) in conflict.iter().zip(lambdas.iter()) {
+        if lambda.is_zero() {
             alternatives.push(vec![NormalizedConstraint {
                 expr: LinearExpr::zero(),
                 strict: false,
@@ -1276,6 +1337,12 @@ pub fn resolve_equality_coefficient_signs(
         return None;
     }
 
+    // Exact-length allocation, not a capacity hint: an oversized conflict
+    // cannot be absorbed by growth, so it fails closed like every other
+    // unsupported shape here.
+    if alternatives.len() > MAX_FARKAS_CONFLICT_LITERALS {
+        return None;
+    }
     let mut choice = vec![0usize; alternatives.len()];
     if !search_recording_choice(&alternatives, &lambdas, &mut choice) {
         return None;

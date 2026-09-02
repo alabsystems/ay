@@ -21,8 +21,9 @@ use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
 use ay_chc::{
-    engines, AdaptiveConfig, AdaptivePortfolio, BudgetPolicy, ChcProblem, EngineType,
-    InvariantModel, LemmaHint, PdrConfig, VerifiedChcResult,
+    engines, AdaptiveConfig, AdaptiveExecutionMode, AdaptivePortfolio, BudgetPolicy,
+    CancellationToken, ChcProblem, ChcProofRunWithBudgetReport, ChcQueryObligation,
+    ChcQueryObligationId, EngineType, InvariantModel, LemmaHint, PdrConfig, VerifiedChcResult,
 };
 
 use crate::proof::ProofRun;
@@ -76,7 +77,7 @@ pub enum ProofMode {
 /// The single shared invocation config.
 ///
 /// Both model-checker-consumer and ty construct one of these and call [`solve`]. Defaults:
-/// `Engine::Auto`, no timeout, `ProofMode::None`.
+/// `Engine::Auto`, no timeout, `ProofMode::None`, adaptive/parallel execution.
 #[derive(Debug, Clone)]
 pub struct EncodeConfig {
     /// Engine selection (default [`Engine::Auto`]).
@@ -107,16 +108,32 @@ pub struct EncodeConfig {
     /// e.g. accumulator bounds `acc <= i * per_max` — that PDR's own
     /// generalization struggles to discover.
     pub lemma_hints: Vec<LemmaHint>,
+    /// Portfolio scheduling policy (default adaptive/parallel).
+    ///
+    /// Select [`AdaptiveExecutionMode::DeterministicSequential`] for stable
+    /// regression measurements: engines run in the canonical fixed order and
+    /// receive deterministic shares of the total timeout.
+    pub execution_mode: AdaptiveExecutionMode,
+    /// Per-portfolio term-store budget in bytes.
+    ///
+    /// Set this when multiple model-checker jobs may coexist in one process;
+    /// `None` uses AY's process-level default.
+    pub memory_budget: Option<usize>,
 }
 
 impl Default for EncodeConfig {
     fn default() -> Self {
+        // Preserve AY_DETERMINISTIC for consumers that enter through the
+        // shared ay-encode facade rather than constructing AdaptiveConfig.
+        let execution_mode = AdaptiveConfig::default().execution_mode();
         Self {
             engine: Engine::Auto,
             timeout: None,
             proof_mode: ProofMode::None,
             strict_validation: false,
             lemma_hints: Vec::new(),
+            execution_mode,
+            memory_budget: None,
         }
     }
 }
@@ -168,6 +185,20 @@ impl EncodeConfig {
         self
     }
 
+    /// Select the adaptive portfolio scheduling policy.
+    #[must_use]
+    pub fn with_execution_mode(mut self, mode: AdaptiveExecutionMode) -> Self {
+        self.execution_mode = mode;
+        self
+    }
+
+    /// Bound term-store memory for each adaptive portfolio invocation.
+    #[must_use]
+    pub fn with_memory_budget(mut self, bytes: usize) -> Self {
+        self.memory_budget = Some(bytes);
+        self
+    }
+
     /// Lower to an [`ay_chc::AdaptiveConfig`] for the portfolio path.
     ///
     /// Applies the timeout as the time budget, forces the chosen engine to the
@@ -194,6 +225,10 @@ impl EncodeConfig {
         // Same validated-candidate hint channel as the PDR path.
         if !self.lemma_hints.is_empty() {
             cfg = cfg.with_user_hints(self.lemma_hints.clone());
+        }
+        cfg = cfg.with_execution_mode(self.execution_mode);
+        if let Some(bytes) = self.memory_budget {
+            cfg = cfg.with_memory_budget(bytes);
         }
         cfg
     }
@@ -239,6 +274,28 @@ impl EncodeConfig {
 /// [`ProofMode::Strict`] Safe path the proof run's transcript is captured into a
 /// [`crate::proof::Certificate`] and threaded onto [`AyVerdict::Proved`].
 pub fn solve(problem: ChcProblem, config: &EncodeConfig) -> crate::Result<AyVerdict> {
+    solve_impl(problem, config, None)
+}
+
+/// Run one solve linked to a caller-owned cooperative-cancellation token.
+///
+/// The caller may cancel `parent` from another thread or arm it with
+/// [`CancellationToken::cancel_after`]. Cancellation is fail-closed: an
+/// in-flight solve winds down as `Unknown` and can never become Safe or Unsafe
+/// merely because cancellation was requested.
+pub fn solve_with_cancellation(
+    problem: ChcProblem,
+    config: &EncodeConfig,
+    parent: &CancellationToken,
+) -> crate::Result<AyVerdict> {
+    solve_impl(problem, config, Some(parent))
+}
+
+fn solve_impl(
+    problem: ChcProblem,
+    config: &EncodeConfig,
+    cancellation: Option<&CancellationToken>,
+) -> crate::Result<AyVerdict> {
     match config.proof_mode {
         ProofMode::None => {
             // Catch AY-classified solver panics on the portfolio path and map
@@ -246,7 +303,15 @@ pub fn solve(problem: ChcProblem, config: &EncodeConfig) -> crate::Result<AyVerd
             // error) panics re-propagate. The `Strict` path already runs under
             // `ay_chc::engines::solve_pdr_proof`'s own `catch_ay_panics`, so it
             // needs no extra wrapper here.
-            let portfolio = AdaptivePortfolio::new(problem, config.to_adaptive_config());
+            let adaptive_config = config.to_adaptive_config();
+            let portfolio = match cancellation {
+                Some(parent) => AdaptivePortfolio::new_for_solve_with_cancellation(
+                    problem,
+                    adaptive_config,
+                    parent,
+                ),
+                None => AdaptivePortfolio::new_for_solve(problem, adaptive_config),
+            };
             let raw: VerifiedChcResult =
                 ay_core::catch_ay_panics(AssertUnwindSafe(|| Ok(portfolio.solve())), |reason| {
                     Err(crate::EncodeError::SolverPanicked(reason))
@@ -254,7 +319,7 @@ pub fn solve(problem: ChcProblem, config: &EncodeConfig) -> crate::Result<AyVerd
             Ok(crate::verdict::from_verified(raw, None))
         }
         ProofMode::Strict => {
-            let run: ProofRun = solve_with_proof(problem, config)?;
+            let run: ProofRun = solve_with_proof_impl(problem, config, cancellation)?;
             // On the Safe path attach the re-checkable certificate built from
             // the proof run's transcript; on Unsafe/Unknown there is no proof
             // artifact and `from_verified` ignores the `None`. Mirror the raw
@@ -270,6 +335,178 @@ pub fn solve(problem: ChcProblem, config: &EncodeConfig) -> crate::Result<AyVerd
     }
 }
 
+/// Result for one independently solved safety query.
+///
+/// Errors and `Unknown` verdicts are local to this obligation; they do not
+/// prevent later obligations in the batch from running.
+#[derive(Debug)]
+#[must_use = "each per-query result must be consumed"]
+pub struct QueryObligationOutcome {
+    id: ChcQueryObligationId,
+    outcome: crate::Result<AyVerdict>,
+}
+
+impl QueryObligationOutcome {
+    /// Stable identity copied from the source problem's query slice.
+    pub fn id(&self) -> &ChcQueryObligationId {
+        &self.id
+    }
+
+    /// Borrow the verdict or invocation error for this query.
+    pub fn outcome(&self) -> &crate::Result<AyVerdict> {
+        &self.outcome
+    }
+
+    /// Consume this row and return its identity and outcome.
+    pub fn into_parts(self) -> (ChcQueryObligationId, crate::Result<AyVerdict>) {
+        (self.id, self.outcome)
+    }
+}
+
+/// Solve every active query independently and return all partial results.
+///
+/// [`ChcProblem::query_obligations`] unfolds the common nullary aggregate
+/// marker and backwards-slices each property before this function invokes AY.
+/// Results stay in deterministic source-clause order.  A timeout, `Unknown`,
+/// or solver error for one property is recorded in that row and does not block
+/// later properties.
+///
+/// Each row preserves `config`'s dispatch semantics: [`ProofMode::None`] keeps
+/// the caller-selected adaptive or deterministic routing, while
+/// [`ProofMode::Strict`] remains the same direct-PDR route as [`solve`]. AY
+/// synchronously cancels and reaps every worker before an invocation returns,
+/// so source-ordered row `i + 1` never overlaps hidden solver workers from row
+/// `i` or multiplies the configured portfolio memory envelope.
+///
+/// `EncodeConfig::timeout` is a **per-obligation** budget here.  Consequently a
+/// batch of `N` difficult queries can consume up to `N * timeout`; callers that
+/// need a batch-wide deadline should combine this API with cooperative
+/// cancellation. Invalid input, including a problem with no query, returns a
+/// typed [`crate::EncodeError::Chc`]. `Ok([])` is reserved for a validated
+/// problem whose queries were all simplified away as vacuously Safe.
+pub fn solve_query_obligations(
+    problem: &ChcProblem,
+    config: &EncodeConfig,
+) -> crate::Result<Vec<QueryObligationOutcome>> {
+    let obligations = problem.query_obligations()?;
+    Ok(collect_query_obligation_outcomes_with(
+        obligations,
+        |problem| solve(problem, config),
+    ))
+}
+
+/// Solve every active query independently under one caller-owned cancellation
+/// token, preserving one partial-result row per surviving query.
+///
+/// A cancellation request reaches the obligation currently in flight. Any
+/// later obligation is recorded as [`crate::EncodeError::Cancelled`] without
+/// starting another portfolio. A caller can impose a batch-wide wall clock by
+/// keeping the guard returned by [`CancellationToken::cancel_after`] alive for
+/// this call; `EncodeConfig::timeout` remains the per-obligation cap.
+pub fn solve_query_obligations_with_cancellation(
+    problem: &ChcProblem,
+    config: &EncodeConfig,
+    parent: &CancellationToken,
+) -> crate::Result<Vec<QueryObligationOutcome>> {
+    let obligations = problem.query_obligations()?;
+    Ok(collect_query_obligation_outcomes_with(
+        obligations,
+        |problem| {
+            if parent.is_cancelled() {
+                Err(crate::EncodeError::Cancelled)
+            } else {
+                solve_with_cancellation(problem, config, parent)
+            }
+        },
+    ))
+}
+
+/// Apply one solver invocation to every already-validated obligation.
+///
+/// Kept crate-private so tests can inject `Unknown` and error outcomes without
+/// relying on timeouts, while production uses the same non-short-circuiting
+/// collection path.
+pub(crate) fn collect_query_obligation_outcomes_with<F>(
+    obligations: Vec<ChcQueryObligation>,
+    mut solve_one: F,
+) -> Vec<QueryObligationOutcome>
+where
+    F: FnMut(ChcProblem) -> crate::Result<AyVerdict>,
+{
+    obligations
+        .into_iter()
+        .map(|obligation| {
+            let (id, problem) = obligation.into_parts();
+            QueryObligationOutcome {
+                id,
+                outcome: solve_one(problem),
+            }
+        })
+        .collect()
+}
+
+/// Run one adaptive solve and return its sealed proof artifacts, stop reason,
+/// cancellation state, and whole-run timing atomically.
+///
+/// Unlike calling [`solve`] and a diagnostic solve separately, every field in
+/// this bundle describes the invocation that produced the bound verdict.
+/// Per-engine budget entries are currently empty because the legacy reporting
+/// path uses a different set of prepasses; AY will not substitute that path for
+/// the authoritative production solve just to manufacture attribution.
+/// Dispatch exactly mirrors [`solve`]: [`ProofMode::None`] uses the adaptive
+/// production portfolio, while [`ProofMode::Strict`] uses the proof-grade
+/// direct-PDR entry point. Neither branch performs a diagnostic re-run.
+pub fn solve_with_proof_report(
+    problem: ChcProblem,
+    config: &EncodeConfig,
+) -> crate::Result<ChcProofRunWithBudgetReport> {
+    solve_with_proof_report_impl(problem, config, None)
+}
+
+/// Authoritative proof/report solve linked to a caller-owned cancellation
+/// token. The returned bundle records the token's completion-boundary snapshot
+/// together with the exact problem-bound result from that same invocation.
+pub fn solve_with_proof_report_with_cancellation(
+    problem: ChcProblem,
+    config: &EncodeConfig,
+    parent: &CancellationToken,
+) -> crate::Result<ChcProofRunWithBudgetReport> {
+    solve_with_proof_report_impl(problem, config, Some(parent))
+}
+
+fn solve_with_proof_report_impl(
+    problem: ChcProblem,
+    config: &EncodeConfig,
+    cancellation: Option<&CancellationToken>,
+) -> crate::Result<ChcProofRunWithBudgetReport> {
+    match config.proof_mode {
+        ProofMode::None => {
+            let adaptive_config = config.to_adaptive_config();
+            let portfolio = match cancellation {
+                Some(parent) => AdaptivePortfolio::new_for_solve_with_cancellation(
+                    problem,
+                    adaptive_config,
+                    parent,
+                ),
+                None => AdaptivePortfolio::new_for_solve(problem, adaptive_config),
+            };
+            ay_core::catch_ay_panics(
+                AssertUnwindSafe(|| Ok(portfolio.solve_proof_run_with_budget_report())),
+                |reason| Err(crate::EncodeError::SolverPanicked(reason)),
+            )
+        }
+        ProofMode::Strict => {
+            let mut pdr_config = config.to_pdr_config();
+            if let Some(parent) = cancellation {
+                pdr_config.cancellation_token = Some(parent.child());
+            }
+            Ok(engines::solve_pdr_proof_with_budget_report(
+                problem, pdr_config,
+            )?)
+        }
+    }
+}
+
 /// Run the PDR proof engine and return the raw proof run for [`crate::proof`]
 /// to digest. Forces `strict_proofs` (via `solve_pdr_proof`'s contract) and a
 /// fresh re-validation.
@@ -280,7 +517,19 @@ pub fn solve(problem: ChcProblem, config: &EncodeConfig) -> crate::Result<AyVerd
 /// an inconclusive or unvalidated search comes back as a `ProofRun` whose result
 /// is `Unknown` (and `accepted_as_proof() == false`).
 pub fn solve_with_proof(problem: ChcProblem, config: &EncodeConfig) -> crate::Result<ProofRun> {
-    let run = engines::solve_pdr_proof(problem, config.to_pdr_config())?;
+    solve_with_proof_impl(problem, config, None)
+}
+
+fn solve_with_proof_impl(
+    problem: ChcProblem,
+    config: &EncodeConfig,
+    cancellation: Option<&CancellationToken>,
+) -> crate::Result<ProofRun> {
+    let mut pdr_config = config.to_pdr_config();
+    if let Some(parent) = cancellation {
+        pdr_config.cancellation_token = Some(parent.child());
+    }
+    let run = engines::solve_pdr_proof(problem, pdr_config)?;
     Ok(ProofRun::new(run))
 }
 

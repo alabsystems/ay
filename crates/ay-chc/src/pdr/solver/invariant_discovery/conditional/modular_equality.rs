@@ -4,15 +4,215 @@
 
 use super::*;
 
+mod candidates;
+
+#[cfg(test)]
+mod tests;
+
+use candidates::{MAX_MODULAR_EQUALITY_MODULUS, MODULAR_EQUALITY_SCAN_NODE_BUDGET};
+
+const MODULAR_EQUALITY_DISCOVERY_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(500);
+const MODULAR_EQUALITY_SMT_CALL_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+const MAX_CASE_SPLIT_MODULUS: i128 = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModularEqualityDomain {
+    Int,
+    BitVec(u32),
+}
+
+impl ModularEqualityDomain {
+    fn from_sorts(lhs: &ChcSort, rhs: &ChcSort) -> Option<Self> {
+        match (lhs, rhs) {
+            (ChcSort::Int, ChcSort::Int) => Some(Self::Int),
+            (ChcSort::BitVec(lhs_width), ChcSort::BitVec(rhs_width))
+                if lhs_width == rhs_width && *lhs_width > 0 =>
+            {
+                Some(Self::BitVec(*lhs_width))
+            }
+            _ => None,
+        }
+    }
+
+    fn supports_modulus(self, modulus: i128) -> bool {
+        if !(2..=MAX_MODULAR_EQUALITY_MODULUS).contains(&modulus) {
+            return false;
+        }
+        match self {
+            Self::Int => true,
+            Self::BitVec(width) if width >= 128 => true,
+            Self::BitVec(width) => (modulus as u128) < (1u128 << width),
+        }
+    }
+
+    fn supports_init_value(self, value: i128) -> bool {
+        match self {
+            Self::Int => true,
+            Self::BitVec(_) if value < 0 => false,
+            Self::BitVec(width) if width >= 128 => true,
+            Self::BitVec(width) => (value as u128) < (1u128 << width),
+        }
+    }
+
+    fn constant(self, value: i128) -> ChcExpr {
+        match self {
+            Self::Int => ChcExpr::Int(value),
+            Self::BitVec(width) => ChcExpr::BitVec(value as u128, width),
+        }
+    }
+
+    fn remainder(self, dividend: ChcExpr, modulus: i128) -> ChcExpr {
+        match self {
+            Self::Int => ChcExpr::mod_op(dividend, ChcExpr::Int(modulus)),
+            Self::BitVec(width) => {
+                ChcExpr::bv_urem(dividend, ChcExpr::BitVec(modulus as u128, width))
+            }
+        }
+    }
+}
+
+struct ModularClauseQuery<'a> {
+    domain: ModularEqualityDomain,
+    body_i: &'a ChcExpr,
+    body_j: &'a ChcExpr,
+    head_i: &'a ChcExpr,
+    head_j: &'a ChcExpr,
+    constraint: &'a ChcExpr,
+    modulus: i128,
+    lhs_name: &'a str,
+    rhs_name: &'a str,
+}
+
+struct ModularDiscoveryPair<'a> {
+    predicate: PredicateId,
+    lhs_index: usize,
+    rhs_index: usize,
+    lhs: &'a ChcVar,
+    rhs: &'a ChcVar,
+    domain: ModularEqualityDomain,
+    lhs_init: i128,
+    rhs_init: i128,
+    start: ay_core::time::Instant,
+}
+
 impl PdrSolver {
+    fn discover_modular_equality_pair(
+        &mut self,
+        pair: &ModularDiscoveryPair<'_>,
+        moduli: &[i128],
+    ) -> bool {
+        for &k in moduli {
+            if !pair.domain.supports_modulus(k)
+                || pair.rhs_init < 0
+                || pair.rhs_init >= k
+                || pair.lhs_init.rem_euclid(k) != pair.rhs_init
+            {
+                continue;
+            }
+            if self.config.verbose {
+                safe_eprintln!(
+                    "PDR: Testing modular equality ({} mod {}) = {} (init: {} mod {} = {})",
+                    pair.lhs.name,
+                    k,
+                    pair.rhs.name,
+                    pair.lhs_init,
+                    k,
+                    pair.rhs_init
+                );
+            }
+            if self.is_cancelled() || pair.start.elapsed() >= MODULAR_EQUALITY_DISCOVERY_BUDGET {
+                return false;
+            }
+            if !self.is_modular_equality_preserved_by_transitions(
+                pair.predicate,
+                pair.lhs_index,
+                pair.rhs_index,
+                k,
+                Some(pair.start),
+            ) {
+                continue;
+            }
+
+            let invariant = ChcExpr::eq(
+                pair.domain.remainder(ChcExpr::var((*pair.lhs).clone()), k),
+                ChcExpr::var((*pair.rhs).clone()),
+            );
+            if self.config.verbose {
+                safe_eprintln!(
+                    "PDR: Discovered modular equality invariant for pred {}: ({} mod {}) = {}",
+                    pair.predicate.index(),
+                    pair.lhs.name,
+                    k,
+                    pair.rhs.name
+                );
+            }
+            self.add_discovered_invariant_algebraic(pair.predicate, invariant, 1);
+        }
+        true
+    }
+
+    fn discover_modular_equality_pairs(
+        &mut self,
+        predicate: PredicateId,
+        canonical_vars: &[ChcVar],
+        moduli: &[i128],
+        start: ay_core::time::Instant,
+    ) -> bool {
+        let init_values = self.get_init_values(predicate);
+        for lhs_index in 0..canonical_vars.len() {
+            for rhs_index in 0..canonical_vars.len() {
+                if lhs_index == rhs_index {
+                    continue;
+                }
+                let lhs = &canonical_vars[lhs_index];
+                let rhs = &canonical_vars[rhs_index];
+                let Some(domain) = ModularEqualityDomain::from_sorts(&lhs.sort, &rhs.sort) else {
+                    continue;
+                };
+                let (Some(lhs_init), Some(rhs_init)) = (
+                    init_values
+                        .get(&lhs.name)
+                        .filter(|bounds| bounds.min == bounds.max)
+                        .map(|bounds| bounds.min),
+                    init_values
+                        .get(&rhs.name)
+                        .filter(|bounds| bounds.min == bounds.max)
+                        .map(|bounds| bounds.min),
+                ) else {
+                    continue;
+                };
+                if !domain.supports_init_value(lhs_init) || !domain.supports_init_value(rhs_init) {
+                    continue;
+                }
+                let pair = ModularDiscoveryPair {
+                    predicate,
+                    lhs_index,
+                    rhs_index,
+                    lhs,
+                    rhs,
+                    domain,
+                    lhs_init,
+                    rhs_init,
+                    start,
+                };
+                if !self.discover_modular_equality_pair(&pair, moduli) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Discover modular equality invariants proactively before the PDR loop starts.
     ///
-    /// For each predicate with fact clauses, finds pairs of integer variables (vi, vj) where:
+    /// For each predicate with fact clauses, finds same-domain `Int` or `BitVec`
+    /// variable pairs `(vi, vj)` where:
     /// 1. (vi mod k) = vj at init (where vj is in range [0, k-1])
     /// 2. The modular equality is preserved by all self-transitions
     ///
-    /// This captures patterns like: (counter mod 2) = toggle_flag
-    /// where counter increments by 1 and toggle_flag alternates between 0 and 1.
+    /// This captures counter/residue and ring-buffer state machines. Candidate
+    /// moduli come from the predicate's own transitions, never a static list.
     pub(in crate::pdr::solver) fn discover_modular_equality_invariants(&mut self) {
         if self.config.verbose {
             safe_eprintln!("PDR: Searching for modular equality invariants");
@@ -22,14 +222,16 @@ impl PdrSolver {
         // Each SMT call can take up to 500ms; with O(n^2) variable pairs this
         // can consume multiple seconds. Cap total time to leave budget for the
         // main blocking loop and verify_model.
-        const MODULAR_EQ_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
         let mod_eq_start = ay_core::time::Instant::now();
 
         let predicates: Vec<_> = self.problem.predicates().to_vec();
-        // Only check small moduli - larger ones are unlikely to be useful
-        let moduli = [2i128];
+        let mut remaining_scan_nodes = MODULAR_EQUALITY_SCAN_NODE_BUDGET;
 
         for pred in &predicates {
+            if self.is_cancelled() || mod_eq_start.elapsed() >= MODULAR_EQUALITY_DISCOVERY_BUDGET {
+                return;
+            }
+
             // Skip predicates without fact clauses (no initial state)
             if !self.predicate_has_facts(pred.id) {
                 continue;
@@ -40,89 +242,25 @@ impl PdrSolver {
                 None => continue,
             };
 
-            // Get initial values for this predicate
-            let init_values = self.get_init_values(pred.id);
+            // Derive a small, stable set of moduli from this predicate's own
+            // self-transitions.  Exhausting the structural scan budget rejects
+            // the remainder of discovery instead of using a partial scan.
+            let Some(moduli) =
+                self.data_driven_modular_equality_moduli(pred.id, &mut remaining_scan_nodes)
+            else {
+                return;
+            };
+            if moduli.is_empty() {
+                continue;
+            }
 
-            // Find pairs where (var_i mod k) = var_j at init
-            for i in 0..canonical_vars.len() {
-                for j in 0..canonical_vars.len() {
-                    if i == j {
-                        continue;
-                    }
-
-                    let var_i = &canonical_vars[i];
-                    let var_j = &canonical_vars[j];
-
-                    // Only check integer variables
-                    if !matches!(var_i.sort, ChcSort::Int) || !matches!(var_j.sort, ChcSort::Int) {
-                        continue;
-                    }
-
-                    // Check if both have constant initial values
-                    let init_i = match init_values.get(&var_i.name) {
-                        Some(bounds) if bounds.min == bounds.max => bounds.min,
-                        _ => continue,
-                    };
-                    let init_j = match init_values.get(&var_j.name) {
-                        Some(bounds) if bounds.min == bounds.max => bounds.min,
-                        _ => continue,
-                    };
-
-                    for &k in &moduli {
-                        // Check if (init_i mod k) = init_j
-                        // Also require init_j to be in valid range [0, k-1]
-                        if init_j < 0 || init_j >= k {
-                            continue;
-                        }
-                        if init_i.rem_euclid(k) != init_j {
-                            continue;
-                        }
-
-                        if self.config.verbose {
-                            safe_eprintln!(
-                                "PDR: Testing modular equality ({} mod {}) = {} (init: {} mod {} = {})",
-                                var_i.name, k, var_j.name, init_i, k, init_j
-                            );
-                        }
-
-                        // Budget + cancellation check before expensive SMT (#3121)
-                        if self.is_cancelled() || mod_eq_start.elapsed() >= MODULAR_EQ_BUDGET {
-                            if self.config.verbose {
-                                safe_eprintln!(
-                                    "PDR: modular equality budget exceeded ({:?}), stopping",
-                                    mod_eq_start.elapsed()
-                                );
-                            }
-                            return;
-                        }
-
-                        // Check if the modular equality is preserved by all transitions
-                        if !self.is_modular_equality_preserved_by_transitions(pred.id, i, j, k) {
-                            continue;
-                        }
-
-                        // Found a valid modular equality invariant! Add it as a lemma.
-                        let mod_expr =
-                            ChcExpr::mod_op(ChcExpr::var(var_i.clone()), ChcExpr::Int(k));
-                        let mod_eq_invariant = ChcExpr::eq(mod_expr, ChcExpr::var(var_j.clone()));
-
-                        if self.config.verbose {
-                            safe_eprintln!(
-                                "PDR: Discovered modular equality invariant for pred {}: ({} mod {}) = {}",
-                                pred.id.index(),
-                                var_i.name,
-                                k,
-                                var_j.name
-                            );
-                        }
-
-                        // Add to frame 1 (not 0, since 0 is for initial constraints).
-                        // Use algebraic path since is_modular_equality_preserved_by_transitions
-                        // already verified transition preservation. This bypasses the SMT-based
-                        // self-inductiveness check which can hang on mod expressions. (#3211)
-                        self.add_discovered_invariant_algebraic(pred.id, mod_eq_invariant, 1);
-                    }
-                }
+            if !self.discover_modular_equality_pairs(
+                pred.id,
+                &canonical_vars,
+                &moduli,
+                mod_eq_start,
+            ) {
+                return;
             }
         }
     }
@@ -132,17 +270,194 @@ impl PdrSolver {
     /// Uses SMT to check that for each transition clause:
     ///   If (body_i mod k) = body_j in pre-state,
     ///   then (head_i mod k) = head_j in post-state.
-    pub(in crate::pdr::solver) fn is_modular_equality_preserved_by_transitions(
+    #[cfg(test)]
+    fn is_modular_equality_preserved_without_budget(
         &mut self,
         predicate: PredicateId,
         idx_i: usize,
         idx_j: usize,
         k: i128,
     ) -> bool {
+        self.is_modular_equality_preserved_by_transitions(predicate, idx_i, idx_j, k, None)
+    }
+
+    fn substitute_modular_head_definitions(
+        head_args: &[ChcExpr],
+        head_i: &ChcExpr,
+        head_j: &ChcExpr,
+        clause_constraint: &ChcExpr,
+    ) -> (ChcExpr, ChcExpr) {
+        let head_var_names: Vec<&str> = head_args
+            .iter()
+            .filter_map(|arg| match arg {
+                ChcExpr::Var(var) => Some(var.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        if head_var_names.is_empty() {
+            return (head_i.clone(), head_j.clone());
+        }
+
+        let mut substitutions = Vec::new();
+        for conjunct in clause_constraint.collect_conjuncts() {
+            let ChcExpr::Op(ChcOp::Eq, ref args) = conjunct else {
+                continue;
+            };
+            if args.len() != 2 {
+                continue;
+            }
+            let definition = match (args[0].as_ref(), args[1].as_ref()) {
+                (ChcExpr::Var(var), value) if head_var_names.contains(&var.name.as_str()) => {
+                    Some(((*var).clone(), (*value).clone()))
+                }
+                (value, ChcExpr::Var(var)) if head_var_names.contains(&var.name.as_str()) => {
+                    Some(((*var).clone(), (*value).clone()))
+                }
+                _ => None,
+            };
+            if let Some(definition) = definition {
+                substitutions.push(definition);
+            }
+        }
+        if substitutions.is_empty() {
+            (head_i.clone(), head_j.clone())
+        } else {
+            (
+                head_i.substitute(&substitutions),
+                head_j.substitute(&substitutions),
+            )
+        }
+    }
+
+    fn large_modular_equality_clause_preserved(
+        smt: &mut crate::smt::SmtContext,
+        verbose: bool,
+        request: &ModularClauseQuery<'_>,
+        discovery_start: Option<ay_core::time::Instant>,
+    ) -> bool {
+        let k = request.modulus;
+        let query = ChcExpr::and_vec(vec![
+            (*request.constraint).clone(),
+            ChcExpr::eq(
+                request.domain.remainder((*request.body_i).clone(), k),
+                (*request.body_j).clone(),
+            ),
+            ChcExpr::ne(
+                request.domain.remainder((*request.head_i).clone(), k),
+                (*request.head_j).clone(),
+            ),
+        ])
+        .propagate_constants()
+        .simplify_constants();
+        if matches!(query, ChcExpr::Bool(false)) {
+            return true;
+        }
+
+        smt.reset();
+        let timeout = discovery_start.map_or(MODULAR_EQUALITY_SMT_CALL_BUDGET, |start| {
+            MODULAR_EQUALITY_DISCOVERY_BUDGET.saturating_sub(start.elapsed())
+        });
+        if timeout.is_zero() {
+            return false;
+        }
+        match smt.check_sat_with_timeout(&query, timeout.min(MODULAR_EQUALITY_SMT_CALL_BUDGET)) {
+            SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => true,
+            SmtResult::Sat(_) => {
+                if verbose {
+                    safe_eprintln!(
+                        "PDR: Modular equality ({} mod {k}) = {} NOT preserved",
+                        request.lhs_name,
+                        request.rhs_name
+                    );
+                }
+                false
+            }
+            SmtResult::Unknown => {
+                if verbose {
+                    safe_eprintln!(
+                        "PDR: Modular equality ({} mod {k}) = {} Unknown",
+                        request.lhs_name,
+                        request.rhs_name
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    fn modular_equality_case_query(request: &ModularClauseQuery<'_>, residue: i128) -> ChcExpr {
+        let k = request.modulus;
+        let query = ChcExpr::and_vec(vec![
+            (*request.constraint).clone(),
+            ChcExpr::eq((*request.body_j).clone(), request.domain.constant(residue)),
+            ChcExpr::eq(
+                request.domain.remainder((*request.body_i).clone(), k),
+                request.domain.constant(residue),
+            ),
+            ChcExpr::ne(
+                request.domain.remainder((*request.head_i).clone(), k),
+                (*request.head_j).clone(),
+            ),
+        ])
+        .propagate_constants();
+
+        match (request.domain, request.body_i) {
+            (ModularEqualityDomain::Int, ChcExpr::Var(body_var)) => {
+                Self::resolve_mod_with_known_residue(&query, &body_var.name, k, residue)
+                    .simplify_constants()
+            }
+            // BV wrap can change a residue unless k divides 2^w, so the
+            // integer rewrite is inapplicable. The SMT checker sees exact BV.
+            _ => query,
+        }
+    }
+
+    fn finish_modular_preservation(
+        &self,
+        checked_self_loop: bool,
+        canonical_vars: &[ChcVar],
+        lhs_index: usize,
+        rhs_index: usize,
+        modulus: i128,
+    ) -> bool {
+        if !checked_self_loop {
+            return false;
+        }
+        if self.config.verbose {
+            safe_eprintln!(
+                "PDR: Modular equality ({} mod {}) = {} is preserved by all transitions",
+                canonical_vars[lhs_index].name,
+                modulus,
+                canonical_vars[rhs_index].name
+            );
+        }
+        true
+    }
+
+    pub(in crate::pdr::solver) fn is_modular_equality_preserved_by_transitions(
+        &mut self,
+        predicate: PredicateId,
+        idx_i: usize,
+        idx_j: usize,
+        k: i128,
+        discovery_start: Option<ay_core::time::Instant>,
+    ) -> bool {
         let canonical_vars = match self.canonical_vars(predicate) {
             Some(v) => v.to_vec(),
             None => return false,
         };
+        let Some(var_i) = canonical_vars.get(idx_i) else {
+            return false;
+        };
+        let Some(var_j) = canonical_vars.get(idx_j) else {
+            return false;
+        };
+        let Some(domain) = ModularEqualityDomain::from_sorts(&var_i.sort, &var_j.sort) else {
+            return false;
+        };
+        if !domain.supports_modulus(k) {
+            return false;
+        }
 
         // Track whether we checked at least one self-loop clause (#1388).
         let mut checked_any_self_loop = false;
@@ -201,43 +516,46 @@ impl PdrSolver {
             // For clauses like `C = A+1 ∧ D = ite(B=0,1,0) → inv(C,D)`, this
             // replaces Var(C) → A+1 and Var(D) → ite(...), enabling algebraic
             // mod resolution on body variables instead of head variables.
-            let (head_i, head_j) = {
-                let head_var_names: Vec<&str> = head_args
-                    .iter()
-                    .filter_map(|a| {
-                        if let ChcExpr::Var(v) = a {
-                            Some(v.name.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if head_var_names.is_empty() {
-                    (head_i_raw.clone(), head_j_raw.clone())
-                } else {
-                    let mut subst = Vec::new();
-                    for conj in clause_constraint.collect_conjuncts() {
-                        if let ChcExpr::Op(ChcOp::Eq, ref args) = conj {
-                            if args.len() == 2 {
-                                if let ChcExpr::Var(v) = args[0].as_ref() {
-                                    if head_var_names.contains(&v.name.as_str()) {
-                                        subst.push((v.clone(), args[1].as_ref().clone()));
-                                    }
-                                } else if let ChcExpr::Var(v) = args[1].as_ref() {
-                                    if head_var_names.contains(&v.name.as_str()) {
-                                        subst.push((v.clone(), args[0].as_ref().clone()));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if subst.is_empty() {
-                        (head_i_raw.clone(), head_j_raw.clone())
-                    } else {
-                        (head_i_raw.substitute(&subst), head_j_raw.substitute(&subst))
-                    }
-                }
+            let (head_i, head_j) = Self::substitute_modular_head_definitions(
+                head_args,
+                head_i_raw,
+                head_j_raw,
+                &clause_constraint,
+            );
+            let request = ModularClauseQuery {
+                domain,
+                body_i,
+                body_j,
+                head_i: &head_i,
+                head_j: &head_j,
+                constraint: &clause_constraint,
+                modulus: k,
+                lhs_name: &canonical_vars[idx_i].name,
+                rhs_name: &canonical_vars[idx_j].name,
             };
+
+            // Enumerating every residue is effective for small k, but scales
+            // linearly in both queries and formula rewrites.  Larger moduli
+            // use one direct consecution query for this clause.  SAT and
+            // Unknown both reject the candidate; only an UNSAT result admits
+            // it, under the same cancellation and remaining-time checks.
+            if k > MAX_CASE_SPLIT_MODULUS {
+                if self.is_cancelled()
+                    || discovery_start
+                        .is_some_and(|start| start.elapsed() >= MODULAR_EQUALITY_DISCOVERY_BUDGET)
+                {
+                    return false;
+                }
+                if !Self::large_modular_equality_clause_preserved(
+                    &mut self.smt,
+                    self.config.verbose,
+                    &request,
+                    discovery_start,
+                ) {
+                    return false;
+                }
+                continue;
+            }
 
             // Case-split on possible remainder values to avoid mod+LIA
             // incompleteness (#3211). The LIA solver can return Unknown on
@@ -249,39 +567,13 @@ impl PdrSolver {
             // that the SMT solver handles it directly.
             let mut clause_preserved = true;
             for c in 0..k {
-                let post_mod_ne = ChcExpr::ne(
-                    ChcExpr::mod_op(head_i.clone(), ChcExpr::Int(k)),
-                    head_j.clone(),
-                );
-                let query = ChcExpr::and_vec(vec![
-                    clause_constraint.clone(),
-                    ChcExpr::eq(body_j.clone(), ChcExpr::Int(c)),
-                    ChcExpr::eq(
-                        ChcExpr::mod_op(body_i.clone(), ChcExpr::Int(k)),
-                        ChcExpr::Int(c),
-                    ),
-                    post_mod_ne,
-                ]);
-
-                // Propagate constants before check_sat. This resolves
-                // body_j = c throughout (including in head_j via clause
-                // constraint), and simplifies mod expressions with known
-                // operands (e.g., (0 mod 2) = 0 folds to true).
-                let query_simplified = query.propagate_constants();
-
-                // Algebraic mod resolution (#1362): after constant propagation,
-                // the formula may still contain (var mod k) expressions where
-                // we know the residue. For example, if body_i is Var(A) and
-                // the formula asserts (A mod 2) = 1, then ((A + 1) mod 2) can
-                // be algebraically resolved to (1 + 1) % 2 = 0. The LIA solver
-                // often returns Unknown on formulas with multiple mod operations,
-                // so resolving them here is critical.
-                let query_resolved = if let ChcExpr::Var(bi_var) = body_i {
-                    Self::resolve_mod_with_known_residue(&query_simplified, &bi_var.name, k, c)
-                        .simplify_constants()
-                } else {
-                    query_simplified.clone()
-                };
+                if self.is_cancelled()
+                    || discovery_start
+                        .is_some_and(|start| start.elapsed() >= MODULAR_EQUALITY_DISCOVERY_BUDGET)
+                {
+                    return false;
+                }
+                let query_resolved = Self::modular_equality_case_query(&request, c);
 
                 // Early exit: if constant propagation resolved to false,
                 // this case is trivially UNSAT (e.g., body_j=1 contradicts
@@ -291,10 +583,16 @@ impl PdrSolver {
                 }
 
                 self.smt.reset();
-                match self
-                    .smt
-                    .check_sat_with_timeout(&query_resolved, std::time::Duration::from_millis(500))
-                {
+                let timeout = discovery_start.map_or(MODULAR_EQUALITY_SMT_CALL_BUDGET, |start| {
+                    MODULAR_EQUALITY_DISCOVERY_BUDGET.saturating_sub(start.elapsed())
+                });
+                if timeout.is_zero() {
+                    return false;
+                }
+                match self.smt.check_sat_with_timeout(
+                    &query_resolved,
+                    timeout.min(MODULAR_EQUALITY_SMT_CALL_BUDGET),
+                ) {
                     SmtResult::Sat(_) => {
                         if self.config.verbose {
                             safe_eprintln!(
@@ -333,20 +631,7 @@ impl PdrSolver {
             }
         }
 
-        // All self-loop transitions preserve the modular equality.
-        // But if zero self-loops were checked, cannot claim preservation vacuously (#1388).
-        if !checked_any_self_loop {
-            return false;
-        }
-        if self.config.verbose {
-            safe_eprintln!(
-                "PDR: Modular equality ({} mod {}) = {} is preserved by all transitions",
-                canonical_vars[idx_i].name,
-                k,
-                canonical_vars[idx_j].name
-            );
-        }
-        true
+        self.finish_modular_preservation(checked_any_self_loop, &canonical_vars, idx_i, idx_j, k)
     }
 
     /// Resolve `(expr mod k)` subexpressions using a known modular residue (#1362).

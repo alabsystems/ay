@@ -240,6 +240,6 @@ int main(int argc, char **argv) {
     AY_CALL(Z3_interrupt, (c));
     AY_CALL(Z3_del_context, (c));
     ay_print_callability();
-    puts("exact Z3 5.0.0 additional family probes passed");
+    puts("exact Z3 5.1.0 additional family probes passed");
     return 0;
 }

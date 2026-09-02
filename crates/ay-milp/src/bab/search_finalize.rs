@@ -404,10 +404,11 @@ fn interrupted_without_incumbent(termination: SearchTermination) -> Outcome {
 }
 
 fn finalize_infeasible(request: FinalizationRequest<'_>) -> Outcome {
-    let mut tree_cert = request.certificate.capture.finalize(
+    let mut tree_cert = request.certificate.capture.finalize_inner(
         request.frame.caller_model,
         terminal_finalize_deadline(request.certificate.full_deadline),
         request.certificate.finalize_reserve,
+        request.frame.opts.skip_finalize_reverify,
     );
     if tree_cert.is_none() && symmetry_retry_allowed(&request.frame.symmetry_retry) {
         tree_cert = retry_without_symmetry(&request.frame);

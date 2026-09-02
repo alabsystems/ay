@@ -125,12 +125,32 @@ fn read_evidence_json(path: &Path) -> Value {
 }
 
 fn verify_drat_proof(cnf: &str, proof_bytes: &[u8]) {
+    use ay_drat_check::drat_parser::ProofStep;
+    use ay_drat_check::SrChecker;
+
     let formula = parse_cnf(cnf.as_bytes()).expect("parse CNF");
     let proof = parse_drat(proof_bytes).expect("parse DRAT");
-    let mut checker = DratChecker::new(formula.num_vars, true);
-    checker
-        .verify(&formula.clauses, &proof)
-        .expect("verify DRAT proof");
+    // Since f660402bf (2026-08-08) the aux-free symmetry SR route is enabled
+    // by default on one-shot solves, so a `.drat` written under the default
+    // declared checker (dsr-trim — see the declared-checker axis, 94a40e2aa)
+    // may carry SR-witnessed `AddPr` a-lines (DSR-in-DRAT-stream). Mirror the
+    // product's own verify routing (crates/ay/src/proof_verify.rs): witnessed
+    // proofs go to the native PR/SR checker, witness-free proofs to the plain
+    // RUP/RAT checker, and both fail closed.
+    if proof
+        .iter()
+        .any(|step| matches!(step, ProofStep::AddPr { .. }))
+    {
+        let mut checker = SrChecker::new(formula.num_vars, true);
+        checker
+            .verify(&formula.clauses, &proof)
+            .expect("verify SR-witnessed DRAT-stream proof");
+    } else {
+        let mut checker = DratChecker::new(formula.num_vars, true);
+        checker
+            .verify(&formula.clauses, &proof)
+            .expect("verify DRAT proof");
+    }
 }
 
 #[test]

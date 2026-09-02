@@ -72,8 +72,12 @@ impl TermStore {
         );
         // int2bv(w, bv2nat(x)) = x, when x has width w
         if let TermData::App(Symbol::Named(name), args) = self.get(arg) {
-            if name == "bv2nat" && args.len() == 1 && self.get_bv_width(args[0]) == Some(width) {
-                return args[0];
+            if name == "bv2nat" {
+                if let &[inner] = args.as_slice() {
+                    if self.get_bv_width(inner) == Some(width) {
+                        return inner;
+                    }
+                }
             }
         }
 

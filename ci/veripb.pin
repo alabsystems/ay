@@ -1,9 +1,9 @@
 # AY <-> VeriPB checker PIN. Single source of truth.
 #
 # Everything that verifies an AY proof — CI, `scripts/ci/pb_certified_gate.sh`,
-# and the Rust gate in `crates/ay-test-support/src/veripb.rs` (module `pin`,
-# which `include_str!`s THIS file) — reads the checker identity from here.
-# There is no second copy to drift.
+# `scripts/cert_ci.sh`, and the Rust gates in `crates/ay-test-support/src/veripb.rs`
+# (module `pin`, which `include_str!`s THIS file) and `crates/ay/src/maxsat_cert.rs`
+# — reads the checker identity from here. There is no second copy to drift.
 #
 # WHY A PIN AT ALL. "VeriPB accepted it" only means something if you can say
 # WHICH VeriPB. Upstream 3.0.2 as published has TWENTY-ONE confirmed wrong-verdict
@@ -11,8 +11,9 @@
 # UNSATISFIABLE` for satisfiable formulas and `s VERIFIED SATISFIABLE` for
 # unsatisfiable ones, given the right (small, non-adversarial-looking) proof.
 # A green CI run against such a checker is not evidence. So the pin names an
-# exact commit PLUS the patches that fix all twenty-one, and the gate re-proves
-# the fixes on every run against committed fixtures before it trusts a verdict.
+# exact upstream commit PLUS one patch that fixes all twenty-one, and the gate
+# re-proves the fixes on every run against committed fixtures before it trusts a
+# verdict.
 #
 # HOW BAD IT GETS. Four of them need NOTHING from the formula, and two of those
 # four contain no arithmetic anywhere. Defect 14 (order auxiliary variables are
@@ -39,20 +40,9 @@
 # different things and conflating them is what made an earlier revision of this
 # file say "six" when the audit said "eight". The defect count is TWENTY-ONE. The
 # fixture count is TWENTY-TWO, because defect 7 (normalization wrapping) has two
-# manifestations with OPPOSITE wrong verdicts and each needs its own pair.
-# Defects 5 and 7 were found late, during the other fixes, and shipped with
-# in-tree Rust regression tests but no standalone fixture; fixtures 07/08/09
-# close that gap. Defects 9 (`pol` addition wrapping the cancellation
-# subtraction) and 10 (propagation slack wrapping) were found later still, by
-# re-auditing the code the first patch did NOT touch for the classes it did
-# fix; fixtures 10 and 11 cover them. Defects 11 to 13 came from auditing the
-# SUBPROOF, SUBSTITUTION and ORDER machinery, which neither earlier pass had
-# looked at, and two of the three are not arithmetic bugs at all. Defects 14 to
-# 21 came from auditing the surfaces that decide what a verdict MEANS — order
-# variable scoping, the legacy version 2.0 parser, solution logging, the
-# conclusion and output guarantees, and the WCNF front end — and NONE of the
-# eight is an arithmetic bug. Two of them need nothing from the formula at all.
-# The mapping is total:
+# manifestations with OPPOSITE wrong verdicts and each needs its own pair. The
+# mapping of the twenty-one defects to the twenty-two fixture directories is
+# total:
 #   1->01  2->02  3->03  4->04  5->09  6->05  7->07 and 08  8->06  9->10
 #   10->11  11->12  12->13  13->14  14->15  15->16  16->17  17->18  18->19
 #   19->20  20->21  21->22
@@ -61,9 +51,12 @@
 # from POSIX sh and parsed by a hand-written Rust reader; keep it boring.
 #
 # TO MOVE THE PIN (checker upgrade):
-#   1. Rebase BOTH patches onto the new upstream commit, in order.
-#   2. Update VERIPB_COMMIT / VERIPB_VERSION / VERIPB_PATCH_SHA256 /
-#      VERIPB_PATCH2_SHA256 here.
+#   1. Rebase the fork's `alab-main` onto the new upstream commit, push it, and
+#      re-cut VERIPB_PATCH as `git diff <upstream> <new-alab-main-tip>` from a
+#      FRESH CLONE of the fork (see below). One patch, no second file.
+#   2. Update VERIPB_COMMIT / VERIPB_VERSION / VERIPB_PATCH / VERIPB_PATCH_SHA256
+#      here, and REWRITE THIS PROSE to match — the pin's history includes a
+#      false-prose incident, so the words move with the value or not at all.
 #   3. Run `scripts/ci/pb_certified_gate.sh`. It rebuilds from scratch, re-runs
 #      the twenty-two soundness fixtures, and re-verifies every certified-track
 #      proof. If the new checker regressed any of the twenty-two, the gate fails
@@ -73,252 +66,83 @@
 # Upstream repository the pinned checker is built from.
 VERIPB_REPO=https://gitlab.com/MIAOresearch/software/VeriPB.git
 
-# Exact upstream commit. `--version` is NOT an identity: 3.0.2 has been many
-# different checkers. The sha is the identity; the version is a cross-check.
+# Exact upstream commit the patch is cut against. `--version` is NOT an
+# identity: 3.0.2 has been many different checkers. The sha is the identity; the
+# version is a cross-check. This is the shared base of the vendored veripb fork
+# and upstream: the same commit, the same tree, on both sides, which is what
+# lets the patch below be applied to a clean upstream checkout and reproduce
+# the fork tip byte for byte.
 VERIPB_COMMIT=4bb10c2ce98a8c80122a7a2399d7f35ffdc6e58e
 
 # What the pinned build must report for `veripb --version` (last field).
 VERIPB_VERSION=3.0.2
 
-# TWO PATCHES, APPLIED IN ORDER. VERIPB_PATCH is the byte-verified fork delta
-# (see below) and VERIPB_PATCH2 is a fix this repository wrote itself. They are
-# separate files ON PURPOSE: VERIPB_PATCH's whole claim to trust is that it is
-# `git diff 4bb10c2c f7f9d442` of the private fork VERBATIM, checkable with
-# `cmp` against a fresh clone. Folding a local fix into it would destroy that
-# property and there would be no way to tell the two apart again. So local work
-# lands as a NEW numbered patch and the fork stays the authority for 0001.
+# ONE PATCH NOW. This repository previously carried TWO: VERIPB_PATCH was the
+# byte-verified fork delta ending at f7f9d442 (eight wrong-verdict fixes plus the
+# Clean-proved kernel), and VERIPB_PATCH2 was a fix written HERE for the
+# remaining thirteen (defects 9-21). That split existed because the local fix had
+# no byte-provenance in the fork and folding it into the fork delta would have
+# destroyed the `cmp`-against-a-clone property of VERIPB_PATCH.
 #
-# THE FORK IS NOW BEHIND THIS REPO. `alab-main` carries none of the fixes for
-# defects 9 to 21; ci/veripb-patches/0002-*.patch is the delta that closes the
-# gap. Push it to the fork (as commits on `alab-main`) at the next opportunity,
-# then re-cut VERIPB_PATCH from the new fork tip and drop 0002 in the SAME
-# change, so this file never claims a provenance the fork cannot back. Nothing
-# here pushes to the fork; it is external.
+# THAT SPLIT IS GONE. 0002's thirteen fixes were ported onto the fork's
+# `alab-main` (the defect-20 output-guarantee fix as a source change; defects
+# 9-19 and 21 were already closed there by the fork's own wrong-verdict campaign,
+# and their ay-side regression instances came over with it), and VERIPB_PATCH is
+# re-cut from the new fork tip. So the fix for every one of the twenty-one
+# defects now lives IN THE FORK, VERIPB_PATCH is once again a pure fork delta with
+# nothing folded in, and VERIPB_PATCH2 is dropped in the same change per the
+# procedure above. There is no file this repository edits in place any more: a
+# further locally found defect is fixed in the fork and the patch re-cut, never
+# added as a second numbered patch here.
 #
-# 0002 is the one file this repository may EDIT IN PLACE: it has no external
-# byte-provenance to preserve, so a further locally found defect extends it
-# (and its recorded sha256) rather than adding a third numbered patch. 0001 is
-# the opposite — never edit it, see below.
+# WHAT THE PATCH IS. The delta of the private fork branch `alab-main` ending at
+# commit b1e80c0fe7e53ba79ad9e466d7a737823aedbbe9, over the shared upstream base
+# VERIPB_COMMIT. It is `git diff --binary 4bb10c2c b1e80c0f` VERBATIM (the
+# `--binary` is load-bearing: the fork added ten binary files after f7f9d442 —
+# a `.cleancert` and nine compressed parser-test instances — that a text-only
+# diff cannot carry). 601 files, +76944/-3084. Reproducible from public sources:
+# clone the upstream repo, `git checkout 4bb10c2c`, `git apply` this patch,
+# `cargo build --release --bin veripb`. Verified 2026-08-29 from a fresh clone
+# of the fork at b1e80c0f: applying this patch to a clean 4bb10c2c checkout
+# reproduces the fork tip's tree EXACTLY (`git write-tree` == b1e80c0f^{tree},
+# `git diff b1e80c0f` empty).
 #
-# Patch applied on top of VERIPB_COMMIT before building. It is the FOUR-commit
-# delta of the private fork branch `alab-main` ENDING AT f7f9d442 — NOT the
-# branch tip. `git merge-base main alab-main` = VERIPB_COMMIT, so the patch is
-# `git diff 4bb10c2c..f7f9d442` verbatim:
+# WHY THE FORK, NOT UPSTREAM. `alab-main` carries all twenty-one soundness fixes
+# plus diagnostics and the Clean-proved kernel `veripb-core-proved`. Upstream
+# 3.0.2 at 4bb10c2c has none of them. The three ay-authored reconciliation
+# commits at the tip are:
+#   88875e79  fix(soundness): output guarantees test the hazard, not the
+#             solution_logged proxy   (defect 20; ported from the old 0002)
+#   3510027c  test(soundness): port ay patch 0002's regression corpus for
+#             defects 9-19, 21
+#   b1e80c0f  chore(kernel-verify): re-bless coverage snapshot and census for
+#             the ported instances
 #
-#   a7836ca6  fix(diagnostics): empty propagation trails; stop double-reporting
-#   ef29860b  fix(soundness): the EIGHT wrong-verdict defects, plus robustness
-#   9bcfba52  feat(proved-core): the Clean-proved kernel (veripb-core-proved)
-#   f7f9d442  fix(proved-core): the kernel now checks 105/105
+# KERNEL STATUS ON THIS BOX, STATED HONESTLY. `veripb-core-proved` is a
+# workspace MEMBER that nothing depends on: `cargo build --bin veripb` does not
+# compile it, and the shipped binary contains none of its symbols, so it decides
+# NO verdict (the gate's phase 2b MEASURES that, it does not assume it). It is
+# built and its tests are run on every gate invocation so it cannot rot. What the
+# gate does NOT do is run `clean check` on the kernel proof itself, and here is
+# why, measured on this box:
 #
-# 68 files, +5714/-95. Reproducible from public sources: clone + checkout +
-# `git apply` + `cargo build --release --bin veripb`. Verified 2026-08-24 from
-# a fresh clone of the vendored veripb fork: `git diff 4bb10c2c f7f9d442`
-# is BYTE-IDENTICAL to the committed patch file (sha256 bcb78b38..., `cmp` clean).
-#
-# WHY THE PIN IS NOT AT THE BRANCH TIP. As of 2026-08-24 alab-main is 34 ahead
-# of VERIPB_COMMIT (0 behind); f7f9d442 is the 4th of those 34. Moving the pin
-# to the tip would take the patch from 68 files/+5714 to 305 files/+37673, and
-# the tip's proved kernel DOES NOT CHECK on the only Clean binary present here:
-#
-#   clean 1.2.0, from the `trust` stage3-tools-bin tree (on the box where this
-#   was measured, .../trust/build/aarch64-apple-darwin/stage3-tools-bin/
+#   clean 1.2.0, from the `trust` stage3-tools-bin tree
+#   (.../trust/build/aarch64-apple-darwin/stage3-tools-bin/
 #   aarch64-apple-darwin/clean)
-#     f7f9d442  kernel: 105 decls, 105 passed,   0 failed   (rc 0)
-#     tip       kernel: 417 decls, 341 passed,  76 failed   (rc 1)
+#     tip (b1e80c0f)  kernel: 874 declarations, 471 checked, 403 unchecked (rc 1)
 #
-# The 76 are not rotted proofs: 67 are cascading `Unknown identifier` from 9
-# roots, and the roots are TOOLCHAIN GAPS, not syntax. `Nat.eq_of_beq_eq_true`
-# (4 sites) does not exist in clean 1.2.0 under that or any probed alias, and
-# `BitVec` (5 sites, the i64 machine-width capcoeff contracts) does not exist
-# at all — it auto-binds as a universe parameter. The fork's own pins name a
-# DIFFERENT Clean lineage, `clean 0.1.0|v0.1.0-22-g6095aa72e` built out of a
-# `clean` checkout's own target/user/debug, which is not present on the box
-# this was measured on. Until that toolchain is available, the tip is
-# UNVERIFIABLE here and the
-# pin stays at f7f9d442, the last commit whose kernel checks green.
-#
-# NOTE ON THE PROVED KERNEL. `veripb-core-proved` is a workspace MEMBER that
-# nothing depends on: `cargo build --bin veripb` does not compile it, and the
-# shipped binary contains none of its symbols. It is built and tested by the
-# gate (phase 2b) so it cannot rot, but it does not decide any verdict. Do not
-# read its presence in this patch as an increase in the trustworthiness of any
-# existing certification claim. See ci/veripb-soundness/README.md.
-VERIPB_PATCH=ci/veripb-patches/0001-ay-validated-soundness-fixes.patch
-VERIPB_PATCH_SHA256=bcb78b38893cc565d716b33dc79a9140d7a119fd9eb90f77d423cced5903e5c7
-
-# SECOND patch, applied on top of VERIPB_PATCH. Written HERE, not in the fork.
-# It fixes the THIRTEEN wrong-verdict defects 0001 does not. Defects 9 and 10
-# came from re-auditing the code 0001 did not touch for the classes it did fix;
-# defects 11 to 13 came from auditing the SUBPROOF, SUBSTITUTION and ORDER
-# machinery, which neither earlier pass had looked at; defects 14 to 21 came
-# from auditing the surfaces that decide what a verdict MEANS rather than how a
-# number is computed — variable SCOPING, the legacy version 2.0 PARSER, solution
-# LOGGING, the conclusion and output GUARANTEES, and the WCNF front end. Ten of
-# these thirteen are not arithmetic bugs at all, which is the point: an audit
-# that only looks for the last defect class finds only the last defect class.
-#
-#   DEFECT 9 (fixture 10) — `pol`'s `+` range-checks the SUM of the two degrees
-#   and then subtracts the literal-cancellation constant in the narrow integer
-#   type, unchecked. That constant is always >= 0, so the subtraction can only
-#   UNDERFLOW, and with overflow checks off in release a row that is MORE
-#   trivially true than its operands is stored with `degree > coeff_sum` — the
-#   empty contradiction. On the 0001-only build the formula `1 x1 1 x2 >= 1 ;`
-#   (the clause x1 OR x2, satisfied by x1=1) plus a six-line proof yields
-#   `s VERIFIED UNSATISFIABLE`, and the same wrapped row forges
-#   `s VERIFIED BOUNDS INF <= obj <= INF`. Present in all four `add`
-#   implementations (`Clause`, `Cardinality`, `GeneralPBConstraint<i64>`,
-#   `GeneralPBConstraint<i128>`), because widening moves the threshold rather
-#   than closing the hole.
-#
-#   DEFECT 10 (fixture 11) — the propagator computes its slack
-#   `coeff_sum - degree` in the row's own width, at three sites in
-#   `GeneralPBWatcher`. Both operands fit; their DIFFERENCE need not. A trivially
-#   true row whose slack exceeds the type wraps NEGATIVE, so every coefficient
-#   compares as greater than the slack and the row is reported to propagate ALL
-#   its literals unconditionally. Two such rows (over `x1` and over `~x1`), both
-#   accepted legitimately as trivially true RUP conclusions, leave the trail in
-#   conflict, and `rup >= 1 ;` then derives the empty contradiction. The poison
-#   is entirely in the PROOF, so at a 0001-only pin no
-#   `s VERIFIED UNSATISFIABLE` was evidence of anything for any formula, and
-#   every RUP-backed auto-discharge was free.
-#
-#   DEFECT 11 (fixture 12) — `SubproofContext::pop_database_goal` FABRICATES a proofgoal
-#   `C_id | witness` when the named database ID has no registered one, instead of
-#   erroring the way `pop_internal_goal` always has. A proof-by-contradiction
-#   subproof registers NO database goals (`pbc` adds none; the version 2.0
-#   `red`/`delc` spellings that map to one have an empty witness, which touches
-#   nothing), so every database ID lands in that branch and the fabricated goal
-#   is `C_id` itself — whose scope premise `¬C_id` contradicts the still present
-#   `C_id` at once. `end_proofgoal` then set `contradiction_proven` on the
-#   ENCLOSING subproof and `finalize` short-circuited, so the obligation a `pbc`
-#   owes — a contradiction from `¬C` — was never checked. Six proof lines, NO
-#   ARITHMETIC, forge `s VERIFIED UNSATISFIABLE` for any formula; through `delc`
-#   under `strengthening_to_core` the same fabrication deletes a CORE constraint
-#   for free and forges `s VERIFIED SATISFIABLE` for an unsatisfiable one. The
-#   fix keeps the one legitimate promotion (goal `#1` of an empty-witness
-#   `red`/`delc`, whose premise IS the subproof's `¬C`) and refuses the rest.
-#
-#   DEFECT 12 (fixture 13) — `substitute` lowers the degree in the row's own width:
-#   `GeneralPBConstraint` does `substituted_degree -= &term.coeff` and
-#   `Cardinality` does `substituted_degree -= 1`, unchecked, per literal mapped
-#   to the constant TRUE. The trivially true `1 x2 >= i64::MIN` under `x2 -> 1`
-#   has the true degree `i64::MIN - 1` and was stored as `>= i64::MAX` over an
-#   EMPTY left-hand side — the empty contradiction. `implies()` short-circuits on
-#   a contradicting source (correctly, for a genuine one), so with such a row in
-#   the database `check_substituted_implication` reported "implied" for every
-#   target and `Proofgoal::autoprove` discharged ANY goal of a `red` step as
-#   `DBImpliesSubstituted`. Five proof lines forge `s VERIFIED UNSATISFIABLE` for
-#   a satisfiable formula, and the wrap also reaches the order-SPECIFICATION
-#   surface with no `rup` line at all. Present in `Cardinality`,
-#   `GeneralPBConstraint<i64>` and `GeneralPBConstraint<i128>` — widening moves
-#   the threshold rather than closing the hole.
-#
-#   DEFECT 13 (fixture 14) — `def_order` never validates the `fresh_right` / `fresh_aux_1` /
-#   `fresh_aux_2` lists of its transitivity proof.
-#   `OrderFreshRightVariablesRule::compute` stored them verbatim and
-#   `get_transitivity_substitution` zipped them against the order's variables
-#   with `izip!`, which STOPS AT THE SHORTEST iterator. `fresh_right ;` is legal
-#   (the list is optional per the development design notes) and yields the empty list, so
-#   both substitutions came out EMPTY and every transitivity proofgoal
-#   `D_i|x→z` was literally `D_i` — already a premise — which an empty
-#   `proof … qed;` discharged by database lookup. Declaring the RIGHT variables
-#   again as `fresh_right` has the correct arity and does the same thing through
-#   the identity substitution. Either way a relation whose strict part contains a
-#   CYCLE installs as a preorder, `dom`'s descent argument becomes vacuous, and a
-#   four-line bogus order forges `s VERIFIED UNSATISFIABLE` for a satisfiable
-#   formula.
-#
-#   DEFECT 14 (fixture 15) — order AUXILIARY VARIABLES are not order-private.
-#   They live in the global variable namespace, and `validate_aux_var` admitted
-#   them exactly where it must not: with no order loaded its `is_none_or`
-#   admitted EVERY variable, and with one loaded it admitted precisely that
-#   order's auxiliary variables. So a top-level `red +1 $a1 >= 1 : $a1 -> 1;`
-#   asserts one TRUE for free — its own proofgoal is trivial under the witness.
-#   The order's SPECIFICATION says `~$a1`, and `scope leq`/`scope geq` injects
-#   that specification as unconditional premises inside any `dom` or `red`
-#   subproof, so the database is contradictory inside every scope proofgoal, one
-#   `rup >= 1;` discharges them all, and `qed` publishes the empty contradiction
-#   at top level. FOUR proof lines forge `s VERIFIED UNSATISFIABLE` for an
-#   ARBITRARY satisfiable formula; three reach paths (via `dom`, via `red`, and
-#   with the variable named BEFORE `load_order`, where the check was a total
-#   no-op) and a fourth in version 2.0, where auxiliary variables are spelled as
-#   ordinary identifiers and the parse-time check never runs at all.
-#
-#   DEFECT 15 (fixture 16) — the legacy version 2.0 parser has NO rule-scope
-#   enforcement. Its version 3.0 sibling has always rejected `The rule X is not
-#   allowed in a Y context`; `grep -n scope` in the version 2.0 parser returned
-#   nothing. So `sol` inside an unterminated `pre_order` validates against the
-#   ORDER's private EMPTY scratch database — `check_solution` finds nothing to
-#   falsify — sets `best_valid_objective_value`, and the hint-less
-#   `conclusion SAT`, for which that value is the sole evidence, publishes
-#   `s VERIFIED SATISFIABLE` for a formula with ZERO models. Six lines, any
-#   unsatisfiable formula, no arithmetic.
-#
-#   DEFECT 16 (fixture 17) — `conclusion ENUMERATION_COMPLETE n` accepts ANY
-#   database contradiction with no provenance test, while counting only `solx`
-#   exclusions. An `obji`-installed objective-improving constraint removes every
-#   solution that is not strictly better than a chosen value and can make the
-#   database contradictory by itself, so `obji 1; rup >= 1;
-#   conclusion ENUMERATION_COMPLETE 0;` certifies "0 solutions" for a formula
-#   with one, in six lines. `soli` reaches it in five.
-#
-#   DEFECT 17 (fixture 18) — `solx` with a legal but EMPTY `preserved:` set
-#   builds its exclusion over no literals: the empty `>= 1`, i.e. the empty
-#   CONTRADICTION, installed in the database AND the core. Two proof lines then
-#   forge an arbitrary optimality bound for a satisfiable formula and make it
-#   "equisatisfiable" to anything at all.
-#
-#   DEFECT 18 (fixture 19) — `conclusion BOUNDS <lb>` short-circuits: any lower
-#   bound not better than the best logged objective is granted the moment the
-#   database contains ANY contradiction — including one assembled out of the
-#   `solx` exclusions themselves, which remove solutions rather than following
-#   from the problem. Four `solx` lines and a `rup` forge
-#   `s VERIFIED BOUNDS 10 <= obj <= 10` for a problem whose optimum is 0.
-#   Deleting the short-circuit does not fix it: the fallback implication check
-#   also succeeds by propagation against a contradicting database, so the
-#   exclusions are what must not be live.
-#
-#   DEFECT 19 (fixture 20) — `output EQUISATISFIABLE` and `output EQUIOPTIMAL`
-#   are not gated against exported solution exclusions; only `EQUIENUMERABLE`
-#   was. Three `solx` lines export the exclusions into the output formula and
-#   certify a 3-solution formula EQUISATISFIABLE to an unsatisfiable one.
-#
-#   DEFECT 20 (fixture 21) — plain `sol` does not set `solution_logged`, so
-#   `sol …; obji v;` evades defect 19's guard while the semantically identical
-#   single rule `soli … : v;` is caught. A textbook asymmetric-sibling bug: the
-#   guard tested a proxy ("a solution was logged") instead of the hazard ("a
-#   solution-restricting constraint is live"), and the proxy was wrong in both
-#   directions — it also stayed set after the constraint had been deleted again.
-#
-#   DEFECT 21 (fixture 22) — the WCNF parser names variables from the literal
-#   TOKEN TEXT instead of its VALUE, building `"x" + &lex.slice()[1..]`. The
-#   DIMACS spellings `-1`, `-01` and `-0001` are one literal; the parser made
-#   them two or three VARIABLES. The infeasible MaxSAT instance `h 1 0` /
-#   `h -01 0` parses as the satisfiable `(x1) AND (~x01)` and is certified as
-#   having an optimal solution. The sibling CNF and OPB parsers were audited for
-#   the same mistake and do not have it.
-#
-# The arithmetic fixes (9, 10, 12) use the idiom 0001 already uses
-# (`finish_weakening`, `lower_rhs`, `normalization_fits_in_type`): checked
-# machine arithmetic on the hot path, and escalation to BigInt — never a clamp —
-# when a value leaves the type, so what the checker stores and compares is the
-# TRUE value. The other ten are not arithmetic: 11, 13, 14, 15, 16, 17, 18, 19
-# and 20 are missing or misplaced checks, fixed by adding the check and failing
-# closed, and 21 is a parser reading a token's text where it needed its value.
-# Fixtures 10 to 22, their `variants/`, and their opposite-verdict companions
-# are the gated evidence; the patch also carries in-tree regression tests, which
-# fail on a 0001-only tree — including POSITIVE ones, because eight of these
-# thirteen fixes RESTRICT a rule and a restriction that goes one step too far is
-# its own defect. Two of the positives are upstream's OWN tests
-# (`dominance_with_aux_vars`, which uses auxiliary variables inside a `scope`,
-# and `optimization_output_opposing_lits_objective`, a legitimate `soli` +
-# `EQUIOPTIMAL` proof); both would fail under the obvious over-broad fix and
-# both are why defects 14 and 19/20 are fixed the way they are.
-#
-# 115 files, +2560/-126. Reproducible the same way as 0001: clone + checkout +
-# `git apply` 0001 + `git apply` 0002 + `cargo build --release --bin veripb`.
-VERIPB_PATCH2=ci/veripb-patches/0002-ay-post-fork-soundness-fixes.patch
-VERIPB_PATCH2_SHA256=fad6c2bc60a3a8a65a2af71a23a67e88692cd5b324e6996a4405b2a204220bf7
+# The gap is a TOOLCHAIN LINEAGE mismatch, not rotted proofs: `Nat.eq_of_beq_eq_true`
+# does not exist in clean 1.2.0 under that or any probed alias, and one explicit
+# `sorry` compatibility shim is present. The fork's own `scripts/verify-proofs.sh`
+# checks the same kernel GREEN under the Clean lineage its pins name
+# (`clean 0.1.0|v0.1.0-22-g...`, 77 suites), which is not present on this box.
+# Until that toolchain is available here the kernel is UNVERIFIABLE on this box,
+# and — exactly as when the pin sat at f7f9d442 — this gate makes NO claim about
+# the kernel proof, only about the crate (that it compiles and its Rust tests
+# pass). Do not read the kernel's presence as an increase in the trustworthiness
+# of any existing certification claim. See ci/veripb-soundness/README.md.
+VERIPB_PATCH=ci/veripb-patches/0001-ay-veripb-alab-main.patch
+VERIPB_PATCH_SHA256=11d772ada406cc637979058c5d218b026ecb77c84713c2bda10938e1896c32a0
 
 # Fixtures the pinned checker MUST reject (one directory per known bug).
 VERIPB_SOUNDNESS_DIR=ci/veripb-soundness

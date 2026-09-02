@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::executor::ProofDeclineMechanism;
 use crate::executor_types::{Statistics, UnknownReason};
 
 use super::{ConsumerAcceptanceError, SolveResult, Term, VerifiedSolveResult};
@@ -241,7 +242,33 @@ pub struct VerificationSummary {
     /// UNSAT/Unknown and for any SAT candidate lacking complete evidence.
     pub sat_model_validated: bool,
     /// True when an UNSAT result has a proof artifact available.
+    ///
+    /// NOTE for census consumers: this is a PRESENTATION flag, not a statement
+    /// about whether a derivation could be built. It is
+    /// `is_unsat() && last_proof().is_some()`, and `last_proof()` returns
+    /// `None` whenever proof output was not requested *at solve time*. A
+    /// consumer that runs with `set_produce_proofs(false)` therefore reads
+    /// `false` here unconditionally, for every query, whatever the proof
+    /// machinery did. Read [`Self::unsat_proof_decline`] to tell "ay declined
+    /// to build a derivation" apart from "nobody asked for one".
     pub unsat_proof_available: bool,
+    /// Why this UNSAT refutation carries no derivation, when ay actively
+    /// declined to record one.
+    ///
+    /// `Some(..)` means the proof machinery ran and refused, and names the
+    /// mechanism. `None` means no decline was recorded — which includes both
+    /// "a proof was built fine" and, importantly, "proofs were never
+    /// requested, so there was nothing to decline". Pair it with
+    /// [`Self::unsat_proof_available`] to read it correctly:
+    ///
+    /// | available | decline   | meaning                                  |
+    /// |-----------|-----------|------------------------------------------|
+    /// | `true`    | `None`    | proof built and exposed                  |
+    /// | `false`   | `Some(m)` | proof machinery ran and declined via `m` |
+    /// | `false`   | `None`    | proof output was never requested         |
+    ///
+    /// Diagnostic only — no gate, verdict, certificate, or export consults it.
+    pub unsat_proof_decline: Option<ProofDeclineMechanism>,
     /// True only when the exact-query UNSAT result consumed a strict
     /// checker-accepted publication certificate. Proof availability or zero
     /// recorded failures alone does not establish this claim.

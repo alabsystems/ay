@@ -158,7 +158,7 @@ impl ReachabilityChecker {
                         // evaluation abstains fail-closed where it cannot read them.
                         SmtValue::Int(_) | SmtValue::BigInt(_) => ChcSort::Int,
                         SmtValue::Real(_) => ChcSort::Real,
-                        SmtValue::BitVec(_, w) => ChcSort::BitVec(*w),
+                        SmtValue::BitVec(_, w) | SmtValue::BigBitVec(_, w) => ChcSort::BitVec(*w),
                         // Skip array/DT/opaque values — not projected by arithmetic MBP
                         SmtValue::Opaque(_)
                         | SmtValue::ConstArray(_)

@@ -204,16 +204,29 @@ impl TheorySolver for ArraySolver<'_> {
         // inverse of the append-only `merge_array_var_data`; `array_vars` is
         // therefore NOT rebuilt from scratch on pop. If the scope stack is
         // empty (defensive), fall back to undoing every recorded merge.
+        assert_eq!(
+            self.array_var_merge_log.len(),
+            self.array_var_merge_undo.len(),
+            "arrays: merge log and undo trail diverged before pop"
+        );
         let merge_mark = self.array_var_merge_scopes.pop().unwrap_or(0);
         while self.array_var_merge_log.len() > merge_mark {
             self.array_var_merge_log.pop();
-            if let Some(undo) = self.array_var_merge_undo.pop() {
-                if let Some(data) = self.array_vars.get_mut(&undo.target) {
-                    data.stores_as_result.truncate(undo.stores_len as usize);
-                    data.parent_selects.truncate(undo.selects_len as usize);
-                    data.parent_stores.truncate(undo.parent_stores_len as usize);
-                    data.prop_upward = undo.prev_prop_upward;
-                }
+            let undo = self
+                .array_var_merge_undo
+                .pop()
+                .expect("arrays: merge log entry must have a parallel undo record");
+            if !undo.target_existed {
+                self.array_vars.remove(&undo.target);
+            } else {
+                let data = self
+                    .array_vars
+                    .get_mut(&undo.target)
+                    .expect("arrays: pre-existing merge target must survive until undo");
+                data.stores_as_result.truncate(undo.stores_len as usize);
+                data.parent_selects.truncate(undo.selects_len as usize);
+                data.parent_stores.truncate(undo.parent_stores_len as usize);
+                data.prop_upward = undo.prev_prop_upward;
             }
         }
 

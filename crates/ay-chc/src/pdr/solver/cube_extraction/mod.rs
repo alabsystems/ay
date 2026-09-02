@@ -222,12 +222,15 @@ impl PdrSolver {
             (SmtValue::BigInt(b), ChcSort::Int) => Some(ChcExpr::from_bigint(b.as_ref().clone())),
             (SmtValue::Real(r), ChcSort::Real) => {
                 use num_traits::ToPrimitive;
-                let n = r.numer().to_i64().unwrap_or(0);
-                let d = r.denom().to_i64().unwrap_or(1);
+                let n = r.numer().to_i64()?;
+                let d = r.denom().to_i64()?;
                 Some(ChcExpr::Real(n, d))
             }
             (SmtValue::Bool(b), ChcSort::Bool) => Some(ChcExpr::Bool(*b)),
-            (SmtValue::BitVec(v, w), ChcSort::BitVec(_)) => Some(ChcExpr::BitVec(*v, *w)),
+            (
+                value @ (SmtValue::BitVec(_, actual_width) | SmtValue::BigBitVec(_, actual_width)),
+                ChcSort::BitVec(expected_width),
+            ) if actual_width == expected_width => value.bitvec_to_chc_expr(),
             _ => None,
         }
     }
@@ -288,11 +291,11 @@ impl PdrSolver {
             // Beyond-i128 witness: exact Horner encoding (never wraps).
             SmtValue::BigInt(b) => Some(ChcExpr::from_bigint(b.as_ref().clone())),
             SmtValue::Bool(b) => Some(ChcExpr::Bool(*b)),
-            SmtValue::BitVec(v, w) => Some(ChcExpr::BitVec(*v, *w)),
+            SmtValue::BitVec(..) | SmtValue::BigBitVec(..) => val.bitvec_to_chc_expr(),
             SmtValue::Real(r) => {
                 use num_traits::ToPrimitive;
-                let n = r.numer().to_i64().unwrap_or(0);
-                let d = r.denom().to_i64().unwrap_or(1);
+                let n = r.numer().to_i64()?;
+                let d = r.denom().to_i64()?;
                 Some(ChcExpr::Real(n, d))
             }
             SmtValue::Datatype(ctor, fields) => {

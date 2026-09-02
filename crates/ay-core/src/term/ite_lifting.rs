@@ -137,9 +137,18 @@ impl TermStore {
                     // Arithmetic predicates: Shannon-expand ITE in arguments (#5081).
                     let is_pred =
                         matches!(name.as_str(), "<" | "<=" | ">" | ">=" | "=" | "distinct");
-                    if is_pred && args.len() == 2 {
-                        let arg0 = self.lift_ite_recursive_with_ctx(args[0], ctx);
-                        let arg1 = self.lift_ite_recursive_with_ctx(args[1], ctx);
+                    let pred_args = if is_pred {
+                        let mut it = args.iter();
+                        match (it.next(), it.next(), it.next()) {
+                            (Some(&a0), Some(&a1), None) => Some((a0, a1)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some((pred_arg0, pred_arg1)) = pred_args {
+                        let arg0 = self.lift_ite_recursive_with_ctx(pred_arg0, ctx);
+                        let arg1 = self.lift_ite_recursive_with_ctx(pred_arg1, ctx);
                         self.lift_ite_from_predicate_with_ctx(&name.clone(), arg0, arg1, ctx)
                     } else if matches!(name.as_str(), "and" | "or" | "xor" | "=>") {
                         let lifted: Vec<TermId> = args
@@ -202,10 +211,16 @@ impl TermStore {
             }
             if let TermData::Ite(cond, then_t, else_t) = self.get(arg).clone() {
                 if self.sort(then_t) != &Sort::Bool {
-                    let mut then_args = lifted_args.clone();
-                    then_args[i] = then_t;
-                    let mut else_args = lifted_args.clone();
-                    else_args[i] = else_t;
+                    let then_args: Vec<TermId> = lifted_args
+                        .iter()
+                        .enumerate()
+                        .map(|(j, &a)| if j == i { then_t } else { a })
+                        .collect();
+                    let else_args: Vec<TermId> = lifted_args
+                        .iter()
+                        .enumerate()
+                        .map(|(j, &a)| if j == i { else_t } else { a })
+                        .collect();
 
                     let result_sort = self.sort(term).clone();
                     let then_app = self.mk_app(sym.clone(), then_args, result_sort.clone());
@@ -328,15 +343,15 @@ impl TermStore {
     /// This ensures that after ITE lifting, expressions like `(+ 64 52)` are
     /// folded to `116` instead of remaining as opaque `mk_app` terms (#4786).
     fn mk_arith_op(&mut self, op: &str, args: Vec<TermId>, sort: Sort) -> TermId {
-        match op {
-            "+" => self.mk_add(args),
-            "-" if args.len() == 1 => self.mk_neg(args[0]),
-            "-" => self.mk_sub(args),
-            "*" => self.mk_mul(args),
-            "/" if args.len() == 2 => self.mk_div(args[0], args[1]),
-            "abs" if args.len() == 1 => self.mk_abs(args[0]),
-            "to_real" if args.len() == 1 => self.mk_to_real(args[0]),
-            "to_int" if args.len() == 1 => self.mk_to_int(args[0]),
+        match (op, args.as_slice()) {
+            ("+", _) => self.mk_add(args),
+            ("-", &[arg]) => self.mk_neg(arg),
+            ("-", _) => self.mk_sub(args),
+            ("*", _) => self.mk_mul(args),
+            ("/", &[lhs, rhs]) => self.mk_div(lhs, rhs),
+            ("abs", &[arg]) => self.mk_abs(arg),
+            ("to_real", &[arg]) => self.mk_to_real(arg),
+            ("to_int", &[arg]) => self.mk_to_int(arg),
             _ => self.mk_app(Symbol::Named(op.to_string()), args, sort),
         }
     }
@@ -370,10 +385,16 @@ impl TermStore {
                 break; // #8414: leave remaining ITEs unlifted.
             }
             if let TermData::Ite(cond, then_t, else_t) = self.get(arg).clone() {
-                let mut then_args = lifted_args.clone();
-                then_args[index] = then_t;
-                let mut else_args = lifted_args.clone();
-                else_args[index] = else_t;
+                let then_args: Vec<TermId> = lifted_args
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &a)| if j == index { then_t } else { a })
+                    .collect();
+                let else_args: Vec<TermId> = lifted_args
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &a)| if j == index { else_t } else { a })
+                    .collect();
 
                 let then_op = self.mk_arith_op(name, then_args, sort.clone());
                 let else_op = self.mk_arith_op(name, else_args, sort);

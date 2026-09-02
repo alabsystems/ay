@@ -44,7 +44,13 @@ impl TermStore {
         // entry in the same bucket instead of aliasing.
         if let Some(ids) = self.hash_cons.get(&hash) {
             for &id in ids {
-                if self.terms[id.index()].term == term && self.terms[id.index()].sort == sort {
+                // Bucket ids always index live entries (`rollback_to` prunes
+                // the buckets when it truncates `terms`); a stale id would
+                // fall through to minting a fresh entry, not panic.
+                let Some(entry) = self.terms.get(id.index()) else {
+                    continue;
+                };
+                if entry.term == term && entry.sort == sort {
                     return id;
                 }
             }
@@ -57,10 +63,10 @@ impl TermStore {
         // The names HashMap entry overhead is tracked separately in mk_var/
         // mk_fresh_named_var.
         let heap_bytes = Self::heap_size(&term);
-        let entry_size = size_of::<TermEntry>() + heap_bytes;
+        let entry_size = size_of::<TermEntry>().saturating_add(heap_bytes);
         GLOBAL_TERM_BYTES.fetch_add(entry_size, Ordering::Relaxed);
-        self.instance_term_bytes += entry_size;
-        self.heap_data_bytes += heap_bytes;
+        self.instance_term_bytes = self.instance_term_bytes.saturating_add(entry_size);
+        self.heap_data_bytes = self.heap_data_bytes.saturating_add(heap_bytes);
 
         // Create new term
         let id = TermId(self.terms.len() as u32);
@@ -78,10 +84,10 @@ impl TermStore {
         bucket.push(id);
         let cap_after = bucket.capacity();
         if cap_after > cap_before {
-            let bucket_growth = (cap_after - cap_before) * size_of::<TermId>();
+            let bucket_growth = (cap_after - cap_before).saturating_mul(size_of::<TermId>());
             GLOBAL_TERM_BYTES.fetch_add(bucket_growth, Ordering::Relaxed);
-            self.instance_term_bytes += bucket_growth;
-            self.bucket_capacity_bytes += bucket_growth;
+            self.instance_term_bytes = self.instance_term_bytes.saturating_add(bucket_growth);
+            self.bucket_capacity_bytes = self.bucket_capacity_bytes.saturating_add(bucket_growth);
         }
 
         id
@@ -93,7 +99,9 @@ impl TermStore {
     /// capacity, and `BigInt`/`BigRational` digit heap storage. The BigInt
     /// estimate uses `bits()` to compute the minimum number of 64-bit limbs,
     /// which slightly underestimates due to Vec capacity rounding but is close
-    /// enough for OOM prevention.
+    /// enough for OOM prevention. All arithmetic saturates: these are
+    /// approximate accounting values, and a saturated estimate is still a
+    /// safe input to the OOM guard.
     pub(super) fn heap_size(term: &TermData) -> usize {
         match term {
             TermData::Const(c) => match c {
@@ -104,14 +112,12 @@ impl TermStore {
                 // falling back to 3 * size_of::<u64>() for small values
                 // (BigInt always allocates at least one limb).
                 Constant::Int(n) => Self::bigint_heap_estimate(n),
-                Constant::Rational(r) => {
-                    Self::bigint_heap_estimate(r.0.numer())
-                        + Self::bigint_heap_estimate(r.0.denom())
-                }
+                Constant::Rational(r) => Self::bigint_heap_estimate(r.0.numer())
+                    .saturating_add(Self::bigint_heap_estimate(r.0.denom())),
                 Constant::BitVec { value, width } => {
                     // The BigInt stores ceil(width/64) limbs on the heap.
                     let limbs = (*width as usize).div_ceil(64);
-                    let estimated = limbs.max(1) * size_of::<u64>();
+                    let estimated = limbs.max(1).saturating_mul(size_of::<u64>());
                     // Also count the BigInt's own heap from its magnitude.
                     estimated.max(Self::bigint_heap_estimate(value))
                 }
@@ -120,29 +126,32 @@ impl TermStore {
             TermData::App(sym, args) => {
                 let sym_heap = match sym {
                     Symbol::Named(n) => n.capacity(),
-                    Symbol::Indexed(n, indices) => {
-                        n.capacity() + indices.capacity() * size_of::<u32>()
-                    }
+                    Symbol::Indexed(n, indices) => n
+                        .capacity()
+                        .saturating_add(indices.capacity().saturating_mul(size_of::<u32>())),
                 };
-                sym_heap + args.capacity() * size_of::<TermId>()
+                sym_heap.saturating_add(args.capacity().saturating_mul(size_of::<TermId>()))
             }
             TermData::Let(bindings, _) => {
                 let per_binding = size_of::<(String, TermId)>();
-                let vec_heap = bindings.capacity() * per_binding;
+                let vec_heap = bindings.capacity().saturating_mul(per_binding);
                 let string_heap: usize = bindings.iter().map(|(s, _)| s.capacity()).sum();
-                vec_heap + string_heap
+                vec_heap.saturating_add(string_heap)
             }
             TermData::Not(_) | TermData::Ite(_, _, _) => 0,
             TermData::Forall(vars, _, triggers) | TermData::Exists(vars, _, triggers) => {
                 let per_var = size_of::<(String, Sort)>();
-                let vars_heap = vars.capacity() * per_var;
+                let vars_heap = vars.capacity().saturating_mul(per_var);
                 let var_string_heap: usize = vars.iter().map(|(s, _)| s.capacity()).sum();
-                let triggers_outer = triggers.capacity() * size_of::<Vec<TermId>>();
+                let triggers_outer = triggers.capacity().saturating_mul(size_of::<Vec<TermId>>());
                 let triggers_inner: usize = triggers
                     .iter()
-                    .map(|t| t.capacity() * size_of::<TermId>())
+                    .map(|t| t.capacity().saturating_mul(size_of::<TermId>()))
                     .sum();
-                vars_heap + var_string_heap + triggers_outer + triggers_inner
+                vars_heap
+                    .saturating_add(var_string_heap)
+                    .saturating_add(triggers_outer)
+                    .saturating_add(triggers_inner)
             }
         }
     }
@@ -158,7 +167,7 @@ impl TermStore {
     fn bigint_heap_estimate(n: &BigInt) -> usize {
         let bit_len = n.bits() as usize;
         let limbs = bit_len.div_ceil(64).max(1);
-        limbs * size_of::<u64>()
+        limbs.saturating_mul(size_of::<u64>())
     }
 
     /// Create a boolean constant
@@ -218,6 +227,17 @@ impl TermStore {
         self.names.get(name).map(|(id, _)| *id)
     }
 
+    /// Mint the next internal variable id.
+    ///
+    /// The counter saturates at `u32::MAX` instead of overflowing: the id
+    /// space cannot be exhausted in practice (2^32 mints), and saturating
+    /// never aliases a LOW id the way wrapping would.
+    fn next_var_id(&mut self) -> u32 {
+        let id = self.var_counter;
+        self.var_counter = self.var_counter.saturating_add(1);
+        id
+    }
+
     /// Create or get a variable with the given name and sort.
     ///
     /// Variables are reused only when both their name and sort match. If the
@@ -255,17 +275,16 @@ impl TermStore {
             return self.mk_fresh_named_var(name, sort);
         }
 
-        let var_id = self.var_counter;
-        self.var_counter += 1;
+        let var_id = self.next_var_id();
 
         let id = self.intern(TermData::Var(name.clone(), var_id), sort.clone());
         // Track names HashMap entry heap: the String key is heap-allocated (#8600).
         // The value (TermId, Sort) is inline in the map entry; we count the key's
         // string capacity as additional heap.
-        let name_heap = name.capacity() + size_of::<(TermId, Sort)>();
+        let name_heap = name.capacity().saturating_add(size_of::<(TermId, Sort)>());
         GLOBAL_TERM_BYTES.fetch_add(name_heap, Ordering::Relaxed);
-        self.instance_term_bytes += name_heap;
-        self.heap_data_bytes += name_heap;
+        self.instance_term_bytes = self.instance_term_bytes.saturating_add(name_heap);
+        self.heap_data_bytes = self.heap_data_bytes.saturating_add(name_heap);
         self.names.insert(name, (id, sort));
         id
     }
@@ -279,15 +298,14 @@ impl TermStore {
     /// new declaration.
     pub fn mk_fresh_named_var(&mut self, name: impl Into<String>, sort: Sort) -> TermId {
         let name = name.into();
-        let var_id = self.var_counter;
-        self.var_counter += 1;
+        let var_id = self.next_var_id();
 
         let id = self.intern(TermData::Var(name.clone(), var_id), sort.clone());
         // Track names HashMap entry heap (#8600).
-        let name_heap = name.capacity() + size_of::<(TermId, Sort)>();
+        let name_heap = name.capacity().saturating_add(size_of::<(TermId, Sort)>());
         GLOBAL_TERM_BYTES.fetch_add(name_heap, Ordering::Relaxed);
-        self.instance_term_bytes += name_heap;
-        self.heap_data_bytes += name_heap;
+        self.instance_term_bytes = self.instance_term_bytes.saturating_add(name_heap);
+        self.heap_data_bytes = self.heap_data_bytes.saturating_add(name_heap);
         self.names.insert(name, (id, sort));
         id
     }
@@ -295,8 +313,7 @@ impl TermStore {
     /// Create a fresh variable (guaranteed unique)
     pub fn mk_fresh_var(&mut self, prefix: &str, sort: Sort) -> TermId {
         loop {
-            let var_id = self.var_counter;
-            self.var_counter += 1;
+            let var_id = self.next_var_id();
 
             let name = format!("{prefix}_{var_id}");
             if self.names.contains_key(name.as_str()) {
@@ -320,8 +337,7 @@ impl TermStore {
     /// (since user symbols starting with `__ay_` are rejected by the frontend).
     #[must_use]
     pub fn mk_internal_symbol(&mut self, purpose: &str) -> String {
-        let id = self.var_counter;
-        self.var_counter += 1;
+        let id = self.next_var_id();
         format!("__ay_{purpose}!{id}")
     }
 

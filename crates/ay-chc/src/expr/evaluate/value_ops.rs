@@ -12,7 +12,7 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 
 use super::super::{maybe_grow_expr_stack, ChcExpr, ChcOp, ExprDepthGuard};
-use super::eval_bv::eval_bv_val;
+use super::eval_bv::eval_bv_big_val;
 use super::evaluate_expr;
 use crate::smt::SmtValue;
 
@@ -142,7 +142,7 @@ fn array_lookup<'a>(
 /// like `(= D:Int (= E 0):Bool)`. The solver operates on the rewritten form
 /// `(= D:Int (ite (= E 0) 1 0))` and produces Int values, but the verifier
 /// must interpret the original cross-sort comparison correctly.
-pub(super) fn smt_values_equal(a: &SmtValue, b: &SmtValue) -> Option<bool> {
+pub(crate) fn smt_values_equal(a: &SmtValue, b: &SmtValue) -> Option<bool> {
     match (a, b) {
         // Same-sort cases: use standard equality
         (SmtValue::Bool(x), SmtValue::Bool(y)) => Some(x == y),
@@ -157,7 +157,14 @@ pub(super) fn smt_values_equal(a: &SmtValue, b: &SmtValue) -> Option<bool> {
         (SmtValue::Int(_), SmtValue::BigInt(_)) | (SmtValue::BigInt(_), SmtValue::Int(_)) => {
             Some(false)
         }
-        (SmtValue::BitVec(v1, w1), SmtValue::BitVec(v2, w2)) => Some(v1 == v2 && w1 == w2),
+        (
+            lhs @ (SmtValue::BitVec(..) | SmtValue::BigBitVec(..)),
+            rhs @ (SmtValue::BitVec(..) | SmtValue::BigBitVec(..)),
+        ) => {
+            let (lhs, lhs_width) = lhs.bitvec_to_biguint()?;
+            let (rhs, rhs_width) = rhs.bitvec_to_biguint()?;
+            Some(lhs_width == rhs_width && lhs == rhs)
+        }
         (SmtValue::Real(x), SmtValue::Real(y)) => Some(x == y),
         (SmtValue::Datatype(ctor1, fields1), SmtValue::Datatype(ctor2, fields2)) => {
             if ctor1 != ctor2 || fields1.len() != fields2.len() {
@@ -456,8 +463,7 @@ pub(crate) fn eval_int_big(expr: &ChcExpr, model: &FxHashMap<String, SmtValue>) 
                 }
             }
             ChcExpr::Op(ChcOp::Bv2Nat, args) if args.len() == 1 => {
-                let (v, _w) = eval_bv_val(&args[0], model)?;
-                // u128 → BigInt is always exact (no fail-closed skip needed).
+                let (v, _w) = eval_bv_big_val(&args[0], model)?;
                 Some(BigInt::from(v))
             }
             _ => None,

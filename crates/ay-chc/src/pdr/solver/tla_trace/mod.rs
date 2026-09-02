@@ -340,6 +340,7 @@ impl PdrSolver {
                 verbose: self.config.verbose,
                 strict_proofs: true,
                 cancellation_token: self.config.cancellation_token.clone(),
+                external_cancellation_token: self.config.external_cancellation_token.clone(),
                 solve_timeout: self.config.solve_timeout,
                 disable_array_scalarization: true,
                 ..crate::pdr::PdrConfig::default()

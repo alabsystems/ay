@@ -115,7 +115,7 @@ implemented C-ABI route raise `NotImplementedError` naming the gap.
 - **Misc:** `is_true`, `is_false`, `simplify`, `set_param`/`get_param`, `parse_smtlib2_string`/`parse_smtlib2_file`.
 
 The suite in `tests/` contains representative verdict and value cross-checks
-against the required `z3-solver==5.0.0.0` oracle. It does not establish
+against the required `z3-solver==5.1.0.0` oracle. It does not establish
 equivalence over every input in the operation domains above.
 
 ### Example applications

@@ -4,6 +4,11 @@
 
 // Textually included by `farkas.rs` to preserve private item paths.
 
+/// Capacity-hint clamp for per-position candidate vectors, which structurally
+/// hold 1 or 2 entries (an equality's two orientations, a disequality's two
+/// strict branches).
+const MAX_PREALLOC_BRANCH_CANDIDATES: usize = 4;
+
 /// One orientation-branching position of a [`ScaledPlan`].
 ///
 /// Only literals that genuinely offer more than one normalized form (an
@@ -99,20 +104,22 @@ fn build_scaled_plan(
     let mut branches = Vec::new();
 
     for (idx, (alts, lambda)) in alternatives.iter().zip(lambdas.iter()).enumerate() {
+        // A position with no candidates offers nothing to fold or branch on.
+        let Some(first) = alts.first() else { continue };
         // A zero multiplier contributes nothing, so its orientation is not a
         // real choice — pin it to the first alternative exactly as the
         // node-at-a-time search did.
-        let candidates: &[NormalizedConstraint] = if lambda.is_zero() { &alts[0..1] } else { alts };
+        let candidates: &[NormalizedConstraint] =
+            if lambda.is_zero() { std::slice::from_ref(first) } else { alts };
 
-        if candidates.len() <= 1 {
-            let alt = &candidates[0];
+        if let Some((alt, [])) = candidates.split_first() {
             base.add_scaled(&alt.expr, lambda);
             base_strict = base_strict || (!lambda.is_zero() && alt.strict);
             continue;
         }
 
-        let mut scaled = Vec::with_capacity(candidates.len());
-        let mut strict = Vec::with_capacity(candidates.len());
+        let mut scaled = Vec::with_capacity(candidates.len().min(MAX_PREALLOC_BRANCH_CANDIDATES));
+        let mut strict = Vec::with_capacity(candidates.len().min(MAX_PREALLOC_BRANCH_CANDIDATES));
         for alt in candidates {
             let mut row = LinearExpr::zero();
             row.add_scaled(&alt.expr, lambda);
@@ -142,12 +149,22 @@ fn build_scaled_plan(
 /// Suffix bounds for [`ScaledPlan::remaining`], built back-to-front so each
 /// depth is the next depth plus this branch's worst-case contribution.
 fn build_remaining_bounds(branches: &[ScaledBranch]) -> Vec<BTreeMap<TermId, BigRational>> {
-    let mut remaining = vec![BTreeMap::new(); branches.len() + 1];
-    for depth in (0..branches.len()).rev() {
-        let mut bounds = remaining[depth + 1].clone();
+    // `bounds` runs deepest-first: it starts as the empty suffix past the last
+    // branch and absorbs one branch's worst case per step, so pushing after
+    // each step yields the suffixes in descending depth — reversed at the end
+    // into ascending order with `branches.len() + 1` entries.
+    // `len + 1` entries; saturating keeps the hint's arithmetic total (a
+    // slice holds at most `isize::MAX` elements, so it never actually
+    // saturates) and the `min` cap below still bounds the preallocation.
+    let mut remaining = Vec::with_capacity(
+        branches.len().saturating_add(1).min(MAX_FARKAS_CONFLICT_LITERALS),
+    );
+    remaining.push(BTreeMap::new());
+    let mut bounds: BTreeMap<TermId, BigRational> = BTreeMap::new();
+    for branch in branches.iter().rev() {
         // Worst case over this branch's candidates, per variable.
         let mut worst: BTreeMap<TermId, BigRational> = BTreeMap::new();
-        for row in &branches[depth].scaled {
+        for row in &branch.scaled {
             for (var, coeff) in &row.coeffs {
                 let magnitude = coeff.abs();
                 match worst.get_mut(var) {
@@ -162,8 +179,9 @@ fn build_remaining_bounds(branches: &[ScaledBranch]) -> Vec<BTreeMap<TermId, Big
         for (var, magnitude) in worst {
             *bounds.entry(var).or_insert_with(BigRational::zero) += magnitude;
         }
-        remaining[depth] = bounds;
+        remaining.push(bounds.clone());
     }
+    remaining.reverse();
     remaining
 }
 
@@ -189,31 +207,55 @@ fn search_plan(
     strict_acc: bool,
     choice: &mut Option<&mut [usize]>,
 ) -> bool {
+    let branches = plan.branches.get(depth..).unwrap_or(&[]);
+    let remaining = plan.remaining.get(depth..).unwrap_or(&[]);
+    search_plan_suffix(branches, remaining, acc, strict_acc, choice)
+}
+
+/// [`search_plan`] on the still-unwalked suffix: `branches` and `remaining`
+/// both start at the current depth, and each recursive call peels one branch
+/// off the front, so the shrinking `branches` slice is the termination
+/// measure.
+fn search_plan_suffix(
+    branches: &[ScaledBranch],
+    remaining: &[BTreeMap<TermId, BigRational>],
+    acc: &mut LinearExpr,
+    strict_acc: bool,
+    choice: &mut Option<&mut [usize]>,
+) -> bool {
     // Exact subtree prune (see `ScaledPlan::remaining`). At the leaf the bound
     // map is empty, so this reduces to `is_contradiction`'s own
     // "every coefficient eliminated" requirement. A plan built without prune
     // bounds has no entry at any depth and simply does not prune — never a
     // zero bound, which would prune every non-cancelled prefix.
-    if let Some(bounds) = plan.remaining.get(depth) {
-        if !subtree_can_cancel(acc, bounds) {
-            return false;
+    let remaining_tail = match remaining.split_first() {
+        Some((bounds, tail)) => {
+            if !subtree_can_cancel(acc, bounds) {
+                return false;
+            }
+            tail
         }
-    }
+        None => remaining,
+    };
 
-    let Some(branch) = plan.branches.get(depth) else {
+    let Some((branch, branches_tail)) = branches.split_first() else {
         return is_contradiction(acc, strict_acc);
     };
 
-    for (alt_idx, scaled) in branch.scaled.iter().enumerate() {
+    for (alt_idx, (scaled, strict)) in
+        branch.scaled.iter().zip(branch.strict.iter()).enumerate()
+    {
         acc.add_expr(scaled);
         if let Some(choice) = choice.as_deref_mut() {
-            choice[branch.idx] = alt_idx;
+            if let Some(slot) = choice.get_mut(branch.idx) {
+                *slot = alt_idx;
+            }
         }
-        let hit = search_plan(
-            plan,
-            depth + 1,
+        let hit = search_plan_suffix(
+            branches_tail,
+            remaining_tail,
             acc,
-            strict_acc || branch.strict[alt_idx],
+            strict_acc || *strict,
             choice,
         );
         acc.sub_expr(scaled);
@@ -222,7 +264,9 @@ fn search_plan(
         }
     }
     if let Some(choice) = choice.as_deref_mut() {
-        choice[branch.idx] = 0;
+        if let Some(slot) = choice.get_mut(branch.idx) {
+            *slot = 0;
+        }
     }
 
     false

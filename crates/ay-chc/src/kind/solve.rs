@@ -417,7 +417,11 @@ impl KindSolver {
                     if fresh_timeout.is_zero() {
                         IncrementalCheckResult::Unknown
                     } else {
-                        fwd_ctx.check_sat_fresh_query(&[ts.query_at(k + 1)], Some(fresh_timeout))
+                        fwd_ctx.check_sat_fresh_query(
+                            &[ts.query_at(k + 1)],
+                            &smt,
+                            Some(fresh_timeout),
+                        )
                     }
                 }
                 other => other,
@@ -562,7 +566,7 @@ impl KindSolver {
                         if fresh_timeout.is_zero() {
                             IncrementalCheckResult::Unknown
                         } else {
-                            bwd_ctx.check_sat_fresh_query(&[], Some(fresh_timeout))
+                            bwd_ctx.check_sat_fresh_query(&[], &smt, Some(fresh_timeout))
                         }
                     }
                     other => other,

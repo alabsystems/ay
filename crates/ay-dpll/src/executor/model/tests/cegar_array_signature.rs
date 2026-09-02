@@ -8,6 +8,8 @@ use super::*;
 use ay_core::TermData;
 use ay_frontend::parse;
 
+mod census_scope;
+
 struct ReadPair {
     executor: Executor,
     left: TermId,
@@ -46,6 +48,17 @@ fn forge_canonical_owner(executor: &mut Executor, identity: &str) {
     executor
         .ctx
         .register_symbol(identity.to_string(), owner, Sort::Bool);
+}
+
+fn lia_census_model(values: &[(TermId, i64)]) -> Model {
+    let mut model = empty_model();
+    model.lia_model = Some(LiaModel {
+        values: values
+            .iter()
+            .map(|&(term, value)| (term, BigInt::from(value)))
+            .collect(),
+    });
+    model
 }
 
 #[test]

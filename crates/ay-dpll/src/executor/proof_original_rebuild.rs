@@ -404,6 +404,7 @@ impl Executor {
         // solve); the trust surgery below reuses this exact `originals` list.
         self.last_proof_rebuild_originals = originals.iter().map(|(c, _)| *c).collect();
         self.last_proof_raw_original_assertions.clear();
+        self.last_proof_expanded_let_sources.clear();
 
         // Also capture the recursively RAW re-interned form of each parsed
         // original. The fold-to-`false` reconstructions assume exact source

@@ -4068,20 +4068,60 @@ impl Executor {
         Some((atom, polarity))
     }
 
-    /// Whether the one strict array *coverage* oracle may defer to stronger,
-    /// independently checked SAT authority.
+    /// Whether a narrowly identified strict-oracle *coverage* gap may defer to
+    /// stronger, independently checked SAT authority.
     ///
-    /// Exact spelling is intentional: every definitive-false array oracle,
-    /// every other coverage reason, and every non-confirming independent result
-    /// remains fail-closed.  The invoked gate accepts only when each exact
-    /// authored assertion directly evaluates to `Bool(true)` with no residual,
-    /// tautology, unsupported-atom, or skipped-assertion escape.
-    fn read_conflict_coverage_gap_has_full_independent_authority(&self, oracle: &str) -> bool {
-        oracle == "arrays-read-conflict-uneval"
-            && matches!(
-                self.confirm_sat_with_fully_evaluated_independent_gate(),
-                ay_model_check::GateVerdict::ConfirmedSat
-            )
+    /// Exact oracle spellings are intentional. `datatype` may enter this lane
+    /// only when the current candidate has a nonempty W6 datatype-array
+    /// inventory that reauthenticates from stamps, carriers, exact field values,
+    /// and the current authored term census. Raw `dt_ground` rows are never
+    /// authority, so scalar-only construction and stale/tampered W6 evidence
+    /// remain fail-closed. The separate model view must then compositionally
+    /// evaluate every exact authored assertion to `Bool(true)` with no residual,
+    /// tautology, unsupported-atom, or skipped-assertion escape. Every other
+    /// oracle and every `ModelViolates` / `CannotConfirm` result remains
+    /// fail-closed.
+    fn strict_coverage_gap_has_full_independent_authority(&self, oracle: &str) -> bool {
+        let reauthenticated_w6 = (oracle == "datatype")
+            .then(|| {
+                self.last_model
+                    .as_ref()
+                    .and_then(|model| self.authenticated_datatype_array_field_classes(model))
+            })
+            .flatten();
+        let in_scope = oracle == "arrays-read-conflict-uneval"
+            || reauthenticated_w6
+                .as_ref()
+                .is_some_and(|classes| !classes.is_empty());
+        if !in_scope {
+            return false;
+        }
+        let verdict = self.confirm_sat_with_fully_evaluated_independent_gate();
+        matches!(verdict, ay_model_check::GateVerdict::ConfirmedSat)
+    }
+
+    /// Run the strict oracle and apply every scoped independent-authority
+    /// exception in one place, so all SAT-validation funnels have identical
+    /// fail-closed policy.
+    fn verify_model_strict_with_scoped_authority(&self) -> Option<(usize, &'static str, TermId)> {
+        match self.verify_model_strict() {
+            Some((_, oracle, _))
+                if self.strict_coverage_gap_has_full_independent_authority(oracle) =>
+            {
+                None
+            }
+            Some((_, oracle, _))
+                if oracle == "datatype-field"
+                    && self.problem_has_datatype_carrying_array()
+                    && matches!(
+                        self.confirm_sat_with_independent_gate(),
+                        ay_model_check::GateVerdict::ConfirmedSat
+                    ) =>
+            {
+                None
+            }
+            other => other,
+        }
     }
 
     /// Run the global strict definitive-false gate on the current SAT result and
@@ -4120,33 +4160,12 @@ impl Executor {
         // certificate can be minted from stale evidence. Env-gated; default
         // off is a no-op.
         self.uflia_complete_free_uf_chain_witness();
-        // #g4-dt-defer (also on this entry, mirroring finalize): a
-        // `datatype-field` strict-oracle rejection on a datatype-carrying-array
-        // problem can be a COMPLETENESS gap (the strict per-theory evaluator
-        // lacks the reconstructed committed datatype-field value / does not run
-        // the independent gate's extensionality-merge + tautology normalizer).
-        // Defer to the independent, fail-closed gate: keep the SAT only when it
-        // returns ConfirmedSat (every assertion re-checked true or proven a
-        // model-independent datatype tautology). ModelViolates / CannotConfirm
-        // still degrade. Scoped to `datatype-field` on dt-carrying-array problems.
-        let mut strict = match self.verify_model_strict() {
-            Some((_, oracle, _))
-                if self.read_conflict_coverage_gap_has_full_independent_authority(oracle) =>
-            {
-                None
-            }
-            Some((_, oracle, _))
-                if oracle == "datatype-field"
-                    && self.problem_has_datatype_carrying_array()
-                    && matches!(
-                        self.confirm_sat_with_independent_gate(),
-                        ay_model_check::GateVerdict::ConfirmedSat
-                    ) =>
-            {
-                None
-            }
-            other => other,
-        };
+        // Central strict-coverage policy (also on the finalize entries): the
+        // existing `datatype-field` array gap and the total-construction
+        // `datatype` gap may defer only to their scoped independent authority.
+        // The latter requires the fully-evaluated gate; see the centralized
+        // helper for the exact fail-closed contract.
+        let mut strict = self.verify_model_strict_with_scoped_authority();
         if let Some((_, oracle, assertion)) = strict {
             if oracle.starts_with("arrays") {
                 self.derive_qfax_refinement_clause(assertion);
@@ -4171,7 +4190,7 @@ impl Executor {
                         }
                     }
                     self.repair_asserted_array_read_pins();
-                    strict = self.verify_model_strict();
+                    strict = self.verify_model_strict_with_scoped_authority();
                     self.qfax_retry_done = false;
                     if strict.is_none() {
                         self.last_rejected_array_assertion = None;
@@ -4753,34 +4772,11 @@ impl Executor {
         // A completion the gates refute degrades to `unknown` exactly as the
         // uncompleted model does today — never a wrong `sat`.
         self.uflia_complete_free_uf_chain_witness();
-        // #g4-dt-defer: a `datatype-field` strict-oracle rejection on a
-        // datatype-carrying-array problem can be a COMPLETENESS gap (the strict
-        // per-theory evaluator lacks the reconstructed committed datatype-field
-        // value), so it computes a genuinely-TRUE assertion false. Defer to the
-        // INDEPENDENT, fail-closed gate -- the SAME arbiter the datatype-array
-        // degrade gate below already uses: keep the SAT only when it returns
-        // ConfirmedSat (every assertion re-checked true; 0 uneval / 0 false;
-        // z3-valid witness). ModelViolates / CannotConfirm fall through to the
-        // strict degrade. Scoped to `datatype-field` on dt-carrying-array
-        // problems, so no other strict oracle is weakened.
-        let strict_verdict = match self.verify_model_strict() {
-            Some((_, oracle, _))
-                if self.read_conflict_coverage_gap_has_full_independent_authority(oracle) =>
-            {
-                None
-            }
-            Some((_, oracle, _))
-                if oracle == "datatype-field"
-                    && self.problem_has_datatype_carrying_array()
-                    && matches!(
-                        self.confirm_sat_with_independent_gate(),
-                        ay_model_check::GateVerdict::ConfirmedSat
-                    ) =>
-            {
-                None
-            }
-            other => other,
-        };
+        // Central strict-coverage policy: both the existing `datatype-field`
+        // array gap and the total-construction `datatype` gap are handled by
+        // the same scoped helper as the other SAT funnels. All non-confirming
+        // independent verdicts remain strict failures.
+        let strict_verdict = self.verify_model_strict_with_scoped_authority();
         // #qfax-rejected-target retry: this cycle's repair ran before
         // the rejection named its assertion. Clear the per-model marker,
         // re-run repair once (the bypass now forces completion for the
@@ -4811,7 +4807,7 @@ impl Executor {
                     }
                 }
                 self.repair_asserted_array_read_pins();
-                let reverdict = self.verify_model_strict();
+                let reverdict = self.verify_model_strict_with_scoped_authority();
                 self.qfax_retry_done = false;
                 if reverdict.is_none() {
                     self.last_rejected_array_assertion = None;
@@ -5212,28 +5208,9 @@ impl Executor {
         // observation pipeline — they must NOT allow a known-wrong
         // model to escape as SAT. Soundness over completeness.
         self.repair_asserted_array_read_pins();
-        // #g4-dt-defer (third strict-gate site in finalize): defer a
-        // `datatype-field` rejection on a datatype-carrying-array problem to the
-        // independent gate — keep the SAT only on ConfirmedSat (every assertion
-        // re-checked true or a proven model-independent datatype tautology).
-        let strict3 = match self.verify_model_strict() {
-            Some((_, oracle, _))
-                if self.read_conflict_coverage_gap_has_full_independent_authority(oracle) =>
-            {
-                None
-            }
-            Some((_, oracle, _))
-                if oracle == "datatype-field"
-                    && self.problem_has_datatype_carrying_array()
-                    && matches!(
-                        self.confirm_sat_with_independent_gate(),
-                        ay_model_check::GateVerdict::ConfirmedSat
-                    ) =>
-            {
-                None
-            }
-            other => other,
-        };
+        // Third strict-gate site in finalize: use the same centralized,
+        // fail-closed coverage policy as both earlier funnels and their retries.
+        let strict3 = self.verify_model_strict_with_scoped_authority();
         // #qfax-rejected-target retry (site 2): same contract as the first
         // strict-gate site above — a successful repair+re-verify may only
         // short-circuit to `Sat` on an independent-gate `ConfirmedSat` (which
@@ -5253,7 +5230,7 @@ impl Executor {
                     }
                 }
                 self.repair_asserted_array_read_pins();
-                let reverdict = self.verify_model_strict();
+                let reverdict = self.verify_model_strict_with_scoped_authority();
                 self.qfax_retry_done = false;
                 if reverdict.is_none() {
                     self.last_rejected_array_assertion = None;
@@ -5852,6 +5829,9 @@ impl Executor {
         }
     }
 }
+
+#[cfg(test)]
+mod scoped_authority_tests;
 
 #[cfg(test)]
 mod failed_assertion_provenance_tests {

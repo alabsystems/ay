@@ -11,7 +11,10 @@
 use ay_core::{Sort, Symbol, TermId, TermStore};
 use num_bigint::BigInt;
 
-use super::discharge_bv_int_bridge_schema;
+use super::{
+    discharge_bv_int_bridge_schema, linear_form, MAX_LINEAR_ATOMS, MAX_LINEAR_DEPTH,
+    MAX_LINEAR_INTEGER_BITS,
+};
 use crate::api::proofs::discharge_trust_clause;
 
 /// The exact clause set collected by `discharge_trust_steps_for_certification`
@@ -100,7 +103,7 @@ fn loop_counter_fixture(width: u32) -> LoopCounterFixture {
 
 #[test]
 fn loop_counter_overflow_trust_clauses_all_discharge_through_the_gate() {
-    for width in [8_u32, 16, 32, 64] {
+    for width in [8_u32, 16, 32, 64, 128] {
         let fixture = loop_counter_fixture(width);
         for (name, clause) in [
             ("t0", fixture.t0),
@@ -119,8 +122,9 @@ fn loop_counter_overflow_trust_clauses_all_discharge_through_the_gate() {
 
 #[test]
 fn modular_residue_and_order_schemas_need_no_solver_at_every_width() {
-    // The point of this lane: no enumeration, so 64-bit is no harder than 8.
-    for width in [8_u32, 16, 32, 64] {
+    // The point of this lane: no enumeration, so Rust's 128-bit words are no
+    // harder than 8-bit words.
+    for width in [8_u32, 16, 32, 64, 128] {
         let fixture = loop_counter_fixture(width);
         for (name, clause) in [("t1", fixture.t1), ("t3", fixture.t3), ("t4", fixture.t4)] {
             assert!(
@@ -148,6 +152,32 @@ fn bvsub_modular_residue_wraps_upward() {
     let eq_wrapped = terms.mk_eq(nat_diff, wrapped);
     let clause = terms.mk_or(vec![eq_base, eq_wrapped]);
     assert!(discharge_bv_int_bridge_schema(&terms, &[clause], &[]));
+}
+
+#[test]
+fn bv2nat_range_requires_the_exact_endpoint_and_a_bounded_width() {
+    let mut terms = TermStore::new();
+    let value = terms.mk_var("range_value", Sort::bitvec(128));
+    let nat = terms.mk_bv2nat(value);
+    let zero = terms.mk_int(BigInt::from(0_u8));
+    let max = terms.mk_int((BigInt::from(1_u8) << 128) - BigInt::from(1_u8));
+    let wrong_max = terms.mk_int((BigInt::from(1_u8) << 128) - BigInt::from(2_u8));
+    let lower = terms.mk_le(zero, nat);
+    let upper = terms.mk_le(nat, max);
+    let wrong_upper = terms.mk_le(nat, wrong_max);
+    assert!(discharge_bv_int_bridge_schema(&terms, &[lower], &[]));
+    assert!(discharge_bv_int_bridge_schema(&terms, &[upper], &[]));
+    assert!(!discharge_bv_int_bridge_schema(&terms, &[wrong_upper], &[]));
+
+    let too_wide = terms.mk_var("too_wide_range_value", Sort::bitvec(129));
+    let too_wide_nat = terms.mk_bv2nat(too_wide);
+    let too_wide_max = terms.mk_int((BigInt::from(1_u8) << 129) - BigInt::from(1_u8));
+    let too_wide_upper = terms.mk_le(too_wide_nat, too_wide_max);
+    assert!(!discharge_bv_int_bridge_schema(
+        &terms,
+        &[too_wide_upper],
+        &[]
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -366,4 +396,57 @@ fn a_bitvec_literal_outside_unsigned_range_declines_the_lane() {
     let eq_wrapped = terms.mk_eq(nat_sum, wrapped);
     let clause = terms.mk_or(vec![eq_base, eq_wrapped]);
     assert!(!discharge_bv_int_bridge_schema(&terms, &[clause], &[]));
+}
+
+#[test]
+fn modular_residue_refuses_unbounded_width_before_modulus_shift() {
+    let width = u32::MAX;
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("unbounded_width_a", Sort::bitvec(width));
+    let b = terms.mk_var("unbounded_width_b", Sort::bitvec(width));
+    let sum = bv_op(&mut terms, "bvadd", vec![a, b], width);
+    let nat_a = terms.mk_bv2nat(a);
+    let nat_b = terms.mk_bv2nat(b);
+    let nat_sum = terms.mk_bv2nat(sum);
+    let base = terms.mk_app(Symbol::named("+"), vec![nat_a, nat_b], Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0_u8));
+    let wrapped = terms.mk_app(Symbol::named("-"), vec![base, zero], Sort::Int);
+    let eq_base = terms.mk_eq(nat_sum, base);
+    let eq_wrapped = terms.mk_eq(nat_sum, wrapped);
+    let clause = terms.mk_or(vec![eq_base, eq_wrapped]);
+
+    assert!(!discharge_bv_int_bridge_schema(&terms, &[clause], &[]));
+}
+
+#[test]
+fn linear_form_refuses_terms_beyond_depth_limit() {
+    let mut terms = TermStore::new();
+    let mut nested = terms.mk_int(BigInt::from(0_u8));
+    for _ in 0..=MAX_LINEAR_DEPTH {
+        nested = terms.mk_app(Symbol::named("-"), vec![nested], Sort::Int);
+    }
+    assert!(linear_form(&terms, nested).is_none());
+}
+
+#[test]
+fn linear_form_refuses_oversized_literals_and_products() {
+    let mut terms = TermStore::new();
+    let oversized = terms.mk_int(BigInt::from(1_u8) << MAX_LINEAR_INTEGER_BITS as usize);
+    assert!(linear_form(&terms, oversized).is_none());
+
+    let factor_value = BigInt::from(1_u8) << (MAX_LINEAR_INTEGER_BITS / 2) as usize;
+    let left = terms.mk_int(factor_value.clone());
+    let right = terms.mk_int(factor_value);
+    let product = terms.mk_app(Symbol::named("*"), vec![left, right], Sort::Int);
+    assert!(linear_form(&terms, product).is_none());
+}
+
+#[test]
+fn linear_form_refuses_more_than_atom_limit() {
+    let mut terms = TermStore::new();
+    let atoms: Vec<_> = (0..=MAX_LINEAR_ATOMS)
+        .map(|index| terms.mk_var(format!("linear_atom_{index}"), Sort::Int))
+        .collect();
+    let sum = terms.mk_app(Symbol::named("+"), atoms, Sort::Int);
+    assert!(linear_form(&terms, sum).is_none());
 }

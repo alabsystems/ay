@@ -12,7 +12,11 @@
 
 use std::time::Duration;
 
-use crate::invoke::{solve, solve_with_proof, EncodeConfig, Engine, ProofMode};
+use crate::invoke::{
+    collect_query_obligation_outcomes_with, solve, solve_query_obligations,
+    solve_query_obligations_with_cancellation, solve_with_proof, solve_with_proof_report,
+    solve_with_proof_report_with_cancellation, EncodeConfig, Engine, ProofMode,
+};
 use crate::verdict::{AyVerdict, UnknownReason};
 use ay_chc::{engines, ChcParser, PdrConfig, VerifiedChcResult};
 
@@ -129,6 +133,259 @@ fn g1_strict_validation_forces_strict_proofs_on_adaptive_config() {
         .with_proof_mode(ProofMode::Strict)
         .to_adaptive_config();
     assert!(via_mode.strict_proofs);
+}
+
+#[test]
+fn deterministic_execution_mode_is_exposed_through_encode_config() {
+    let config = EncodeConfig::new()
+        .with_execution_mode(ay_chc::AdaptiveExecutionMode::DeterministicSequential)
+        .with_memory_budget(64 * 1024 * 1024);
+    assert_eq!(
+        config.execution_mode,
+        ay_chc::AdaptiveExecutionMode::DeterministicSequential
+    );
+    let adaptive = config.to_adaptive_config();
+    assert_eq!(adaptive.memory_budget(), Some(64 * 1024 * 1024));
+}
+
+#[test]
+fn per_query_batch_returns_safe_and_unsafe_properties_independently() {
+    let problem = parse(
+        r#"
+(set-logic HORN)
+(declare-rel reached ())
+(declare-rel error_p0 ())
+(declare-rel error_p1 ())
+(declare-rel error ())
+(rule reached)
+(rule (=> reached error_p0))
+(rule (=> false error_p1))
+(rule (=> error_p0 error))
+(rule (=> error_p1 error))
+(query error)
+"#,
+    );
+    let outcomes = solve_query_obligations(
+        &problem,
+        &EncodeConfig::new().with_timeout(Duration::from_secs(10)),
+    )
+    .expect("valid multi-query problem should split and solve");
+
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes[0].id().label(), "error_p0");
+    assert!(matches!(outcomes[0].outcome(), Ok(AyVerdict::Violated(_))));
+    assert_eq!(outcomes[1].id().label(), "error_p1");
+    assert!(matches!(
+        outcomes[1].outcome(),
+        Ok(AyVerdict::Proved { .. })
+    ));
+}
+
+#[test]
+fn per_query_batch_rejects_no_query_and_invalid_input_but_accepts_vacuous_query() {
+    assert!(matches!(
+        solve_query_obligations(&ay_chc::ChcProblem::new(), &EncodeConfig::new()),
+        Err(crate::EncodeError::Chc(crate::ChcError::NoQuery))
+    ));
+
+    let mut invalid = ay_chc::ChcProblem::new();
+    let unary = invalid.declare_predicate("unary", vec![ay_chc::ChcSort::Int]);
+    invalid.add_clause(ay_chc::HornClause::query(
+        ay_chc::ClauseBody::predicates_only(vec![(unary, vec![])]),
+    ));
+    assert!(matches!(
+        solve_query_obligations(&invalid, &EncodeConfig::new()),
+        Err(crate::EncodeError::Chc(crate::ChcError::ArityMismatch {
+            expected: 1,
+            actual: 0,
+            ..
+        }))
+    ));
+
+    let mut vacuous = ay_chc::ChcProblem::new();
+    vacuous.add_clause(ay_chc::HornClause::query(ay_chc::ClauseBody::constraint(
+        ay_chc::ChcExpr::Bool(false),
+    )));
+    let outcomes = solve_query_obligations(&vacuous, &EncodeConfig::new())
+        .expect("a simplified-false query is valid and vacuously safe");
+    assert!(outcomes.is_empty());
+}
+
+#[test]
+fn per_query_batch_continues_after_unknown_and_error_rows() {
+    let problem = parse(
+        r#"
+(set-logic HORN)
+(declare-rel error_p0 ())
+(declare-rel error_p1 ())
+(declare-rel error_p2 ())
+(declare-rel error ())
+(rule (=> error_p0 error))
+(rule (=> error_p1 error))
+(rule (=> error_p2 error))
+(query error)
+"#,
+    );
+    let obligations = problem
+        .query_obligations()
+        .expect("valid marker query should split");
+    assert_eq!(obligations.len(), 3);
+
+    let mut calls = 0;
+    let outcomes = collect_query_obligation_outcomes_with(obligations, |_| {
+        let call = calls;
+        calls += 1;
+        match call {
+            0 => Ok(AyVerdict::Unknown {
+                reason: UnknownReason::Inconclusive,
+                detail: Some("injected unknown".to_owned()),
+            }),
+            1 => Err(crate::EncodeError::Unimplemented("injected failure")),
+            _ => Ok(AyVerdict::Unknown {
+                reason: UnknownReason::NotApplicable,
+                detail: Some("reached after error".to_owned()),
+            }),
+        }
+    });
+
+    assert_eq!(calls, 3, "every row must be attempted");
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(outcomes[0].id().label(), "error_p0");
+    assert_eq!(outcomes[1].id().label(), "error_p1");
+    assert_eq!(outcomes[2].id().label(), "error_p2");
+    assert!(matches!(
+        outcomes[0].outcome(),
+        Ok(AyVerdict::Unknown { .. })
+    ));
+    assert!(matches!(
+        outcomes[1].outcome(),
+        Err(crate::EncodeError::Unimplemented("injected failure"))
+    ));
+    assert!(matches!(
+        outcomes[2].outcome(),
+        Ok(AyVerdict::Unknown {
+            reason: UnknownReason::NotApplicable,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn cancelled_query_batch_preserves_all_remaining_rows_without_starting_solves() {
+    let problem = parse(
+        r#"
+(set-logic HORN)
+(declare-rel error_p0 ())
+(declare-rel error_p1 ())
+(declare-rel error ())
+(rule (=> error_p0 error))
+(rule (=> error_p1 error))
+(query error)
+"#,
+    );
+    let cancellation = ay_chc::CancellationToken::new();
+    cancellation.cancel();
+    let outcomes =
+        solve_query_obligations_with_cancellation(&problem, &EncodeConfig::new(), &cancellation)
+            .expect("a valid cancelled batch still returns its partial-result rows");
+
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes
+        .iter()
+        .all(|row| matches!(row.outcome(), Err(crate::EncodeError::Cancelled))));
+}
+
+#[test]
+fn proof_report_binds_telemetry_to_the_authoritative_result() {
+    let problem = parse(SAFE_CHC);
+    let expected_hash = crate::normalized_chc_input_sha256(&problem);
+    let report = solve_with_proof_report(
+        problem,
+        &EncodeConfig::new()
+            .with_strict_validation(true)
+            .with_timeout(Duration::from_secs(10)),
+    )
+    .expect("proof-and-telemetry solve should run");
+
+    assert_eq!(
+        report.proof_run().problem().normalized_input_sha256(),
+        expected_hash
+    );
+    assert_eq!(
+        report.stop_reason(),
+        ay_chc::ChcProofRunStopReason::Definitive
+    );
+    assert!(!report.cancellation_requested_at_return());
+}
+
+#[test]
+fn strict_proof_report_uses_the_same_direct_pdr_route_as_strict_solve() {
+    let report = solve_with_proof_report(
+        parse(SAFE_CHC),
+        &EncodeConfig::new()
+            .with_proof_mode(ProofMode::Strict)
+            .with_timeout(Duration::from_secs(10)),
+    )
+    .expect("strict proof-and-telemetry solve should run");
+
+    assert_eq!(report.proof_run().metadata().engine(), "pdr");
+    assert_eq!(report.adaptive_trace().observations().len(), 1);
+    assert_eq!(
+        report.adaptive_trace().observations()[0].stage,
+        "direct_pdr_proof"
+    );
+    assert!(matches!(
+        report.proof_run().result(),
+        VerifiedChcResult::Safe(_)
+    ));
+}
+
+#[test]
+fn strict_proof_report_fails_closed_at_a_precancelled_return_boundary() {
+    let cancellation = ay_chc::CancellationToken::new();
+    cancellation.cancel();
+    let report = solve_with_proof_report_with_cancellation(
+        parse(SAFE_CHC),
+        &EncodeConfig::new()
+            .with_proof_mode(ProofMode::Strict)
+            .with_timeout(Duration::from_secs(10)),
+        &cancellation,
+    )
+    .expect("pre-cancelled direct-PDR reporting should return non-proof evidence");
+
+    assert!(matches!(
+        report.proof_run().result(),
+        VerifiedChcResult::Unknown(_)
+    ));
+    assert_eq!(
+        report.stop_reason(),
+        ay_chc::ChcProofRunStopReason::ExternallyCancelled
+    );
+    assert!(report.cancellation_requested_at_return());
+}
+
+#[test]
+fn proof_report_exposes_caller_owned_cancellation() {
+    let cancellation = ay_chc::CancellationToken::new();
+    cancellation.cancel();
+    let report = solve_with_proof_report_with_cancellation(
+        parse(SAFE_CHC),
+        &EncodeConfig::new()
+            .with_execution_mode(ay_chc::AdaptiveExecutionMode::DeterministicSequential)
+            .with_timeout(Duration::from_secs(10)),
+        &cancellation,
+    )
+    .expect("cancelled proof/report solve should fail closed, not error");
+
+    assert!(matches!(
+        report.proof_run().result(),
+        VerifiedChcResult::Unknown(_)
+    ));
+    assert_eq!(
+        report.stop_reason(),
+        ay_chc::ChcProofRunStopReason::ExternallyCancelled
+    );
+    assert!(report.cancellation_requested_at_return());
 }
 
 // --- Round-trip parity: invoke::solve vs raw ay-chc (Step-0 gate) ------------
@@ -291,4 +548,38 @@ fn solve_with_proof_certificate_is_bound_and_coherent() {
     // metadata_json round-trips the proof-run transcript metadata.
     let json = cert.metadata_json();
     assert!(json.get("normalized_input_sha256").is_some());
+}
+
+#[test]
+fn unknown_reason_normalization_remains_one_to_one() {
+    use ay_chc::VerifiedUnknownReason;
+
+    for (source, expected) in [
+        (
+            VerifiedUnknownReason::Inconclusive,
+            UnknownReason::Inconclusive,
+        ),
+        (
+            VerifiedUnknownReason::BmcExhaustedSearch,
+            UnknownReason::BmcExhaustedSearch,
+        ),
+        (
+            VerifiedUnknownReason::BmcBudgetExhausted,
+            UnknownReason::BmcBudgetExhausted,
+        ),
+        (
+            VerifiedUnknownReason::NotApplicable,
+            UnknownReason::NotApplicable,
+        ),
+        (
+            VerifiedUnknownReason::OverApproximatedRefutation,
+            UnknownReason::OverApproximatedRefutation,
+        ),
+        (
+            VerifiedUnknownReason::CandidateNotAdmitted,
+            UnknownReason::CandidateNotAdmitted,
+        ),
+    ] {
+        assert_eq!(UnknownReason::from(source), expected);
+    }
 }

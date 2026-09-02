@@ -73,7 +73,9 @@
 //! or WITHHOLD").
 //!
 //! Composed SAT models materialize `cata_k(x)` as [`ChcExpr::FuncApp`] terms
-//! with reserved names (`__ay_cata_<kind>@<sort>`). Downstream re-checks that
+//! with per-problem collision-free names (normally `cata_<kind>@<sort>`;
+//! deterministically freshened when a source symbol already has that name).
+//! Downstream re-checks that
 //! treat those symbols as uninterpreted are strictly conservative: an
 //! unconstrained UF admits more behaviours than the real catamorphism, so a
 //! query-clause discharge that succeeds under the UF reading also holds for
@@ -90,7 +92,10 @@ use ay_core::time::Instant;
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::smt::executor_adapter::{quote_symbol, sort_to_smtlib};
+use crate::smt::executor_adapter::{
+    collect_uninterpreted_function_declarations_for_exprs, emit_declare_uninterpreted_function,
+    quote_symbol, sort_to_smtlib,
+};
 use crate::{
     ChcExpr, ChcProblem, ChcSort, ChcVar, ClauseBody, ClauseHead, HornClause, InvariantModel,
     PredicateId, PredicateInterpretation,
@@ -129,7 +134,7 @@ const CATA_MAX_SENTINEL: i64 = -1_000_000_000;
 // ============================================================================
 
 /// One catamorphism from the fixed v1 pool.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum CataKind {
     /// Total node count across all (mutually) recursive ADT fields.
     Size,
@@ -157,6 +162,139 @@ pub(crate) enum CataKind {
     Sorted,
 }
 
+/// Collision-free names for the catamorphism UFs generated for one source
+/// problem.  The historical `cata_<tag>@<sort>` spelling is retained whenever
+/// it is free; a colliding spelling is replaced by a deterministic fresh name.
+/// The reverse map is also the authority for recognizing generated symbols:
+/// source UFs are never classified as catamorphisms merely because their name
+/// happens to have the historical shape.
+#[derive(Debug, Clone)]
+struct CataSymbols {
+    by_semantic: BTreeMap<(CataKind, String), String>,
+    by_name: BTreeMap<String, (CataKind, String)>,
+}
+
+impl CataSymbols {
+    fn build(problem: &ChcProblem, registry: &DtRegistry) -> Self {
+        let mut occupied = BTreeSet::new();
+        for predicate in problem.predicates() {
+            occupied.insert(predicate.name.clone());
+        }
+        for clause in problem.clauses() {
+            for var in clause.vars() {
+                occupied.insert(var.name);
+            }
+            for (_, args) in &clause.body.predicates {
+                for arg in args {
+                    collect_source_term_symbols(arg, &mut occupied);
+                }
+            }
+            if let Some(constraint) = &clause.body.constraint {
+                collect_source_term_symbols(constraint, &mut occupied);
+            }
+            if let ClauseHead::Predicate(_, args) = &clause.head {
+                for arg in args {
+                    collect_source_term_symbols(arg, &mut occupied);
+                }
+            }
+        }
+        for (sort_name, ctors) in &registry.sorts {
+            occupied.insert(sort_name.clone());
+            for ctor in ctors {
+                occupied.insert(ctor.name.clone());
+                occupied.insert(format!("is-{}", ctor.name));
+                occupied.extend(ctor.fields.iter().map(|field| field.selector.clone()));
+            }
+        }
+
+        let mut kinds = vec![
+            CataKind::Size,
+            CataKind::Height,
+            CataKind::IntSum,
+            CataKind::RootDisc,
+            CataKind::Min,
+            CataKind::Max,
+            CataKind::Sorted,
+        ];
+        for ctors in registry.sorts.values() {
+            for ctor in ctors {
+                let kind = CataKind::CtorCount(ctor.name.clone());
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+            }
+        }
+
+        let mut by_semantic = BTreeMap::new();
+        let mut by_name = BTreeMap::new();
+        let mut fresh_index = 0usize;
+        for kind in kinds {
+            for sort_name in registry.sorts.keys() {
+                let legacy = kind.uf_name(sort_name);
+                let name = if !occupied.contains(&legacy) && !by_name.contains_key(&legacy) {
+                    legacy
+                } else {
+                    loop {
+                        let candidate = format!("cata$ay${fresh_index}");
+                        fresh_index += 1;
+                        if !occupied.contains(&candidate) && !by_name.contains_key(&candidate) {
+                            break candidate;
+                        }
+                    }
+                };
+                occupied.insert(name.clone());
+                by_semantic.insert((kind.clone(), sort_name.clone()), name.clone());
+                by_name.insert(name, (kind.clone(), sort_name.clone()));
+            }
+        }
+        Self {
+            by_semantic,
+            by_name,
+        }
+    }
+
+    fn name(&self, kind: &CataKind, sort_name: &str) -> String {
+        self.by_semantic
+            .get(&(kind.clone(), sort_name.to_string()))
+            // Every production pool is drawn from the fixed kinds plus the
+            // registry's constructors, all allocated by `build` above.
+            // Missing metadata is an internal construction bug; falling back
+            // to a historical spelling here could reintroduce a collision.
+            .expect("cata symbol metadata covers every generated function")
+            .clone()
+    }
+
+    fn parse<'a>(&'a self, name: &str) -> Option<(CataKind, &'a str)> {
+        let (kind, sort_name) = self.by_name.get(name)?;
+        Some((kind.clone(), sort_name.as_str()))
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+}
+
+fn collect_source_term_symbols(expr: &ChcExpr, out: &mut BTreeSet<String>) {
+    match expr {
+        ChcExpr::Var(var) => {
+            out.insert(var.name.clone());
+        }
+        ChcExpr::FuncApp(name, _, args) | ChcExpr::PredicateApp(name, _, args) => {
+            out.insert(name.clone());
+            for arg in args {
+                collect_source_term_symbols(arg, out);
+            }
+        }
+        ChcExpr::Op(_, args) => {
+            for arg in args {
+                collect_source_term_symbols(arg, out);
+            }
+        }
+        ChcExpr::ConstArray(_, value) => collect_source_term_symbols(value, out),
+        _ => {}
+    }
+}
+
 impl CataKind {
     fn tag(&self) -> String {
         match self {
@@ -171,8 +309,9 @@ impl CataKind {
         }
     }
 
-    /// Parse a reserved catamorphism UF symbol (`cata_<tag>@<sort>`) back
+    /// Parse the historical catamorphism UF spelling (`cata_<tag>@<sort>`) back
     /// into its kind and sort name. Inverse of [`CataKind::uf_name`].
+    #[cfg(test)]
     pub(crate) fn parse_symbol(name: &str) -> Option<(Self, &str)> {
         let rest = name.strip_prefix("cata_")?;
         let (tag, sort_name) = rest.split_once('@')?;
@@ -189,12 +328,12 @@ impl CataKind {
         Some((kind, sort_name))
     }
 
-    /// Reserved uninterpreted-function name for this catamorphism at a sort.
+    /// Historical uninterpreted-function name for this catamorphism at a sort.
     ///
     /// NOTE: must NOT start with `__ay_` — the ay-frontend elaborator rejects
     /// declarations of that internal prefix, and the obligation scripts
-    /// declare these symbols. The `@` separator keeps accidental collision
-    /// with user symbols implausible (it forces SMT-LIB quoting).
+    /// declare these symbols. [`CataSymbols`] freshens this spelling whenever
+    /// it collides with a source symbol.
     pub(crate) fn uf_name(&self, sort_name: &str) -> String {
         format!("cata_{}@{}", self.tag(), sort_name)
     }
@@ -562,6 +701,7 @@ pub(crate) enum CataSkip {
     NoDatatypes,
     UnsupportedArgumentSort(String),
     ClauseTooLarge(usize),
+    InvalidFunctionSignature(String),
 }
 
 /// One per-original-clause implication obligation `θ ⇒ θ#`, encoded as a
@@ -626,6 +766,7 @@ pub(crate) struct CataAbstraction {
     pub(crate) dropped_conjuncts: usize,
     pool: Vec<CataKind>,
     registry: DtRegistry,
+    symbols: CataSymbols,
     layout: FxHashMap<PredicateId, Vec<ArgMap>>,
     /// Original predicate signatures (for model composition).
     original_preds: Vec<(PredicateId, Vec<ChcSort>)>,
@@ -691,6 +832,7 @@ impl CataAbstraction {
         if registry.is_empty() || !problem.has_datatype_sorts() {
             return Err(CataSkip::NoDatatypes);
         }
+        let symbols = CataSymbols::build(problem, &registry);
 
         // Reject signatures the v1 lane cannot represent faithfully.
         for pred in problem.predicates() {
@@ -739,13 +881,15 @@ impl CataAbstraction {
         let mut obligations = Vec::new();
         let mut dropped_conjuncts = 0usize;
         for (clause_index, clause) in problem.clauses().iter().enumerate() {
-            let mut ctx = ClauseCtx::new(&registry, pool, clause);
+            let mut ctx = ClauseCtx::new(&registry, pool, &symbols, clause);
             let abstract_clause = ctx.translate_clause(clause, &layout)?;
             dropped_conjuncts += ctx.dropped;
+            let script = ctx.obligation_script(clause)?;
+            let sub_scripts = ctx.obligation_sub_scripts(clause)?;
             obligations.push(ClauseObligation {
                 clause_index,
-                script: ctx.obligation_script(clause),
-                sub_scripts: ctx.obligation_sub_scripts(clause),
+                script,
+                sub_scripts,
             });
             abstract_problem.add_clause(abstract_clause);
         }
@@ -761,6 +905,7 @@ impl CataAbstraction {
             dropped_conjuncts,
             pool: pool.to_vec(),
             registry,
+            symbols,
             layout,
             original_preds,
             obligation_cursor: Cell::new((0, 0)),
@@ -964,7 +1109,7 @@ impl CataAbstraction {
                     } => {
                         for (k, kind) in self.pool.iter().enumerate() {
                             let cata_term = func_app(
-                                kind.uf_name(sort_name),
+                                self.symbols.name(kind, sort_name),
                                 ChcSort::Int,
                                 vec![ChcExpr::var(orig_vars[j].clone())],
                             );
@@ -1101,6 +1246,7 @@ struct TupleInfo {
 struct ClauseCtx<'a> {
     registry: &'a DtRegistry,
     pool: &'a [CataKind],
+    symbols: &'a CataSymbols,
     /// Deterministic insertion order (obligations + naming).
     tuples: Vec<TupleInfo>,
     /// Abstract conjuncts (θ#): recurrences, min facts, tuple equalities,
@@ -1114,7 +1260,12 @@ struct ClauseCtx<'a> {
 }
 
 impl<'a> ClauseCtx<'a> {
-    fn new(registry: &'a DtRegistry, pool: &'a [CataKind], clause: &HornClause) -> Self {
+    fn new(
+        registry: &'a DtRegistry,
+        pool: &'a [CataKind],
+        symbols: &'a CataSymbols,
+        clause: &HornClause,
+    ) -> Self {
         let mut used_names: Vec<String> = clause.body.vars().into_iter().map(|v| v.name).collect();
         for v in clause.head.vars() {
             if !used_names.contains(&v.name) {
@@ -1124,6 +1275,7 @@ impl<'a> ClauseCtx<'a> {
         Self {
             registry,
             pool,
+            symbols,
             tuples: Vec::new(),
             abs_conjuncts: Vec::new(),
             dropped: 0,
@@ -1539,7 +1691,7 @@ impl<'a> ClauseCtx<'a> {
     /// recurrences). It stops BEFORE the `¬θ#` goal assertion and `check-sat`,
     /// so the monolithic [`Self::obligation_script`] and the per-conjunct
     /// [`Self::obligation_sub_scripts`] share one construction.
-    fn obligation_env_prefix(&self, clause: &HornClause) -> String {
+    fn obligation_env_prefix(&self, clause: &HornClause) -> Result<String, CataSkip> {
         // Datatypes REACHABLE from this clause's own terms (tuple sorts + any
         // datatype variable in θ), closed over constructor-field datatype
         // references. Declaring the rest sends ay's DT solver into irrelevant
@@ -1556,6 +1708,24 @@ impl<'a> ClauseCtx<'a> {
                 .emit_declare_datatypes_filtered(Some(&used_sorts)),
         );
 
+        let ordinary_uf_declarations = collect_uninterpreted_function_declarations_for_exprs(
+            clause
+                .body
+                .constraint
+                .iter()
+                .chain(self.tuples.iter().map(|tuple| &tuple.term))
+                .chain(self.abs_conjuncts.iter()),
+        )
+        .map_err(|error| CataSkip::InvalidFunctionSignature(error.to_string()))?;
+        for declaration in &ordinary_uf_declarations {
+            // Reserved catamorphism symbols have exact datatype-domain
+            // declarations below.  All other typed FuncApps need their source
+            // declaration reconstructed before θ or θ# is asserted.
+            if !self.symbols.contains(&declaration.name) {
+                smt.push_str(&emit_declare_uninterpreted_function(declaration));
+            }
+        }
+
         // Catamorphism UFs: every pool member at every REACHABLE sort.
         for kind in self.pool {
             for sort_name in self.registry.sorts.keys() {
@@ -1564,7 +1734,7 @@ impl<'a> ClauseCtx<'a> {
                 }
                 smt.push_str(&format!(
                     "(declare-fun {} ({}) Int)\n",
-                    quote_symbol(&kind.uf_name(sort_name)),
+                    quote_symbol(&self.symbols.name(kind, sort_name)),
                     quote_symbol(sort_name)
                 ));
             }
@@ -1620,7 +1790,7 @@ impl<'a> ClauseCtx<'a> {
             for (k, kind) in self.pool.iter().enumerate() {
                 // Tie the abstraction variable to the UF value.
                 let uf_term = func_app(
-                    kind.uf_name(&tuple.sort_name),
+                    self.symbols.name(kind, &tuple.sort_name),
                     ChcSort::Int,
                     vec![tuple.term.clone()],
                 );
@@ -1654,11 +1824,16 @@ impl<'a> ClauseCtx<'a> {
                         let field_terms: Vec<ChcExpr> =
                             args.iter().map(|a| a.as_ref().clone()).collect();
                         for kind in self.pool {
-                            if let Some(rhs) =
-                                recurrence_rhs(kind, ctor, &field_terms, self.registry, self.pool)
-                            {
+                            if let Some(rhs) = recurrence_rhs(
+                                kind,
+                                ctor,
+                                &field_terms,
+                                self.registry,
+                                self.pool,
+                                self.symbols,
+                            ) {
                                 let lhs = func_app(
-                                    kind.uf_name(&tuple.sort_name),
+                                    self.symbols.name(kind, &tuple.sort_name),
                                     ChcSort::Int,
                                     vec![tuple.term.clone()],
                                 );
@@ -1683,15 +1858,15 @@ impl<'a> ClauseCtx<'a> {
                 }
             }
         }
-        smt
+        Ok(smt)
     }
 
     /// The MONOLITHIC obligation script `θ ∧ ¬(⋀ᵢ θ#ᵢ) ⊨ ⊥`, retained for
     /// diagnostics ([`Self::obligation_scripts`], the dump env var) and the
     /// symbol-declaration tests. The discharge path uses the per-conjunct
     /// decomposition instead (see [`Self::obligation_sub_scripts`]).
-    fn obligation_script(&self, clause: &HornClause) -> String {
-        let mut smt = self.obligation_env_prefix(clause);
+    fn obligation_script(&self, clause: &HornClause) -> Result<String, CataSkip> {
+        let mut smt = self.obligation_env_prefix(clause)?;
         // ¬θ#.
         let theta_sharp = if self.abs_conjuncts.is_empty() {
             ChcExpr::Bool(true)
@@ -1701,7 +1876,7 @@ impl<'a> ClauseCtx<'a> {
         smt.push_str("(assert ");
         smt.push_str(&InvariantModel::expr_to_smtlib(&ChcExpr::not(theta_sharp)));
         smt.push_str(")\n(check-sat)\n");
-        smt
+        Ok(smt)
     }
 
     /// Decompose the single conjunctive obligation `θ ⊨ ⋀ᵢ θ#ᵢ` into one
@@ -1721,15 +1896,16 @@ impl<'a> ClauseCtx<'a> {
     /// SINGLE conjunct, so no wide disjunction is ever built and every sub-query
     /// discharges in milliseconds. Pure discharge-side restructuring: the SMT
     /// engine and the obligation SEMANTICS are untouched.
-    fn obligation_sub_scripts(&self, clause: &HornClause) -> Vec<String> {
-        let prefix = self.obligation_env_prefix(clause);
+    fn obligation_sub_scripts(&self, clause: &HornClause) -> Result<Vec<String>, CataSkip> {
+        let prefix = self.obligation_env_prefix(clause)?;
         if self.abs_conjuncts.is_empty() {
             // θ# ≡ true ⇒ ¬θ# ≡ false; the obligation is trivially discharged.
             let mut smt = prefix;
             smt.push_str("(assert false)\n(check-sat)\n");
-            return vec![smt];
+            return Ok(vec![smt]);
         }
-        self.abs_conjuncts
+        Ok(self
+            .abs_conjuncts
             .iter()
             .map(|conjunct| {
                 let mut smt = prefix.clone();
@@ -1738,7 +1914,7 @@ impl<'a> ClauseCtx<'a> {
                 smt.push_str("))\n(check-sat)\n");
                 smt
             })
-            .collect()
+            .collect())
     }
 
     /// One-level unfolding axiom for an abstracted term `t` of sort `S`:
@@ -1770,20 +1946,28 @@ impl<'a> ClauseCtx<'a> {
                 .collect();
             for kind in self.pool {
                 let lhs = func_app(
-                    kind.uf_name(&tuple.sort_name),
+                    self.symbols.name(kind, &tuple.sort_name),
                     ChcSort::Int,
                     vec![tuple.term.clone()],
                 );
-                if let Some(rhs) =
-                    recurrence_rhs(kind, ctor, &field_terms, self.registry, self.pool)
-                {
+                if let Some(rhs) = recurrence_rhs(
+                    kind,
+                    ctor,
+                    &field_terms,
+                    self.registry,
+                    self.pool,
+                    self.symbols,
+                ) {
                     parts.push(ChcExpr::eq(lhs, rhs));
                 }
                 // Min facts of the recursive fields' catamorphism values.
                 for (field, term) in ctor.fields.iter().zip(&field_terms) {
                     if let FieldKind::Adt(field_sort) = &field.kind {
-                        let sub =
-                            func_app(kind.uf_name(field_sort), ChcSort::Int, vec![term.clone()]);
+                        let sub = func_app(
+                            self.symbols.name(kind, field_sort),
+                            ChcSort::Int,
+                            vec![term.clone()],
+                        );
                         let n_sub = self.registry.ctors(field_sort).map_or(0, <[CtorInfo]>::len);
                         parts.extend(cata_min_facts(kind, &sub, n_sub));
                     }
@@ -1815,6 +1999,7 @@ fn recurrence_rhs(
     field_terms: &[ChcExpr],
     registry: &DtRegistry,
     pool: &[CataKind],
+    symbols: &CataSymbols,
 ) -> Option<ChcExpr> {
     let adt_field_values: Vec<ChcExpr> = ctor
         .fields
@@ -1822,7 +2007,7 @@ fn recurrence_rhs(
         .zip(field_terms)
         .filter_map(|(field, term)| match &field.kind {
             FieldKind::Adt(field_sort) => Some(func_app(
-                kind.uf_name(field_sort),
+                symbols.name(kind, field_sort),
                 ChcSort::Int,
                 vec![term.clone()],
             )),
@@ -1843,17 +2028,19 @@ fn recurrence_rhs(
     // identity of min/max (and vacuously sorted). Only Min/Max/Sorted use this;
     // Size/Height/IntSum/CtorCount must still count every field, so they keep
     // `adt_field_values`. See [`is_empty_leaf_term`].
-    let adt_elem_values: Vec<ChcExpr> =
-        ctor.fields
-            .iter()
-            .zip(field_terms)
-            .filter_map(|(field, term)| match &field.kind {
-                FieldKind::Adt(field_sort) if !is_empty_leaf_term(registry, term) => Some(
-                    func_app(kind.uf_name(field_sort), ChcSort::Int, vec![term.clone()]),
-                ),
-                _ => None,
-            })
-            .collect();
+    let adt_elem_values: Vec<ChcExpr> = ctor
+        .fields
+        .iter()
+        .zip(field_terms)
+        .filter_map(|(field, term)| match &field.kind {
+            FieldKind::Adt(field_sort) if !is_empty_leaf_term(registry, term) => Some(func_app(
+                symbols.name(kind, field_sort),
+                ChcSort::Int,
+                vec![term.clone()],
+            )),
+            _ => None,
+        })
+        .collect();
     match kind {
         CataKind::Size => Some(sum_exprs(
             std::iter::once(ChcExpr::int(1))
@@ -1920,24 +2107,26 @@ fn recurrence_rhs(
             // Element-free leaves (`nil`) are vacuously sorted and carry `+∞`
             // as their `min`; excluding them makes `head ≤ min(rest)` vacuous
             // for a singleton rather than the spurious `head ≤ sentinel`.
-            let rest_mins: Vec<ChcExpr> =
-                ctor.fields
-                    .iter()
-                    .zip(field_terms)
-                    .filter_map(|(field, term)| match &field.kind {
-                        FieldKind::Adt(fs) if !is_empty_leaf_term(registry, term) => Some(
-                            func_app(CataKind::Min.uf_name(fs), ChcSort::Int, vec![term.clone()]),
-                        ),
-                        _ => None,
-                    })
-                    .collect();
+            let rest_mins: Vec<ChcExpr> = ctor
+                .fields
+                .iter()
+                .zip(field_terms)
+                .filter_map(|(field, term)| match &field.kind {
+                    FieldKind::Adt(fs) if !is_empty_leaf_term(registry, term) => Some(func_app(
+                        symbols.name(&CataKind::Min, fs),
+                        ChcSort::Int,
+                        vec![term.clone()],
+                    )),
+                    _ => None,
+                })
+                .collect();
             let rest_sorteds: Vec<ChcExpr> = ctor
                 .fields
                 .iter()
                 .zip(field_terms)
                 .filter_map(|(field, term)| match &field.kind {
                     FieldKind::Adt(fs) if !is_empty_leaf_term(registry, term) => Some(func_app(
-                        CataKind::Sorted.uf_name(fs),
+                        symbols.name(&CataKind::Sorted, fs),
                         ChcSort::Int,
                         vec![term.clone()],
                     )),
@@ -2335,22 +2524,23 @@ pub(crate) fn cata_model_excludes_error(
     per_query_budget: Duration,
     deadline: Option<Instant>,
 ) -> bool {
+    let registry = DtRegistry::build(problem);
+    if registry.is_empty() {
+        return false;
+    }
+    let symbols = CataSymbols::build(problem, &registry);
+
     // Only applicable to models that actually mention reserved cata symbols.
     let mut mentions_cata = false;
     for pred in problem.predicates() {
         if let Some(interp) = model.get(&pred.id) {
-            if formula_mentions_cata(&interp.formula) {
+            if formula_mentions_cata(&interp.formula, &symbols) {
                 mentions_cata = true;
                 break;
             }
         }
     }
     if !mentions_cata {
-        return false;
-    }
-
-    let registry = DtRegistry::build(problem);
-    if registry.is_empty() {
         return false;
     }
 
@@ -2363,7 +2553,7 @@ pub(crate) fn cata_model_excludes_error(
                 return false;
             }
         }
-        let Some(script) = query_discharge_script(problem, model, clause, &registry) else {
+        let Some(script) = query_discharge_script(model, clause, &registry, &symbols) else {
             return false;
         };
         if !run_obligation_expect_unsat(&script, per_query_budget) {
@@ -2373,15 +2563,15 @@ pub(crate) fn cata_model_excludes_error(
     true
 }
 
-fn formula_mentions_cata(expr: &ChcExpr) -> bool {
+fn formula_mentions_cata(expr: &ChcExpr, symbols: &CataSymbols) -> bool {
     match expr {
         ChcExpr::FuncApp(name, _, args) => {
-            CataKind::parse_symbol(name).is_some() || args.iter().any(|a| formula_mentions_cata(a))
+            symbols.contains(name) || args.iter().any(|a| formula_mentions_cata(a, symbols))
         }
         ChcExpr::Op(_, args) | ChcExpr::PredicateApp(_, _, args) => {
-            args.iter().any(|a| formula_mentions_cata(a))
+            args.iter().any(|a| formula_mentions_cata(a, symbols))
         }
-        ChcExpr::ConstArray(_, v) => formula_mentions_cata(v),
+        ChcExpr::ConstArray(_, v) => formula_mentions_cata(v, symbols),
         _ => false,
     }
 }
@@ -2391,9 +2581,10 @@ fn collect_cata_applications(
     expr: &ChcExpr,
     out: &mut Vec<(ChcExpr, String)>,
     kinds_by_sort: &mut BTreeMap<String, Vec<CataKind>>,
+    symbols: &CataSymbols,
 ) {
     if let ChcExpr::FuncApp(name, _, args) = expr {
-        if let Some((kind, sort_name)) = CataKind::parse_symbol(name) {
+        if let Some((kind, sort_name)) = symbols.parse(name) {
             if args.len() == 1 {
                 let term = args[0].as_ref().clone();
                 if !out.iter().any(|(t, _)| t == &term) {
@@ -2409,10 +2600,10 @@ fn collect_cata_applications(
     match expr {
         ChcExpr::FuncApp(_, _, args) | ChcExpr::Op(_, args) | ChcExpr::PredicateApp(_, _, args) => {
             for arg in args {
-                collect_cata_applications(arg, out, kinds_by_sort);
+                collect_cata_applications(arg, out, kinds_by_sort, symbols);
             }
         }
-        ChcExpr::ConstArray(_, v) => collect_cata_applications(v, out, kinds_by_sort),
+        ChcExpr::ConstArray(_, v) => collect_cata_applications(v, out, kinds_by_sort, symbols),
         _ => {}
     }
 }
@@ -2420,10 +2611,10 @@ fn collect_cata_applications(
 /// Build the discharge script for one query clause of the ORIGINAL problem
 /// under the composed model: `⋀ interps(args) ∧ θ ∧ cata-facts` must be UNSAT.
 fn query_discharge_script(
-    _problem: &ChcProblem,
     model: &InvariantModel,
     clause: &HornClause,
     registry: &DtRegistry,
+    symbols: &CataSymbols,
 ) -> Option<String> {
     // Instantiate every body predicate's interpretation at its argument terms.
     let mut instantiated: Vec<ChcExpr> = Vec::new();
@@ -2445,7 +2636,7 @@ fn query_discharge_script(
     let mut applications: Vec<(ChcExpr, String)> = Vec::new();
     let mut kinds_by_sort: BTreeMap<String, Vec<CataKind>> = BTreeMap::new();
     for formula in &instantiated {
-        collect_cata_applications(formula, &mut applications, &mut kinds_by_sort);
+        collect_cata_applications(formula, &mut applications, &mut kinds_by_sort, symbols);
     }
     // The `Sorted` recurrence references the `Min` UF of its recursive fields;
     // ensure `Min` is declared (and available as a "pool" member) for every
@@ -2464,6 +2655,18 @@ fn query_discharge_script(
     let mut smt = String::with_capacity(4096);
     smt.push_str("(set-logic ALL)\n");
     smt.push_str(&registry.emit_declare_datatypes());
+    let ordinary_uf_declarations = collect_uninterpreted_function_declarations_for_exprs(
+        clause.body.constraint.iter().chain(instantiated.iter()),
+    )
+    .ok()?;
+    for declaration in &ordinary_uf_declarations {
+        // Reserved catamorphism functions are declared below from their exact
+        // datatype domain.  The generic collector sees the same `FuncApp`
+        // nodes, so filter them here to avoid duplicate declarations.
+        if !symbols.contains(&declaration.name) {
+            smt.push_str(&emit_declare_uninterpreted_function(declaration));
+        }
+    }
     for (sort_name, kinds) in &kinds_by_sort {
         if registry.ctors(sort_name).is_none() {
             return None;
@@ -2471,7 +2674,7 @@ fn query_discharge_script(
         for kind in kinds {
             smt.push_str(&format!(
                 "(declare-fun {} ({}) Int)\n",
-                quote_symbol(&kind.uf_name(sort_name)),
+                quote_symbol(&symbols.name(kind, sort_name)),
                 quote_symbol(sort_name)
             ));
         }
@@ -2517,7 +2720,11 @@ fn query_discharge_script(
         let kinds = kinds_by_sort.get(sort_name)?;
         let n_ctors = registry.ctors(sort_name).map_or(0, <[CtorInfo]>::len);
         for kind in kinds {
-            let uf_term = func_app(kind.uf_name(sort_name), ChcSort::Int, vec![term.clone()]);
+            let uf_term = func_app(
+                symbols.name(kind, sort_name),
+                ChcSort::Int,
+                vec![term.clone()],
+            );
             for fact in cata_min_facts(kind, &uf_term, n_ctors) {
                 smt.push_str("(assert ");
                 smt.push_str(&InvariantModel::expr_to_smtlib(&fact));
@@ -2532,10 +2739,14 @@ fn query_discharge_script(
                     let field_terms: Vec<ChcExpr> =
                         args.iter().map(|a| a.as_ref().clone()).collect();
                     for kind in kinds {
-                        if let Some(rhs) = recurrence_rhs(kind, ctor, &field_terms, registry, kinds)
+                        if let Some(rhs) =
+                            recurrence_rhs(kind, ctor, &field_terms, registry, kinds, symbols)
                         {
-                            let lhs =
-                                func_app(kind.uf_name(sort_name), ChcSort::Int, vec![term.clone()]);
+                            let lhs = func_app(
+                                symbols.name(kind, sort_name),
+                                ChcSort::Int,
+                                vec![term.clone()],
+                            );
                             smt.push_str("(assert ");
                             smt.push_str(&InvariantModel::expr_to_smtlib(&ChcExpr::eq(lhs, rhs)));
                             smt.push_str(")\n");
@@ -2545,7 +2756,9 @@ fn query_discharge_script(
             }
         }
         if !is_ctor_term {
-            if let Some(axiom) = standalone_unfolding_axiom(registry, kinds, term, sort_name) {
+            if let Some(axiom) =
+                standalone_unfolding_axiom(registry, kinds, term, sort_name, symbols)
+            {
                 smt.push_str("(assert ");
                 smt.push_str(&InvariantModel::expr_to_smtlib(&axiom));
                 smt.push_str(")\n");
@@ -2565,6 +2778,7 @@ fn standalone_unfolding_axiom(
     kinds: &[CataKind],
     term: &ChcExpr,
     sort_name: &str,
+    symbols: &CataSymbols,
 ) -> Option<ChcExpr> {
     let ctors = registry.ctors(sort_name)?;
     if ctors.is_empty() {
@@ -2589,14 +2803,18 @@ fn standalone_unfolding_axiom(
             })
             .collect();
         for kind in kinds {
-            let lhs = func_app(kind.uf_name(sort_name), ChcSort::Int, vec![term.clone()]);
-            if let Some(rhs) = recurrence_rhs(kind, ctor, &field_terms, registry, kinds) {
+            let lhs = func_app(
+                symbols.name(kind, sort_name),
+                ChcSort::Int,
+                vec![term.clone()],
+            );
+            if let Some(rhs) = recurrence_rhs(kind, ctor, &field_terms, registry, kinds, symbols) {
                 parts.push(ChcExpr::eq(lhs, rhs));
             }
             for (field, sub_term) in ctor.fields.iter().zip(&field_terms) {
                 if let FieldKind::Adt(field_sort) = &field.kind {
                     let sub = func_app(
-                        kind.uf_name(field_sort),
+                        symbols.name(kind, field_sort),
                         ChcSort::Int,
                         vec![sub_term.clone()],
                     );

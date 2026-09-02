@@ -132,10 +132,12 @@ pub fn recognize_fresh_def_bound(
     let TermData::App(sym, operands) = terms.get(*atom) else {
         return Err(FreshDefBoundShapeError::NotBinaryLe);
     };
-    if sym.name() != "<=" || operands.len() != 2 {
+    if sym.name() != "<=" {
         return Err(FreshDefBoundShapeError::NotBinaryLe);
     }
-    let (lhs, rhs) = (operands[0], operands[1]);
+    let &[lhs, rhs] = operands.as_slice() else {
+        return Err(FreshDefBoundShapeError::NotBinaryLe);
+    };
     // EXACTLY one operand may be the definiendum. `(<= d d)` cannot describe a
     // definition (and `mk_le` folds it to `true` anyway), and a step whose
     // declared symbol appears on neither side declares nothing.

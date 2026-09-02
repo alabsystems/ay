@@ -21,6 +21,720 @@ use ay_test_support::env::{lock_env, ScopedEnvVar};
 use ntest::timeout;
 use std::time::Duration;
 
+#[path = "adaptive_tests/array_ghost_candidate.rs"]
+mod array_ghost_candidate;
+#[path = "adaptive_tests/engine_selection.rs"]
+mod engine_selection;
+
+#[test]
+fn deterministic_execution_environment_values_are_parsed_without_mutating_process_state() {
+    for enabled in ["1", "true", "TRUE", "yes", "On"] {
+        assert!(
+            deterministic_execution_value(std::ffi::OsStr::new(enabled)),
+            "{enabled:?} should enable deterministic execution"
+        );
+    }
+    for disabled in ["", "0", "false", "no", "off", "anything-else"] {
+        assert!(
+            !deterministic_execution_value(std::ffi::OsStr::new(disabled)),
+            "{disabled:?} should leave adaptive execution enabled"
+        );
+    }
+}
+
+#[test]
+fn one_shot_constructor_cancellation_is_permanent_and_in_reported_elapsed_time() {
+    let parent = crate::CancellationToken::new();
+    parent.cancel();
+    let portfolio = AdaptivePortfolio::new_for_solve_with_cancellation(
+        create_simple_loop(),
+        AdaptiveConfig::test_default().with_time_budget(Duration::ZERO),
+        &parent,
+    );
+
+    // Resetting the caller token cannot reopen an invocation whose constructor
+    // already stopped at a cancellation boundary.
+    parent.reset();
+    std::thread::sleep(Duration::from_millis(20));
+    let (result, report) = portfolio.solve_with_budget_report();
+
+    assert!(matches!(result, VerifiedChcResult::Unknown(_)));
+    assert!(
+        report.total_elapsed >= Duration::from_millis(15),
+        "one-shot telemetry must start before constructor preprocessing: {:?}",
+        report.total_elapsed
+    );
+}
+
+#[test]
+fn one_shot_constructor_deadline_includes_preprocessing() {
+    let portfolio = AdaptivePortfolio::new_for_solve(
+        create_simple_loop(),
+        AdaptiveConfig::test_default().with_time_budget(Duration::from_nanos(1)),
+    );
+
+    assert!(matches!(portfolio.solve(), VerifiedChcResult::Unknown(_)));
+}
+
+#[test]
+fn adaptive_worker_inherits_expired_ambient_solve_deadline() {
+    let portfolio = AdaptivePortfolio::new(
+        create_simple_loop(),
+        AdaptiveConfig::test_default().with_time_budget(Duration::from_secs(5)),
+    );
+    let _deadline = crate::smt::ScopedSolveDeadline::new(Some(Instant::now()));
+
+    assert!(
+        matches!(portfolio.solve(), VerifiedChcResult::Unknown(_)),
+        "the large-stack worker must not replace an expired caller-thread deadline"
+    );
+}
+
+#[test]
+fn deterministic_execution_mode_builds_fixed_sequential_schedule() {
+    let budget = Duration::from_secs(12);
+    let solver = AdaptivePortfolio::new(
+        create_simple_loop(),
+        AdaptiveConfig::test_default()
+            .with_time_budget(budget)
+            .with_execution_mode(AdaptiveExecutionMode::DeterministicSequential),
+    );
+
+    let portfolio = solver.make_default_portfolio_config();
+    assert!(!portfolio.parallel);
+    assert_eq!(portfolio.timeout, Some(budget));
+    assert_eq!(portfolio.parallel_timeout, None);
+    assert_eq!(
+        portfolio.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Default
+    );
+    assert_eq!(
+        portfolio.budget_policy(EngineType::Kind),
+        BudgetPolicy::Default,
+        "deterministic schedules must retain their full precomputed allocation"
+    );
+
+    let explicit = AdaptivePortfolio::new(
+        create_simple_loop(),
+        AdaptiveConfig::test_default()
+            .with_time_budget(budget)
+            .with_execution_mode(AdaptiveExecutionMode::DeterministicSequential)
+            .with_engine_budget(EngineType::Bmc, BudgetPolicy::Fixed(Duration::from_secs(7))),
+    );
+    let mut explicit_portfolio = explicit.make_default_portfolio_config();
+    explicit.prepare_portfolio_config(
+        &mut explicit_portfolio,
+        StagedProbeBudgetProfile::BmcAndKind,
+    );
+    assert_eq!(
+        explicit_portfolio.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Fixed(Duration::from_secs(7)),
+        "deterministic mode must still honor an explicit caller allocation"
+    );
+}
+
+#[test]
+fn unclassified_default_portfolio_clamps_to_authoritative_remaining_wall() {
+    let solver = AdaptivePortfolio::new(
+        create_simple_loop(),
+        AdaptiveConfig::test_default()
+            .with_time_budget(Duration::from_secs(30))
+            .with_execution_mode(AdaptiveExecutionMode::AdaptiveParallel),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let config = solver
+        .default_portfolio_config_for_deadline(Some(deadline))
+        .expect("future authoritative deadline should leave a portfolio slice");
+    let timeout = config
+        .parallel_timeout
+        .expect("parallel default must receive the remaining whole-run wall");
+    assert!(timeout <= Duration::from_secs(5));
+    assert!(timeout < solver.config.time_budget);
+
+    assert!(solver
+        .default_portfolio_config_for_deadline(Some(Instant::now()))
+        .is_none());
+    assert!(matches!(
+        solver.solve_default(Some(Instant::now())),
+        PortfolioResult::Unknown
+    ));
+}
+
+#[test]
+fn deterministic_preferred_order_is_applied_before_engine_cap() {
+    let solver = AdaptivePortfolio::new(
+        create_simple_loop(),
+        AdaptiveConfig::test_default()
+            .with_execution_mode(AdaptiveExecutionMode::DeterministicSequential)
+            .with_preferred_engine_order(vec![EngineType::Bmc])
+            .with_max_engines(Some(1)),
+    );
+
+    let mut portfolio = solver.make_default_portfolio_config();
+    assert!(
+        portfolio.engines.len() > 1,
+        "the engine cap must be deferred until after preferred ordering"
+    );
+    solver.prepare_portfolio_config(&mut portfolio, StagedProbeBudgetProfile::BmcAndKind);
+
+    assert!(matches!(
+        portfolio.engines.as_slice(),
+        [EngineConfig::Bmc(_)]
+    ));
+    assert_eq!(
+        portfolio.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Default
+    );
+}
+
+#[test]
+fn parallel_preferred_primary_survives_engine_cap_without_a_probe_budget() {
+    let budget = Duration::from_secs(120);
+    for primary in [EngineType::Bmc, EngineType::Kind] {
+        let solver = AdaptivePortfolio::new(
+            create_simple_loop(),
+            AdaptiveConfig::with_budget(budget, false)
+                .with_preferred_engine_order(vec![primary])
+                .with_max_engines(Some(1)),
+        );
+        let mut portfolio = solver.make_default_portfolio_config();
+        solver.prepare_portfolio_config(&mut portfolio, StagedProbeBudgetProfile::BmcAndKind);
+
+        assert_eq!(portfolio.engines.len(), 1);
+        assert_eq!(portfolio.engines[0].engine_type(), primary);
+        assert_eq!(
+            portfolio.budget_policy(primary),
+            BudgetPolicy::Default,
+            "the final primary engine must keep the full row budget"
+        );
+    }
+}
+
+#[test]
+fn unbounded_pdr_external_cancellation_preserves_budget_markers() {
+    let solver = AdaptivePortfolio::new(
+        create_simple_loop(),
+        AdaptiveConfig::test_default().with_time_budget(Duration::ZERO),
+    );
+    let mut pdr = PdrConfig::default();
+
+    solver.apply_user_hints(&mut pdr);
+
+    assert!(
+        pdr.cancellation_token.is_none(),
+        "external cancellation must not opt unbounded PDR into token-budget policy"
+    );
+    assert!(
+        pdr.solve_timeout.is_none(),
+        "external cancellation must not synthesize a solve timeout"
+    );
+    let observer = pdr
+        .external_cancellation_token
+        .as_ref()
+        .expect("unbounded PDR must still observe adaptive cancellation");
+    assert!(!observer.is_cancelled());
+
+    solver.cancellation_handle().cancel();
+    assert!(observer.is_cancelled());
+}
+
+#[test]
+fn explicit_adaptive_execution_mode_keeps_parallel_portfolio() {
+    let solver = AdaptivePortfolio::new(
+        create_simple_loop(),
+        AdaptiveConfig::test_default().with_execution_mode(AdaptiveExecutionMode::AdaptiveParallel),
+    );
+    let portfolio = solver.make_default_portfolio_config();
+    assert!(portfolio.parallel);
+    assert_eq!(portfolio.timeout, None);
+}
+
+#[test]
+fn timed_adaptive_builders_install_capacity_safe_staged_probe_defaults() {
+    let budget = Duration::from_secs(120);
+    let adaptive = AdaptivePortfolio::new(
+        create_simple_loop(),
+        AdaptiveConfig::with_budget(budget, false).with_max_engines(None),
+    );
+
+    let default = adaptive.make_default_portfolio_config();
+    assert_eq!(
+        default.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Fixed(Duration::from_secs(2))
+    );
+    assert_eq!(
+        default.budget_policy(EngineType::Kind),
+        BudgetPolicy::Fixed(Duration::from_secs(3))
+    );
+    for engine in [EngineType::Pdr, EngineType::Pdkind, EngineType::Tpa] {
+        assert_eq!(default.budget_policy(engine), BudgetPolicy::Default);
+    }
+
+    let learned = adaptive.make_learned_portfolio_config(None);
+    assert!(matches!(
+        learned.engines.first(),
+        Some(EngineConfig::Tpa(_))
+    ));
+    assert_eq!(
+        learned.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Fixed(Duration::from_secs(2))
+    );
+    assert_eq!(
+        learned.budget_policy(EngineType::Kind),
+        BudgetPolicy::Fixed(Duration::from_secs(3))
+    );
+
+    let counter = AdaptivePortfolio::new(
+        create_body_equality_counter_loop(),
+        AdaptiveConfig::with_budget(budget, false).with_max_engines(None),
+    );
+    let counter_learned = counter.make_learned_portfolio_config(None);
+    assert!(matches!(
+        counter_learned.engines.first(),
+        Some(EngineConfig::Kind(_))
+    ));
+    assert_eq!(
+        counter_learned.budget_policy(EngineType::Kind),
+        BudgetPolicy::Default,
+        "the selector's first Kind engine is a primary lane"
+    );
+
+    let simple = adaptive.simple_loop_portfolio_config(budget);
+    assert_eq!(
+        simple.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Fixed(Duration::from_secs(2))
+    );
+    for engine in [EngineType::Pdr, EngineType::Pdkind, EngineType::Tpa] {
+        assert_eq!(simple.budget_policy(engine), BudgetPolicy::Default);
+    }
+    let array = adaptive.simple_loop_array_portfolio_config(budget);
+    assert_eq!(
+        array.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Fixed(Duration::from_secs(2))
+    );
+
+    let multi_problem = create_multi_predicate_safe();
+    let features = ProblemClassifier::classify(&multi_problem);
+    let multi = AdaptivePortfolio::new(
+        multi_problem,
+        AdaptiveConfig::with_budget(budget, false).with_max_engines(None),
+    );
+    let multi_config = multi.multi_pred_linear_portfolio_config(
+        PdrConfig::default(),
+        PdrConfig::portfolio_variant_with_splits(),
+        &features,
+    );
+    assert_eq!(
+        multi_config.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Fixed(Duration::from_secs(2))
+    );
+    assert_eq!(
+        multi_config.budget_policy(EngineType::Kind),
+        BudgetPolicy::Fixed(Duration::from_secs(3))
+    );
+}
+
+#[test]
+fn staged_probe_defaults_preserve_acyclic_complete_bmc() {
+    let budget = Duration::from_secs(120);
+    let problem = create_two_predicate_gate_problem(None);
+    let features = ProblemClassifier::classify(&problem);
+    assert!(!features.has_cycles);
+    let adaptive = AdaptivePortfolio::new(
+        problem,
+        AdaptiveConfig::with_budget(budget, false).with_max_engines(None),
+    );
+    let config = adaptive.multi_pred_linear_portfolio_config(
+        PdrConfig::default(),
+        PdrConfig::portfolio_variant_with_splits(),
+        &features,
+    );
+    let bmc = config
+        .engines
+        .iter()
+        .find_map(|engine| match engine {
+            EngineConfig::Bmc(bmc) => Some(bmc),
+            _ => None,
+        })
+        .expect("acyclic multi-predicate route should include complete BMC");
+    assert!(bmc.acyclic_safe);
+    assert_eq!(
+        config.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Default,
+        "proof-complete acyclic BMC must not be converted into a short probe"
+    );
+}
+
+#[test]
+fn staged_probe_defaults_preserve_primary_bv_bmc_and_short_row_fairness() {
+    let budget = Duration::from_secs(120);
+    let bv = AdaptivePortfolio::new(
+        create_identity_simple_loop(ChcSort::BitVec(8)),
+        AdaptiveConfig::with_budget(budget, false).with_max_engines(None),
+    );
+    let learned = bv.make_learned_portfolio_config(None);
+    let learned_bmc = learned
+        .engines
+        .iter()
+        .find_map(|engine| match engine {
+            EngineConfig::Bmc(bmc) => Some(bmc),
+            _ => None,
+        })
+        .expect("BV selector should include BMC");
+    assert!(learned_bmc.time_budget.is_some());
+    assert_eq!(
+        learned.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Default,
+        "the selector's explicitly budgeted BV BMC is a primary lane"
+    );
+    assert_eq!(
+        learned.budget_policy(EngineType::Kind),
+        BudgetPolicy::Fixed(Duration::from_secs(3))
+    );
+
+    let native = bv.bv_native_portfolio_config(budget);
+    assert_eq!(
+        native.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Default,
+        "BV-native BMC scales from the lane budget and must not be a short probe"
+    );
+    let boolean = bv.boolean_simple_loop_portfolio_config(budget, &[]);
+    assert_eq!(
+        boolean.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Default,
+        "the reduced Boolean/BV roster keeps BMC as a primary lane"
+    );
+
+    let short = AdaptivePortfolio::new(
+        create_simple_loop(),
+        AdaptiveConfig::with_budget(Duration::from_millis(1), false).with_max_engines(None),
+    );
+    let short_default = short.make_default_portfolio_config();
+    assert_eq!(
+        short_default.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Default
+    );
+    assert_eq!(
+        short_default.budget_policy(EngineType::Kind),
+        BudgetPolicy::Default,
+        "a built-in probe must never extend an already shorter fair wave"
+    );
+
+    let mut reconciled = bv.make_default_portfolio_config();
+    assert_eq!(
+        reconciled.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Fixed(Duration::from_secs(2))
+    );
+    AdaptivePortfolio::reconcile_staged_probe_budget_defaults(
+        &mut reconciled,
+        StagedProbeBudgetProfile::BmcAndKind,
+        &[],
+        Some(Duration::from_secs(1)),
+    );
+    assert_eq!(
+        reconciled.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Default
+    );
+    assert_eq!(
+        reconciled.budget_policy(EngineType::Kind),
+        BudgetPolicy::Default,
+        "post-construction reconciliation must honor a shorter authoritative remainder"
+    );
+}
+
+#[test]
+fn disabled_leading_engine_exposes_uncapped_primary_successor() {
+    let budget = Duration::from_secs(120);
+    let adaptive = AdaptivePortfolio::new(
+        create_simple_loop(),
+        AdaptiveConfig::with_budget(budget, false)
+            .with_max_engines(Some(1))
+            .with_engine_budget(EngineType::Pdr, BudgetPolicy::Disabled),
+    );
+    let mut config = adaptive.make_default_portfolio_config();
+    adaptive.prepare_portfolio_config(&mut config, StagedProbeBudgetProfile::BmcAndKind);
+
+    assert_eq!(
+        config.budget_policy(EngineType::Pdr),
+        BudgetPolicy::Disabled
+    );
+    assert!(
+        matches!(config.engines.as_slice(), [EngineConfig::Bmc(_)]),
+        "disabled engines must not consume max_engines capacity: {:?}",
+        config
+            .engines
+            .iter()
+            .map(EngineConfig::name)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        config.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Default,
+        "a disabled predecessor must not leave the new primary BMC capped"
+    );
+}
+
+#[test]
+fn portfolio_construction_reconciles_probes_against_ambient_deadline() {
+    let adaptive = AdaptivePortfolio::new(
+        create_simple_loop(),
+        AdaptiveConfig::with_budget(Duration::from_secs(120), false).with_max_engines(None),
+    );
+    let config = adaptive.make_default_portfolio_config();
+    assert_eq!(
+        config.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Fixed(Duration::from_secs(2))
+    );
+
+    let _deadline =
+        crate::smt::ScopedSolveDeadline::new(Some(Instant::now() + Duration::from_secs(1)));
+    let mut solver = adaptive.make_portfolio_solver(config, None);
+    let reconciled = solver.config_mut_for_budget_reconciliation();
+    assert_eq!(
+        reconciled.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Default
+    );
+    assert_eq!(
+        reconciled.budget_policy(EngineType::Kind),
+        BudgetPolicy::Default,
+        "the post-preprocessing roster must use the actual outer-wall remainder"
+    );
+}
+
+#[test]
+fn caller_engine_budgets_override_route_defaults_even_on_direct_nested_builders() {
+    let budget = Duration::from_secs(120);
+    let adaptive = AdaptivePortfolio::new(
+        create_identity_simple_loop(ChcSort::BitVec(8)),
+        AdaptiveConfig::with_budget(budget, false)
+            .with_max_engines(None)
+            .with_engine_budget(EngineType::Bmc, BudgetPolicy::MinPercent(100)),
+    );
+
+    let default = adaptive.make_default_portfolio_config();
+    assert_eq!(
+        default.budget_policy(EngineType::Bmc),
+        BudgetPolicy::MinPercent(100)
+    );
+    assert_eq!(
+        default.budget_policy(EngineType::Kind),
+        BudgetPolicy::Fixed(Duration::from_secs(3))
+    );
+
+    let native = adaptive.bv_native_portfolio_config(budget);
+    assert_eq!(
+        native.budget_policy(EngineType::Bmc),
+        BudgetPolicy::MinPercent(100),
+        "nested BV routes that bypass run_portfolio must still honor the caller"
+    );
+
+    let exact_defaults = vec![
+        (EngineType::Bmc, BudgetPolicy::Fixed(Duration::from_secs(2))),
+        (
+            EngineType::Kind,
+            BudgetPolicy::Fixed(Duration::from_secs(3)),
+        ),
+    ];
+    let exact = AdaptivePortfolio::new(
+        create_simple_loop(),
+        AdaptiveConfig::with_budget(budget, false)
+            .with_max_engines(None)
+            .with_engine_budgets(exact_defaults.clone()),
+    );
+    let mut exact_config = exact.make_default_portfolio_config();
+    AdaptivePortfolio::reconcile_staged_probe_budget_defaults(
+        &mut exact_config,
+        StagedProbeBudgetProfile::BmcAndKind,
+        &exact_defaults,
+        Some(Duration::from_secs(1)),
+    );
+    assert_eq!(
+        exact_config.budget_policy(EngineType::Bmc),
+        BudgetPolicy::Fixed(Duration::from_secs(2))
+    );
+    assert_eq!(
+        exact_config.budget_policy(EngineType::Kind),
+        BudgetPolicy::Fixed(Duration::from_secs(3)),
+        "caller policies equal to built-in values must retain caller ownership"
+    );
+}
+
+#[test]
+fn budget_report_path_solves_exact_singleton_array_forall() {
+    let input = r#"
+(set-logic HORN)
+(declare-var a (Array (_ BitVec 64) (_ BitVec 64)))
+(declare-var b (Array (_ BitVec 64) (_ BitVec 64)))
+(declare-rel P ((Array (_ BitVec 64) (_ BitVec 64))))
+(declare-rel bad ())
+(rule (=> (forall ((i (_ BitVec 64))) (= (select b i) #x0000000000000007)) (P b)))
+(rule (=> (and (P a) (not (= (select a #x0000000000000005) #x0000000000000007))) bad))
+(query bad)
+    "#;
+    let problem = ChcParser::parse(input).expect("body-forall fixture should parse");
+    assert!(
+        !problem.has_stripped_body_forall(),
+        "the singleton array initializer has an exact const-array elimination"
+    );
+    let portfolio = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
+    let (result, _) = portfolio.solve_with_budget_report();
+    assert!(
+        matches!(result, VerifiedChcResult::Safe(_)),
+        "the exact mini_forall fixture should be proved Safe, got {result:?}"
+    );
+}
+
+#[test]
+fn adaptive_report_observes_the_authoritative_cancelled_invocation() {
+    let cancellation = crate::CancellationToken::new();
+    cancellation.cancel();
+    let portfolio = AdaptivePortfolio::new(
+        create_simple_loop(),
+        AdaptiveConfig::test_default()
+            .with_execution_mode(AdaptiveExecutionMode::DeterministicSequential),
+    )
+    .with_cancellation_parent(&cancellation);
+
+    let (result, report) = portfolio.solve_with_adaptive_report();
+    assert!(matches!(result, VerifiedChcResult::Unknown(_)));
+    assert!(report
+        .strategy_trace()
+        .observations()
+        .iter()
+        .any(|observation| observation.stage == "budget_or_cancellation_before_dispatch"));
+    assert!(report
+        .strategy_trace()
+        .observations()
+        .iter()
+        .any(|observation| {
+            observation.stage == "adaptive_round"
+                && observation.gate_reason == "initial"
+                && observation.outcome == crate::AdaptiveStrategyOutcome::Unknown
+        }));
+    let terminal = report
+        .strategy_trace()
+        .observations()
+        .last()
+        .expect("authoritative solve must emit a terminal observation");
+    assert_eq!(terminal.stage, "authoritative_solve");
+    assert_eq!(terminal.outcome, crate::AdaptiveStrategyOutcome::Unknown);
+    assert!(
+        terminal
+            .elapsed
+            .abs_diff(report.budget_report().total_elapsed)
+            <= Duration::from_micros(1)
+    );
+}
+
+#[test]
+fn report_paths_recheck_the_same_boundary_after_report_assembly() {
+    let solver = AdaptivePortfolio::new(create_simple_loop(), AdaptiveConfig::test_default());
+    let decisive = VerifiedChcResult::from_validated(
+        PortfolioResult::Safe(InvariantModel::new()),
+        ValidationEvidence::FullVerification,
+    );
+    solver.cancellation_handle().cancel();
+    assert!(matches!(
+        solver.enforce_authoritative_publication_boundary(decisive, None),
+        VerifiedChcResult::Unknown(_)
+    ));
+
+    let src = include_str!("adaptive.rs");
+    let budget_start = src
+        .find("pub fn solve_with_budget_report(")
+        .expect("budget-report entry point must remain present");
+    let budget_end = src[budget_start..]
+        .find("/// Solve through the authoritative production pipeline")
+        .map(|offset| budget_start + offset)
+        .expect("budget-report entry point must precede adaptive report docs");
+    let budget_path = &src[budget_start..budget_end];
+    assert!(
+        budget_path
+            .rfind("enforce_authoritative_publication_boundary")
+            .expect("budget report needs a final publication gate")
+            > budget_path
+                .find("report.total_elapsed")
+                .expect("budget report must be assembled")
+    );
+
+    let adaptive_start = src
+        .find("pub fn solve_with_adaptive_report(")
+        .expect("adaptive-report entry point must remain present");
+    let adaptive_end = src[adaptive_start..]
+        .find("/// Panic-safe variant")
+        .map(|offset| adaptive_start + offset)
+        .expect("adaptive-report entry point must precede try_solve docs");
+    let adaptive_path = &src[adaptive_start..adaptive_end];
+    assert!(
+        adaptive_path
+            .rfind("enforce_authoritative_publication_boundary")
+            .expect("adaptive report needs a final publication gate")
+            > adaptive_path
+                .find("AdaptiveSolveReport::new")
+                .expect("adaptive report must be fully assembled")
+    );
+}
+
+#[test]
+fn concurrent_adaptive_reports_do_not_cross_contaminate_traces() {
+    let cancellation = crate::CancellationToken::new();
+    cancellation.cancel();
+    let portfolio = std::sync::Arc::new(
+        AdaptivePortfolio::new(
+            create_simple_loop(),
+            AdaptiveConfig::test_default()
+                .with_execution_mode(AdaptiveExecutionMode::DeterministicSequential),
+        )
+        .with_cancellation_parent(&cancellation),
+    );
+
+    // Queue both calls behind the same lock so they contend deterministically.
+    let invocation_guard = portfolio
+        .solve_invocation_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let reports = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let portfolio = portfolio.clone();
+                let ready_tx = ready_tx.clone();
+                scope.spawn(move || {
+                    ready_tx.send(()).expect("test receiver remains live");
+                    portfolio.solve_with_adaptive_report().1
+                })
+            })
+            .collect();
+        ready_rx.recv().expect("first solve reached contention");
+        ready_rx.recv().expect("second solve reached contention");
+        drop(invocation_guard);
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("concurrent report must not panic"))
+            .collect::<Vec<_>>()
+    });
+
+    for report in reports {
+        let observations = report.strategy_trace().observations();
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.stage == "authoritative_solve")
+                .count(),
+            1,
+            "a trace must contain only its own terminal event"
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.stage == "adaptive_round")
+                .count(),
+            1,
+            "a trace must contain only its own initial round"
+        );
+    }
+}
+
 // The one workspace env choke point: serialized, restore-on-exit env mutation
 // (unifies the former ghost_pair_env_lock onto it).
 fn create_simple_loop() -> ChcProblem {
@@ -47,6 +761,37 @@ fn create_simple_loop() -> ChcProblem {
     ));
 
     // Inv(x) /\ x > 5 => false (safe: x never exceeds 5)
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(inv, vec![ChcExpr::var(x.clone())])],
+            Some(ChcExpr::gt(ChcExpr::var(x), ChcExpr::int(5))),
+        ),
+        ClauseHead::False,
+    ));
+
+    problem
+}
+
+fn create_body_equality_counter_loop() -> ChcProblem {
+    let mut problem = ChcProblem::new();
+    let inv = problem.declare_predicate("CounterInv", vec![ChcSort::Int]);
+    let x = ChcVar::new("counter_x", ChcSort::Int);
+    let next = ChcVar::new("counter_next", ChcSort::Int);
+
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(inv, vec![ChcExpr::int(0)]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(inv, vec![ChcExpr::var(x.clone())])],
+            Some(ChcExpr::eq(
+                ChcExpr::var(next.clone()),
+                ChcExpr::add(ChcExpr::var(x.clone()), ChcExpr::int(1)),
+            )),
+        ),
+        ClauseHead::Predicate(inv, vec![ChcExpr::var(next)]),
+    ));
     problem.add_clause(HornClause::new(
         ClauseBody::new(
             vec![(inv, vec![ChcExpr::var(x.clone())])],
@@ -115,6 +860,44 @@ fn create_const_key_array_cegar_safe_problem() -> ChcProblem {
     ));
 
     problem
+}
+
+fn create_model_checker_consumer_arrn_problem(array_params: usize) -> ChcProblem {
+    assert!((2..=4).contains(&array_params));
+    let array_sort = "(Array (_ BitVec 64) (_ BitVec 32))";
+    let predicate_array_sorts = std::iter::repeat_n(array_sort, array_params)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let array_binders = (0..array_params)
+        .map(|index| format!("(a{index} {array_sort})"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let array_args = (0..array_params)
+        .map(|index| format!("a{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let carried_array_args = (1..array_params)
+        .map(|index| format!("a{index}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let input = format!(
+        "(set-logic HORN)\n\
+         (declare-fun P ((_ BitVec 64) {predicate_array_sorts}) Bool)\n\
+         (assert (forall ((base {array_sort}) {array_binders})\n\
+           (=> (= a0 (store base #x0000000000000000 #x00000007))\n\
+               (P #x0000000000000000 {array_args}))))\n\
+         (assert (forall ((i (_ BitVec 64)) {array_binders} (b2 {array_sort}))\n\
+           (=> (and (P i {array_args})\n\
+                    (bvult i #x000000000000000F)\n\
+                    (= b2 (store a0 (bvadd i #x0000000000000001) #x00000000)))\n\
+               (P (bvadd i #x0000000000000001) b2 {carried_array_args}))))\n\
+         (assert (forall ((i (_ BitVec 64)) {array_binders})\n\
+           (=> (and (P i {array_args})\n\
+                    (not (= (select a0 #x0000000000000000) #x00000007)))\n\
+               false)))\n\
+         (check-sat)\n"
+    );
+    ChcParser::parse(&input).expect("MODEL_CHECKER_CONSUMER arrN fixture should parse")
 }
 
 fn create_reducible_lia_array_chain() -> ChcProblem {
@@ -1634,6 +2417,26 @@ fn test_final_demotes_unvalidated_preprocessed_query_only_discharge_9716() {
 }
 
 #[test]
+fn preprocessed_safe_model_validation_never_starts_after_deadline_or_cancellation() {
+    let adaptive = AdaptivePortfolio::new(create_simple_loop(), AdaptiveConfig::test_default());
+    let model = InvariantModel::default();
+    assert!(!adaptive.validate_preprocessed_safe_model(
+        &model,
+        "expired-validation-test",
+        Instant::now(),
+        &adaptive.cancellation_token,
+    ));
+
+    adaptive.cancellation_handle().cancel();
+    assert!(!adaptive.validate_preprocessed_safe_model(
+        &model,
+        "cancelled-validation-test",
+        Instant::now() + Duration::from_secs(1),
+        &adaptive.cancellation_token,
+    ));
+}
+
+#[test]
 #[cfg_attr(debug_assertions, timeout(60_000))]
 #[cfg_attr(not(debug_assertions), timeout(20_000))]
 fn test_large_non_array_acyclic_linear_graph_uses_direct_dag_bmc_9004() {
@@ -2810,6 +3613,129 @@ fn test_array_const_key_cegar_route_accepts_original_validated_safe() {
 }
 
 #[test]
+fn array_const_key_route_observes_cancel_and_expired_deadline_before_preprocessing() {
+    for cancelled in [true, false] {
+        let adaptive = AdaptivePortfolio::new(
+            create_const_key_array_cegar_safe_problem(),
+            AdaptiveConfig::test_default(),
+        );
+        if cancelled {
+            adaptive.cancellation_handle().cancel();
+        }
+        let trace_session = adaptive.decision_log.begin_trace();
+        let deadline = if cancelled {
+            Instant::now() + Duration::from_secs(1)
+        } else {
+            Instant::now()
+        };
+        assert!(adaptive
+            .try_array_const_key_cegar_route_with_budget(
+                Some(deadline),
+                Duration::from_secs(1),
+                Duration::from_millis(100),
+            )
+            .is_none());
+        let trace = trace_session.finish();
+        let observation = trace
+            .observations()
+            .iter()
+            .find(|observation| observation.stage == "array_const_key_cegar")
+            .expect("rejected attempt must be observable");
+        if cancelled {
+            assert!(observation.gate_reason.contains("cancelled before"));
+            assert_eq!(observation.outcome, crate::AdaptiveStrategyOutcome::Unknown);
+        } else {
+            assert!(observation
+                .gate_reason
+                .contains("minimum preprocessing-inclusive"));
+            assert_eq!(
+                observation.outcome,
+                crate::AdaptiveStrategyOutcome::TimedOut
+            );
+        }
+    }
+}
+
+#[test]
+#[timeout(10_000)]
+fn deterministic_const_key_route_honors_tiny_term_memory_budget() {
+    let adaptive = AdaptivePortfolio::new(
+        create_const_key_array_cegar_safe_problem(),
+        AdaptiveConfig::test_default().with_memory_budget(1),
+    );
+    let trace_session = adaptive.decision_log.begin_trace();
+    let result = adaptive.try_array_const_key_cegar_route_with_budget(
+        Some(Instant::now() + Duration::from_secs(2)),
+        Duration::from_secs(2),
+        Duration::from_millis(500),
+    );
+    let trace = trace_session.finish();
+    assert!(result.is_none(), "one-byte term budget must fail closed");
+    assert!(trace
+        .observations()
+        .iter()
+        .filter(|observation| observation.stage == "array_const_key_cegar")
+        .all(|observation| observation.outcome != crate::AdaptiveStrategyOutcome::Safe));
+}
+
+#[test]
+#[timeout(30_000)]
+fn deterministic_array_const_key_route_solves_model_checker_consumer_arrn_family() {
+    for array_params in 2..=4 {
+        let problem = create_model_checker_consumer_arrn_problem(array_params);
+        let original = problem.clone();
+        let adaptive = AdaptivePortfolio::new(
+            problem,
+            AdaptiveConfig::test_default()
+                .with_execution_mode(AdaptiveExecutionMode::DeterministicSequential)
+                .with_memory_budget(512 * 1024 * 1024),
+        );
+
+        let (result, report) = adaptive.solve_with_adaptive_report();
+        let VerifiedChcResult::Safe(invariant) = result else {
+            panic!(
+                "deterministic const-key route did not prove arrN_{array_params} Safe: {result:?}"
+            );
+        };
+        assert!(
+            crate::engines::validate_external_invariant_model(
+                &original,
+                invariant.model(),
+                &PdrConfig {
+                    strict_proofs: true,
+                    solve_timeout: Some(Duration::from_secs(2)),
+                    disable_array_scalarization: true,
+                    preserve_original_clauses: true,
+                    ..PdrConfig::default()
+                },
+            )
+            .expect("independent original-clause validation should complete"),
+            "arrN_{array_params} model must satisfy the unscalarized original clauses"
+        );
+        let route_observations: Vec<_> = report
+            .strategy_trace()
+            .observations()
+            .iter()
+            .filter(|observation| observation.stage == "array_const_key_cegar")
+            .collect();
+        assert_eq!(
+            route_observations.len(),
+            1,
+            "one deterministic const-key attempt must produce one observation"
+        );
+        assert_eq!(
+            route_observations[0].outcome,
+            crate::AdaptiveStrategyOutcome::Safe
+        );
+        assert!(report
+            .strategy_trace()
+            .observations()
+            .iter()
+            .all(|observation| observation.stage != "deterministic_array_const_key_cegar"));
+    }
+}
+
+#[test]
 fn test_argument_constant_invariant_route_is_quarantined_by_default() {
     let problem = create_array_argument_constant_safe_problem();
     let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
@@ -3306,6 +4232,24 @@ fn test_finalize_verified_result_demotes_reachable_unsafe_when_final_budget_expi
     assert!(
         matches!(result, VerifiedChcResult::Unknown(_)),
         "final Unsafe validation must fail closed when the caller budget is already expired"
+    );
+}
+
+#[test]
+fn test_finalize_verified_result_demotes_safe_when_global_deadline_expired() {
+    let problem = create_simple_loop();
+    let model = true_model_for_first_predicate(&problem);
+    let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
+
+    let result = adaptive.finalize_verified_result_with_deadline(
+        PortfolioResult::Safe(model),
+        ValidationEvidence::AlgebraicClosedForm,
+        Some(Instant::now()),
+    );
+
+    assert!(
+        matches!(result, VerifiedChcResult::Unknown(_)),
+        "a Safe candidate completed outside the whole-run boundary must fail closed"
     );
 }
 
@@ -6079,6 +7023,28 @@ fn create_array_ghost_pair_safe_problem() -> ChcProblem {
     .expect("ghost-pair safe fixture parses")
 }
 
+/// Safe BV64-indexed problem whose inductive invariant is necessarily
+/// quantified: `forall i : BV64. 0 <= a[i]`. Arbitrary nonnegative stores
+/// prevent the route from proving the property with `a = const 0`; the PDR
+/// model must constrain the appended ghost value.
+fn create_bv64_array_ghost_pair_safe_problem() -> ChcProblem {
+    ChcParser::parse(
+        "(set-logic HORN)\n\
+         (declare-fun P ((Array (_ BitVec 64) Int)) Bool)\n\
+         (assert (forall ((a (Array (_ BitVec 64) Int)))\n\
+           (=> (= a ((as const (Array (_ BitVec 64) Int)) 0)) (P a))))\n\
+         (assert (forall ((a (Array (_ BitVec 64) Int))\n\
+                          (a2 (Array (_ BitVec 64) Int))\n\
+                          (address (_ BitVec 64)) (value Int))\n\
+           (=> (and (P a) (<= 0 value) (= a2 (store a address value)))\n\
+               (P a2))))\n\
+         (assert (forall ((a (Array (_ BitVec 64) Int)) (q (_ BitVec 64)))\n\
+           (=> (and (P a) (< (select a q) 0)) false)))\n\
+         (check-sat)\n",
+    )
+    .expect("BV64 ghost-pair safe fixture parses")
+}
+
 /// Unsafe variant: the initial array is unconstrained, so the query is
 /// reachable.
 fn create_array_ghost_pair_unsafe_problem() -> ChcProblem {
@@ -6125,6 +7091,185 @@ fn create_array_ghost_pair_compaction_safe_problem() -> ChcProblem {
     .expect("ghost-pair compaction fixture parses")
 }
 
+/// MODEL_CHECKER_CONSUMER-sized wrapper graph around the same quantified const-zero loop.
+/// The real `check_arc` measurement has 99 predicates; the wrappers here make
+/// that declaration count exact while retaining a tiny post-compaction solve
+/// core and an original certificate obligation for every wrapper rule.
+fn create_array_ghost_pair_wrapper_chain_safe_problem(predicate_count: usize) -> ChcProblem {
+    assert!(predicate_count >= 2);
+    let mut problem = ChcProblem::new();
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let predicates: Vec<_> = (0..predicate_count)
+        .map(|index| {
+            problem.declare_predicate(
+                format!("GhostWrapper{index}"),
+                vec![array_sort.clone(), ChcSort::Int],
+            )
+        })
+        .collect();
+    let array = ChcVar::new("wrapper_array", array_sort.clone());
+    let step = ChcVar::new("wrapper_step", ChcSort::Int);
+    let query_index = ChcVar::new("wrapper_query_index", ChcSort::Int);
+
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(
+            ChcExpr::var(array.clone()),
+            ChcExpr::const_array(ChcSort::Int, ChcExpr::int(0)),
+        )),
+        ClauseHead::Predicate(
+            predicates[0],
+            vec![ChcExpr::var(array.clone()), ChcExpr::int(0)],
+        ),
+    ));
+    for pair in predicates.windows(2) {
+        problem.add_clause(HornClause::new(
+            ClauseBody::predicates_only(vec![(
+                pair[0],
+                vec![ChcExpr::var(array.clone()), ChcExpr::var(step.clone())],
+            )]),
+            ClauseHead::Predicate(
+                pair[1],
+                vec![ChcExpr::var(array.clone()), ChcExpr::var(step.clone())],
+            ),
+        ));
+    }
+
+    let loop_predicate = *predicates.last().expect("nonempty wrapper chain");
+    problem.add_clause(HornClause::new(
+        ClauseBody::predicates_only(vec![(
+            loop_predicate,
+            vec![ChcExpr::var(array.clone()), ChcExpr::var(step.clone())],
+        )]),
+        ClauseHead::Predicate(
+            loop_predicate,
+            vec![
+                ChcExpr::store(
+                    ChcExpr::var(array.clone()),
+                    ChcExpr::var(step.clone()),
+                    ChcExpr::int(0),
+                ),
+                ChcExpr::add(ChcExpr::var(step.clone()), ChcExpr::int(1)),
+            ],
+        ),
+    ));
+    problem.add_clause(HornClause::query(ClauseBody::new(
+        vec![(
+            loop_predicate,
+            vec![ChcExpr::var(array.clone()), ChcExpr::var(step)],
+        )],
+        Some(ChcExpr::and_all([
+            ChcExpr::le(ChcExpr::int(0), ChcExpr::var(query_index.clone())),
+            ChcExpr::not(ChcExpr::eq(
+                ChcExpr::select(ChcExpr::var(array), ChcExpr::var(query_index)),
+                ChcExpr::int(0),
+            )),
+        ])),
+    )));
+    problem
+}
+
+#[test]
+#[timeout(120000)]
+fn array_ghost_pair_surface_admits_model_checker_consumer_scale_and_caps_predicates() {
+    use crate::transform::{ArrayGhostPairTransformer, Transformer};
+
+    let cancellation = crate::CancellationToken::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut problem = create_array_ghost_pair_wrapper_chain_safe_problem(99);
+    problem.add_datatype_def(
+        "UnusedModelCheckerConsumerPrelude".to_string(),
+        vec![("UnusedModelCheckerConsumerCtor".to_string(), Vec::new())],
+    );
+    assert!(
+        !problem.uses_datatype_features(),
+        "a declaration-only MODEL_CHECKER_CONSUMER prelude is not active datatype use"
+    );
+    let expected_datatypes = problem.datatype_defs().clone();
+    admit_problem_clone_fanout(
+        &problem,
+        array_ghost_pair_clone_caps(ARRAY_GHOST_PAIR_ROUTE_MAX_INPUT_ARITY),
+        ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+        &cancellation,
+        deadline,
+    )
+    .expect("the measured 99-predicate MODEL_CHECKER_CONSUMER scale must be admitted");
+
+    let raw_ghost = Box::new(ArrayGhostPairTransformer::new(1))
+        .transform(problem)
+        .problem;
+    assert_eq!(
+        raw_ghost.predicates()[0].arg_sorts.len(),
+        4,
+        "the admitted prelude must still reach ghost instrumentation"
+    );
+    assert_eq!(
+        raw_ghost.datatype_defs(),
+        &expected_datatypes,
+        "ghost rebuilding must preserve the bounded unused prelude"
+    );
+    admit_problem_clone_fanout(
+        &raw_ghost,
+        array_ghost_pair_clone_caps(ARRAY_GHOST_PAIR_ROUTE_MAX_TRANSFORMED_ARITY),
+        ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+        &cancellation,
+        deadline,
+    )
+    .expect("the actual ghost-expanded MODEL_CHECKER_CONSUMER-scale surface must remain admitted");
+    let summary = PreprocessSummary::build_with_limits(
+        raw_ghost.clone(),
+        false,
+        Some(deadline),
+        &cancellation,
+    )
+    .expect("bounded preprocessing must finish on the wrapper graph");
+    assert!(
+        raw_ghost.predicates().len()
+            >= summary
+                .transformed_problem
+                .predicates()
+                .len()
+                .max(1)
+                .saturating_mul(ARRAY_GHOST_PAIR_PREPROCESS_REDUCTION_FACTOR),
+        "the 99-predicate graph must reach the lane's major-reduction path"
+    );
+
+    let check_rc_scale = create_array_ghost_pair_wrapper_chain_safe_problem(142);
+    admit_problem_clone_fanout(
+        &check_rc_scale,
+        array_ghost_pair_clone_caps(ARRAY_GHOST_PAIR_ROUTE_MAX_INPUT_ARITY),
+        ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+        &cancellation,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .expect("the measured 142-predicate check_rc scale must remain admitted");
+
+    let oversized = create_array_ghost_pair_wrapper_chain_safe_problem(
+        ARRAY_GHOST_PAIR_ROUTE_MAX_PREDICATES + 1,
+    );
+    let failure = admit_problem_clone_fanout(
+        &oversized,
+        array_ghost_pair_clone_caps(ARRAY_GHOST_PAIR_ROUTE_MAX_INPUT_ARITY),
+        ARRAY_GHOST_PAIR_ROUTE_CLONE_FANOUT,
+        &cancellation,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .expect_err("one predicate beyond the bounded envelope must be rejected");
+    assert!(matches!(
+        failure,
+        RouteAdmissionFailure::Cap(reason)
+            if reason.contains("cloned predicates 514 > cap 512")
+    ));
+    assert_eq!(
+        array_ghost_pair_preprocessed_surface_admitted(
+            &oversized,
+            &cancellation,
+            Instant::now() + Duration::from_secs(30),
+        ),
+        Ok(false),
+        "an oversized optional compacted shape must retain the raw path"
+    );
+}
+
 #[test]
 #[timeout(120000)]
 fn test_array_ghost_pair_route_kill_switch_returns_none() {
@@ -6140,6 +7285,35 @@ fn test_array_ghost_pair_route_kill_switch_returns_none() {
         result.is_none(),
         "AY_CHC_DISABLE_ARRAY_GHOST_PAIRS must disable the ghost-pair lane"
     );
+}
+
+#[test]
+#[timeout(10000)]
+fn array_ghost_pair_route_honors_tiny_term_memory_budget() {
+    let adaptive = AdaptivePortfolio::new(
+        create_array_ghost_pair_safe_problem(),
+        AdaptiveConfig::test_default().with_memory_budget(1),
+    );
+    let trace_session = adaptive.decision_log.begin_trace();
+    let result = adaptive.try_array_ghost_pair_route(Some(Instant::now() + Duration::from_secs(2)));
+    let trace = trace_session.finish();
+
+    assert!(
+        result.is_none(),
+        "one-byte term budget must prevent a ghost-pair verdict"
+    );
+    let observation = trace
+        .observations()
+        .iter()
+        .find(|observation| observation.stage == "array_ghost_pairs")
+        .expect("term-budget rejection must be observable");
+    assert_eq!(
+        observation.outcome,
+        crate::AdaptiveStrategyOutcome::CapExceeded
+    );
+    assert!(observation
+        .gate_reason
+        .contains("cannot admit the baseline SMT term store"));
 }
 
 #[test]
@@ -6220,6 +7394,103 @@ fn test_array_ghost_pair_route_certifies_safe_quantified_fixture() {
     assert!(
         matches!(finalized, VerifiedChcResult::Safe(_)),
         "finalize must accept the sealed certificate on its own problem, got {finalized:?}"
+    );
+}
+
+/// Full-route scale regression for the former 24-predicate/64-clause gates.
+/// The loop uses the functional store form produced by parser normalization,
+/// so its compacted synthesis core is the established quantified-array
+/// fixture while all 99 array-carrying wrappers remain original proof rules.
+#[test]
+#[timeout(300000)]
+fn test_array_ghost_pair_route_certifies_99_predicate_wrapper_chain() {
+    let _env_guard = lock_env();
+    let problem = create_array_ghost_pair_wrapper_chain_safe_problem(99);
+    assert_eq!(problem.predicates().len(), 99);
+    assert!(
+        problem.clauses().len() > 64,
+        "fixture must exceed both former declaration-count gates"
+    );
+    let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
+
+    let trace_session = adaptive.decision_log.begin_trace();
+    let result = adaptive.try_array_ghost_pair_route(Some(Instant::now() + Duration::from_mins(4)));
+    let trace = trace_session.finish();
+    let Some((PortfolioResult::Safe(model), evidence)) = result else {
+        panic!(
+            "ghost-pair route must certify the 99-predicate wrapper graph, got {result:?}; trace={:?}",
+            trace.observations()
+        );
+    };
+    assert!(matches!(
+        evidence,
+        ValidationEvidence::QuantifiedArrayInvariantCertificate
+    ));
+    assert!(model.has_quantified_array_certificate());
+
+    let finalized = adaptive.finalize_verified_result(PortfolioResult::Safe(model), evidence);
+    assert!(
+        matches!(finalized, VerifiedChcResult::Safe(_)),
+        "finalize must recheck the large original certificate, got {finalized:?}"
+    );
+}
+
+/// End-to-end typed-index pin: the adaptive route must synthesize a ghost
+/// invariant over a BV64 index, seal its quantified meaning on the original
+/// array clauses, and retain Safe through the final certificate re-check.
+#[test]
+#[timeout(300000)]
+fn test_array_ghost_pair_route_certifies_bv64_quantified_fixture() {
+    let _env_guard = lock_env();
+    let problem = create_bv64_array_ghost_pair_safe_problem();
+    let predicate = problem.predicates()[0].id;
+    let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
+
+    let deadline = Instant::now() + Duration::from_mins(4);
+    let result = adaptive.try_array_ghost_pair_route(Some(deadline));
+
+    let Some((PortfolioResult::Safe(model), evidence)) = result else {
+        panic!("ghost-pair route must certify the BV64 quantified fixture, got {result:?}");
+    };
+    assert!(
+        matches!(
+            evidence,
+            ValidationEvidence::QuantifiedArrayInvariantCertificate
+        ),
+        "BV64 route Safe must carry quantified-certificate evidence, got {evidence:?}"
+    );
+    assert!(
+        model.has_quantified_array_certificate(),
+        "BV64 route Safe model must carry the sealed certificate"
+    );
+    assert!(
+        model.is_empty(),
+        "the quantified certificate, not a QF interpretation, is the witness"
+    );
+
+    let certificate = model
+        .ghost_pair_certificate()
+        .expect("Safe route model carries the sealed ghost certificate");
+    let interpretation = certificate
+        .ghost_interpretation(predicate)
+        .expect("sealed certificate retains the transformed P interpretation");
+    assert_eq!(
+        interpretation.vars[1].sort,
+        ChcSort::BitVec(64),
+        "the synthesized ghost index must keep the original BV64 key sort"
+    );
+    assert!(
+        interpretation
+            .formula
+            .vars()
+            .contains(&interpretation.vars[2]),
+        "the synthesized invariant must constrain the ghost value, not merely the original array"
+    );
+
+    let finalized = adaptive.finalize_verified_result(PortfolioResult::Safe(model), evidence);
+    assert!(
+        matches!(finalized, VerifiedChcResult::Safe(_)),
+        "finalize must accept the sealed BV64 certificate, got {finalized:?}"
     );
 }
 
@@ -6573,11 +7844,12 @@ fn test_9227_rekey_rejects_array_carrying_transformed_problem() {
     // under an equisat-grade chain.
     assert!(
         adaptive
-            .try_promote_equisat_acyclic_exhaustion(
+            .try_promote_equisat_acyclic_exhaustion_until(
                 &problem,
                 &equisat_grade_memory(),
                 4,
-                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(5),
+                &adaptive.cancellation_token,
             )
             .is_none(),
         "array-carrying transformed problem must never be promoted (#9227)"
@@ -6599,14 +7871,85 @@ fn test_9227_rekey_rejects_non_equisat_chain() {
     );
     assert!(
         adaptive
-            .try_promote_equisat_acyclic_exhaustion(
+            .try_promote_equisat_acyclic_exhaustion_until(
                 &scalar_transformed,
                 &non_equisat_memory(),
                 4,
-                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(5),
+                &adaptive.cancellation_token,
             )
             .is_none(),
         "non-equisat transform chain must keep the #9227 fail-closed rejection"
+    );
+}
+
+#[test]
+#[cfg_attr(debug_assertions, timeout(120_000))]
+#[cfg_attr(not(debug_assertions), timeout(60_000))]
+fn test_preprocessed_safe_rejects_fabricated_non_equisat_summary_across_fallthrough() {
+    // Fabricate a transformed summary unrelated to this reachable original.
+    // Neither two UNSAT checks of a predicate-free transformed query nor an
+    // exhaustive empty-model BMC proof of a transformed scalar DAG may cross
+    // back to the original without an equisat-grade transform chain.
+    let mut original = ChcProblem::new();
+    let reachable = original.declare_predicate("FabricatedOriginalReachable", vec![]);
+    original.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(reachable, vec![]),
+    ));
+    original.add_clause(HornClause::new(
+        ClauseBody::predicates_only(vec![(reachable, vec![])]),
+        ClauseHead::False,
+    ));
+    let adaptive = AdaptivePortfolio::new(
+        original.clone(),
+        AdaptiveConfig::test_default().with_time_budget(Duration::from_secs(20)),
+    );
+    let features = adaptive.features();
+
+    let summary = |transformed_problem| PreprocessSummary {
+        original_problem: original.clone(),
+        transformed_problem,
+        back_translator: Box::new(crate::transform::IdentityBackTranslator),
+        bv_abstracted: false,
+        transform_memory: non_equisat_memory(),
+    };
+
+    // First exercise the CheckedQueryOnlyDischarge candidate and its complete
+    // fallthrough: the query is UNSAT, but the transform grade is not exact;
+    // the subsequent BMC is inapplicable because no predicates remain.
+    let mut query_only_safe = ChcProblem::new();
+    query_only_safe.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(false)),
+        ClauseHead::False,
+    ));
+    let query_result = adaptive.run_preprocessed_acyclic_bmc_probe_until(
+        summary(query_only_safe),
+        &features,
+        Instant::now() + Duration::from_secs(5),
+        "test-fabricated-query-only",
+        false,
+        &adaptive.cancellation_token,
+    );
+    assert!(
+        query_result.is_none(),
+        "fabricated non-equisat query-only summary must fail closed, got {query_result:?}"
+    );
+
+    // Then exercise the transformed-BMC landing itself. This safe scalar DAG
+    // produces the empty exhaustive certificate that used to be mislabeled
+    // ScalarAcyclicBmcExhaustive despite the non-equisat transform memory.
+    let bmc_result = adaptive.run_preprocessed_acyclic_bmc_probe_until(
+        summary(stage0_scalar_acyclic_safe_problem()),
+        &features,
+        Instant::now() + Duration::from_secs(10),
+        "test-fabricated-transformed-bmc",
+        true,
+        &adaptive.cancellation_token,
+    );
+    assert!(
+        bmc_result.is_none(),
+        "fabricated non-equisat transformed BMC Safe must fail closed, got {bmc_result:?}"
     );
 }
 
@@ -6620,11 +7963,12 @@ fn test_9227_rekey_promotes_equisat_array_free_chain_with_fresh_rerun() {
         array_original,
         AdaptiveConfig::test_default().with_time_budget(Duration::from_secs(20)),
     );
-    let promoted = adaptive.try_promote_equisat_acyclic_exhaustion(
+    let promoted = adaptive.try_promote_equisat_acyclic_exhaustion_until(
         &scalar_transformed,
         &equisat_grade_memory(),
         4,
-        Duration::from_secs(10),
+        Instant::now() + Duration::from_secs(10),
+        &adaptive.cancellation_token,
     );
     assert!(
         matches!(
@@ -6696,7 +8040,11 @@ fn test_recheck_query_only_discharge_confirms_unsat_bodies_and_rejects_sat() {
         ClauseHead::False,
     ));
     assert!(
-        adaptive.recheck_query_only_discharge(&unsat_query_only, Duration::from_secs(5)),
+        adaptive.recheck_query_only_discharge_until(
+            &unsat_query_only,
+            Instant::now() + Duration::from_secs(5),
+            &adaptive.cancellation_token,
+        ),
         "UNSAT query bodies must re-confirm on a fresh executor"
     );
 
@@ -6708,9 +8056,567 @@ fn test_recheck_query_only_discharge_confirms_unsat_bodies_and_rejects_sat() {
         ClauseHead::False,
     ));
     assert!(
-        !adaptive.recheck_query_only_discharge(&sat_query_only, Duration::from_secs(5)),
+        !adaptive.recheck_query_only_discharge_until(
+            &sat_query_only,
+            Instant::now() + Duration::from_secs(5),
+            &adaptive.cancellation_token,
+        ),
         "a satisfiable query body must fail the recheck"
     );
+}
+
+#[test]
+fn query_only_acceptance_helpers_reject_expired_and_cancelled_boundaries() {
+    let x = ChcVar::new("x", ChcSort::Int);
+    let mut query_only = ChcProblem::new();
+    query_only.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::and(
+            ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(1)),
+            ChcExpr::eq(ChcExpr::var(x), ChcExpr::int(2)),
+        )),
+        ClauseHead::False,
+    ));
+    let transformed = stage0_scalar_acyclic_safe_problem();
+    let adaptive = AdaptivePortfolio::new(
+        stage0_array_acyclic_safe_problem(),
+        AdaptiveConfig::test_default(),
+    );
+
+    assert!(!adaptive.recheck_query_only_discharge_until(
+        &query_only,
+        Instant::now(),
+        &adaptive.cancellation_token,
+    ));
+    assert!(adaptive
+        .try_promote_equisat_acyclic_exhaustion_until(
+            &transformed,
+            &equisat_grade_memory(),
+            4,
+            Instant::now(),
+            &adaptive.cancellation_token,
+        )
+        .is_none());
+
+    adaptive.cancellation_handle().cancel();
+    let future = Instant::now() + Duration::from_secs(1);
+    assert!(!adaptive.recheck_query_only_discharge_until(
+        &query_only,
+        future,
+        &adaptive.cancellation_token,
+    ));
+    assert!(adaptive
+        .try_promote_equisat_acyclic_exhaustion_until(
+            &transformed,
+            &equisat_grade_memory(),
+            4,
+            future,
+            &adaptive.cancellation_token,
+        )
+        .is_none());
+}
+
+#[test]
+fn preprocessed_acceptance_paths_keep_final_absolute_boundary_gates() {
+    let src = include_str!("adaptive_multi_pred.rs");
+    let discharge_start = src
+        .find("fn discharge_preprocessed_query_only_problem(")
+        .expect("query-only discharge helper must remain present");
+    let discharge_end = src[discharge_start..]
+        .find("/// Independent fresh-executor re-proof")
+        .map(|offset| discharge_start + offset)
+        .expect("query-only discharge helper must precede its recheck helper");
+    let discharge = &src[discharge_start..discharge_end];
+    let replay = discharge
+        .find("BmcSolver::replay_confirm_unsafe_on_problem(")
+        .expect("SAT query bodies must replay on original clauses");
+    assert!(
+        discharge[replay..].contains("then_some(QueryOnlyDischarge::VerifiedUnsafe"),
+        "query-only replay Unsafe must pass a final absolute boundary gate"
+    );
+
+    let probe_start = src
+        .find("pub(crate) fn run_preprocessed_acyclic_bmc_probe_until(")
+        .expect("absolute-deadline preprocessed probe must remain present");
+    let probe_end = src[probe_start..]
+        .find("/// Ground-witness back-translation landing")
+        .map(|offset| probe_start + offset)
+        .expect("preprocessed probe must precede ground landing");
+    let probe = &src[probe_start..probe_end];
+    let fallback_replay = probe
+        .rfind("BmcSolver::replay_confirm_unsafe_on_problem(")
+        .expect("transformed Unsafe fallback must replay on original clauses");
+    assert!(
+        probe[fallback_replay..].contains("if !boundary_open()"),
+        "transformed Unsafe fallback replay must reject late/cancelled evidence"
+    );
+    assert!(
+        probe.contains("ScopedSmtDeadline::install_until(probe_deadline)")
+            && probe.contains("scoped_thread_term_memory_budget(self.config.memory_budget)"),
+        "query-only SMT work must inherit the probe's absolute deadline and memory budget"
+    );
+
+    let collapse_start = src
+        .find("pub(crate) fn run_scalarized_collapse_probe(")
+        .expect("scalarized collapse probe must remain present");
+    let collapse = &src[collapse_start..];
+    assert!(
+        collapse.contains("!level_cancel.is_cancelled()")
+            && collapse.contains("Instant::now() < level_deadline")
+            && collapse.contains("drop(level_timeout);"),
+        "level BMC must finish within its own slice, then release that timer before landing"
+    );
+
+    let dispatch_start = src
+        .find("pub(crate) fn try_acyclic_bmc_probe(")
+        .expect("acyclic BMC dispatcher must remain present");
+    let dispatch_end = src[dispatch_start..]
+        .find("pub(crate) fn acyclic_bmc_stage_budget(")
+        .map(|offset| dispatch_start + offset)
+        .expect("acyclic dispatcher must precede its budget helper");
+    let dispatch = &src[dispatch_start..dispatch_end];
+    assert!(
+        dispatch.contains("build_int_only_with_limits")
+            && dispatch.contains("build_bv_native_with_limits")
+            && dispatch.contains("run_preprocessed_acyclic_bmc_probe_until"),
+        "exact/native transforms and their probes must share the enclosing absolute boundary"
+    );
+}
+
+#[test]
+fn preprocessed_probe_never_reopens_an_expired_enclosing_deadline() {
+    let problem = create_simple_loop();
+    let summary = PreprocessSummary::build_bv_native(problem.clone(), false);
+    let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
+    let features = adaptive.features();
+    let _deadline = crate::smt::ScopedSolveDeadline::new(Some(Instant::now()));
+
+    assert!(adaptive
+        .run_preprocessed_acyclic_bmc_probe(
+            summary,
+            &features,
+            Duration::from_secs(5),
+            "expired-enclosing-deadline",
+            false,
+        )
+        .is_none());
+}
+
+/// Small threaded-memory analogue for the exact-acyclic transformed Unsafe
+/// landing. Store forwarding makes the array state dead, then dead-parameter
+/// elimination removes it from the BMC problem; the ground translator must
+/// reconstruct those values before original-clause validation.
+fn ground_landing_threaded_memory_problem(query_value: i128) -> ChcProblem {
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let mut problem = ChcProblem::new();
+    let p0 = problem.declare_predicate("GroundMemory0", vec![ChcSort::Int, array_sort.clone()]);
+    let p1 = problem.declare_predicate("GroundMemory1", vec![ChcSort::Int, array_sort.clone()]);
+    let x = ChcVar::new("x", ChcSort::Int);
+    let y = ChcVar::new("y", ChcSort::Int);
+    let memory = ChcVar::new("memory", array_sort.clone());
+    let updated = ChcVar::new("updated", array_sort);
+
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0))),
+        ClauseHead::Predicate(
+            p0,
+            vec![ChcExpr::var(x.clone()), ChcExpr::var(memory.clone())],
+        ),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(
+                p0,
+                vec![ChcExpr::var(x.clone()), ChcExpr::var(memory.clone())],
+            )],
+            Some(ChcExpr::and(
+                ChcExpr::eq(
+                    ChcExpr::var(updated.clone()),
+                    ChcExpr::store(
+                        ChcExpr::var(memory.clone()),
+                        ChcExpr::int(7),
+                        ChcExpr::int(41),
+                    ),
+                ),
+                ChcExpr::eq(
+                    ChcExpr::var(y.clone()),
+                    ChcExpr::add(
+                        ChcExpr::select(ChcExpr::var(updated), ChcExpr::int(7)),
+                        ChcExpr::int(1),
+                    ),
+                ),
+            )),
+        ),
+        ClauseHead::Predicate(p1, vec![ChcExpr::var(y), ChcExpr::var(memory.clone())]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(p1, vec![ChcExpr::var(x.clone()), ChcExpr::var(memory)])],
+            Some(ChcExpr::eq(ChcExpr::var(x), ChcExpr::int(query_value))),
+        ),
+        ClauseHead::False,
+    ));
+    problem
+}
+
+#[test]
+#[timeout(60_000)]
+fn preprocessed_exact_acyclic_unsafe_lands_by_original_ground_validation() {
+    let problem = ground_landing_threaded_memory_problem(42);
+    let original = problem.clone();
+    let adaptive = AdaptivePortfolio::new(
+        problem.clone(),
+        AdaptiveConfig::test_default().with_time_budget(Duration::from_secs(10)),
+    );
+    let features = adaptive.features();
+    assert!(!features.has_cycles && features.uses_arrays);
+
+    let summary = PreprocessSummary::build_array_forwarding_only(problem, false);
+    assert!(
+        !summary.transform_memory.is_identity_grade(),
+        "fixture must exercise forwarding/dead-parameter back-translation"
+    );
+    assert!(
+        !summary.transformed_problem.has_array_sorts(),
+        "forwarding plus slicing should remove the dead memory state"
+    );
+
+    let result = adaptive.run_preprocessed_acyclic_bmc_probe(
+        summary,
+        &features,
+        Duration::from_secs(8),
+        "test-ground-memory",
+        true,
+    );
+    let Some((PortfolioResult::Unsafe(cex), ValidationEvidence::FullVerification)) = result else {
+        panic!("reachable threaded-memory path must land as verified Unsafe: {result:?}");
+    };
+    let derivation = cex
+        .ground_derivation
+        .as_ref()
+        .expect("accepted transformed Unsafe must retain original-space ground evidence");
+    crate::ground_derivation::validate_ground_derivation(&original, derivation)
+        .expect("landing must validate the translated derivation on original clauses");
+}
+
+/// Deterministic execution must retain the forwarding/exact-acyclic route
+/// used by compiler-generated threaded-memory systems instead of jumping
+/// directly from the SAFE-only const-key probe to the generic portfolio.
+#[test]
+#[timeout(30_000)]
+fn deterministic_array_forwarded_acyclic_bmc_lands_original_ground_witness() {
+    let problem = ground_landing_threaded_memory_problem(42);
+    let original = problem.clone();
+    let adaptive = AdaptivePortfolio::new(
+        problem,
+        AdaptiveConfig::test_default()
+            .with_execution_mode(AdaptiveExecutionMode::DeterministicSequential)
+            .with_memory_budget(512 * 1024 * 1024),
+    );
+
+    let (result, report) = adaptive.solve_with_adaptive_report();
+    let VerifiedChcResult::Unsafe(verified) = result else {
+        panic!("deterministic forwarded exact-BMC route must prove reachable: {result:?}");
+    };
+    assert!(
+        report
+            .strategy_trace()
+            .observations()
+            .iter()
+            .any(|observation| {
+                observation.stage == "deterministic_array_forwarded_acyclic_bmc"
+                    && observation.outcome == crate::AdaptiveStrategyOutcome::Unsafe
+            }),
+        "authoritative deterministic solve must attribute the verdict to the forwarded exact-BMC route: {:?}",
+        report.strategy_trace().observations()
+    );
+    let route_observation = report
+        .strategy_trace()
+        .observations()
+        .iter()
+        .find(|observation| observation.stage == "deterministic_array_forwarded_acyclic_bmc")
+        .expect("accepted route must retain evidence telemetry");
+    assert!(route_observation
+        .gate_reason
+        .contains("evidence=FullVerification"));
+    let derivation = verified
+        .counterexample()
+        .ground_derivation
+        .as_ref()
+        .expect("deterministic route must retain original-space ground evidence");
+    crate::ground_derivation::validate_ground_derivation(&original, derivation)
+        .expect("deterministic route's derivation must validate on ORIGINAL clauses");
+}
+
+fn cyclic_array_forwarding_problem() -> ChcProblem {
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let mut problem = ChcProblem::new();
+    let predicate = problem.declare_predicate("CyclicArray", vec![array_sort.clone()]);
+    let array = ChcVar::new("array", array_sort);
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(predicate, vec![ChcExpr::var(array.clone())]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::predicates_only(vec![(predicate, vec![ChcExpr::var(array.clone())])]),
+        ClauseHead::Predicate(
+            predicate,
+            vec![ChcExpr::store(
+                ChcExpr::var(array.clone()),
+                ChcExpr::int(0),
+                ChcExpr::int(0),
+            )],
+        ),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::predicates_only(vec![(predicate, vec![ChcExpr::var(array)])]),
+        ClauseHead::False,
+    ));
+    problem
+}
+
+#[test]
+fn deterministic_array_forwarding_logs_feature_rejection() {
+    let adaptive = AdaptivePortfolio::new(
+        cyclic_array_forwarding_problem(),
+        AdaptiveConfig::test_default(),
+    );
+    let trace_session = adaptive.decision_log.begin_trace();
+    let result = adaptive.try_deterministic_array_forwarded_acyclic_bmc_route(Some(
+        Instant::now() + Duration::from_secs(1),
+    ));
+    let trace = trace_session.finish();
+
+    assert!(result.is_none());
+    let observation = trace
+        .observations()
+        .iter()
+        .find(|observation| observation.stage == "deterministic_array_forwarded_acyclic_bmc")
+        .expect("feature rejection must be observable");
+    assert_eq!(
+        observation.outcome,
+        crate::AdaptiveStrategyOutcome::NotApplicable
+    );
+    assert!(observation
+        .gate_reason
+        .contains("predicate graph is cyclic"));
+}
+
+#[test]
+#[timeout(10_000)]
+fn deterministic_array_forwarding_honors_tiny_term_memory_budget() {
+    let adaptive = AdaptivePortfolio::new(
+        ground_landing_threaded_memory_problem(42),
+        AdaptiveConfig::test_default().with_memory_budget(1),
+    );
+    let trace_session = adaptive.decision_log.begin_trace();
+    let result = adaptive.try_deterministic_array_forwarded_acyclic_bmc_route(Some(
+        Instant::now() + Duration::from_secs(2),
+    ));
+    let trace = trace_session.finish();
+    assert!(
+        result.is_none(),
+        "one-byte term budget must prevent a forwarded verdict"
+    );
+    let observation = trace
+        .observations()
+        .iter()
+        .find(|observation| observation.stage == "deterministic_array_forwarded_acyclic_bmc")
+        .expect("term-budget rejection must be observable");
+    assert_eq!(
+        observation.outcome,
+        crate::AdaptiveStrategyOutcome::CapExceeded
+    );
+    assert!(observation
+        .gate_reason
+        .contains("cannot admit the baseline SMT term store"));
+}
+
+#[test]
+fn deterministic_array_forwarding_rejects_oversized_surface_before_transform() {
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let mut sorts = vec![array_sort];
+    sorts.extend(std::iter::repeat_n(
+        ChcSort::Int,
+        DETERMINISTIC_ARRAY_FORWARDED_MAX_PREDICATE_ARITY,
+    ));
+    let mut problem = ChcProblem::new();
+    let pred = problem.declare_predicate("OversizedForwardingSurface", sorts.clone());
+    let args: Vec<_> = sorts
+        .into_iter()
+        .enumerate()
+        .map(|(index, sort)| ChcExpr::var(ChcVar::new(format!("oversized_{index}"), sort)))
+        .collect();
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(pred, args.clone()),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::predicates_only(vec![(pred, args)]),
+        ClauseHead::False,
+    ));
+
+    let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
+    let trace_session = adaptive.decision_log.begin_trace();
+    let result = adaptive.try_deterministic_array_forwarded_acyclic_bmc_route(Some(
+        Instant::now() + Duration::from_secs(1),
+    ));
+    let trace = trace_session.finish();
+
+    assert!(result.is_none());
+    let observations: Vec<_> = trace
+        .observations()
+        .iter()
+        .filter(|observation| observation.stage == "deterministic_array_forwarded_acyclic_bmc")
+        .collect();
+    assert_eq!(
+        observations.len(),
+        1,
+        "one rejected attempt must be observable"
+    );
+    assert_eq!(
+        observations[0].outcome,
+        crate::AdaptiveStrategyOutcome::CapExceeded
+    );
+    assert!(observations[0]
+        .gate_reason
+        .contains("max_predicate_arity 257 > cap 256"));
+    assert!(observations[0].budget > Duration::ZERO);
+}
+
+fn stale_ground_landing_problem(query_value: i128) -> ChcProblem {
+    let mut problem = ChcProblem::new();
+    let p0 = problem.declare_predicate("StaleGround0", vec![ChcSort::Int]);
+    let p1 = problem.declare_predicate("StaleGround1", vec![ChcSort::Int]);
+    let x = ChcVar::new("x", ChcSort::Int);
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(p0, vec![ChcExpr::int(0)]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::predicates_only(vec![(p0, vec![ChcExpr::var(x.clone())])]),
+        ClauseHead::Predicate(
+            p1,
+            vec![ChcExpr::add(ChcExpr::var(x.clone()), ChcExpr::int(1))],
+        ),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(p1, vec![ChcExpr::var(x.clone())])],
+            Some(ChcExpr::eq(ChcExpr::var(x), ChcExpr::int(query_value))),
+        ),
+        ClauseHead::False,
+    ));
+    problem
+}
+
+/// A transformed derivation valid only for a stale/different query must be
+/// rejected by original ground validation. With no original counterexample
+/// for the replay fallback, the probe must fail closed instead of assigning
+/// `FullVerification` to bare invalidity translation.
+#[test]
+#[timeout(30_000)]
+fn preprocessed_exact_acyclic_stale_ground_evidence_fails_closed() {
+    let original = stale_ground_landing_problem(2); // unreachable: chain ends at 1
+    let transformed = stale_ground_landing_problem(1); // reachable candidate
+    let adaptive = AdaptivePortfolio::new(
+        original.clone(),
+        AdaptiveConfig::test_default().with_time_budget(Duration::from_secs(5)),
+    );
+    let features = adaptive.features();
+    let back_translator: Box<dyn crate::transform::BackTranslator> =
+        Box::new(crate::transform::IdentityBackTranslator);
+    let transform_memory = back_translator.transform_memory();
+    let summary = PreprocessSummary {
+        original_problem: original,
+        transformed_problem: transformed,
+        back_translator,
+        bv_abstracted: false,
+        transform_memory,
+    };
+
+    let result = adaptive.run_preprocessed_acyclic_bmc_probe(
+        summary,
+        &features,
+        Duration::from_secs(4),
+        "test-stale-ground",
+        true,
+    );
+    assert!(
+        result.is_none(),
+        "stale transformed evidence and a Safe original replay must fail closed, got {result:?}"
+    );
+}
+
+#[test]
+fn ground_backtranslation_landing_rejects_expired_and_cancelled_boundaries() {
+    let adaptive = AdaptivePortfolio::new(
+        ground_landing_threaded_memory_problem(42),
+        AdaptiveConfig::test_default(),
+    );
+    let candidate = Counterexample::new(Vec::new())
+        .with_ground_derivation(crate::ground_derivation::GroundDerivation::default());
+    let translator = crate::transform::IdentityBackTranslator;
+    let cancellation = crate::CancellationToken::new();
+    assert!(adaptive
+        .ground_backtranslate_landing(
+            &candidate,
+            &translator,
+            "test-expired-ground-landing",
+            false,
+            Some(Instant::now()),
+            &cancellation,
+        )
+        .is_none());
+
+    cancellation.cancel();
+    assert!(adaptive
+        .ground_backtranslate_landing(
+            &candidate,
+            &translator,
+            "test-cancelled-ground-landing",
+            false,
+            Some(Instant::now() + Duration::from_secs(1)),
+            &cancellation,
+        )
+        .is_none());
+}
+
+#[test]
+fn scalarized_collapse_probe_never_starts_after_budget_or_cancellation_boundary() {
+    let problem = stale_ground_landing_problem(2);
+    let adaptive = AdaptivePortfolio::new(problem.clone(), AdaptiveConfig::test_default());
+    let features = adaptive.features();
+    let translator: std::sync::Arc<std::sync::Mutex<Box<dyn crate::transform::BackTranslator>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Box::new(
+            crate::transform::IdentityBackTranslator,
+        )));
+
+    assert!(adaptive
+        .run_scalarized_collapse_probe(
+            &problem,
+            &translator,
+            &features,
+            Duration::ZERO,
+            "test-zero-collapse",
+            false,
+            None,
+            None,
+        )
+        .is_none());
+
+    adaptive.cancellation_handle().cancel();
+    assert!(adaptive
+        .run_scalarized_collapse_probe(
+            &problem,
+            &translator,
+            &features,
+            Duration::from_secs(1),
+            "test-cancelled-collapse",
+            false,
+            None,
+            None,
+        )
+        .is_none());
 }
 
 /// Build the BV wide-hub archetype analogue for the BMC-only scalarized

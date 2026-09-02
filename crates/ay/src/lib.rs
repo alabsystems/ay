@@ -612,7 +612,12 @@ pub mod chc {
         normalized_chc_input_sha256,
         // Engine API
         AdaptiveConfig,
+        AdaptiveExecutionMode,
         AdaptivePortfolio,
+        AdaptiveSolveReport,
+        AdaptiveSolveTrace,
+        AdaptiveStrategyObservation,
+        AdaptiveStrategyOutcome,
         // BMC cross-check API (#8578)
         BmcConfig,
         BmcSolver,
@@ -663,9 +668,13 @@ pub mod chc {
         ChcProofRunArtifactValidationError,
         ChcProofRunArtifactValidationErrorReason,
         ChcProofRunArtifacts,
+        ChcProofRunStopReason,
+        ChcProofRunWithBudgetReport,
         ChcProofSolverIdentity,
         ChcProofTranscriptConsumerEvidence,
         ChcProofTranscriptMetadata,
+        ChcQueryObligation,
+        ChcQueryObligationId,
         ChcReplayCheckResult,
         ChcReplayCheckerIdentity,
         ChcReplayEvidence,
@@ -729,6 +738,7 @@ pub mod chc {
         CHC_PROOF_TRANSCRIPT_CONSUMER_EVIDENCE_SCHEMA,
         CHC_PROOF_TRANSCRIPT_SCHEMA,
         CHC_REPLAY_EVIDENCE_SCHEMA,
+        MAX_BITVECTOR_WIDTH,
         NORMALIZED_CHC_INPUT_SCHEMA,
     };
 }

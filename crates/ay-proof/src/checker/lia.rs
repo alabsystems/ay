@@ -198,6 +198,13 @@ pub(crate) fn validate_arith_eq_implies_bound(
     Ok(())
 }
 
+/// Recognize the exact equality-to-bound adapter accepted by the strict
+/// checker, including literal order, arithmetic sorts, and operand identity.
+#[must_use]
+pub fn recognize_arith_eq_implies_bound(terms: &TermStore, clause: &[TermId]) -> bool {
+    validate_arith_eq_implies_bound(terms, ProofId(0), clause).is_ok()
+}
+
 pub(crate) fn validate_int_bounds_tautology(
     terms: &TermStore,
     step_id: ProofId,

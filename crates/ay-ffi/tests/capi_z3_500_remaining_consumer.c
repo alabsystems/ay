@@ -364,6 +364,6 @@ int main(int argc, char **argv) {
 
     AY_CALL(Z3_del_context, (context));
     ay_print_callability();
-    puts("exact Z3 5.0.0 remaining safe-call probes passed");
+    puts("exact Z3 5.1.0 remaining safe-call probes passed");
     return 0;
 }

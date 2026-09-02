@@ -90,7 +90,7 @@ fn sort_from_smt_value(value: &SmtValue) -> ChcSort {
         SmtValue::Bool(_) => ChcSort::Bool,
         SmtValue::Int(_) | SmtValue::BigInt(_) => ChcSort::Int,
         SmtValue::Real(_) => ChcSort::Real,
-        SmtValue::BitVec(_, w) => ChcSort::BitVec(*w),
+        SmtValue::BitVec(_, w) | SmtValue::BigBitVec(_, w) => ChcSort::BitVec(*w),
         SmtValue::Opaque(_) => ChcSort::Int,
         SmtValue::ConstArray(default) => {
             let val_sort = sort_from_smt_value(default);
@@ -106,50 +106,6 @@ fn sort_from_smt_value(value: &SmtValue) -> ChcSort {
         }
         // DT sort info not stored in SmtValue; use uninterpreted as placeholder.
         SmtValue::Datatype(ctor, _) => ChcSort::Uninterpreted(ctor.clone()),
-    }
-}
-
-/// Convert an SmtValue to a well-sorted ChcExpr (#6047).
-fn smt_value_to_chc_expr(value: &SmtValue) -> ChcExpr {
-    match value {
-        SmtValue::Int(n) => ChcExpr::Int(*n),
-        // Beyond-i128 witness: exact Horner encoding (never wraps).
-        SmtValue::BigInt(b) => ChcExpr::from_bigint(b.as_ref().clone()),
-        SmtValue::Bool(b) => ChcExpr::Bool(*b),
-        SmtValue::Real(r) => {
-            use num_traits::ToPrimitive;
-            let n = r.numer().to_i64().unwrap_or(0);
-            let d = r.denom().to_i64().unwrap_or(1);
-            ChcExpr::Real(n, d)
-        }
-        SmtValue::BitVec(n, w) => ChcExpr::BitVec(*n, *w),
-        SmtValue::Opaque(name) => ChcExpr::var(ChcVar::new(name.clone(), ChcSort::Int)),
-        SmtValue::ConstArray(default) => {
-            // ConstArray key sort is not stored in SmtValue; default to Int.
-            ChcExpr::ConstArray(ChcSort::Int, Arc::new(smt_value_to_chc_expr(default)))
-        }
-        SmtValue::ArrayMap { default, entries } => {
-            let idx_sort = entries
-                .first()
-                .map(|(k, _)| sort_from_smt_value(k))
-                .unwrap_or(ChcSort::Int);
-            let mut arr = ChcExpr::ConstArray(idx_sort, Arc::new(smt_value_to_chc_expr(default)));
-            for (idx, val) in entries {
-                arr = ChcExpr::store(arr, smt_value_to_chc_expr(idx), smt_value_to_chc_expr(val));
-            }
-            arr
-        }
-        SmtValue::Datatype(ctor, fields) => {
-            let field_exprs: Vec<Arc<ChcExpr>> = fields
-                .iter()
-                .map(|f| Arc::new(smt_value_to_chc_expr(f)))
-                .collect();
-            ChcExpr::FuncApp(
-                ctor.clone(),
-                ChcSort::Uninterpreted(ctor.clone()),
-                field_exprs,
-            )
-        }
     }
 }
 
@@ -179,24 +135,32 @@ fn canonical_datatype_field_sort(
     }
 }
 
-fn smt_value_to_chc_expr_for_sort(value: &SmtValue, expected_sort: &ChcSort) -> ChcExpr {
-    match (expected_sort, value) {
+fn smt_value_to_chc_expr_for_sort(value: &SmtValue, expected_sort: &ChcSort) -> Option<ChcExpr> {
+    Some(match (expected_sort, value) {
+        (ChcSort::Bool, SmtValue::Bool(value)) => ChcExpr::Bool(*value),
+        (ChcSort::Int, SmtValue::Int(value)) => ChcExpr::Int(*value),
+        (ChcSort::Int, SmtValue::BigInt(value)) => ChcExpr::from_bigint(value.as_ref().clone()),
+        (ChcSort::Real, SmtValue::Real(value)) => {
+            use num_traits::ToPrimitive;
+            ChcExpr::Real(value.numer().to_i64()?, value.denom().to_i64()?)
+        }
         (ChcSort::BitVec(width), SmtValue::Int(n)) => {
-            ChcExpr::BitVec(bitvec_bits_from_int(*n, *width), *width)
+            SmtValue::bitvec_from_bigint((*n).into(), *width).bitvec_to_chc_expr()?
         }
-        (ChcSort::BitVec(width), SmtValue::BitVec(bits, actual_width)) if width == actual_width => {
-            ChcExpr::BitVec(*bits, *width)
+        (ChcSort::BitVec(width), SmtValue::BigInt(n)) => {
+            SmtValue::bitvec_from_bigint(n.as_ref().clone(), *width).bitvec_to_chc_expr()?
         }
-        (ChcSort::BitVec(width), SmtValue::BitVec(bits, _)) => {
-            ChcExpr::BitVec(mask_bitvec_bits(*bits, *width), *width)
-        }
+        (
+            ChcSort::BitVec(expected_width),
+            value @ (SmtValue::BitVec(_, actual_width) | SmtValue::BigBitVec(_, actual_width)),
+        ) if expected_width == actual_width => value.bitvec_to_chc_expr()?,
         (ChcSort::Array(index_sort, element_sort), SmtValue::ConstArray(default)) => {
             ChcExpr::ConstArray(
                 index_sort.as_ref().clone(),
                 Arc::new(smt_value_to_chc_expr_for_sort(
                     default,
                     element_sort.as_ref(),
-                )),
+                )?),
             )
         }
         (ChcSort::Array(index_sort, element_sort), SmtValue::ArrayMap { default, entries }) => {
@@ -205,13 +169,13 @@ fn smt_value_to_chc_expr_for_sort(value: &SmtValue, expected_sort: &ChcSort) -> 
                 Arc::new(smt_value_to_chc_expr_for_sort(
                     default,
                     element_sort.as_ref(),
-                )),
+                )?),
             );
             for (idx, val) in entries {
                 arr = ChcExpr::store(
                     arr,
-                    smt_value_to_chc_expr_for_sort(idx, index_sort.as_ref()),
-                    smt_value_to_chc_expr_for_sort(val, element_sort.as_ref()),
+                    smt_value_to_chc_expr_for_sort(idx, index_sort.as_ref())?,
+                    smt_value_to_chc_expr_for_sort(val, element_sort.as_ref())?,
                 );
             }
             arr
@@ -219,46 +183,29 @@ fn smt_value_to_chc_expr_for_sort(value: &SmtValue, expected_sort: &ChcSort) -> 
         // DT constructor: use expected sort for correct ChcSort::Datatype
         // instead of Uninterpreted placeholder. Recurse with field sorts from
         // the constructor definition when available (#7045 Gap B).
-        (ChcSort::Datatype { .. }, SmtValue::Datatype(ctor, fields)) => {
+        (ChcSort::Datatype { constructors, .. }, SmtValue::Datatype(ctor, fields)) => {
+            let constructor = constructors
+                .iter()
+                .find(|candidate| candidate.name == *ctor)?;
+            if constructor.selectors.len() != fields.len() {
+                return None;
+            }
             let field_exprs: Vec<Arc<ChcExpr>> = fields
                 .iter()
                 .enumerate()
-                .map(|(i, f)| {
-                    let expr = if let Some(field_sort) =
-                        canonical_datatype_field_sort(expected_sort, ctor, i)
-                    {
-                        smt_value_to_chc_expr_for_sort(f, &field_sort)
-                    } else {
-                        smt_value_to_chc_expr(f)
-                    };
-                    Arc::new(expr)
+                .map(|(i, f)| -> Option<Arc<ChcExpr>> {
+                    let field_sort = canonical_datatype_field_sort(expected_sort, ctor, i)?;
+                    let expr = smt_value_to_chc_expr_for_sort(f, &field_sort)?;
+                    Some(Arc::new(expr))
                 })
-                .collect();
+                .collect::<Option<_>>()?;
             ChcExpr::FuncApp(ctor.clone(), expected_sort.clone(), field_exprs)
         }
         (_, SmtValue::Opaque(name)) => {
             ChcExpr::var(ChcVar::new(name.clone(), expected_sort.clone()))
         }
-        _ => smt_value_to_chc_expr(value),
-    }
-}
-
-fn bitvec_bits_from_int(value: i128, width: u32) -> u128 {
-    if width >= 128 {
-        // Two's-complement bit-pattern reinterpretation (int2bv semantics).
-        value as u128
-    } else {
-        let modulus = 1i128 << width;
-        (value.rem_euclid(modulus)) as u128
-    }
-}
-
-fn mask_bitvec_bits(value: u128, width: u32) -> u128 {
-    if width >= 128 {
-        value
-    } else {
-        value & ((1u128 << width) - 1)
-    }
+        _ => return None,
+    })
 }
 
 /// Build a substitution pair from a variable name and SMT value.
@@ -285,7 +232,13 @@ fn instance_subst_var_and_value(
         *saw_unknown = true;
     }
     let var = ChcVar::new(name.to_owned(), sort.clone());
-    let expr = smt_value_to_chc_expr_for_sort(value, &sort);
+    let expr = smt_value_to_chc_expr_for_sort(value, &sort).unwrap_or_else(|| {
+        // Leave the variable unconcretized and force the enclosing replay to
+        // return Unknown. This is fail-closed for a hostile/out-of-range model
+        // width and avoids either a panic or a fabricated zero assignment.
+        *saw_unknown = true;
+        ChcExpr::var(var.clone())
+    });
     (var, expr)
 }
 
@@ -304,7 +257,8 @@ fn smt_value_contains_opaque(value: &SmtValue) -> bool {
         | SmtValue::Int(_)
         | SmtValue::BigInt(_)
         | SmtValue::Real(_)
-        | SmtValue::BitVec(_, _) => false,
+        | SmtValue::BitVec(_, _)
+        | SmtValue::BigBitVec(_, _) => false,
     }
 }
 

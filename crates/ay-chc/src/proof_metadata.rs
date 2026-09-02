@@ -2583,6 +2583,39 @@ pub struct ChcPdrProofRun {
     metadata: ChcProofTranscriptMetadata,
 }
 
+/// Why the authoritative proof-and-telemetry invocation stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ChcProofRunStopReason {
+    /// A verified Safe or Unsafe verdict was produced.
+    Definitive,
+    /// The configured whole-run budget elapsed before a verdict.
+    BudgetExhausted,
+    /// The embedding caller's cooperative-cancellation token was set when the
+    /// invocation returned without a definitive verdict.
+    ExternallyCancelled,
+    /// Search ended without a verdict for another reason.
+    Inconclusive,
+}
+
+/// Atomic, problem-bound proof result and telemetry bundle.
+///
+/// Construction is solver-owned. Callers cannot accidentally pair artifacts
+/// from one solve with timing or stop data collected by another solve. The
+/// budget report's `total_elapsed` and adaptive strategy trace cover the exact
+/// guarded production solve. The budget report's per-engine entries remain
+/// empty because specialized adaptive lanes are represented by the trace
+/// rather than being forced into an inaccurate concrete-engine identity.
+#[derive(Debug)]
+#[must_use = "proof reports must be inspected; Unknown is non-proof evidence"]
+pub struct ChcProofRunWithBudgetReport {
+    proof_run: ChcPdrProofRun,
+    budget_report: crate::BudgetReport,
+    adaptive_trace: crate::AdaptiveSolveTrace,
+    stop_reason: ChcProofRunStopReason,
+    cancellation_requested_at_return: bool,
+}
+
 /// Stable proof-relevant option identity for CHC/PDR evidence manifests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -5262,11 +5295,19 @@ fn unknown_reason_label(reason: VerifiedUnknownReason) -> &'static str {
     reason.code()
 }
 
+/// Return the resource limit that demonstrably ended this run, if any.
+///
+/// `Some` is actionable telemetry: it tells a consumer that more budget could
+/// change the answer. Therefore ambiguous causes and verdict-admission failures
+/// must not invent a limit merely because a timeout can contribute to them.
 fn unknown_limit_code(marker: &crate::VerifiedUnknownMarker) -> Option<&'static str> {
     match marker.reason() {
         VerifiedUnknownReason::BmcExhaustedSearch => Some("bmc_max_depth_reached"),
         VerifiedUnknownReason::BmcBudgetExhausted => Some("bmc_budget_exhausted"),
-        VerifiedUnknownReason::Inconclusive | VerifiedUnknownReason::NotApplicable => None,
+        VerifiedUnknownReason::Inconclusive
+        | VerifiedUnknownReason::NotApplicable
+        | VerifiedUnknownReason::OverApproximatedRefutation
+        | VerifiedUnknownReason::CandidateNotAdmitted => None,
     }
 }
 

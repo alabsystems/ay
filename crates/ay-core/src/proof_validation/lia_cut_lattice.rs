@@ -165,8 +165,12 @@ pub fn int_cut_lattice_gap_core(terms: &TermStore, clause: &[TermId]) -> Option<
     if let Some(gap) = pool.find_gap() {
         return Some(gap);
     }
-    for (i, left) in rows.iter().enumerate() {
-        for (j, right) in rows.iter().enumerate().skip(i + 1) {
+    // Upper-triangle pair walk without index arithmetic: each outer step
+    // leaves `pairs` positioned just past `i`, so its clone enumerates exactly
+    // the `j > i` suffix with the original indices intact.
+    let mut pairs = rows.iter().enumerate();
+    while let Some((i, left)) = pairs.next() {
+        for (j, right) in pairs.clone() {
             for (derived, multipliers) in eliminating_combinations(left, right) {
                 pool.insert(
                     &derived,

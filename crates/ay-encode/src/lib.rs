@@ -82,8 +82,11 @@ pub use ay_bindings::rebuild_with_children;
 /// Re-exported for consumers that hand-build a [`ay_chc::ChcProblem`] (model-checker-consumer's
 /// typed lowering, the model-checker consumer's `ChcTranslator`) rather than going through SMT-LIB text.
 pub use ay_chc::{
-    AdaptiveConfig, AdaptivePortfolio, BudgetPolicy, ChcExpr, ChcOp, ChcParser, ChcProblem,
-    ChcSort, ChcVar, EngineType, HornClause, PredicateId, VerifiedChcResult,
+    AdaptiveConfig, AdaptiveExecutionMode, AdaptivePortfolio, AdaptiveSolveReport,
+    AdaptiveSolveTrace, AdaptiveStrategyObservation, AdaptiveStrategyOutcome, BudgetPolicy,
+    CancellationToken, ChcError, ChcExpr, ChcOp, ChcParser, ChcProblem, ChcQueryObligation,
+    ChcQueryObligationId, ChcSort, ChcVar, EngineType, HornClause, PredicateId, SmtValue,
+    VerifiedChcResult, MAX_BITVECTOR_WIDTH,
 };
 
 /// The content-addressed CHC normalization helpers from [`ay_chc`].
@@ -104,14 +107,18 @@ pub use ay_chc::{normalized_chc_input, normalized_chc_input_sha256};
 /// without depending on `ay-chc` directly.
 pub use ay_chc::{
     ChcPdrProofRun, ChcProofArtifactDigest, ChcProofRunArtifact, ChcProofRunArtifacts,
-    ChcProofTranscriptConsumerEvidence, ChcProofTranscriptMetadata,
+    ChcProofRunStopReason, ChcProofRunWithBudgetReport, ChcProofTranscriptConsumerEvidence,
+    ChcProofTranscriptMetadata,
 };
 
 /// Portfolio observability types from [`ay_chc`] (G8, optional).
 ///
-/// Re-exported so consumers can read the per-engine [`BudgetReport`] and compare
-/// an [`EngineStopReason`] structurally instead of via a Debug-string hack. These
-/// feed diagnostics only (not verdicts).
+/// Re-exported so consumers can read authoritative whole-run timing and, when
+/// driving a concrete `PortfolioSolver` directly, compare per-engine
+/// [`EngineStopReason`] values structurally instead of via Debug strings. These
+/// feed diagnostics only (not verdicts); adaptive proof reports intentionally
+/// leave per-engine entries empty because specialized routes are represented
+/// by [`AdaptiveSolveTrace`] instead of inaccurate concrete-engine identities.
 pub use ay_chc::{BudgetReport, EngineStopReason};
 
 /// Convenience alias: every public fallible op in this crate returns this.
@@ -128,12 +135,14 @@ pub enum EncodeError {
     /// A term/sort builder produced an ill-sorted expression.
     Sort(SortError),
     /// The AY CHC layer (parse / portfolio / PDR) failed.
-    Chc(ay_chc::ChcError),
+    Chc(ChcError),
     /// The AY solver panicked with an AY-classified internal panic (G3).
     ///
     /// Carries AY's panic reason string. Programmer-error panics (non-AY) are
     /// *not* captured here — they re-propagate so they surface as real bugs.
     SolverPanicked(String),
+    /// The caller cancelled an obligation before its solve was started.
+    Cancelled,
     /// A feature was requested that this skeleton has not implemented yet.
     Unimplemented(&'static str),
 }
@@ -144,6 +153,7 @@ impl std::fmt::Display for EncodeError {
             Self::Sort(e) => write!(f, "ay-encode sort error: {e}"),
             Self::Chc(e) => write!(f, "ay-encode chc error: {e}"),
             Self::SolverPanicked(reason) => write!(f, "ay-encode: solver panicked: {reason}"),
+            Self::Cancelled => write!(f, "ay-encode: solve cancelled by caller"),
             Self::Unimplemented(what) => write!(f, "ay-encode: not yet implemented: {what}"),
         }
     }
@@ -155,6 +165,7 @@ impl std::error::Error for EncodeError {
             Self::Sort(e) => Some(e),
             Self::Chc(e) => Some(e),
             Self::SolverPanicked(_) => None,
+            Self::Cancelled => None,
             Self::Unimplemented(_) => None,
         }
     }
@@ -166,8 +177,8 @@ impl From<SortError> for EncodeError {
     }
 }
 
-impl From<ay_chc::ChcError> for EncodeError {
-    fn from(e: ay_chc::ChcError) -> Self {
+impl From<ChcError> for EncodeError {
+    fn from(e: ChcError) -> Self {
         Self::Chc(e)
     }
 }

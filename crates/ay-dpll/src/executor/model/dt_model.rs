@@ -18,11 +18,27 @@ use crate::executor_format::{format_default_value_surface, format_sort_surface};
 
 use super::rendered_dt_limits::SchemaSourceBudget;
 use super::{EvalValue, Executor, Model};
+use array_field_hazard::bounded_sort_carries_array_field_datatype;
 use census_values::{CensusCtx, CensusKey, CensusMemo};
 
+mod array_field_hazard;
 pub(in crate::executor::model) mod census_values;
 
 const CEGAR_DISTINCT_OPERAND_LIMIT: usize = 256;
+
+/// Shared array-census result. `complete` records whether the authored closure
+/// stayed within the ground fragment the exact datatype-array certificate can
+/// interpret. The general congruence backstop may still use ground observations
+/// reachable outside an unsupported subtree when it is `false`, because that
+/// gate acts only on a definite conflicting pair rather than certifying the
+/// whole model.
+struct CensusIdentity {
+    reachable: HashSet<TermId>,
+    uf: HashMap<TermId, TermId>,
+    class_cells: HashMap<TermId, Vec<(CensusKey, TermId)>>,
+    hard_true: HashSet<TermId>,
+    complete: bool,
+}
 
 thread_local! {
     /// Per-thread override map consulted at the top of [`Executor::evaluate_term`].
@@ -1263,6 +1279,11 @@ impl Executor {
     ///   undecidable value -> reject (fail-closed; an extraction gap is never a
     ///   certification). An asserted DISTINCT/`(not (= X Y))` whose operands
     ///   reconstruct to equal maps (no differing witnessed cell) -> reject.
+    /// - A nonempty `let` or any quantifier makes the shared authored census
+    ///   incomplete and its binder-conditioned subtree is excluded. Exact
+    ///   datatype-array certification rejects that closure; only the general
+    ///   degrade-on-proven-conflict consumer may reuse ground observations from
+    ///   sibling/public roots outside the unsupported subtree.
     ///
     /// Runs AFTER the strict per-assertion oracle (which validated the scalar/BV
     /// and decidable-datatype assertions), so a `true` means the model satisfies
@@ -1294,7 +1315,17 @@ impl Executor {
         // array equalities + derived nested-select identity, and the observed
         // cell function per identity class. Shared verbatim with the general
         // select-congruence gate so the two never diverge.
-        let (reachable, uf, class_cells) = self.census_build_identity(model, &memo);
+        let query_roots = self.independent_gate_query_roots();
+        let CensusIdentity {
+            reachable,
+            uf,
+            class_cells,
+            hard_true,
+            complete,
+        } = self.census_build_identity(model, &memo, &query_roots);
+        if !complete {
+            return false;
+        }
         let ctx = CensusCtx {
             uf: &uf,
             class_cells: &class_cells,
@@ -1386,7 +1417,7 @@ impl Executor {
         // evaluated index at which the reconstructed values differ). If two
         // operands' observed cells agree on every common key, the model cannot be
         // shown to satisfy the disequality -> fail closed.
-        for &a in &self.ctx.assertions {
+        for &a in &hard_true {
             let operands: Vec<TermId> = match self.ctx.terms.get(a) {
                 TermData::App(Symbol::Named(operator), _) if operator == "distinct" => {
                     let Some(operands) = self.exact_cegar_distinct_operands(a) else {
@@ -1525,9 +1556,11 @@ impl Executor {
     }
 
     /// Build the model's array-identity structure, shared by the datatype census
-    /// and the general select-congruence gate: `(reachable, uf, class_cells)`.
+    /// and the general select-congruence gate.
     ///
-    /// - `reachable`: every term reachable from the assertions (App/Not/Ite/Let).
+    /// - `reachable`: every term reachable from the exact public-query roots
+    ///   outside unsupported binder subtrees. Encountering one does not discard
+    ///   ground observations already queued from sibling/public roots.
     /// - `uf`: union-find over array-sorted terms — unions every reachable array
     ///   equality the MODEL committed to TRUE (top-level asserted OR a nested
     ///   literal the SAT assignment set true), then fixpoint-unions array-valued
@@ -1536,18 +1569,27 @@ impl Executor {
     ///   undetermined equality does not force identity, so it is not unioned.
     /// - `class_cells`: per identity-class rep, the `(evaluated-index key, select
     ///   term)` cells actually read on that class.
+    /// - `complete`: false when a nonempty `let` or quantifier was encountered.
+    ///   Exact datatype-array certification must reject that incomplete closure;
+    ///   the general degrade-on-proven-violation gate may still consume it.
     fn census_build_identity(
         &self,
         model: &Model,
         memo: &CensusMemo,
-    ) -> (
-        HashSet<TermId>,
-        HashMap<TermId, TermId>,
-        HashMap<TermId, Vec<(CensusKey, TermId)>>,
-    ) {
+        query_roots: &[TermId],
+    ) -> CensusIdentity {
         let mut reachable: HashSet<TermId> = Default::default();
+        let mut complete = true;
         {
-            let mut stack: Vec<TermId> = self.ctx.assertions.clone();
+            // CEGAR and datatype deepening append theory-valid helper clauses to
+            // `ctx.assertions`. They constrain the search, but their auxiliary
+            // reads are not observations in the public model. In particular,
+            // post-hoc completion of an unobserved W6 array field need not agree
+            // with stale SAT values for generated selector/read terms. Root the
+            // publication census in the immutable authored window instead. If a
+            // caller authored the same interned term, it is reachable here and
+            // remains checked.
+            let mut stack: Vec<TermId> = query_roots.to_vec();
             while let Some(t) = stack.pop() {
                 if !reachable.insert(t) {
                     continue;
@@ -1560,11 +1602,11 @@ impl Executor {
                         stack.push(*th);
                         stack.push(*el);
                     }
-                    TermData::Let(bindings, body) => {
+                    TermData::Let(bindings, body) if bindings.is_empty() => {
                         stack.push(*body);
-                        for (_, v) in bindings {
-                            stack.push(*v);
-                        }
+                    }
+                    TermData::Let(_, _) | TermData::Forall(_, _, _) | TermData::Exists(_, _, _) => {
+                        complete = false;
                     }
                     _ => {}
                 }
@@ -1572,6 +1614,31 @@ impl Executor {
         }
 
         let mut uf: HashMap<TermId, TermId> = HashMap::default();
+        // Public roots and their exact top-level `and` conjuncts are hard
+        // facts even when preprocessing eliminated their SAT variables. Keep
+        // that authored polarity separate from nested equality atoms, which
+        // still require a positive model assignment before they may merge two
+        // array identities.
+        let mut hard_true: HashSet<TermId> = HashSet::default();
+        let mut hard_stack = query_roots.to_vec();
+        while let Some(term) = hard_stack.pop() {
+            if !hard_true.insert(term) {
+                continue;
+            }
+            if self.ctx.terms.sort(term) == &Sort::Bool
+                && self.cegar_theory_identity_is_coherent("and")
+            {
+                if let TermData::App(Symbol::Named(operator), args) = self.ctx.terms.get(term) {
+                    if operator == "and"
+                        && args
+                            .iter()
+                            .all(|&argument| self.ctx.terms.sort(argument) == &Sort::Bool)
+                    {
+                        hard_stack.extend(args.iter().copied());
+                    }
+                }
+            }
+        }
         let union = |uf: &mut HashMap<TermId, TermId>, x: TermId, y: TermId| {
             let rx = Self::census_find(uf, x);
             let ry = Self::census_find(uf, y);
@@ -1582,7 +1649,7 @@ impl Executor {
         for &term in &reachable {
             if let Some((left, right)) = self.exact_cegar_equality_operands(term) {
                 if matches!(self.ctx.terms.sort(left), Sort::Array(_))
-                    && self.sat_term_assigned_true(model, term)
+                    && (hard_true.contains(&term) || self.sat_term_assigned_true(model, term))
                 {
                     union(&mut uf, left, right);
                 }
@@ -1632,7 +1699,13 @@ impl Executor {
         }
 
         let class_cells = self.census_class_cells(model, &reachable, &uf, memo);
-        (reachable, uf, class_cells)
+        CensusIdentity {
+            reachable,
+            uf,
+            class_cells,
+            hard_true,
+            complete,
+        }
     }
 
     /// Per identity-class rep, the `(evaluated-index key, select term)` cells
@@ -1659,11 +1732,13 @@ impl Executor {
 
     /// General model-based SELECT-CONGRUENCE gate — the sound backstop for the
     /// eager array encoding's derived-equal-index hole for ANY element sort
-    /// (uninterpreted, scalar, datatype). Returns `true` iff the candidate model
-    /// DEFINITELY violates select-congruence: two reads on the same array
+    /// (uninterpreted, scalar, datatype). Returns `true` iff the candidate
+    /// model DEFINITELY violates select-congruence: two reads on the same array
     /// identity class at the same evaluated index whose element values are
-    /// provably incompatible (`census_compatible == Some(false)`). The caller
-    /// degrades such a SAT to a sound `unknown`.
+    /// provably incompatible (`census_compatible == Some(false)`). `false` means
+    /// no such pair was found. Nonempty lets and quantifiers make the shared
+    /// census incomplete for exact certification, but ground observations from
+    /// sibling/public roots remain usable by this degrade-only check.
     ///
     /// This is degrade-on-PROVEN-violation (not certify): a genuine SAT model is
     /// select-congruent on its read cells, so it never trips; only a model the
@@ -1673,7 +1748,8 @@ impl Executor {
     /// specific inconsistency.
     pub(in crate::executor) fn array_select_congruence_violated(&self, model: &Model) -> bool {
         let memo = CensusMemo::new();
-        let violation = self.census_first_congruence_violation(model, &memo);
+        let query_roots = self.independent_gate_query_roots();
+        let violation = self.census_first_congruence_violation(model, &memo, &query_roots);
         if let Some((r1, r2)) = violation {
             if ay_core::misc_cli_flags().census_trace {
                 const CANON_DEPTH: u32 = 20;
@@ -1701,9 +1777,12 @@ impl Executor {
         &self,
         model: &Model,
         memo: &CensusMemo,
+        query_roots: &[TermId],
     ) -> Option<(TermId, TermId)> {
         const CANON_DEPTH: u32 = 20;
-        let (_reachable, uf, class_cells) = self.census_build_identity(model, memo);
+        let CensusIdentity {
+            uf, class_cells, ..
+        } = self.census_build_identity(model, memo, query_roots);
         let ctx = CensusCtx {
             uf: &uf,
             class_cells: &class_cells,
@@ -1748,7 +1827,8 @@ impl Executor {
         // Phase A (immutable analysis): locate the first violating read pair.
         let pair = {
             let memo = CensusMemo::new();
-            self.census_first_congruence_violation(model, &memo)
+            let query_roots = self.independent_gate_query_roots();
+            self.census_first_congruence_violation(model, &memo, &query_roots)
         };
         let (r1, r2) = pair?;
         // Phase B (mutable construction): build the congruence lemma.
@@ -1888,87 +1968,9 @@ impl Executor {
     /// `(dat (select A j))` under `i = j`), so the cell fabricates a collapsed
     /// const-default field the strict arrays oracle then correctly rejects.
     pub(super) fn sort_carries_array_field_datatype(&self, sort: &Sort) -> bool {
-        fn walk(exec: &Executor, sort: &Sort, visited: &mut Vec<String>) -> bool {
-            let dt_name = match sort {
-                Sort::Array(a) => {
-                    return walk(exec, &a.index_sort, visited)
-                        || walk(exec, &a.element_sort, visited);
-                }
-                Sort::Datatype(dt) => dt.name.clone(),
-                Sort::Uninterpreted(n) => n.clone(),
-                _ => return false,
-            };
-            let Some((_, ctors)) = exec.ctx.datatype_iter().find(|(n, _)| *n == dt_name) else {
-                return false;
-            };
-            if visited.iter().any(|v| v == &dt_name) {
-                return false;
-            }
-            visited.push(dt_name);
-            let ctors: Vec<String> = ctors.to_vec();
-            let hit = ctors.iter().any(|ctor| {
-                exec.ctx
-                    .constructor_selector_info(ctor)
-                    .is_some_and(|fields| {
-                        fields.iter().any(|(_, fsort)| {
-                            matches!(fsort, Sort::Array(_)) || walk(exec, fsort, visited)
-                        })
-                    })
-            });
-            visited.pop();
-            hit
-        }
-        let mut visited = Vec::new();
-        walk(self, sort, &mut visited)
-    }
-
-    /// Whether completing an array of sort `array_sort` into committed cells
-    /// would have to spell out a nested array FIELD that the problem reads
-    /// through a datatype cell of that array (#dt-array-model-census).
-    ///
-    /// This is the exact hazard behind [`Self::sort_carries_array_field_datatype`]:
-    /// the per-term cell renderer spells the nested field from ONE field term,
-    /// so two congruent field reads (`(dat (select A i))` / `(dat (select A j))`
-    /// under `i = j`, observed at DISJOINT inner indices) collapse into a
-    /// fabricated const-default field, and the strict arrays oracle rejects
-    /// the cell-level equality `z = (select A i)` (measured: 62 rejections of
-    /// assertion 1 on the `datatype_array_field_select_congruence_certifies`
-    /// pin, `unknown` instead of the census-certified `sat`). Only an array
-    /// whose datatype cells are actually opened through an array-sorted field
-    /// read is affected; an array of such a sort that is merely compared or
-    /// stored (no nested field read anywhere) has nothing for the renderer to
-    /// mis-spell and keeps its printable completed witness. Callers leave the
-    /// affected arrays UNcompleted so the observation-based census certifies
-    /// them cell-by-cell from the asserted reads.
-    pub(super) fn array_field_datatype_cells_observed(
-        &self,
-        array_sort: &ay_core::ArraySort,
-    ) -> bool {
-        if !self.sort_carries_array_field_datatype(&array_sort.element_sort) {
-            return false;
-        }
-        let terms = &self.ctx.terms;
-        terms.term_ids().any(|field_read| {
-            // `(field (select A idx))` with an ARRAY-sorted field over a
-            // datatype-sorted cell of an array of exactly this sort.
-            let TermData::App(_, args) = terms.get(field_read) else {
-                return false;
-            };
-            if args.len() != 1 || !matches!(terms.sort(field_read), Sort::Array(_)) {
-                return false;
-            }
-            let TermData::App(sym, sel_args) = terms.get(args[0]) else {
-                return false;
-            };
-            // The cell sort is the element sort itself (declared datatypes
-            // surface as `Sort::Uninterpreted(name)` in this term store, so
-            // do not demand `Sort::Datatype` here — `sort_carries_array_field_datatype`
-            // above already resolved the name against the datatype registry).
-            sym.name() == "select"
-                && sel_args.len() == 2
-                && terms.sort(args[0]) == &array_sort.element_sort
-                && matches!(terms.sort(sel_args[0]), Sort::Array(a) if a.as_ref() == array_sort)
-        })
+        // Resource exhaustion is hazardous, never evidence that the sort is
+        // safe for an unauthenticated structured-row fallback.
+        bounded_sort_carries_array_field_datatype(self, sort).unwrap_or(true)
     }
 
     /// A sort that (recursively through arrays) carries a declared datatype.

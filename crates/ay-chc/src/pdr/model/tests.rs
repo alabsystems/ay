@@ -156,6 +156,107 @@ fn replay_obligations_fail_closed_when_interpretation_is_missing() {
         .contains("missing invariant interpretation"));
 }
 
+#[test]
+fn constant_false_replay_uses_strict_certifiable_guard_contradiction() {
+    let mut problem = ChcProblem::new();
+    let error = problem.declare_predicate("error", Vec::new());
+    problem.add_clause(HornClause::query(ClauseBody::predicates_only(vec![(
+        error,
+        Vec::new(),
+    )])));
+
+    let mut model = InvariantModel::new();
+    model.set(
+        error,
+        PredicateInterpretation::new(Vec::new(), ChcExpr::Bool(false)),
+    );
+
+    let obligations = model
+        .replay_obligations(&problem)
+        .expect("nullary false replay obligation");
+    let [obligation] = obligations.as_slice() else {
+        panic!("fixture must produce exactly one replay obligation");
+    };
+    assert!(obligation
+        .smtlib
+        .contains("(assert chc_replay_false_guard)"));
+    assert!(obligation
+        .smtlib
+        .contains("(assert (not chc_replay_false_guard))"));
+    assert!(
+        !obligation.smtlib.contains("(assert false)"),
+        "literal false cannot retain authored Assume authority"
+    );
+    assert!(
+        !obligation.smtlib.contains("(define-fun error"),
+        "an unused false-bodied definition must not enter the guarded contradiction"
+    );
+    let cert = crate::smt::executor_adapter::smtlib_strict_unsat_cert_via_executor(
+        &obligation.smtlib,
+        None,
+    )
+    .expect("the guarded constant-false replay query must retain a native strict certificate");
+    assert_eq!(
+        cert.bundle.obligation_assertions.len(),
+        2,
+        "the strict proof must retain both sides of the authored contradiction"
+    );
+    let checked = ay_dpll::api::re_check_bundle_strict(&cert.bundle)
+        .expect("the guarded contradiction bundle must independently recheck");
+    assert!(!checked.assume_terms.is_empty());
+    assert_eq!(checked.assume_terms, cert.bundle.obligation_assertions);
+}
+
+#[test]
+fn replay_obligations_declare_scalar_ufs_before_use() {
+    let mut problem = ChcProblem::new();
+    let inv = problem.declare_predicate("inv", vec![ChcSort::Int]);
+    let x = ChcVar::new("x", ChcSort::Int);
+    let f_x = || {
+        ChcExpr::FuncApp(
+            "f".to_string(),
+            ChcSort::Int,
+            vec![ChcExpr::var(x.clone()).into()],
+        )
+    };
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(f_x(), ChcExpr::Int(0))),
+        ClauseHead::Predicate(inv, vec![ChcExpr::var(x.clone())]),
+    ));
+    problem.add_clause(HornClause::query(ClauseBody::new(
+        vec![(inv, vec![ChcExpr::var(x.clone())])],
+        Some(ChcExpr::not(ChcExpr::eq(f_x(), ChcExpr::Int(0)))),
+    )));
+
+    let mut model = InvariantModel::new();
+    let parameter = ChcVar::new("x", ChcSort::Int);
+    let invariant_f = ChcExpr::FuncApp(
+        "f".to_string(),
+        ChcSort::Int,
+        vec![ChcExpr::var(parameter.clone()).into()],
+    );
+    model.set(
+        inv,
+        PredicateInterpretation::new(vec![parameter], ChcExpr::eq(invariant_f, ChcExpr::Int(0))),
+    );
+
+    let obligations = model
+        .replay_obligations(&problem)
+        .expect("ordinary UF signatures should make replay self-contained");
+    for obligation in obligations {
+        let declaration = obligation
+            .smtlib
+            .find("(declare-fun f (Int) Int)")
+            .expect("replay script must declare f");
+        let use_site = obligation.smtlib.find("(f x)").expect("fixture must use f");
+        assert!(
+            declaration < use_site,
+            "f must be declared before its first replay use: {}",
+            obligation.smtlib
+        );
+    }
+}
+
 // =======================================================================
 // Tests for expr_to_smtlib - #1651
 // =======================================================================

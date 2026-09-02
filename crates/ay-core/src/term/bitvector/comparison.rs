@@ -13,13 +13,13 @@ fn bv_unsigned_max(width: u32) -> BigInt {
 /// i.e. `2^(w-1) - 1`. Requires `width >= 1` (guaranteed by `get_bv_width`,
 /// which rejects zero-width sorts).
 fn bv_signed_max_bits(width: u32) -> BigInt {
-    (BigInt::one() << (width - 1)) - BigInt::one()
+    (BigInt::one() << width.saturating_sub(1)) - BigInt::one()
 }
 
 /// Unsigned *representation* of the signed minimum of a width-`w` bitvector,
 /// i.e. `2^(w-1)` (two's complement `-2^(w-1)`). Requires `width >= 1`.
 fn bv_signed_min_bits(width: u32) -> BigInt {
-    BigInt::one() << (width - 1)
+    BigInt::one() << width.saturating_sub(1)
 }
 
 impl TermStore {
@@ -167,7 +167,8 @@ impl TermStore {
 
     /// Helper to interpret a bitvector as a signed (two's complement) value
     pub(super) fn to_signed(value: &BigInt, width: u32) -> BigInt {
-        let max_positive = BigInt::one() << (width - 1);
+        // Saturating: width >= 1 for every valid BitVec sort (see get_bv_width).
+        let max_positive = BigInt::one() << width.saturating_sub(1);
         if value >= &max_positive {
             // Negative value: value - 2^width
             let modulus = BigInt::one() << width;

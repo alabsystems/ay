@@ -40,6 +40,17 @@ fn test_quote_symbol_reserved() {
     assert_eq!(quote_symbol("exists"), "|exists|");
     assert_eq!(quote_symbol("assert"), "|assert|");
     assert_eq!(quote_symbol("check-sat"), "|check-sat|");
+    for reserved in [
+        "choice",
+        "lambda",
+        "cl",
+        "assume",
+        "step",
+        "anchor",
+        "declare-rare-rule",
+    ] {
+        assert_eq!(quote_symbol(reserved), format!("|{reserved}|"));
+    }
 }
 
 #[test]

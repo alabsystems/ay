@@ -6,6 +6,23 @@
 
 use super::*;
 
+/// Exact source authority available for a reconstructed conjunction premise.
+pub(super) enum LinearAndSourceProvenance {
+    /// A top-level application was already entered in the raw-source ledger by
+    /// the common original-assertion capture pass.
+    IndexedApplication,
+    /// A top-level `let` row expands to this exact raw conjunction. The source
+    /// spelling remains mandatory: pinned Carcara does not match a `let`
+    /// premise to its expanded body, so the printer must emit its certified
+    /// source-exact let-elimination bridge before derived steps use the
+    /// conjunction.
+    ExpandedLet {
+        expanded_root: TermId,
+        source_index: usize,
+        source_surface: String,
+    },
+}
+
 impl Executor {
     /// `(and .. p .. (not p) ..)` with a syntactically complementary conjunct
     /// pair: two `and_pos` extractions resolved to the empty clause.
@@ -128,6 +145,7 @@ impl Executor {
         &mut self,
         proof: &mut Proof,
         operands: &[FrontendTerm],
+        source_provenance: LinearAndSourceProvenance,
     ) -> bool {
         let mut conjs = Vec::with_capacity(operands.len());
         for op in operands {
@@ -144,6 +162,12 @@ impl Executor {
         if !matches!(
             self.ctx.terms.get(x),
             TermData::App(Symbol::Named(op), a) if op == "and" && a.len() == conjs.len()
+        ) {
+            return false;
+        }
+        if matches!(
+            &source_provenance,
+            LinearAndSourceProvenance::ExpandedLet { expanded_root, .. } if *expanded_root != x
         ) {
             return false;
         }
@@ -259,6 +283,47 @@ impl Executor {
         {
             return false;
         }
+        let (next_term_overrides, expanded_let_source) = match &source_provenance {
+            LinearAndSourceProvenance::IndexedApplication => (None, None),
+            LinearAndSourceProvenance::ExpandedLet {
+                source_index,
+                source_surface,
+                ..
+            } => {
+                if !source_surface.trim_start().starts_with("(let") {
+                    return false;
+                }
+                let source = (x, *source_index, source_surface.clone());
+                if self.last_proof_expanded_let_sources.len() >= MAX_PROVENANCE_REPAIR_TERMS
+                    && !self.last_proof_expanded_let_sources.contains(&source)
+                {
+                    return false;
+                }
+                if self
+                    .last_proof_expanded_let_sources
+                    .iter()
+                    .any(|(root, index, surface)| {
+                        *root == x && (*index != *source_index || surface != source_surface)
+                    })
+                {
+                    return false;
+                }
+                let mut overrides = self.last_proof_term_overrides.clone().unwrap_or_default();
+                if overrides
+                    .get(&x)
+                    .is_some_and(|existing| existing != source_surface)
+                {
+                    return false;
+                }
+                overrides.insert(x, source_surface.clone());
+                if !crate::executor::proof_surface_syntax::surface_override_map_is_bounded(
+                    &overrides,
+                ) {
+                    return false;
+                }
+                (Some(overrides), Some(source))
+            }
+        };
         let terms = &mut self.ctx.terms;
         let not_x = terms.mk_not_raw(x);
         let clause: Vec<TermId> = sel_conjs.iter().map(|&c| terms.mk_not_raw(c)).collect();
@@ -287,11 +352,26 @@ impl Executor {
             current = new_proof.add_resolution(clause[k + 1..].to_vec(), c, current, uid);
         }
         *proof = new_proof;
+        if let Some(overrides) = next_term_overrides {
+            self.last_proof_term_overrides = Some(overrides);
+        }
+        if let Some(source) = expanded_let_source {
+            if !self.last_proof_expanded_let_sources.contains(&source) {
+                self.last_proof_expanded_let_sources.push(source);
+            }
+        }
         // `x` is recursively raw-interned from the parsed conjunction above,
         // and the independently checked Farkas rebuild has now succeeded.
         // Record that exact source term so the final exporter accepts the
         // rebuilt Assume without granting authority to any generated leaf.
         self.record_rebuilt_authored_proof_premise(x);
+        if matches!(
+            source_provenance,
+            LinearAndSourceProvenance::ExpandedLet { .. }
+        ) && !self.last_proof_raw_original_assertions.contains(&x)
+        {
+            self.last_proof_raw_original_assertions.push(x);
+        }
         true
     }
 }

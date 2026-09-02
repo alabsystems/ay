@@ -383,6 +383,14 @@ impl PdrSolver {
     ) -> Vec<(ChcVar, ChcExpr)> {
         let mut subst: Vec<(ChcVar, ChcExpr)> = Vec::new();
         for (name, value) in &root_entry.instances {
+            // `root_entry` was produced by a predicate-headed clause, whose
+            // local binders are not the binders of this query clause.  Carry
+            // only the positional predicate arguments across that scope
+            // boundary; `extend_query_arg_subst` maps them onto the query's
+            // actual body-argument variables below.
+            if !is_canonical_arg_name(name) {
+                continue;
+            }
             subst.push(instance_subst_var_and_value(
                 name,
                 value,
@@ -396,6 +404,12 @@ impl PdrSolver {
             for &premise_idx in &root_entry.premises {
                 if let Some(premise_entry) = witness.entries.get(premise_idx) {
                     for (name, value) in &premise_entry.instances {
+                        // Premise clause locals are independently scoped too.
+                        // Canonical argument names are the only witness keys
+                        // with a well-defined meaning in the query clause.
+                        if !is_canonical_arg_name(name) {
+                            continue;
+                        }
                         if let Some((_, existing_expr)) =
                             subst.iter().find(|(var, _)| var.name == *name)
                         {

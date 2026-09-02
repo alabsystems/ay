@@ -42,31 +42,28 @@ impl TermStore {
             }
 
             let result = match self.get(term).clone() {
-                TermData::App(Symbol::Named(ref name), ref args)
-                    if name == "select" && args.len() == 2 =>
-                {
-                    let array = args[0];
-                    let index = args[1];
+                TermData::App(ref sym, ref args) => match (sym, args.as_slice()) {
+                    (Symbol::Named(name), &[array, index]) if name == "select" => {
+                        // Recursively expand children first
+                        let expanded_array = self.expand_select_store_inner(array, cache);
+                        let expanded_index = self.expand_select_store_inner(index, cache);
 
-                    // Recursively expand children first
-                    let expanded_array = self.expand_select_store_inner(array, cache);
-                    let expanded_index = self.expand_select_store_inner(index, cache);
-
-                    // Now try to expand select-over-store on the result
-                    self.expand_select_over_store(expanded_array, expanded_index, 50)
-                }
-                TermData::App(ref sym, ref args) => {
-                    let new_args: Vec<TermId> = args
-                        .iter()
-                        .map(|&a| self.expand_select_store_inner(a, cache))
-                        .collect();
-                    if new_args == *args {
-                        term
-                    } else {
-                        let sort = self.sort(term).clone();
-                        self.intern(TermData::App(sym.clone(), new_args), sort)
+                        // Now try to expand select-over-store on the result
+                        self.expand_select_over_store(expanded_array, expanded_index, 50)
                     }
-                }
+                    _ => {
+                        let new_args: Vec<TermId> = args
+                            .iter()
+                            .map(|&a| self.expand_select_store_inner(a, cache))
+                            .collect();
+                        if new_args == *args {
+                            term
+                        } else {
+                            let sort = self.sort(term).clone();
+                            self.intern(TermData::App(sym.clone(), new_args), sort)
+                        }
+                    }
+                },
                 TermData::Not(inner) => {
                     let new_inner = self.expand_select_store_inner(inner, cache);
                     if new_inner == inner {
@@ -125,17 +122,19 @@ impl TermStore {
         depth: usize,
         symbolic_ite_budget: usize,
     ) -> TermId {
-        if depth == 0 {
+        // `depth` is the strictly decreasing recursion measure: every recursive
+        // call below passes `next_depth = depth - 1`, and expansion stops here
+        // once the measure reaches zero.
+        let Some(next_depth) = depth.checked_sub(1) else {
             return self.mk_select(array, index);
-        }
+        };
 
         match self.get(array).clone() {
-            TermData::App(Symbol::Named(ref name), ref args)
-                if name == "store" && args.len() == 3 =>
-            {
-                let inner_array = args[0];
-                let store_index = args[1];
-                let store_value = args[2];
+            TermData::App(Symbol::Named(ref name), ref args) if name == "store" => {
+                let &[inner_array, store_index, store_value] = args.as_slice() else {
+                    // Malformed store arity -- treat like any non-store array term.
+                    return self.mk_select(array, index);
+                };
 
                 // If indices are syntactically identical, just return the value
                 if store_index == index {
@@ -152,7 +151,7 @@ impl TermStore {
                     return self.expand_select_over_store_inner(
                         inner_array,
                         index,
-                        depth - 1,
+                        next_depth,
                         symbolic_ite_budget,
                     );
                 }
@@ -161,16 +160,16 @@ impl TermStore {
                 // Stopping at deep chains prevents O(2^N) ITE explosion on
                 // storeinv-family benchmarks (#6367). The runtime array theory
                 // solver handles the remaining store levels via ROW1/ROW2 lemmas.
-                if symbolic_ite_budget == 0 {
+                let Some(next_budget) = symbolic_ite_budget.checked_sub(1) else {
                     return self.mk_select(array, index);
-                }
+                };
 
                 let eq = self.mk_eq_coerce(store_index, index);
                 let else_branch = self.expand_select_over_store_inner(
                     inner_array,
                     index,
-                    depth - 1,
-                    symbolic_ite_budget - 1,
+                    next_depth,
+                    next_budget,
                 );
                 self.mk_ite(eq, store_value, else_branch)
             }
@@ -201,7 +200,7 @@ impl TermStore {
                     return self.expand_select_over_store_inner(
                         else_arr,
                         index,
-                        depth - 1,
+                        next_depth,
                         symbolic_ite_budget,
                     );
                 }
@@ -211,7 +210,7 @@ impl TermStore {
                     return self.expand_select_over_store_inner(
                         then_arr,
                         index,
-                        depth - 1,
+                        next_depth,
                         symbolic_ite_budget,
                     );
                 }
@@ -253,11 +252,17 @@ impl TermStore {
                 return true;
             }
             match self.get(current).clone() {
-                TermData::App(Symbol::Named(ref name), ref args)
-                    if name == "store" && args.len() == 3 =>
-                {
-                    let inner_array = args[0];
-                    let store_index = args[1];
+                TermData::App(Symbol::Named(ref name), ref args) if name == "store" => {
+                    let mut store_args = args.iter();
+                    let (Some(&inner_array), Some(&store_index), Some(_), None) = (
+                        store_args.next(),
+                        store_args.next(),
+                        store_args.next(),
+                        store_args.next(),
+                    ) else {
+                        // Malformed store arity -- treat as a non-store term.
+                        return current == base_arr;
+                    };
 
                     // If store index equals read index, the store affects the read
                     if store_index == read_index {
@@ -343,31 +348,33 @@ impl TermStore {
             }
 
             let result = match self.get(term).clone() {
-                TermData::App(Symbol::Named(ref name), ref args)
-                    if name == "select" && args.len() == 2 =>
-                {
-                    let array = args[0];
-                    let index = args[1];
+                TermData::App(ref sym, ref args) => match (sym, args.as_slice()) {
+                    (Symbol::Named(name), &[array, index]) if name == "select" => {
+                        let expanded_array =
+                            self.expand_select_store_inner_with_budget(array, cache, budget);
+                        let expanded_index =
+                            self.expand_select_store_inner_with_budget(index, cache, budget);
 
-                    let expanded_array =
-                        self.expand_select_store_inner_with_budget(array, cache, budget);
-                    let expanded_index =
-                        self.expand_select_store_inner_with_budget(index, cache, budget);
-
-                    self.expand_select_over_store_inner(expanded_array, expanded_index, 50, budget)
-                }
-                TermData::App(ref sym, ref args) => {
-                    let new_args: Vec<TermId> = args
-                        .iter()
-                        .map(|&a| self.expand_select_store_inner_with_budget(a, cache, budget))
-                        .collect();
-                    if new_args == *args {
-                        term
-                    } else {
-                        let sort = self.sort(term).clone();
-                        self.intern(TermData::App(sym.clone(), new_args), sort)
+                        self.expand_select_over_store_inner(
+                            expanded_array,
+                            expanded_index,
+                            50,
+                            budget,
+                        )
                     }
-                }
+                    _ => {
+                        let new_args: Vec<TermId> = args
+                            .iter()
+                            .map(|&a| self.expand_select_store_inner_with_budget(a, cache, budget))
+                            .collect();
+                        if new_args == *args {
+                            term
+                        } else {
+                            let sort = self.sort(term).clone();
+                            self.intern(TermData::App(sym.clone(), new_args), sort)
+                        }
+                    }
+                },
                 TermData::Not(inner) => {
                     let new_inner =
                         self.expand_select_store_inner_with_budget(inner, cache, budget);

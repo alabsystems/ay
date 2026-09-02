@@ -10,11 +10,44 @@
 // `macro_rules!` that expanded to `{}`, with a header promising that "Phase 2
 // will replace them with real deductive_contract_macros attributes". Phase 2 landed in the
 // compiler and this crate had simply not moved. The erasing macros are gone;
-// the crate now carries FIRST-CLASS compiler contracts, in the same
-// `` form already used by `ay-pb-core`
-// (src/eval.rs, src/portfolio.rs) and `ay-dpll`.
+// the crate now carries FIRST-CLASS compiler contracts.
 //
-// HOW THE FIRST-CLASS FORM RESOLVES (verified against the toolchain source,
+// ── THE SPELLING CHANGED, 2026-08-30: CLAUSES, NOT ATTRIBUTES ───────────────
+//
+// The attribute form this header describes below — `` — is GONE from this repo. It was correct while the
+// default toolchain was stock Rust, and it stopped being correct the moment
+// rust-toolchain.toml pinned Trust with verification on: the
+// compiler then injects `cfg(deductive_verify)` ITSELF (condition 2 below), so the
+// `cfg_attr` always fires, and condition 3 — an `--extern trust` overlay that
+// only the ratchet lane supplies — is not met in an ordinary `cargo check`.
+// Fail-closed, as designed, means E0433 `cannot find module or crate `trust``
+// and a crate that does not build. Two sites in this crate's `literal.rs` and
+// three more across `ay-pb-core`/`ay-dpll` were in exactly that state.
+//
+// The sanctioned spelling is the NATIVE CLAUSE GRAMMAR the Trust parser reads
+// directly (rustc_parse/src/parser/generics.rs, `parse_contract`):
+//
+//     fn from_dimacs(dimacs: i32) -> Self requires dimacs != 0 { .. }
+//     fn clamp16(v: u8) -> u8 ensures result <= 16 { .. }
+//
+// Measured properties of that grammar, read off the parser and confirmed by
+// probe on rustc 1.99.0-dev (1979a7b85):
+//   * clauses sit AFTER the return type and BEFORE any `where` clause, because
+//     `parse_contract` runs between `parse_fn_decl` and `parse_where_clause`;
+//   * `requires`/`ensures`/`decreases` may be CHAINED in any order and repeated
+//     (one `decreases` only) — and two `ensures` clauses is how a conjunction is
+//     said, since `ensures a && b` does not discharge as one clause;
+//   * `result` names the return value, and needs no `|ret|` closure wrapper (that
+//     shape is required only of attribute-origin ensures);
+//   * a clause is UNCONDITIONAL. There is no `cfg` gate, no `trust` dependency
+//     and no overlay, so the contract is present in every build rather than in
+//     one lane. Raw grammar is parsed before cfg-stripping, which is also why it
+//     cannot be hidden from a stock compiler — see the `[toolchain]` note.
+//
+// The rest of this header is retained as the record of the form that was
+// replaced, and of why it failed.
+//
+// HOW THE FIRST-CLASS FORM RESOLVED (verified against the toolchain source,
 // rustc_resolve/src/macros.rs:806-866 and :1404-1424). `#[trust::requires(..)]`
 // and `#[trust::ensures(..)]` are replaced, after name resolution and before
 // expansion, by the compiler-owned builtins `trust_contracts_requires` /
@@ -84,15 +117,18 @@
 // is no `decreases` attribute.
 //
 // The Trust compiler also has native clause grammar (`requires`, `ensures`,
-// `invariant`, `decreases`). It cannot live in this source while AY's
-// authority-honest default is stock Rust: raw grammar is parsed before cfg
-// stripping, so stock rustc rejects it and there is no fallback. Keep native
-// clauses in explicit Trust-only probes until the compiler is distributable
-// and its default build is complete.
+// `invariant`, `decreases`). This paragraph used to say it "cannot live in this
+// source while AY's authority-honest default is stock Rust", and to direct
+// native clauses into Trust-only probes "until the compiler is distributable
+// and its default build is complete". That condition was MET on 2026-08-30:
+// rust-toolchain.toml pins Trust, .cargo/config.toml sets the
+// advisory policy, and the ratchet gate requires both. The clauses moved into
+// `src/`, and the direction is now the reverse — write the clause, not the
+// attribute.
 //
 // That boundary does not discard the useful 2026-08-27 findings. The two
-// nonzero-DIMACS preconditions in `literal.rs` remain first-class checked
-// attributes in the explicit overlay lane and prove. The former preconditions
+// nonzero-DIMACS preconditions in `literal.rs` are now native `requires`
+// clauses; they need no overlay and still prove. The former preconditions
 // on `Variable::new` and `Literal::from_index` remain deleted because their
 // runtime monitors changed documented recoverable panics into process aborts.
 // The measured native loop clause on `leb128::read_u64` also remains out:

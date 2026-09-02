@@ -65,6 +65,47 @@ struct CollectionPreflight<'a> {
 }
 
 impl Executor {
+    /// Exact roots consumed by datatype construction. The solver-facing
+    /// assertion vector may already have been preprocessed; retaining the
+    /// preserved authored roots is necessary for load-bearing datatype
+    /// disequalities that model validation will replay later.
+    pub(super) fn datatype_model_collection_roots(&self, extra_roots: &[TermId]) -> Vec<TermId> {
+        let authored_roots = self.independent_gate_query_roots();
+        let authored_array_field_datatype = self
+            .authored_datatype_array_construction_cells()
+            .is_some_and(|cells| !cells.is_empty());
+        let mut seen = HashSet::default();
+        let mut roots: Vec<_> = authored_roots
+            .into_iter()
+            .filter(|root| seen.insert(*root))
+            .collect();
+        // The W6 certificate and its model values are defined over the exact
+        // authored publication window. Datatype deepening and CEGAR append
+        // solver-generated tautologies to `ctx.assertions`; admitting those as
+        // model-construction roots can exhaust the bounded collector or make an
+        // internal selector application poison the entire authored class. The
+        // actual solve still contains every generated lemma. Only candidate
+        // construction is narrowed here, and the unchanged final gates replay
+        // every authored root, so omitting generated roots can only lose a
+        // candidate and fail closed.
+        if !authored_array_field_datatype {
+            roots.extend(
+                self.ctx
+                    .assertions
+                    .iter()
+                    .copied()
+                    .filter(|root| seen.insert(*root)),
+            );
+        }
+        roots.extend(
+            extra_roots
+                .iter()
+                .copied()
+                .filter(|root| seen.insert(*root)),
+        );
+        roots
+    }
+
     /// Traverse the exact collection roots without cloning application
     /// payloads. The returned scope proves that all vectors and quadratic
     /// fixpoints materialized by `dt_collect` fit the opaque-lane envelope.
@@ -82,20 +123,15 @@ impl Executor {
                 datatype_members: HashMap::default(),
             });
         }
-        let root_count = self.ctx.assertions.len().checked_add(extra_roots.len())?;
+        let roots = self.datatype_model_collection_roots(extra_roots);
+        let root_count = roots.len();
         let declarations = self.ctx.bounded_projection_declaration_inventory_size()?;
         let declaration_scan_work = declarations.checked_mul(8)?.checked_mul(257)?;
         let mut budget = OpaqueDtCollectionBudget::new();
         if !budget.record_roots(root_count) {
             return None;
         }
-        let mut stack: Vec<TermId> = self
-            .ctx
-            .assertions
-            .iter()
-            .copied()
-            .chain(extra_roots.iter().copied())
-            .collect();
+        let mut stack = roots;
         let mut seen = HashSet::default();
         let guard = RenderedDatatypeGuard::new(self);
         if !guard.is_bounded() {
@@ -130,20 +166,15 @@ impl Executor {
         const MAX_DISCOVERY_TERMS: usize = 4_096;
         const MAX_DISCOVERY_EDGES: usize = 4_096;
         const MAX_DISCOVERY_ROOTS: usize = 1_024;
-        if self.ctx.assertions.len().saturating_add(extra_roots.len()) > MAX_DISCOVERY_ROOTS {
+        let roots = self.datatype_model_collection_roots(extra_roots);
+        if roots.len() > MAX_DISCOVERY_ROOTS {
             return false;
         }
         let guard = RenderedDatatypeGuard::new(self);
         if !guard.is_bounded() {
             return false;
         }
-        let mut stack: Vec<TermId> = self
-            .ctx
-            .assertions
-            .iter()
-            .copied()
-            .chain(extra_roots.iter().copied())
-            .collect();
+        let mut stack = roots;
         let mut seen = HashSet::default();
         let mut edges = 0usize;
         while let Some(term) = stack.pop() {

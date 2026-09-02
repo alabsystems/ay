@@ -17,9 +17,17 @@ use ay_proof::{
     AlethePrintError, DatatypeMemberSignature, PartialProofCheck, ProofCheckError, ProofQuality,
 };
 use num_rational::BigRational;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
-use crate::array_proof_check::{check_array_clause, ArrayStepVerdict};
-use crate::bv_proof_check::{check_bv_assertions_unsat, check_bv_clause, BvStepVerdict};
+use crate::array_proof_check::{
+    check_array_clause, check_array_clause_with_controls, ArrayStepVerdict,
+};
+use crate::bv_proof_check::{
+    check_bv_assertions_unsat, check_bv_assertions_unsat_with_controls, check_bv_clause,
+    check_bv_clause_with_controls, BvStepVerdict,
+};
 
 mod artifact_types;
 pub use artifact_types::{FarkasCertificate, ProofAcceptanceMode};
@@ -47,6 +55,136 @@ use bv_int_bridge_schema::discharge_bv_int_bridge_schema;
 fn probe_discharge(message: impl FnOnce() -> String) {
     if ay_core::misc_cli_flags().probe_cert_reject {
         eprintln!("--probe-cert-reject: discharge_trust_clause {}", message());
+    }
+}
+
+/// Caller-owned resource envelope for the fresh executors used while
+/// discharging one deferred-trust clause.
+///
+/// The ordinary proof-export API has no active solve transaction. Its legacy
+/// specialized BV/array checks therefore remain unbounded, while its generic
+/// replay/probe lanes retain their existing local one-second cap. The mandatory
+/// UNSAT publication funnel supplies its live interrupt, absolute deadline, RSS
+/// ceiling, and per-executor term-store ceiling so a corroborating solve cannot
+/// silently escape the outer query's controls.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TrustClauseDischargeControls {
+    pub(crate) interrupt: Option<Arc<AtomicBool>>,
+    pub(crate) deadline: Option<ay_core::time::Instant>,
+    pub(crate) memory_limit: Option<usize>,
+    pub(crate) term_memory_limit: Option<usize>,
+}
+
+impl TrustClauseDischargeControls {
+    fn exact_term_memory_exceeded(&self, terms: &ay_core::TermStore) -> bool {
+        self.term_memory_limit
+            .is_some_and(|limit| terms.true_memory_bytes() > limit)
+    }
+
+    fn stop_requested(&self, terms: &ay_core::TermStore) -> bool {
+        self.interrupt
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            || self
+                .deadline
+                .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
+            || crate::memory::memory_exceeded(self.memory_limit)
+            || ay_sys::process_memory_exceeded()
+            || ay_core::TermStore::global_memory_exceeded()
+            || self
+                .term_memory_limit
+                .is_some_and(|limit| terms.instance_memory_exceeded(limit))
+    }
+
+    pub(crate) fn nested_deadline(&self) -> ay_core::time::Instant {
+        let local = ay_core::time::Instant::now() + Duration::from_secs(1);
+        self.deadline.map_or(local, |outer| outer.min(local))
+    }
+
+    fn accept_if_live(&self, terms: &ay_core::TermStore) -> Option<()> {
+        (!self.stop_requested(terms) && !self.exact_term_memory_exceeded(terms)).then_some(())
+    }
+
+    pub(crate) fn live_until(
+        &self,
+        terms: &ay_core::TermStore,
+        deadline: ay_core::time::Instant,
+    ) -> bool {
+        ay_core::time::Instant::now() < deadline && !self.stop_requested(terms)
+    }
+
+    pub(crate) fn accept_until(
+        &self,
+        terms: &ay_core::TermStore,
+        deadline: ay_core::time::Instant,
+    ) -> bool {
+        self.live_until(terms, deadline) && !self.exact_term_memory_exceeded(terms)
+    }
+
+    pub(crate) fn term_store_clone_fits(
+        &self,
+        terms: &ay_core::TermStore,
+        deadline: ay_core::time::Instant,
+    ) -> bool {
+        self.accept_until(terms, deadline)
+            && crate::memory::probe_clone_fits(terms.true_memory_bytes(), self.memory_limit)
+    }
+
+    fn install_on(&self, executor: &mut crate::Executor, deadline: ay_core::time::Instant) -> bool {
+        executor.set_memory_limit(self.memory_limit);
+        executor.set_term_memory_limit(self.term_memory_limit);
+        executor.set_solve_controls(self.interrupt.clone(), Some(deadline));
+        self.accept_until(&executor.ctx.terms, deadline)
+    }
+
+    /// Install this publication envelope on a fresh native proof-checking
+    /// solver before translation allocates into its private term store.
+    pub(crate) fn start_native_solver(
+        &self,
+        solver: &mut super::Solver,
+        deadline: ay_core::time::Instant,
+    ) -> bool {
+        solver.set_memory_limit(self.memory_limit);
+        solver.set_term_memory_limit(self.term_memory_limit);
+        self.native_solver_accepts(solver, deadline)
+    }
+
+    /// Poll both the caller controls and the fresh solver's own term store.
+    pub(crate) fn native_solver_live(
+        &self,
+        solver: &super::Solver,
+        deadline: ay_core::time::Instant,
+    ) -> bool {
+        self.live_until(solver.terms(), deadline)
+    }
+
+    fn native_solver_accepts(
+        &self,
+        solver: &super::Solver,
+        deadline: ay_core::time::Instant,
+    ) -> bool {
+        self.accept_until(solver.terms(), deadline)
+    }
+
+    /// Run a fresh native internal query under the already-elapsing deadline.
+    /// `None` means the envelope fired before or after the checked result.
+    pub(crate) fn check_native_solver_until(
+        &self,
+        solver: &mut super::Solver,
+        deadline: ay_core::time::Instant,
+    ) -> Option<super::VerifiedSolveResult> {
+        if !self.native_solver_accepts(solver, deadline) {
+            return None;
+        }
+        let remaining = deadline.checked_duration_since(ay_core::time::Instant::now())?;
+        solver.set_timeout(Some(remaining));
+        let result = if let Some(interrupt) = self.interrupt.clone() {
+            solver.check_sat_interruptible_internal_query(move || interrupt.load(Ordering::Relaxed))
+        } else {
+            solver.check_sat_internal_query()
+        };
+        self.native_solver_accepts(solver, deadline)
+            .then_some(result)
     }
 }
 
@@ -415,12 +553,44 @@ pub(crate) fn discharge_trust_clause(
     clause: &[ay_core::TermId],
     assertions: &[ay_core::TermId],
 ) -> Option<()> {
+    let controls = TrustClauseDischargeControls::default();
+    discharge_trust_clause_impl(terms, clause, assertions, &controls, None)
+}
+
+/// [`discharge_trust_clause`] under an already-elapsing publication resource
+/// envelope. Any fired/exceeded control declines the clause (fail-closed).
+pub(crate) fn discharge_trust_clause_with_controls(
+    terms: &ay_core::TermStore,
+    clause: &[ay_core::TermId],
+    assertions: &[ay_core::TermId],
+    controls: &TrustClauseDischargeControls,
+) -> Option<()> {
+    discharge_trust_clause_impl(terms, clause, assertions, controls, Some(controls))
+}
+
+/// Shared discharge funnel. `specialized_controls == None` preserves the
+/// ordinary proof-export API's legacy unbounded BV/array solvers; mandatory
+/// publication passes the active envelope through those private solvers too.
+fn discharge_trust_clause_impl(
+    terms: &ay_core::TermStore,
+    clause: &[ay_core::TermId],
+    assertions: &[ay_core::TermId],
+    controls: &TrustClauseDischargeControls,
+    specialized_controls: Option<&TrustClauseDischargeControls>,
+) -> Option<()> {
+    if controls.stop_requested(terms) {
+        return None;
+    }
     // Terminal empty trust clause → re-discharge the original problem assertions.
     if clause.is_empty() {
-        return match check_bv_assertions_unsat(terms, assertions) {
+        let verdict = specialized_controls.map_or_else(
+            || check_bv_assertions_unsat(terms, assertions),
+            |controls| check_bv_assertions_unsat_with_controls(terms, assertions, controls),
+        );
+        return match verdict {
             BvStepVerdict::Valid => {
                 probe_discharge(|| "ACCEPT empty-clause bv-assertions-unsat".to_string());
-                Some(())
+                controls.accept_if_live(terms)
             }
             // SAT/Unknown/unmodellable: the UNSAT claim is not independently
             // reproducible. Never accept (fail closed).
@@ -431,10 +601,14 @@ pub(crate) fn discharge_trust_clause(
         };
     }
 
-    match check_bv_clause(terms, clause) {
+    let bv_verdict = specialized_controls.map_or_else(
+        || check_bv_clause(terms, clause),
+        |controls| check_bv_clause_with_controls(terms, clause, controls),
+    );
+    match bv_verdict {
         BvStepVerdict::Valid => {
             probe_discharge(|| "ACCEPT check_bv_clause".to_string());
-            return Some(());
+            return controls.accept_if_live(terms);
         }
         // Invalid: ¬clause is SAT → NOT a BV tautology. Never accept.
         BvStepVerdict::Invalid { .. } => {
@@ -444,10 +618,17 @@ pub(crate) fn discharge_trust_clause(
         // Unchecked: the BV checker could not model it; try the array checker.
         BvStepVerdict::Unchecked { .. } => {}
     }
-    match check_array_clause(terms, clause) {
+    if controls.stop_requested(terms) {
+        return None;
+    }
+    let array_verdict = specialized_controls.map_or_else(
+        || check_array_clause(terms, clause),
+        |controls| check_array_clause_with_controls(terms, clause, controls),
+    );
+    match array_verdict {
         ArrayStepVerdict::Valid => {
             probe_discharge(|| "ACCEPT check_array_clause".to_string());
-            return Some(());
+            return controls.accept_if_live(terms);
         }
         // Invalid: an independent solve refuted it. Never accept.
         ArrayStepVerdict::Invalid { .. } => {
@@ -458,10 +639,16 @@ pub(crate) fn discharge_trust_clause(
         // coverage limit of those checkers, not evidence about the clause.
         ArrayStepVerdict::Skipped | ArrayStepVerdict::Unchecked { .. } => {}
     }
+    if controls.stop_requested(terms) {
+        return None;
+    }
 
-    if discharge_source_bv_lia(terms, clause, assertions) {
+    if discharge_source_bv_lia(terms, clause, assertions, controls) {
         probe_discharge(|| "ACCEPT discharge_source_bv_lia".to_string());
-        return Some(());
+        return controls.accept_if_live(terms);
+    }
+    if controls.stop_requested(terms) {
+        return None;
     }
 
     // CLOSED-FORM BV<->Int BRIDGE SCHEMAS (#unsat-cert-bridge-schema).
@@ -487,10 +674,32 @@ pub(crate) fn discharge_trust_clause(
     // pins.
     if discharge_bv_int_bridge_schema(terms, clause, assertions) {
         probe_discharge(|| "ACCEPT discharge_bv_int_bridge_schema".to_string());
-        return Some(());
+        return controls.accept_if_live(terms);
+    }
+    if controls.stop_requested(terms) {
+        return None;
+    }
+    let arena_deadline = controls.nested_deadline();
+    if !controls.term_store_clone_fits(terms, arena_deadline) {
+        return None;
     }
     let mut arena = terms.clone();
-    let negated: Vec<_> = clause.iter().map(|&term| arena.mk_not(term)).collect();
+    if controls.stop_requested(&arena) {
+        return None;
+    }
+    let mut negated = Vec::new();
+    if negated.try_reserve_exact(clause.len()).is_err() {
+        return None;
+    }
+    for &term in clause {
+        if controls.stop_requested(&arena) {
+            return None;
+        }
+        negated.push(arena.mk_not(term));
+    }
+    if controls.stop_requested(&arena) {
+        return None;
+    }
 
     // ENTAILMENT DISCHARGE (#unsat-cert-entailment).
     //
@@ -517,15 +726,16 @@ pub(crate) fn discharge_trust_clause(
     // every C, but that is exactly the verdict being certified. `Unsat` is the
     // only accepting outcome; Sat, Unknown, and timeout all decline.
     if !assertions.is_empty() {
+        let deadline = controls.nested_deadline();
         let mut entail = ay_frontend::Context::new();
-        entail.terms = arena.clone();
+        entail.terms = arena;
         entail.assertions = assertions.to_vec();
         entail.assertions.extend_from_slice(&negated);
         let mut exec = crate::Executor::new();
         exec.ctx = entail;
-        exec.set_deadline(Some(
-            ay_core::time::Instant::now() + std::time::Duration::from_secs(1),
-        ));
+        if !controls.install_on(&mut exec, deadline) {
+            return None;
+        }
         let started = std::time::Instant::now();
         let accepted = executor_reports_plain_strict_unsat(&mut exec);
         let elapsed = started.elapsed();
@@ -537,9 +747,17 @@ pub(crate) fn discharge_trust_clause(
                 exec.statistics().get_string("unknown.reason"),
             )
         });
-        if accepted {
+        if accepted && controls.accept_until(&exec.ctx.terms, deadline) {
             return Some(());
         }
+        if ay_core::time::Instant::now() >= deadline || controls.stop_requested(&exec.ctx.terms) {
+            return None;
+        }
+        arena = std::mem::take(&mut exec.ctx.terms);
+    }
+
+    if controls.stop_requested(&arena) {
+        return None;
     }
 
     // THEORY-AGNOSTIC STANDALONE FALLBACK (#unsat-cert-general-discharge).
@@ -565,12 +783,13 @@ pub(crate) fn discharge_trust_clause(
     // in that proof all decline.
     let mut probe = ay_frontend::Context::new();
     probe.terms = arena;
-    probe.assertions = negated.clone();
+    probe.assertions = negated;
+    let deadline = controls.nested_deadline();
     let mut exec = crate::Executor::new();
     exec.ctx = probe;
-    exec.set_deadline(Some(
-        ay_core::time::Instant::now() + std::time::Duration::from_secs(1),
-    ));
+    if !controls.install_on(&mut exec, deadline) {
+        return None;
+    }
     let started = std::time::Instant::now();
     let accepted = executor_reports_plain_strict_unsat(&mut exec);
     let elapsed = started.elapsed();
@@ -582,7 +801,7 @@ pub(crate) fn discharge_trust_clause(
             exec.statistics().get_string("unknown.reason"),
         )
     });
-    accepted.then_some(())
+    (accepted && controls.accept_until(&exec.ctx.terms, deadline)).then_some(())
 }
 
 /// Evaluate the proof through all three validation levels in a single pass.
@@ -979,6 +1198,149 @@ impl super::Solver {
         let terms = self.executor.terms();
         let (partial, _err) = check_proof_partial(proof, terms);
         Some(partial)
+    }
+}
+
+#[cfg(test)]
+mod trust_clause_resource_control_tests {
+    use super::*;
+
+    #[test]
+    fn nested_executor_inherits_live_publication_controls() {
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let outer_deadline = ay_core::time::Instant::now() + Duration::from_secs(1);
+        let controls = TrustClauseDischargeControls {
+            interrupt: Some(Arc::clone(&interrupt)),
+            deadline: Some(outer_deadline),
+            memory_limit: Some(usize::MAX),
+            term_memory_limit: Some(usize::MAX),
+        };
+        let effective_deadline = controls.nested_deadline();
+        assert_eq!(effective_deadline, outer_deadline);
+
+        let mut executor = crate::Executor::new();
+        assert!(controls.install_on(&mut executor, effective_deadline));
+        assert_eq!(executor.current_solve_deadline(), Some(outer_deadline));
+        assert_eq!(executor.memory_limit(), Some(usize::MAX));
+        assert_eq!(executor.term_memory_limit(), Some(usize::MAX));
+
+        interrupt.store(true, Ordering::Relaxed);
+        assert!(executor.solve_interrupt_is_set());
+    }
+
+    #[test]
+    fn controlled_discharge_rejects_expired_or_exhausted_envelopes() {
+        let mut terms = ay_core::TermStore::new();
+        let tautology = terms.true_term();
+        let proposition = terms.mk_var("controlled_assertion_p", ay_core::Sort::Bool);
+        let not_proposition = terms.mk_not_raw(proposition);
+        let expired = ay_core::time::Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond must fit before the current instant");
+        let expired_controls = TrustClauseDischargeControls {
+            deadline: Some(expired),
+            ..TrustClauseDischargeControls::default()
+        };
+        assert!(
+            discharge_trust_clause_with_controls(&terms, &[tautology], &[], &expired_controls,)
+                .is_none()
+        );
+
+        let exhausted_controls = TrustClauseDischargeControls {
+            term_memory_limit: Some(0),
+            ..TrustClauseDischargeControls::default()
+        };
+        assert!(discharge_trust_clause_with_controls(
+            &terms,
+            &[tautology],
+            &[],
+            &exhausted_controls,
+        )
+        .is_none());
+
+        let live_child_controls = TrustClauseDischargeControls {
+            term_memory_limit: Some(usize::MAX),
+            ..TrustClauseDischargeControls::default()
+        };
+        assert_eq!(
+            check_bv_clause_with_controls(&terms, &[tautology], &live_child_controls),
+            BvStepVerdict::Valid
+        );
+        assert_eq!(
+            check_array_clause_with_controls(&terms, &[tautology], &live_child_controls),
+            ArrayStepVerdict::Valid
+        );
+        assert_eq!(
+            check_bv_assertions_unsat_with_controls(
+                &terms,
+                &[proposition, not_proposition],
+                &live_child_controls,
+            ),
+            BvStepVerdict::Valid
+        );
+
+        // Directly exercise each fresh specialized Solver under a ceiling far
+        // below its non-empty baseline store. This isolates child propagation
+        // from the later structural replay lanes in the full discharge funnel.
+        let child_exhausted_controls = TrustClauseDischargeControls {
+            term_memory_limit: Some(1),
+            ..TrustClauseDischargeControls::default()
+        };
+        let BvStepVerdict::Unchecked { reason } =
+            check_bv_clause_with_controls(&terms, &[tautology], &child_exhausted_controls)
+        else {
+            panic!("tiny child term limit must decline the BV checker");
+        };
+        assert!(reason.contains("resource envelope"));
+        let ArrayStepVerdict::Unchecked { reason } =
+            check_array_clause_with_controls(&terms, &[tautology], &child_exhausted_controls)
+        else {
+            panic!("tiny child term limit must decline the array checker");
+        };
+        assert!(reason.contains("resource envelope"));
+        let BvStepVerdict::Unchecked { reason } = check_bv_assertions_unsat_with_controls(
+            &terms,
+            &[proposition, not_proposition],
+            &child_exhausted_controls,
+        ) else {
+            panic!("tiny child term limit must decline the BV assertion checker");
+        };
+        assert!(reason.contains("resource envelope"));
+    }
+
+    #[test]
+    fn clone_preflight_uses_an_exact_term_store_census() {
+        let mut terms = ay_core::TermStore::new();
+        let baseline = terms.true_memory_bytes();
+        assert!(!terms.instance_memory_exceeded(baseline));
+        for index in 0..512 {
+            let _ = terms.mk_var(
+                format!("clone_preflight_exact_census_{index}"),
+                ay_core::Sort::Bool,
+            );
+            if terms.true_memory_bytes() > baseline {
+                break;
+            }
+        }
+        let growth = terms.true_memory_bytes().saturating_sub(baseline);
+        assert!(growth > 0, "fixture must grow the source term store");
+        assert!(
+            growth < 64 * 1024,
+            "fixture must remain inside the hot-path cache window"
+        );
+        assert!(
+            !terms.instance_memory_exceeded(baseline),
+            "cached hot-path census must still be stale for this regression"
+        );
+
+        let controls = TrustClauseDischargeControls {
+            term_memory_limit: Some(baseline),
+            ..TrustClauseDischargeControls::default()
+        };
+        assert!(!controls.term_store_clone_fits(
+            &terms,
+            ay_core::time::Instant::now() + Duration::from_secs(1),
+        ));
     }
 }
 

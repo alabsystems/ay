@@ -65,6 +65,9 @@ solve options
   --deterministic|--no-deterministic
   --memory-budget <bytes>      open-node/SAT-ReLU logical memory budget
   --tree-cert-leaves <n>       tree-certificate leaf budget (default 256; 0 = off)
+  --skip-finalize-reverify     skip the tree-certificate emission self-verify (opt-in;
+                               only for a consumer that independently re-verifies the
+                               emitted certificate — the bytes are identical either way)
   --seed-solution <path>       reference incumbent, `name value` per line (advice only)
   --require <none|witness|full>   evidence posture (DEFAULT: witness)
   --emit-cert <path.ayc>       certificate path (DEFAULT: <input>.ayc)
@@ -379,6 +382,7 @@ fn cmd_solve(args: &[String]) -> ExitCode {
     switches.extend([
         "no-emit-cert",
         "no-opt-tree",
+        "skip-finalize-reverify",
         "no-root-dual",
         "deterministic",
         "no-deterministic",

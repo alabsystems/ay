@@ -10,11 +10,65 @@
 
 use super::ChcParser;
 use crate::expr::maybe_grow_expr_stack;
-use crate::{ChcError, ChcExpr, ChcResult, ChcSort, ChcVar};
+use crate::{ChcError, ChcExpr, ChcOp, ChcResult, ChcSort, ChcVar, MAX_BITVECTOR_WIDTH};
 use num_bigint::BigInt;
 use std::sync::Arc;
 
+pub(super) const MAX_SINGLETON_FORALL_INSPECTION_NODES: usize = 65_536;
+const MAX_SINGLETON_FORALL_SORT_NODES: usize = 256;
+const MAX_SINGLETON_FORALL_SORT_DEPTH: usize = 64;
+pub(super) const MAX_SINGLETON_FORALL_SORT_NAME_BYTES: usize = 16 * 1024;
+pub(super) const MAX_SINGLETON_FORALL_BINDER_NAME_BYTES: usize = 16 * 1024;
+
 impl ChcParser {
+    fn validate_indexed_bv_application(op: ChcOp, args: &[ChcExpr]) -> ChcResult<()> {
+        if args.len() != 1 {
+            return Err(ChcError::Parse(format!(
+                "indexed bitvector operator {op:?} requires exactly one argument"
+            )));
+        }
+
+        if matches!(op, ChcOp::Int2Bv(_)) {
+            if args[0].sort() != ChcSort::Int {
+                return Err(ChcError::Parse("int2bv requires an Int argument".into()));
+            }
+            return Ok(());
+        }
+
+        let ChcSort::BitVec(input_width) = args[0].sort() else {
+            return Err(ChcError::Parse(format!(
+                "indexed bitvector operator {op:?} requires a bitvector argument"
+            )));
+        };
+        let result_width = match op {
+            ChcOp::BvExtract(hi, lo) => {
+                if hi < lo || hi >= input_width {
+                    return Err(ChcError::Parse(format!(
+                        "extract indices {hi}:{lo} are outside bitvector width {input_width}"
+                    )));
+                }
+                hi.checked_sub(lo).and_then(|width| width.checked_add(1))
+            }
+            ChcOp::BvZeroExtend(extension) | ChcOp::BvSignExtend(extension) => {
+                input_width.checked_add(extension)
+            }
+            ChcOp::BvRepeat(repetitions) => input_width.checked_mul(repetitions),
+            ChcOp::BvRotateLeft(_) | ChcOp::BvRotateRight(_) => Some(input_width),
+            _ => return Ok(()),
+        };
+        let Some(result_width) = result_width else {
+            return Err(ChcError::Parse(format!(
+                "indexed bitvector operator {op:?} result width overflows u32"
+            )));
+        };
+        if result_width == 0 || result_width > MAX_BITVECTOR_WIDTH {
+            return Err(ChcError::Parse(format!(
+                "indexed bitvector operator {op:?} result width {result_width} is outside the supported range 1..={MAX_BITVECTOR_WIDTH}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Parse an expression
     pub(super) fn parse_expr(&mut self) -> ChcResult<ChcExpr> {
         // Stacker protection: CHC formulas with many predicates and args can
@@ -93,6 +147,7 @@ impl ChcParser {
         // Handle indexed BV ops and (_ is Ctor) testers.
         match func_expr {
             ChcExpr::Op(op, ref existing_args) if existing_args.is_empty() => {
+                Self::validate_indexed_bv_application(op, &args)?;
                 let args_arc: Vec<Arc<ChcExpr>> = args.into_iter().map(Arc::new).collect();
                 Ok(ChcExpr::Op(op, args_arc))
             }
@@ -258,7 +313,13 @@ impl ChcParser {
         // (the development design notes, z3-cross-checked
         // in both directions.)
         //
-        // Rename ONLY on a binder-vs-binder collision inside the SAME clause.
+        // Rename on a binder-vs-binder collision inside the SAME clause, and
+        // when a binder shadows a global function/relation symbol.  The latter
+        // is semantically ordinary lexical shadowing while parsing, but this
+        // parser strips quantifiers into a flat clause-variable scope: without
+        // a fresh name the serialized clause would later try to declare both a
+        // variable `c` and the original nullary `(declare-fun c () T)` in one
+        // SMT namespace.
         // A binder shadowing a file-scoped `declare-var` is the ordinary
         // `(declare-var x Int)` + `(forall ((x Int)) ...)` idiom: there is only
         // one binding of `x` in the clause, so nothing is captured and the name
@@ -266,6 +327,8 @@ impl ChcParser {
         // five regressions in name-dependent machinery (BMC witness replay,
         // formula-form round trips) plus a 1.8x suite slowdown.
         let renames_before = self.active_renames.len();
+        let mut binder_count = 0usize;
+        let mut singleton_binder_name = None;
         loop {
             self.skip_whitespace_and_comments();
             if self.peek_char() == Some(')') {
@@ -280,16 +343,31 @@ impl ChcParser {
             self.expect_char(')')?;
 
             // Register variable in scope (CHC treats quantifiers as implicit)
-            if self.clause_binder_names.contains(&var_name)
+            let registered_name = if self.clause_binder_names.contains(&var_name)
                 || self.declared_var_names.contains(&var_name)
+                || self.functions.contains_key(&var_name)
+                || self.predicates.contains_key(&var_name)
             {
                 let fresh = self.fresh_binder_name(&var_name);
                 self.variables.insert(fresh.clone(), sort);
                 self.clause_binder_names.insert(fresh.clone());
-                self.active_renames.push((var_name, fresh));
+                self.active_renames.push((var_name, fresh.clone()));
+                fresh
             } else {
                 self.clause_binder_names.insert(var_name.clone());
-                self.variables.insert(var_name, sort);
+                self.variables.insert(var_name.clone(), sort);
+                var_name
+            };
+            binder_count = binder_count.saturating_add(1);
+            if binder_count == 1 && registered_name.len() <= MAX_SINGLETON_FORALL_BINDER_NAME_BYTES
+            {
+                // This is the only additional binder-name copy made for the
+                // exact singleton rule.  Bound it before cloning; the sort is
+                // borrowed from `variables` after the body has parsed, so this
+                // path does not duplicate a hostile recursive sort either.
+                singleton_binder_name = Some(registered_name);
+            } else {
+                singleton_binder_name = None;
             }
         }
         self.expect_char(')')?;
@@ -302,6 +380,31 @@ impl ChcParser {
         self.active_renames.truncate(renames_before);
         self.skip_whitespace_and_comments();
         self.expect_char(')')?;
+
+        // Exact array extensionality, not quantifier approximation:
+        //
+        //   forall i:K. select(a, i) = v    <=>
+        //   a = ((as const (Array K V)) v)
+        //
+        // SMT sorts are non-empty and array equality is extensional, so this
+        // equivalence is valid. Keep the recognition intentionally narrow:
+        // one negative-position forall binder, exact equality/select shape,
+        // exact key/value sorts, and neither `a` nor `v` may mention the
+        // binder. Any near miss takes the existing fail-closed over-
+        // approximation path and retains the Unsafe-to-Unknown downgrade.
+        if quantifier == "forall" && self.polarity < 0 && binder_count == 1 {
+            if let Some(binder_name) = singleton_binder_name {
+                if let Some(binder_sort) = self.variables.get(&binder_name) {
+                    if let Some(rewritten) = Self::eliminate_singleton_forall_const_array(
+                        &body,
+                        &binder_name,
+                        binder_sort,
+                    ) {
+                        return Ok(rewritten);
+                    }
+                }
+            }
+        }
 
         // Stripping the binder hoists its variable into the FLAT clause scope,
         // where it becomes universally quantified over the whole clause. That
@@ -335,6 +438,221 @@ impl ChcParser {
 
         // The variables are already registered.
         Ok(body)
+    }
+
+    pub(super) fn eliminate_singleton_forall_const_array(
+        body: &ChcExpr,
+        binder_name: &str,
+        binder_sort: &ChcSort,
+    ) -> Option<ChcExpr> {
+        let mut sort_nodes = 0usize;
+        let mut sort_name_bytes = 0usize;
+        if !Self::singleton_forall_sort_is_bounded(
+            binder_sort,
+            &mut sort_nodes,
+            &mut sort_name_bytes,
+        ) {
+            return None;
+        }
+        let ChcExpr::Op(ChcOp::Eq, equality_args) = body else {
+            return None;
+        };
+        let [left, right] = equality_args.as_slice() else {
+            return None;
+        };
+
+        Self::const_array_equality_from_select(
+            left,
+            right,
+            binder_name,
+            binder_sort,
+            sort_nodes,
+            sort_name_bytes,
+        )
+        .or_else(|| {
+            Self::const_array_equality_from_select(
+                right,
+                left,
+                binder_name,
+                binder_sort,
+                sort_nodes,
+                sort_name_bytes,
+            )
+        })
+    }
+
+    fn const_array_equality_from_select(
+        select_side: &Arc<ChcExpr>,
+        value_side: &Arc<ChcExpr>,
+        binder_name: &str,
+        binder_sort: &ChcSort,
+        mut sort_nodes: usize,
+        mut sort_name_bytes: usize,
+    ) -> Option<ChcExpr> {
+        let ChcExpr::Op(ChcOp::Select, select_args) = select_side.as_ref() else {
+            return None;
+        };
+        let [array, index] = select_args.as_slice() else {
+            return None;
+        };
+        let ChcExpr::Var(index_var) = index.as_ref() else {
+            return None;
+        };
+        let mut index_sort_nodes = 0usize;
+        let mut index_sort_name_bytes = 0usize;
+        if index_var.name != binder_name
+            || !Self::singleton_forall_sort_is_bounded(
+                &index_var.sort,
+                &mut index_sort_nodes,
+                &mut index_sort_name_bytes,
+            )
+            || !Self::sorts_compatible(binder_sort, &index_var.sort)
+            || !Self::expr_is_binder_free(array, binder_name)
+            || !Self::expr_is_binder_free(value_side, binder_name)
+        {
+            return None;
+        }
+
+        // Keep the exact rule intentionally at `select(a, i)` where `a` is an
+        // array variable. Besides matching MODEL_CHECKER_CONSUMER's initializer, this lets
+        // the rewrite share both expression roots instead of cloning arbitrary
+        // PredicateApp/FuncApp/Op payloads.
+        let ChcExpr::Var(array_var) = array.as_ref() else {
+            return None;
+        };
+        if !Self::singleton_forall_sort_is_bounded(
+            &array_var.sort,
+            &mut sort_nodes,
+            &mut sort_name_bytes,
+        ) {
+            return None;
+        }
+        let ChcSort::Array(key_sort, value_sort) = &array_var.sort else {
+            return None;
+        };
+        if !Self::sorts_compatible(key_sort, binder_sort)
+            || !Self::singleton_forall_value_has_sort(
+                value_side,
+                value_sort,
+                &mut sort_nodes,
+                &mut sort_name_bytes,
+            )
+        {
+            return None;
+        }
+
+        let constant_array = ChcExpr::ConstArray(key_sort.as_ref().clone(), Arc::clone(value_side));
+
+        Some(ChcExpr::Op(
+            ChcOp::Eq,
+            vec![Arc::clone(array), Arc::new(constant_array)],
+        ))
+    }
+
+    fn singleton_forall_value_has_sort(
+        value: &ChcExpr,
+        expected: &ChcSort,
+        sort_nodes: &mut usize,
+        sort_name_bytes: &mut usize,
+    ) -> bool {
+        match value {
+            ChcExpr::Bool(_) => matches!(expected, ChcSort::Bool),
+            ChcExpr::Int(_) => matches!(expected, ChcSort::Int),
+            ChcExpr::Real(_, _) => matches!(expected, ChcSort::Real),
+            ChcExpr::BitVec(_, width) => matches!(expected, ChcSort::BitVec(w) if w == width),
+            ChcExpr::Var(var) => {
+                Self::singleton_forall_sort_is_bounded(&var.sort, sort_nodes, sort_name_bytes)
+                    && Self::sorts_compatible(expected, &var.sort)
+            }
+            ChcExpr::FuncApp(_, sort, _) => {
+                Self::singleton_forall_sort_is_bounded(sort, sort_nodes, sort_name_bytes)
+                    && Self::sorts_compatible(expected, sort)
+            }
+            ChcExpr::PredicateApp(_, _, _) => matches!(expected, ChcSort::Bool),
+            // Computing the sort of an arbitrary Op/ConstArray recursively
+            // would require another owned traversal. These are outside the
+            // narrow MODEL_CHECKER_CONSUMER equivalence and retain the conservative guard.
+            ChcExpr::Op(_, _)
+            | ChcExpr::ConstArray(_, _)
+            | ChcExpr::ConstArrayMarker(_)
+            | ChcExpr::IsTesterMarker(_) => false,
+        }
+    }
+
+    fn singleton_forall_sort_is_bounded(
+        root: &ChcSort,
+        sort_nodes: &mut usize,
+        sort_name_bytes: &mut usize,
+    ) -> bool {
+        *sort_nodes = match (*sort_nodes).checked_add(1) {
+            Some(count) if count <= MAX_SINGLETON_FORALL_SORT_NODES => count,
+            _ => return false,
+        };
+        let mut stack = vec![(root, 0usize)];
+        while let Some((sort, depth)) = stack.pop() {
+            if depth > MAX_SINGLETON_FORALL_SORT_DEPTH {
+                return false;
+            }
+            match sort {
+                ChcSort::Array(key, value) => {
+                    *sort_nodes = match (*sort_nodes).checked_add(2) {
+                        Some(count) if count <= MAX_SINGLETON_FORALL_SORT_NODES => count,
+                        _ => return false,
+                    };
+                    stack.push((value.as_ref(), depth + 1));
+                    stack.push((key.as_ref(), depth + 1));
+                }
+                ChcSort::Uninterpreted(name) | ChcSort::Datatype { name, .. } => {
+                    *sort_name_bytes = match (*sort_name_bytes).checked_add(name.len()) {
+                        Some(bytes) if bytes <= MAX_SINGLETON_FORALL_SORT_NAME_BYTES => bytes,
+                        _ => return false,
+                    };
+                }
+                ChcSort::Bool | ChcSort::Int | ChcSort::Real | ChcSort::BitVec(_) => {}
+            }
+        }
+        true
+    }
+
+    pub(super) fn expr_is_binder_free(root: &ChcExpr, binder_name: &str) -> bool {
+        let mut stack = vec![root];
+        // Charge nodes when they are SCHEDULED, before extending the work
+        // stack. Charging only on pop still lets one hostile flat application
+        // allocate an unbounded stack in a single `extend`.
+        let mut scheduled = 1usize;
+        while let Some(expr) = stack.pop() {
+            match expr {
+                // SMT-LIB binder identity is lexical.  Comparing the complete
+                // `ChcVar` would incorrectly treat a malformed same-name,
+                // different-sort occurrence as free and could make the exact
+                // rule capture it.
+                ChcExpr::Var(var) if var.name == binder_name => return false,
+                ChcExpr::Op(_, args)
+                | ChcExpr::PredicateApp(_, _, args)
+                | ChcExpr::FuncApp(_, _, args) => {
+                    scheduled = match scheduled.checked_add(args.len()) {
+                        Some(count) if count <= MAX_SINGLETON_FORALL_INSPECTION_NODES => count,
+                        _ => return false,
+                    };
+                    stack.extend(args.iter().map(AsRef::as_ref));
+                }
+                ChcExpr::ConstArray(_, value) => {
+                    scheduled = match scheduled.checked_add(1) {
+                        Some(count) if count <= MAX_SINGLETON_FORALL_INSPECTION_NODES => count,
+                        _ => return false,
+                    };
+                    stack.push(value.as_ref());
+                }
+                ChcExpr::Bool(_)
+                | ChcExpr::Int(_)
+                | ChcExpr::Real(_, _)
+                | ChcExpr::BitVec(_, _)
+                | ChcExpr::Var(_)
+                | ChcExpr::ConstArrayMarker(_)
+                | ChcExpr::IsTesterMarker(_) => {}
+            }
+        }
+        true
     }
 
     /// Parse a numeral expression
@@ -434,7 +752,25 @@ impl ChcParser {
             "true" => Ok(ChcExpr::Bool(true)),
             "false" => Ok(ChcExpr::Bool(false)),
             _ => {
-                // Check if it's a nullary predicate application first
+                // Local binders shadow global nullary symbols.  Resolve the
+                // active capture-avoiding rename before consulting predicate,
+                // constructor, or ordinary-UF tables; otherwise a `let` or
+                // quantifier such as `(let ((c 0)) c)` silently denotes a
+                // global `(declare-fun c () Int)` instead of its local `c`.
+                let scoped_name = if self.active_renames.is_empty() {
+                    name.clone()
+                } else {
+                    self.active_renames
+                        .iter()
+                        .rev()
+                        .find(|(from, _)| *from == name)
+                        .map_or_else(|| name.clone(), |(_, to)| to.clone())
+                };
+                if let Some(sort) = self.variables.get(&scoped_name).cloned() {
+                    return Ok(ChcExpr::var(ChcVar::new(scoped_name, sort)));
+                }
+
+                // No local binding: check for a global nullary predicate.
                 if let Some((pred_id, sorts)) = self.predicates.get(&name).cloned() {
                     if sorts.is_empty() {
                         // Nullary predicate - create a PredicateApp with no arguments
@@ -451,30 +787,9 @@ impl ChcParser {
                         return Ok(ChcExpr::FuncApp(name, ret_sort, Vec::new()));
                     }
                 }
-                // An active binder rename shadows everything else: inside a
-                // renamed binder's body this name denotes THAT binder, not the
-                // outer binding of the same name. Innermost wins, so scan back.
-                // `active_renames` is empty unless a capture actually occurred.
-                let name = if self.active_renames.is_empty() {
-                    name
-                } else {
-                    match self
-                        .active_renames
-                        .iter()
-                        .rev()
-                        .find(|(from, _)| *from == name)
-                    {
-                        Some((_, to)) => to.clone(),
-                        None => name,
-                    }
-                };
-                // Look up variable
-                if let Some(sort) = self.variables.get(&name).cloned() {
-                    Ok(ChcExpr::var(ChcVar::new(name, sort)))
-                } else {
-                    // Assume it's an integer variable if not declared
-                    Ok(ChcExpr::var(ChcVar::new(name, ChcSort::Int)))
-                }
+                // Assume an otherwise-unknown symbol is an integer variable,
+                // preserving the parser's existing permissive fallback.
+                Ok(ChcExpr::var(ChcVar::new(scoped_name, ChcSort::Int)))
             }
         }
     }

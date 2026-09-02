@@ -411,7 +411,7 @@ fn test_z3_compat_version() {
         let mut rev: c_uint = 0;
         Z3_get_version(&raw mut major, &raw mut minor, &raw mut build, &raw mut rev);
         assert_eq!(major, 5);
-        assert_eq!(minor, 0);
+        assert_eq!(minor, 1);
         assert_eq!(build, 0);
         assert_eq!(rev, 0);
 
@@ -421,7 +421,7 @@ fn test_z3_compat_version() {
             std::ffi::CStr::from_ptr(full)
                 .to_str()
                 .expect("compatibility version must be valid UTF-8"),
-            concat!("AY ", env!("CARGO_PKG_VERSION"), " (Z3 5.0.0.0 compatible)")
+            concat!("AY ", env!("CARGO_PKG_VERSION"), " (Z3 5.1.0.0 compatible)")
         );
     }
 }

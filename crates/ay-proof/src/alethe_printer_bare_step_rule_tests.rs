@@ -102,8 +102,21 @@ fn string_content_axiom_keeps_its_internal_rule_identity() {
 #[test]
 fn int_bounds_tautology_publishes_exact_unit_farkas_surface() {
     let mut terms = TermStore::new();
-    let clause = string_content_clause(&mut terms);
-    let step = theory_lemma(vec![clause], TheoryLemmaKind::IntBoundsTautology);
+    let x = terms.mk_var("int_bounds_x", Sort::Int);
+    let five = terms.mk_int(5.into());
+    let six = terms.mk_int(6.into());
+    // Over Int, `x <= 5` and `x < 6` are equivalent.  This clause is the exact
+    // rounded-bound tautology recognized by the strict checker, rather than a
+    // foreign formula merely wearing the `IntBoundsTautology` tag.
+    let upper = terms.mk_le(x, five);
+    let rounded = terms.mk_lt(x, six);
+    let not_upper = terms.mk_not_raw(upper);
+    let step = theory_lemma(
+        vec![not_upper, rounded],
+        TheoryLemmaKind::IntBoundsTautology,
+    );
+    let forged_clause = string_content_clause(&mut terms);
+    let forged = theory_lemma(vec![forged_clause], TheoryLemmaKind::IntBoundsTautology);
     let printer = AlethePrinter::new(&terms);
 
     let text = printer
@@ -112,7 +125,16 @@ fn int_bounds_tautology_publishes_exact_unit_farkas_surface() {
 
     assert_eq!(
         text,
-        "(step t1 (cl (str.contains bare_x (str.++ bare_y \"a\"))) :rule la_generic :args (1))"
+        "(step t1 (cl (not (<= int_bounds_x 5)) (< int_bounds_x 6)) :rule la_generic :args (1 1))"
+    );
+
+    assert!(
+        matches!(
+            printer.format_step(&forged, ProofId(2)),
+            Err(AlethePrintError::InvalidSurfaceStep { ref reason, .. })
+                if reason.contains("integer bounds tautology")
+        ),
+        "a foreign clause must not gain la_generic authority from a forged kind tag"
     );
 }
 
@@ -166,14 +188,6 @@ fn no_theory_lemma_kind_publishes_a_rule_its_bare_step_cannot_back() {
         let Ok(text) = printer.format_step(&step, ProofId(1)) else {
             continue;
         };
-        if matches!(kind, TheoryLemmaKind::IntBoundsTautology) {
-            assert_eq!(
-                text,
-                "(step t1 (cl (str.contains bare_x (str.++ bare_y \"a\"))) :rule la_generic :args (1))",
-                "the sole argument-bearing kind in this sweep must retain its exact audited surface"
-            );
-            continue;
-        }
         checked += 1;
         let rule = text
             .rsplit_once(":rule ")

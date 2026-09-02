@@ -16,22 +16,9 @@ impl PdrSolver {
         value: i128,
     ) -> SmtValue {
         match var.sort {
-            ChcSort::BitVec(width) => {
-                SmtValue::BitVec(Self::bitvec_bits_from_i64(value, width), width)
-            }
+            ChcSort::BitVec(width) => SmtValue::bitvec_from_bigint(value.into(), width),
             _ => SmtValue::Int(value),
         }
-    }
-
-    fn bitvec_bits_from_i64(value: i128, width: u32) -> u128 {
-        let mask = if width >= 128 {
-            u128::MAX
-        } else if width == 0 {
-            0
-        } else {
-            (1u128 << width) - 1
-        };
-        (value as u128) & mask
     }
 
     /// Build counterexample from proof obligation chain
@@ -70,6 +57,10 @@ impl PdrSolver {
                             }
                             SmtValue::BitVec(n, _) => {
                                 i64::try_from(*n).ok().map(|v| (name.clone(), v))
+                            }
+                            SmtValue::BigBitVec(n, _) => {
+                                num_traits::ToPrimitive::to_i64(n.as_ref())
+                                    .map(|v| (name.clone(), v))
                             }
                             // Beyond-i128 witnesses never fit the i64 public
                             // API; skip (the derivation witness still carries
@@ -379,6 +370,9 @@ impl PdrSolver {
                             }
                         }
                         SmtValue::BitVec(n, _) => i64::try_from(*n).ok().map(|v| (name.clone(), v)),
+                        SmtValue::BigBitVec(n, _) => {
+                            num_traits::ToPrimitive::to_i64(n.as_ref()).map(|v| (name.clone(), v))
+                        }
                         // Beyond-i128 witnesses never fit the i64 public API;
                         // skip (fail-closed, never truncate).
                         SmtValue::BigInt(_)

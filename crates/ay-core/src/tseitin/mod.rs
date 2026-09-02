@@ -155,7 +155,9 @@ impl<'a> Tseitin<'a> {
     /// Allocate a fresh CNF variable
     fn fresh_var(&mut self) -> u32 {
         let var = self.next_var;
-        self.next_var += 1;
+        // Saturating: variable indices are bounded far below u32::MAX by the
+        // i32 CnfLit domain, so the counter can never legitimately wrap.
+        self.next_var = var.saturating_add(1);
         var
     }
 
@@ -176,13 +178,15 @@ impl<'a> Tseitin<'a> {
         if positive {
             var
         } else {
-            -var
+            Self::negate(var)
         }
     }
 
     /// Negate a literal
     fn negate(lit: CnfLit) -> CnfLit {
-        -lit
+        // Valid DIMACS literals are ±var with var >= 1, so negation never
+        // overflows i32; wrapping_neg is total and identical on that domain.
+        lit.wrapping_neg()
     }
 
     /// Add a clause (no proof annotation).

@@ -165,6 +165,38 @@ fn test_min_core_fuel_exhaustion_returns_none() {
     );
 }
 
+/// A bounded-rank abort is "not proved", not a numeric rank. In particular,
+/// two coefficient-bound aborts must not compare equal and accidentally
+/// validate a core.
+#[test]
+fn test_rank_coefficient_abort_is_not_rank_zero() {
+    let oversized = BigRational::from(BigInt::one() << 256usize);
+    let rows = vec![vec![oversized.clone(), BigRational::zero()]];
+    let target = vec![oversized, BigRational::zero()];
+
+    assert!(
+        !LiaSolver::affine_core_verified(&rows, &target, &[0]),
+        "aborted base and augmented ranks must never validate a core"
+    );
+}
+
+/// Inputs at the coefficient limit can still create an oversized exact
+/// intermediate. The pre-operation bound makes that one operation finite,
+/// and the post-operation bound declines the partial core.
+#[test]
+fn test_min_core_intermediate_coefficient_explosion_returns_none() {
+    let max_width = (BigInt::one() << 256usize) - BigInt::one();
+    let inverse = BigRational::new(BigInt::one(), max_width.clone());
+    let rows = vec![vec![inverse.clone(), BigRational::from(max_width.clone())]];
+    let target = rows[0].clone();
+
+    let mut fuel = 1_000_000;
+    assert!(
+        LiaSolver::affine_core_candidate(&rows, &target, &mut fuel).is_none(),
+        "normalizing by 1/M creates M^2 and must fail closed"
+    );
+}
+
 // ========================================================================
 // End-to-end through the LIA solver
 // ========================================================================
@@ -241,6 +273,54 @@ fn test_min_core_narrows_solver_conflict_to_chain() {
     // The narrowed conflict is still a real theory contradiction.
     let result = TheoryResult::Unsat(conflict.literals);
     assert_conflict_soundness(result, LiaSolver::new(&terms));
+}
+
+/// The affine accelerator must decline an otherwise valid implication when a
+/// source coefficient exceeds its exact-arithmetic bound. Declining cannot be
+/// turned into an affine conflict.
+#[test]
+fn test_affine_oversized_source_coefficient_returns_no_conflict() {
+    let mut terms = TermStore::new();
+
+    let x = terms.mk_var("x", Sort::Int);
+    let zero = terms.mk_int(BigInt::zero());
+    let oversized = terms.mk_int(BigInt::one() << 256usize);
+    let scaled_x = terms.mk_mul(vec![oversized, x]);
+    let scaled_eq_zero = terms.mk_eq(scaled_x, zero);
+    let x_eq_zero = terms.mk_eq(x, zero);
+
+    let mut solver = LiaSolver::new(&terms);
+    solver.assert_literal(scaled_eq_zero, true);
+    solver.assert_literal(x_eq_zero, false);
+
+    assert!(
+        solver.check_affine_disequality_implication(false).is_none(),
+        "coefficient-bound abort must return no implication, never a conflict"
+    );
+}
+
+/// An armed cooperative timeout is observed by the affine accelerator itself,
+/// before it can publish an implication conflict.
+#[test]
+fn test_affine_immediate_timeout_returns_no_conflict() {
+    let mut terms = TermStore::new();
+
+    let x = terms.mk_var("x", Sort::Int);
+    let zero = terms.mk_int(BigInt::zero());
+    let two = terms.mk_int(BigInt::from(2));
+    let two_x = terms.mk_mul(vec![two, x]);
+    let two_x_eq_zero = terms.mk_eq(two_x, zero);
+    let x_eq_zero = terms.mk_eq(x, zero);
+
+    let mut solver = LiaSolver::new(&terms);
+    solver.assert_literal(two_x_eq_zero, true);
+    solver.assert_literal(x_eq_zero, false);
+    solver.set_timeout_callback(|| true);
+
+    assert!(
+        solver.check_affine_disequality_implication(false).is_none(),
+        "cancelled affine elimination must not publish a conflict"
+    );
 }
 
 // ========================================================================

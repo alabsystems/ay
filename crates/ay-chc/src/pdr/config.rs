@@ -110,6 +110,12 @@ pub struct PdrConfig {
     pub(crate) tla_trace_path: Option<String>,
     /// Cancellation token for cooperative stopping (portfolio solving)
     pub cancellation_token: Option<CancellationToken>,
+    /// External cancellation observer that does not imply a solve budget.
+    ///
+    /// Adaptive unbounded PDR lanes use this token so embedding callers can
+    /// stop them without changing the historical search policy selected by
+    /// `cancellation_token.is_some()` / `solve_timeout.is_some()` checks.
+    pub(crate) external_cancellation_token: Option<CancellationToken>,
     /// Opt-in early hopeless self-report (wishlist item 5a).
     ///
     /// When true AND the convergence monitor reports `ConvergenceHealth::Stuck`
@@ -381,6 +387,7 @@ impl Default for PdrConfig {
             enable_tla_trace: false,
             tla_trace_path: None,
             cancellation_token: None,
+            external_cancellation_token: None,
             give_up_on_stuck: false, // OFF: opt-in for schedulers with another lane (item 5a)
             solve_timeout: None,
             disable_array_scalarization: false,
@@ -642,6 +649,21 @@ impl PdrConfig {
     pub fn with_cancellation_token(mut self, token: Option<CancellationToken>) -> Self {
         self.cancellation_token = token;
         self
+    }
+
+    /// Cancellation token to pass to nested engines without turning an
+    /// external-only observer into a PDR search-budget signal.
+    pub(crate) fn effective_cancellation_token(&self) -> Option<CancellationToken> {
+        match (&self.cancellation_token, &self.external_cancellation_token) {
+            (Some(token), Some(external)) => {
+                let mut combined = token.clone();
+                combined.link_upstream(external);
+                Some(combined)
+            }
+            (Some(token), None) => Some(token.clone()),
+            (None, Some(external)) => Some(external.clone()),
+            (None, None) => None,
+        }
     }
 
     /// Builder: add user-provided lemma hints.

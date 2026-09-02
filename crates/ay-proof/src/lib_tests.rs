@@ -360,6 +360,55 @@ fn bv_bitblast_constant_disequality_exports_checked_evaluate() {
     }
 }
 
+#[test]
+fn alethe_reserved_variable_names_are_quoted_in_declarations_and_farkas_rows() {
+    use ay_core::{FarkasAnnotation, TheoryLemmaKind};
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("cl", Sort::Int);
+    let zero = terms.mk_int(0.into());
+    let lower = terms.mk_app(Symbol::named("<="), [zero, x], Sort::Bool);
+    let upper = terms.mk_app(Symbol::named("<"), [x, zero], Sort::Bool);
+    let not_lower = terms.mk_not_raw(lower);
+    let not_upper = terms.mk_not_raw(upper);
+    let proof = Proof::from_steps(vec![ProofStep::TheoryLemma {
+        theory: "LIA".to_string(),
+        clause: vec![not_lower, not_upper],
+        farkas: Some(FarkasAnnotation::from_ints(&[1, 1])),
+        kind: TheoryLemmaKind::LiaGeneric,
+        lia: None,
+    }]);
+
+    let output = try_export_alethe(&proof, &terms).expect("reserved name must remain printable");
+    assert!(output.contains("(declare-fun |cl| () Int)"), "{output}");
+    assert!(output.contains("(not (<= 0 |cl|))"), "{output}");
+    assert!(output.contains("(not (< |cl| 0))"), "{output}");
+    assert!(output.contains(":rule la_generic :args (1 1)"), "{output}");
+    assert!(!output.contains(":rule hole"), "{output}");
+}
+
+#[test]
+fn carcara_surface_preflight_rejects_unrepresentable_names_and_sorts() {
+    for name in ["a|b", "a\\b"] {
+        let mut terms = TermStore::new();
+        let atom = terms.mk_var(name, Sort::Bool);
+        let proof = Proof::from_steps(vec![ProofStep::Assume(atom)]);
+        assert!(matches!(
+            try_export_alethe(&proof, &terms),
+            Err(AlethePrintError::UnavailableAuthenticatedSurface { .. })
+        ));
+    }
+
+    let mut terms = TermStore::new();
+    let fp = terms.mk_var("fp_surface", Sort::FloatingPoint(8, 24));
+    let equality = terms.mk_app(Symbol::named("="), [fp, fp], Sort::Bool);
+    let proof = Proof::from_steps(vec![ProofStep::Assume(equality)]);
+    assert!(matches!(
+        try_export_alethe(&proof, &terms),
+        Err(AlethePrintError::UnavailableAuthenticatedSurface { .. })
+    ));
+}
+
 /// `promote_bv_identity_collapse` reconstructs an authored bit-vector identity
 /// as a `BvBitBlast` unit lemma. For the bit-wise idempotency shapes that
 /// lemma is EXACTLY reconstructible from Carcara's per-operator bit-blasting
@@ -591,24 +640,38 @@ fn test_theory_lemma_la_generic_fractional_farkas() {
 
     let mut terms = TermStore::new();
     let x = terms.mk_var("x", Sort::Real);
-    let five = terms.mk_rational(num_rational::BigRational::from(num_bigint::BigInt::from(5)));
-    let ten = terms.mk_rational(num_rational::BigRational::from(num_bigint::BigInt::from(
-        10,
+    let two = terms.mk_rational(num_rational::BigRational::from(num_bigint::BigInt::from(2)));
+    let three = terms.mk_rational(num_rational::BigRational::from(num_bigint::BigInt::from(3)));
+    let fifteen = terms.mk_rational(num_rational::BigRational::from(num_bigint::BigInt::from(
+        15,
+    )));
+    let twenty = terms.mk_rational(num_rational::BigRational::from(num_bigint::BigInt::from(
+        20,
     )));
 
-    let x_le_5 = terms.mk_le(x, five);
-    let x_ge_10 = terms.mk_ge(x, ten);
+    // 3x <= 15 and 2x >= 20. Scaling the rows by 1/2 and 3/4
+    // respectively eliminates x and leaves the impossible constant 15/2.
+    let three_x = terms.mk_app(Symbol::named("*"), [three, x], Sort::Real);
+    let two_x = terms.mk_app(Symbol::named("*"), [two, x], Sort::Real);
+    let x_le_5 = terms.mk_le(three_x, fifteen);
+    let x_ge_10 = terms.mk_ge(two_x, twenty);
 
     let not_x_le_5 = terms.mk_not(x_le_5);
     let not_x_ge_10 = terms.mk_not(x_ge_10);
 
     let mut proof = Proof::new();
+    let upper_assumption = proof.add_assume(x_le_5, None);
+    let lower_assumption = proof.add_assume(x_ge_10, None);
     // Use fractional coefficients: 1/2 and 3/4
-    proof.add_theory_lemma_with_farkas(
+    let farkas = proof.add_theory_lemma_with_farkas(
         "LRA",
         vec![not_x_le_5, not_x_ge_10],
         FarkasAnnotation::new(vec![Rational64::new(1, 2), Rational64::new(3, 4)]),
     );
+    let lower_unit = proof.add_resolution(vec![not_x_ge_10], x_le_5, upper_assumption, farkas);
+    proof.add_resolution(Vec::new(), x_ge_10, lower_assumption, lower_unit);
+
+    check_proof_strict(&proof, &terms).expect("fractional Farkas rows must eliminate x");
 
     let output = export_alethe(&proof, &terms);
     assert!(
@@ -2703,15 +2766,26 @@ fn test_let_rooted_assume_bridges_to_a_certified_and_pos_gate() {
 
     let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
     overrides.insert(and_term, "(let ((?v_0 q)) (and p ?v_0 r))".to_string());
+    assert!(certified_let_assume_bridge_is_supported(
+        &terms,
+        and_term,
+        overrides.get(&and_term).expect("let surface"),
+        Some(&overrides),
+    ));
 
     let mut proof = Proof::new();
-    proof.add_assume(and_term, None);
-    proof.add_rule_step(
+    let assumed_and = proof.add_assume(and_term, None);
+    let and_gate = proof.add_rule_step(
         AletheRule::AndPos(0),
         vec![demorgan, p],
         vec![],
         vec![and_term],
     );
+    // Keep the authored assumption live. An unconsumed assumption deliberately
+    // retains its source spelling only at the leaf and owes no bridge; this
+    // resolution is the proof edge that makes the source-to-canonical bridge
+    // necessary and is therefore part of the behavior this test exercises.
+    proof.add_resolution(vec![p], and_term, assumed_and, and_gate);
 
     let output = try_export_alethe_with_problem_scope_and_overrides(
         &proof,
@@ -2771,15 +2845,24 @@ fn test_let_rooted_assume_falls_back_to_a_single_hole_when_normalization_diverge
     let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
     // Authored operand order differs from AY's canonical order.
     overrides.insert(and_term, "(let ((?v_0 q)) (and ?v_0 p r))".to_string());
+    assert!(!certified_let_assume_bridge_is_supported(
+        &terms,
+        and_term,
+        overrides.get(&and_term).expect("let surface"),
+        Some(&overrides),
+    ));
 
     let mut proof = Proof::new();
-    proof.add_assume(and_term, None);
-    proof.add_rule_step(
+    let assumed_and = proof.add_assume(and_term, None);
+    let and_gate = proof.add_rule_step(
         AletheRule::AndPos(0),
         vec![demorgan, p],
         vec![],
         vec![and_term],
     );
+    // As above, consume the authored assumption so the bridge is owed. The
+    // fallback under test must never be introduced for an unused proof leaf.
+    proof.add_resolution(vec![p], and_term, assumed_and, and_gate);
 
     let output = try_export_alethe_with_problem_scope_and_overrides(
         &proof,

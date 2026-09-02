@@ -7,7 +7,7 @@
 use super::types::SmtValue;
 use ay_core::Sort;
 use ay_frontend::SExpr;
-use num_bigint::BigInt;
+use num_bigint::{BigInt, BigUint};
 use num_rational::BigRational;
 use num_traits::Zero;
 
@@ -28,8 +28,8 @@ fn parse_symbolic_model_value(s: &str) -> Option<SmtValue> {
 
 /// Parse a string model value into an `SmtValue` based on the expected sort.
 ///
-/// Returns `None` on parse failure with a warning logged to stderr.
-/// Callers should fall back to `default_smt_value` on `None`.
+/// Returns `None` on parse failure with a warning logged to stderr. Proof and
+/// witness callers must propagate that failure rather than inventing a value.
 pub(super) fn parse_smt_value_str(s: &str, sort: &Sort) -> Option<SmtValue> {
     let trimmed = s.trim();
     match sort {
@@ -45,14 +45,14 @@ pub(super) fn parse_smt_value_str(s: &str, sort: &Sort) -> Option<SmtValue> {
             }),
         },
         Sort::Int => {
-            if let Ok(v) = trimmed.parse::<i128>() {
-                Some(SmtValue::Int(v))
+            if let Ok(v) = trimmed.parse::<BigInt>() {
+                Some(SmtValue::int_from_bigint(v))
             } else if let Some(inner) = trimmed
                 .strip_prefix("(- ")
                 .and_then(|s| s.strip_suffix(')'))
             {
-                if let Ok(v) = inner.trim().parse::<i128>() {
-                    Some(SmtValue::Int(-v))
+                if let Ok(v) = inner.trim().parse::<BigInt>() {
+                    Some(SmtValue::int_from_bigint(-v))
                 } else if let Some(symbol) = parse_symbolic_model_value(trimmed) {
                     Some(symbol)
                 } else {
@@ -73,44 +73,37 @@ pub(super) fn parse_smt_value_str(s: &str, sort: &Sort) -> Option<SmtValue> {
             }
         }
         Sort::BitVec(bvs) => {
-            // Wide BV (>128-bit) values are truncated to low 128 bits because
-            // SmtValue::BitVec stores u128. The internal solver decomposes wide
-            // BV into ≤128-bit chunks, so this truncation only affects executor
-            // fallback model values and is semantically harmless (#7040).
+            if bvs.width == 0 || bvs.width > crate::MAX_BITVECTOR_WIDTH {
+                safe_eprintln!(
+                    "[CHC-SMT] WARNING: parse_smt_value_str: unsupported BV width {}",
+                    bvs.width
+                );
+                return None;
+            }
             let val = if let Some(hex) = trimmed.strip_prefix("#x") {
-                if hex.len() > 32 {
-                    let low = &hex[hex.len() - 32..];
-                    u128::from_str_radix(low, 16).unwrap_or(0)
-                } else {
-                    match u128::from_str_radix(hex, 16) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            safe_eprintln!(
-                                "[CHC-SMT] WARNING: parse_smt_value_str: \
-                                 unparseable BV hex: {s:?}"
-                            );
-                            return None;
-                        }
+                match BigUint::parse_bytes(hex.as_bytes(), 16) {
+                    Some(v) => v,
+                    None => {
+                        safe_eprintln!(
+                            "[CHC-SMT] WARNING: parse_smt_value_str: \
+                             unparseable BV hex: {s:?}"
+                        );
+                        return None;
                     }
                 }
             } else if let Some(bin) = trimmed.strip_prefix("#b") {
-                if bin.len() > 128 {
-                    let low = &bin[bin.len() - 128..];
-                    u128::from_str_radix(low, 2).unwrap_or(0)
-                } else {
-                    match u128::from_str_radix(bin, 2) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            safe_eprintln!(
-                                "[CHC-SMT] WARNING: parse_smt_value_str: \
-                                 unparseable BV binary: {s:?}"
-                            );
-                            return None;
-                        }
+                match BigUint::parse_bytes(bin.as_bytes(), 2) {
+                    Some(v) => v,
+                    None => {
+                        safe_eprintln!(
+                            "[CHC-SMT] WARNING: parse_smt_value_str: \
+                             unparseable BV binary: {s:?}"
+                        );
+                        return None;
                     }
                 }
             } else {
-                match trimmed.parse::<u128>() {
+                match trimmed.parse::<BigUint>() {
                     Ok(v) => v,
                     Err(_) => {
                         return parse_symbolic_model_value(trimmed).or_else(|| {
@@ -123,7 +116,7 @@ pub(super) fn parse_smt_value_str(s: &str, sort: &Sort) -> Option<SmtValue> {
                     }
                 }
             };
-            Some(SmtValue::BitVec(val, bvs.width))
+            Some(SmtValue::bitvec_from_biguint(val, bvs.width))
         }
         Sort::Real => parse_real_value(trimmed)
             .or_else(|| parse_symbolic_model_value(trimmed))
@@ -230,11 +223,12 @@ fn parse_decimal_or_integer_rational(s: &str) -> Option<BigRational> {
 }
 
 /// Provide a default `SmtValue` for a given sort.
+#[cfg(test)]
 pub(super) fn default_smt_value(sort: &Sort) -> SmtValue {
     match sort {
         Sort::Bool => SmtValue::Bool(false),
         Sort::Int => SmtValue::Int(0),
-        Sort::BitVec(bvs) => SmtValue::BitVec(0, bvs.width),
+        Sort::BitVec(bvs) => SmtValue::bitvec_from_biguint(BigUint::zero(), bvs.width),
         Sort::Real => SmtValue::Real(BigRational::from_integer(BigInt::from(0i64))),
         _ => SmtValue::Int(0),
     }

@@ -285,6 +285,7 @@ fn test_run_with_writer_solves_satisfiable_opb() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(30_000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -314,6 +315,7 @@ fn test_run_with_writer_testscheduling_t030_preparse_route_reports_incumbent() {
     let cmd = PbCommand::Solve {
         file: PathBuf::from(path),
         timeout: Some(180_000),
+        memory_mb: None,
         proof: None,
         stats: true,
         stats_json: false,
@@ -352,6 +354,7 @@ fn test_run_with_writer_testscheduling_t050_preparse_route_accepts_fixture() {
     let cmd = PbCommand::Solve {
         file: PathBuf::from(path),
         timeout: Some(180_000),
+        memory_mb: None,
         proof: None,
         stats: true,
         stats_json: false,
@@ -402,6 +405,7 @@ fn test_run_with_writer_fool_solitaire_table_2_0_preparse_route_accepts_fixture(
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(30_000),
+        memory_mb: None,
         proof: None,
         stats: true,
         stats_json: false,
@@ -447,6 +451,7 @@ fn test_run_with_writer_same_queens_knights_b35_preparse_route_accepts_fixture()
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(30_000),
+        memory_mb: None,
         proof: None,
         stats: true,
         stats_json: false,
@@ -496,6 +501,7 @@ fn test_run_with_writer_average_avoiding_mini40_preparse_route_accepts_fixture()
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(30_000),
+        memory_mb: None,
         proof: None,
         stats: true,
         stats_json: false,
@@ -541,6 +547,7 @@ fn test_run_with_writer_solitaire_pattern_table_3_3_9_preparse_route_accepts_fix
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(30_000),
+        memory_mb: None,
         proof: None,
         stats: true,
         stats_json: false,
@@ -588,6 +595,7 @@ fn test_run_with_writer_feature_subscription_preparse_route_accepts_50_250_fixtu
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(30_000),
+        memory_mb: None,
         proof: None,
         stats: true,
         stats_json: false,
@@ -661,6 +669,7 @@ fn test_run_with_writer_feature_subscription_50_750_preparse_routes_accept_fixtu
         let cmd = PbCommand::Solve {
             file: file.path().to_path_buf(),
             timeout: Some(30_000),
+            memory_mb: None,
             proof: None,
             stats: true,
             stats_json: false,
@@ -714,6 +723,7 @@ fn test_run_with_writer_haplotype_preparse_route_accepts_fixture() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(30_000),
+        memory_mb: None,
         proof: None,
         stats: true,
         stats_json: false,
@@ -760,6 +770,7 @@ fn test_run_with_writer_charlotte_routing_preparse_route_accepts_fixture() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(30_000),
+        memory_mb: None,
         proof: None,
         stats: true,
         stats_json: false,
@@ -806,6 +817,7 @@ fn test_run_with_writer_solves_unsatisfiable_opb() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -841,6 +853,7 @@ fn test_run_with_writer_proof_mode_propagates_proof_io_errors() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: Some(proof_path),
         stats: false,
         stats_json: false,
@@ -873,6 +886,7 @@ fn test_run_with_writer_emits_stats_comments() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: None,
         stats: true,
         stats_json: false,
@@ -950,6 +964,7 @@ fn run_wbo_text_with_edac(text: &str, wcsp_edac: bool) -> String {
     let cmd = PbCommand::Solve {
         file: path.clone(),
         timeout: Some(10_000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -1583,6 +1598,7 @@ fn test_optimization_finds_optimum() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -1619,6 +1635,7 @@ fn test_optimization_range_overflow_still_fails_closed_at_cli() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -1657,6 +1674,7 @@ fn test_optimization_trivial_zero_cost() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -1688,6 +1706,7 @@ fn test_wbo_optimization() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -1717,6 +1736,7 @@ fn test_wbo_output_projects_away_relaxation_variables() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -1767,6 +1787,7 @@ fn test_wbo_wcsp_output_emits_only_final_projected_objective() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -1832,6 +1853,7 @@ fn test_wbo_unsatisfiable_soft_constraint() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -1860,6 +1882,7 @@ fn test_native_solver_satisfiable() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -1892,6 +1915,7 @@ fn test_native_solver_nonlinear_linearizes_before_solving() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -1925,6 +1949,7 @@ fn test_proof_mode_nonlinear_fails_closed() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: Some(proof.path().to_path_buf()),
         stats: false,
         stats_json: false,
@@ -1995,6 +2020,7 @@ fn assert_proof_mode_no_cert_path_fails_closed(file_path: &Path, name: &str) {
     let cmd = PbCommand::Solve {
         file: file_path.to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: Some(proof_path.clone()),
         stats: false,
         stats_json: false,
@@ -2186,6 +2212,7 @@ fn test_proof_mode_testscheduling_t030_certified_optimum() {
     let cmd = PbCommand::Solve {
         file: Path::new(&path).to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: Some(proof.path().to_path_buf()),
         stats: false,
         stats_json: false,
@@ -2242,6 +2269,7 @@ fn assert_proof_mode_koops_identity_complement_certifies_unsat(
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: Some(proof.path().to_path_buf()),
         stats: false,
         stats_json: false,
@@ -2305,6 +2333,7 @@ fn test_native_solver_unsatisfiable() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -2336,6 +2365,7 @@ fn test_native_solver_cardinality() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -2366,6 +2396,7 @@ fn test_native_solver_optimization_falls_back() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -2396,6 +2427,7 @@ fn test_run_with_writer_proof_mode_respects_zero_timeout() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(0),
+        memory_mb: None,
         proof: Some(proof.path().to_path_buf()),
         stats: false,
         stats_json: false,
@@ -2429,6 +2461,7 @@ fn test_run_with_writer_proof_mode_clique_writes_conflict_row_map_sidecar() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5000),
+        memory_mb: None,
         proof: Some(proof.path().to_path_buf()),
         stats: false,
         stats_json: false,
@@ -2463,6 +2496,7 @@ fn test_run_with_writer_timeout_applies_during_parse() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(0),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -2787,6 +2821,7 @@ fn early_structural_check_decides_pigeonhole_unsat_via_cli() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(750),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -2827,6 +2862,7 @@ fn early_structural_check_leaves_satisfiable_decision_untouched() {
     let cmd = PbCommand::Solve {
         file: file.path().to_path_buf(),
         timeout: Some(5_000),
+        memory_mb: None,
         proof: None,
         stats: false,
         stats_json: false,
@@ -2972,151 +3008,11 @@ fn decision_sat_gate_passes_through_non_sat_verdicts() {
 // ---------------------------------------------------------------------------
 // Certified-optimization budget split.
 //
-// These are REGRESSION tests for a measured defect, not shape tests. Before the
-// split existed, `solve_optimization_with_proof` gave the native proof-logging
-// CDCL the caller's whole `timeout_dur` and then called the certificate stage
-// with the SAME `start`/`timeout_dur`, so the stage's budget was `B - B = 0` for
-// every `B` and every `*_interruptible` helper returned `None` on its first
-// check. The property that matters is therefore not "the numbers are these
-// numbers" but "what is left for certification is STRICTLY POSITIVE".
-
-#[test]
-fn test_cert_opt_budget_split_leaves_the_certificate_stage_a_real_budget() {
-    let instance =
-        ay_pb::parse_opb("* #variable= 2 #constraint= 1\nmin: +1 x1 +1 x2 ;\n+1 x1 +1 x2 >= 1 ;\n")
-            .expect("fixture should parse");
-    let objective = instance.objective.clone().expect("objective present");
-
-    for budget in [
-        std::time::Duration::from_secs(5),
-        std::time::Duration::from_secs(60),
-        std::time::Duration::from_secs(600),
-    ] {
-        let start = std::time::Instant::now();
-        let split = compute_cert_opt_budget_split(&instance, &objective, Some(budget), start);
-        let deadline = split
-            .native_deadline
-            .expect("a bounded, single-literal-linear run must be eligible");
-        let hard = split
-            .native_hard_limit
-            .expect("ceiling present when capped");
-
-        // THE POINT: the native phase stops strictly before the caller's
-        // deadline, so what follows it is not scheduled after its budget is
-        // gone.
-        let overall_deadline = start + budget;
-        assert!(
-            deadline < overall_deadline,
-            "native slice must end before the overall deadline ({budget:?})"
-        );
-        assert!(
-            hard < overall_deadline,
-            "even the extended ceiling must end before the overall deadline ({budget:?})"
-        );
-        assert!(
-            deadline < hard,
-            "the ceiling must be able to extend the slice"
-        );
-        // And the reserve behind it is a real slice of wall clock, not zero.
-        assert!(
-            certify_reserve(budget) > std::time::Duration::ZERO,
-            "certification reserve must be positive at {budget:?}"
-        );
-        assert!(
-            certify_reserve(budget) <= budget / 2,
-            "the reserve must never take more than half the budget"
-        );
-    }
-}
-
-#[test]
-fn test_cert_opt_budget_split_declines_where_it_would_only_cost_search() {
-    let instance =
-        ay_pb::parse_opb("* #variable= 2 #constraint= 1\nmin: +1 x1 +1 x2 ;\n+1 x1 +1 x2 >= 1 ;\n")
-            .expect("fixture should parse");
-    let objective = instance.objective.clone().expect("objective present");
-
-    // No timeout: today's unbounded-native semantics are preserved exactly.
-    let unbounded =
-        compute_cert_opt_budget_split(&instance, &objective, None, std::time::Instant::now());
-    assert!(unbounded.native_deadline.is_none());
-    assert!(unbounded.native_hard_limit.is_none());
-
-    // A multi-literal (non-linear) objective term is outside the OPT-LIN
-    // helpers' domain, so reserving for them would take time from the search
-    // and buy nothing.
-    let product_objective = ay_pb::PbObjective {
-        terms: vec![ay_pb::PbTerm {
-            coeff: 1,
-            lits: vec![
-                ay_pb::PbLit {
-                    var: 1,
-                    negated: false,
-                },
-                ay_pb::PbLit {
-                    var: 2,
-                    negated: false,
-                },
-            ],
-        }],
-    };
-    let nonlinear = compute_cert_opt_budget_split(
-        &instance,
-        &product_objective,
-        Some(std::time::Duration::from_secs(60)),
-        std::time::Instant::now(),
-    );
-    assert!(nonlinear.native_deadline.is_none());
-}
-
-#[test]
-fn test_certify_reserve_clamps() {
-    // remaining/8, clamped to [10s, 300s], and never more than remaining/2.
-    assert_eq!(
-        certify_reserve(std::time::Duration::from_secs(10)),
-        std::time::Duration::from_secs(5)
-    );
-    assert_eq!(
-        certify_reserve(std::time::Duration::from_secs(800)),
-        std::time::Duration::from_secs(100)
-    );
-    assert_eq!(
-        certify_reserve(std::time::Duration::from_secs(3000)),
-        std::time::Duration::from_secs(300)
-    );
-    assert_eq!(
-        certify_reserve(std::time::Duration::ZERO),
-        std::time::Duration::ZERO
-    );
-}
-
-#[test]
-fn test_extend_native_deadline_is_monotone_and_clamped() {
-    let now = std::time::Instant::now();
-    let split = CertOptBudgetSplit {
-        native_deadline: Some(now + std::time::Duration::from_secs(10)),
-        native_hard_limit: Some(now + std::time::Duration::from_secs(20)),
-        improve_grace: std::time::Duration::from_secs(60),
-    };
-    let cell = std::cell::Cell::new(split.native_deadline);
-    extend_native_deadline(&cell, &split);
-    let extended = cell.get().expect("still capped");
-    assert!(
-        extended <= split.native_hard_limit.unwrap(),
-        "the grace must never push past the hard ceiling"
-    );
-    assert!(
-        extended >= split.native_deadline.unwrap(),
-        "extension must be monotone"
-    );
-
-    // Uncapped stays uncapped: no deadline can be invented here.
-    let uncapped = CertOptBudgetSplit {
-        native_deadline: None,
-        native_hard_limit: None,
-        improve_grace: std::time::Duration::from_secs(60),
-    };
-    let none_cell = std::cell::Cell::new(None);
-    extend_native_deadline(&none_cell, &uncapped);
-    assert!(none_cell.get().is_none());
-}
+// THE TESTS FOR IT ARE NOT HERE ANY MORE. The split, the reserve and their
+// invariants moved to `ay_pb::proof` (module `opt_budget`) together with the
+// code, because this file and `crates/ay-pb/src/bin/ay.rs` each carried a copy
+// of both the implementation AND its tests -- so a drift between the two copies
+// passed both suites. The regression they encode (before the split existed the
+// certificate stage got `B - B = 0` and every `*_interruptible` helper returned
+// `None` on its first check) is now asserted once, for every caller, by
+// `opt_budget::tests::split_leaves_the_certificate_stage_a_real_budget`.

@@ -104,7 +104,7 @@ USAGE:
       Exit non-zero iff any pair of produced values/verdicts CONFLICTS.
 
   ay-z3-parity smtlib-conformance <profile|init|run|check|receipt-check> ...
-      Maintain the fail-closed SMT-LIB 2.7 + exact Z3 5.0.0 conformance
+      Maintain the fail-closed SMT-LIB 2.7 + exact Z3 5.1.0 conformance
       contract. The contract has closed dimensions for grammar, commands,
       theories, logics, typing/scope, command state, SAT models, UNSAT proofs,
       unknown policy, the Z3 overlay, corpus closure, and gate integrity.
@@ -116,7 +116,7 @@ USAGE:
 DEFAULTS:
   --ay        target/debug/libay_ffi.dylib
   --ay-cli    sibling `ay` next to --ay, else target/release/ay (scoreboard)
-  --z3        /opt/homebrew/lib/python3.14/site-packages/z3/lib/libz3.dylib
+  --z3        /opt/homebrew/opt/z3/lib/libz3.dylib
   --timeout   10 (diff) / 20 (bench, scoreboard)  per-(file,solver) wall seconds
   --jobs      1    (bench/scoreboard; requested workers, host planner may cap)
   --json-out  ay-z3-bench.json (bench) / ay-z3-scoreboard.json (scoreboard)

@@ -11,6 +11,7 @@ use ay_core::Sort;
 
 use crate::executor::Executor;
 
+#[cfg(test)]
 pub(super) use super::rendered_dt_limits::rendered_sexp_within_limits;
 use super::rendered_dt_limits::{
     SchemaSourceBudget, MAX_RENDERED_DT_BYTES, MAX_RENDERED_DT_DEPTH, MAX_RENDERED_DT_NODES,
@@ -302,6 +303,14 @@ fn check_constructor(
                     return None;
                 }
             }
+            Sort::Array(array) if allow_bounded_int => {
+                check_concrete_array_sort(
+                    &array.index_sort,
+                    &array.element_sort,
+                    nodes,
+                    static_render_bytes,
+                )?;
+            }
             Sort::Uninterpreted(field_name) => {
                 if !schemas.contains_key(field_name) {
                     return None;
@@ -318,6 +327,41 @@ fn check_constructor(
         }
     }
     Some(datatype_fields == 1)
+}
+
+/// The concrete array-cell reader currently supports scalar finite-map keys
+/// and values only. Arbitrarily large numerals and strings remain bounded by
+/// the enclosing rendered S-expression limit; bitvectors additionally carry a
+/// schema-level width cap.
+fn check_concrete_array_sort(
+    index_sort: &Sort,
+    element_sort: &Sort,
+    nodes: &mut usize,
+    static_render_bytes: &mut usize,
+) -> Option<()> {
+    for sort in [index_sort, element_sort] {
+        *nodes = nodes.checked_add(1)?;
+        if *nodes > MAX_RENDERED_DT_NODES {
+            return None;
+        }
+        match sort {
+            Sort::Bool | Sort::Int | Sort::Real | Sort::String => {}
+            Sort::BitVec(bitvec) if bitvec.width <= 256 => {
+                let width = usize::try_from(bitvec.width).ok()?;
+                let bytes = if width % 4 == 0 {
+                    width / 4 + 2
+                } else {
+                    width + 2
+                };
+                *static_render_bytes = static_render_bytes.checked_add(bytes)?;
+                if *static_render_bytes > MAX_RENDERED_DT_BYTES {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(())
 }
 
 impl Executor {

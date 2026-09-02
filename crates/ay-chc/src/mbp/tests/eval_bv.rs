@@ -74,6 +74,33 @@ fn test_eval_bv_variable_lookup() {
 }
 
 #[test]
+fn test_eval_bv_deliberately_declines_wide_and_malformed_models() {
+    let mbp = Mbp::new();
+    let mut model = FxHashMap::default();
+    let wide_value: num_bigint::BigUint =
+        (num_bigint::BigUint::from(1_u8) << 128_usize) | num_bigint::BigUint::from(7_u8);
+    model.insert(
+        "wide".to_string(),
+        SmtValue::bitvec_from_biguint(wide_value.clone(), 129),
+    );
+    let wide = ChcExpr::Var(ChcVar::new("wide", ChcSort::BitVec(129)));
+
+    // The MBP-local u128 lane is optional and declines; the generic path
+    // still exposes the exact value for array/model reconstruction.
+    assert_eq!(mbp.eval_bv(&wide, &model), None);
+    assert_eq!(
+        mbp.eval_generic(&wide, &model)
+            .and_then(|value| value.bitvec_to_biguint()),
+        Some((wide_value, 129))
+    );
+
+    model.insert("narrow".to_string(), SmtValue::BitVec(3, 7));
+    let mismatched = ChcExpr::Var(ChcVar::new("narrow", ChcSort::BitVec(8)));
+    assert_eq!(mbp.eval_bv(&mismatched, &model), None);
+    assert_eq!(mbp.eval_bv(&ChcExpr::BitVec(0, 0), &model), None);
+}
+
+#[test]
 fn test_eval_bv_comparisons_in_eval_bool() {
     let mbp = Mbp::new();
     let model = FxHashMap::default();

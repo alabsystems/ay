@@ -64,6 +64,7 @@
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::{Constant, Proof, ProofId, ProofStep, Sort, Symbol, TermData, TermId, TermStore};
 
+use crate::api::proofs::TrustClauseDischargeControls;
 use crate::api::{FuncDecl, Logic, Solver, Term};
 
 /// Verdict for a single proof step examined by the bit-vector checker.
@@ -209,6 +210,28 @@ pub fn check_bv_proof(proof: &Proof, terms: &TermStore) -> BvProofReport {
 /// of the negations of the literals, which we assert into a fresh solver and
 /// require to be UNSAT.
 pub fn check_bv_clause(terms: &TermStore, clause: &[TermId]) -> BvStepVerdict {
+    check_bv_clause_impl(terms, clause, None)
+}
+
+pub(crate) fn check_bv_clause_with_controls(
+    terms: &TermStore,
+    clause: &[TermId],
+    controls: &TrustClauseDischargeControls,
+) -> BvStepVerdict {
+    check_bv_clause_impl(terms, clause, Some(controls))
+}
+
+fn check_bv_clause_impl(
+    terms: &TermStore,
+    clause: &[TermId],
+    controls: Option<&TrustClauseDischargeControls>,
+) -> BvStepVerdict {
+    let controlled_deadline = controls.map(TrustClauseDischargeControls::nested_deadline);
+    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+        if !controls.live_until(terms, deadline) {
+            return resource_unchecked();
+        }
+    }
     if clause.is_empty() {
         return BvStepVerdict::Unchecked {
             reason: "bv lemma clause is empty; nothing to discharge".to_string(),
@@ -218,6 +241,11 @@ pub fn check_bv_clause(terms: &TermStore, clause: &[TermId]) -> BvStepVerdict {
     // A single-element clause may itself be an `(or ...)` term: flatten it so we
     // negate the actual disjunction rather than a structurally-nested literal.
     let literals = flatten_clause(terms, clause);
+    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+        if !controls.live_until(terms, deadline) {
+            return resource_unchecked();
+        }
+    }
 
     // Mixed Int+BV obligations cannot be soundly discharged by this thin
     // word-level translator (see `problem_mixes_int_and_bv`): the QF_BV coercion
@@ -237,8 +265,18 @@ pub fn check_bv_clause(terms: &TermStore, clause: &[TermId]) -> BvStepVerdict {
     // the BV-inclusive array+UF logic so the discharge can model them. All of
     // these are decidable, so a well-formed clause resolves to UNSAT or SAT.
     let logic = pick_logic(terms, &literals);
+    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+        if !controls.live_until(terms, deadline) {
+            return resource_unchecked();
+        }
+    }
     let mut solver = Solver::new(logic);
-    let mut translator = Translator::new();
+    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+        if !controls.start_native_solver(&mut solver, deadline) {
+            return resource_unchecked();
+        }
+    }
+    let mut translator = Translator::new(controls.zip(controlled_deadline));
 
     // Assert the negation of each literal of the clause. `¬(l1 ∨ ... ∨ ln)` is
     // `¬l1 ∧ ... ∧ ¬ln`.
@@ -261,9 +299,21 @@ pub fn check_bv_clause(terms: &TermStore, clause: &[TermId]) -> BvStepVerdict {
         }
         let negated = solver.not(translated);
         solver.assert_term(negated);
+        if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+            if !controls.native_solver_live(&solver, deadline) {
+                return resource_unchecked();
+            }
+        }
     }
 
-    let result = solver.check_sat_internal_query();
+    let result = if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+        let Some(result) = controls.check_native_solver_until(&mut solver, deadline) else {
+            return resource_unchecked();
+        };
+        result
+    } else {
+        solver.check_sat_internal_query()
+    };
     if result.is_unsat() {
         BvStepVerdict::Valid
     } else if result.is_sat() {
@@ -309,6 +359,28 @@ pub fn check_bv_clause(terms: &TermStore, clause: &[TermId]) -> BvStepVerdict {
 /// jointly UNSAT. An empty assertion set is `Unchecked` (an empty conjunction is
 /// trivially SAT, so it is never a valid UNSAT discharge).
 pub fn check_bv_assertions_unsat(terms: &TermStore, assertions: &[TermId]) -> BvStepVerdict {
+    check_bv_assertions_unsat_impl(terms, assertions, None)
+}
+
+pub(crate) fn check_bv_assertions_unsat_with_controls(
+    terms: &TermStore,
+    assertions: &[TermId],
+    controls: &TrustClauseDischargeControls,
+) -> BvStepVerdict {
+    check_bv_assertions_unsat_impl(terms, assertions, Some(controls))
+}
+
+fn check_bv_assertions_unsat_impl(
+    terms: &TermStore,
+    assertions: &[TermId],
+    controls: Option<&TrustClauseDischargeControls>,
+) -> BvStepVerdict {
+    let controlled_deadline = controls.map(TrustClauseDischargeControls::nested_deadline);
+    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+        if !controls.live_until(terms, deadline) {
+            return resource_unchecked();
+        }
+    }
     if assertions.is_empty() {
         return BvStepVerdict::Unchecked {
             reason: "assertion set is empty; an empty conjunction is satisfiable, \
@@ -335,8 +407,18 @@ pub fn check_bv_assertions_unsat(terms: &TermStore, assertions: &[TermId]) -> Bv
     }
 
     let logic = pick_logic(terms, assertions);
+    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+        if !controls.live_until(terms, deadline) {
+            return resource_unchecked();
+        }
+    }
     let mut solver = Solver::new(logic);
-    let mut translator = Translator::new();
+    if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+        if !controls.start_native_solver(&mut solver, deadline) {
+            return resource_unchecked();
+        }
+    }
+    let mut translator = Translator::new(controls.zip(controlled_deadline));
 
     // Assert each obligation POSITIVELY: we want UNSAT of their conjunction.
     for &assertion in assertions {
@@ -356,9 +438,21 @@ pub fn check_bv_assertions_unsat(terms: &TermStore, assertions: &[TermId]) -> Bv
             };
         }
         solver.assert_term(translated);
+        if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+            if !controls.native_solver_live(&solver, deadline) {
+                return resource_unchecked();
+            }
+        }
     }
 
-    let result = solver.check_sat_internal_query();
+    let result = if let (Some(controls), Some(deadline)) = (controls, controlled_deadline) {
+        let Some(result) = controls.check_native_solver_until(&mut solver, deadline) else {
+            return resource_unchecked();
+        };
+        result
+    } else {
+        solver.check_sat_internal_query()
+    };
     if result.is_unsat() {
         BvStepVerdict::Valid
     } else if result.is_sat() {
@@ -374,6 +468,12 @@ pub fn check_bv_assertions_unsat(terms: &TermStore, assertions: &[TermId]) -> Bv
                      assertions as UNSAT"
                 .to_string(),
         }
+    }
+}
+
+fn resource_unchecked() -> BvStepVerdict {
+    BvStepVerdict::Unchecked {
+        reason: "proof-discharge resource envelope expired or was exceeded".to_string(),
     }
 }
 
@@ -521,21 +621,24 @@ fn solver_is_bool(solver: &Solver, term: Term) -> bool {
 /// Translates terms from a proof's [`TermStore`] into a fresh [`Solver`],
 /// preserving sub-term sharing so semantically-equal sub-terms map to identical
 /// solver terms (required for a sound discharge).
-struct Translator {
+struct Translator<'a> {
     /// Memo of proof `TermId` -> translated solver `Term`.
     memo: HashMap<TermId, Term>,
     /// Declared uninterpreted function symbols, keyed by `(name, arg_sorts, ret)`.
     funcs: HashMap<(String, Vec<Sort>, Sort), FuncDecl>,
     /// Counter for unique leaf-constant names.
     next_id: u32,
+    /// Mandatory-publication envelope, polled at every recursive node.
+    controls: Option<(&'a TrustClauseDischargeControls, ay_core::time::Instant)>,
 }
 
-impl Translator {
-    fn new() -> Self {
+impl<'a> Translator<'a> {
+    fn new(controls: Option<(&'a TrustClauseDischargeControls, ay_core::time::Instant)>) -> Self {
         Self {
             memo: HashMap::default(),
             funcs: HashMap::default(),
             next_id: 0,
+            controls,
         }
     }
 
@@ -553,10 +656,22 @@ impl Translator {
         terms: &TermStore,
         tid: TermId,
     ) -> Result<Term, String> {
+        if self
+            .controls
+            .is_some_and(|(controls, deadline)| !controls.native_solver_live(solver, deadline))
+        {
+            return Err("proof-discharge resource envelope expired or was exceeded".to_string());
+        }
         if let Some(t) = self.memo.get(&tid) {
             return Ok(*t);
         }
         let result = self.translate_uncached(solver, terms, tid)?;
+        if self
+            .controls
+            .is_some_and(|(controls, deadline)| !controls.native_solver_live(solver, deadline))
+        {
+            return Err("proof-discharge resource envelope expired or was exceeded".to_string());
+        }
         self.memo.insert(tid, result);
         Ok(result)
     }

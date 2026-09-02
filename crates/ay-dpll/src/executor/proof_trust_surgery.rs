@@ -70,7 +70,7 @@ mod repaired_units;
 #[path = "proof_trust_surgery/surface_let_tests.rs"]
 mod surface_let_tests;
 #[path = "proof_trust_surgery/surface_terms.rs"]
-mod surface_terms;
+pub(in crate::executor) mod surface_terms;
 #[path = "proof_trust_surgery/tautology.rs"]
 mod tautology;
 #[path = "proof_trust_surgery/term_helpers.rs"]

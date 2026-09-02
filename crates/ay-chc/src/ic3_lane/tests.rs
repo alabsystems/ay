@@ -2,8 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Unit tests for the IC3 portfolio lane, including the IntBlast path that
-//! lowers an unbounded `Int` counter to bit-blasted latches.
+//! IC3 portfolio lane tests, including the bit-blasted unbounded-`Int` path.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,7 +74,7 @@ fn count_parity_loop_maps_and_is_safe() {
     let problem = count_parity_problem(1);
 
     // The CHC must now MAP (non-None) through the IntBlast lowering.
-    let lowering = lower_loop(&problem).expect("count-parity CHC should map (non-None)");
+    let lowering = lower_loop_default(&problem).expect("count-parity CHC should map (non-None)");
 
     // Layout: latch 0 = acc (Bool); latches 1..=INT_WIDTH = count bits. The bad
     // property `acc != count[0]` reads only {acc(0), count[0](1)}, and each
@@ -276,8 +275,8 @@ fn bv64_cfg_maps_and_ic3_finds_acc_iff_count0() {
 
     // (a)+(b)+(c): the REAL-shaped 7-relation BitVec(64) CHC MAPS through the
     // linearize -> bit-blast -> Bv-op-encode lowering.
-    let lowering =
-        lower_loop(&problem).expect("7-relation BitVec(64) count-parity CHC should map (non-None)");
+    let lowering = lower_loop_default(&problem)
+        .expect("7-relation BitVec(64) count-parity CHC should map (non-None)");
 
     // Layout: latch 0 = acc (Bool); latch 1 = count[0]. The bad property
     // `(bvand count 1) == 1` is constant-folded during bit-blasting — each high
@@ -323,7 +322,8 @@ fn bv64_false_parity_cfg_is_not_safe() {
     // step = 2: count[0] never changes while acc toggles, so acc != count[0]
     // is reachable. Maps, but the bit-level engine must NOT report Safe.
     let problem = bv64_count_parity_cfg(2);
-    let lowering = lower_loop(&problem).expect("false-parity BitVec(64) CFG should still map");
+    let lowering =
+        lower_loop_default(&problem).expect("false-parity BitVec(64) CFG should still map");
     let mut solver = Ic3Solver::new(lowering.ts, false);
     assert!(
         !matches!(solver.solve(), Ic3Result::Safe { .. }),
@@ -420,7 +420,7 @@ fn dead_block_state_args_slice_to_parity_coi() {
     let full = 1 + (1 + ndead) * INT_WIDTH;
     assert!(full > 5 * INT_WIDTH, "header should be wide");
 
-    let lowering = lower_loop(&problem).expect("dead-arg count-parity CHC should map");
+    let lowering = lower_loop_default(&problem).expect("dead-arg count-parity CHC should map");
     // COI slice keeps only {acc(0), count[0](1)}.
     assert_eq!(
         lowering.ts.num_state_vars, 2,
@@ -457,7 +457,7 @@ fn dead_block_state_args_false_is_not_safe() {
     // step = 2: count[0] pinned to 0 while acc toggles -> reachably bad. The slice
     // keeps {acc, count[0]} and IC3 must still find the counterexample.
     let problem = dead_block_state_problem(2, 4);
-    let lowering = lower_loop(&problem).expect("should map");
+    let lowering = lower_loop_default(&problem).expect("should map");
     assert_eq!(lowering.ts.num_state_vars, 2);
     let mut solver = Ic3Solver::new(lowering.ts, false);
     assert!(
@@ -687,7 +687,7 @@ fn bv64_real_ssa_cfg(step: u128) -> ChcProblem {
 fn bv64_real_ssa_cfg_validates() {
     let problem = bv64_real_ssa_cfg(1);
     assert!(
-        lower_loop(&problem).is_some(),
+        lower_loop_default(&problem).is_some(),
         "real SSA CFG should map/linearize"
     );
     let model = try_prove_chc_loop(&problem, Duration::from_secs(30))
@@ -726,7 +726,7 @@ fn false_parity_loop_is_not_safe() {
     // produces no candidate (soundness at the bit level; the kernel re-check is
     // the ultimate gate).
     let problem = count_parity_problem(2);
-    let lowering = lower_loop(&problem).expect("should still map");
+    let lowering = lower_loop_default(&problem).expect("should still map");
     let mut solver = Ic3Solver::new(lowering.ts, false);
     assert!(
         !matches!(solver.solve(), Ic3Result::Safe { .. }),
@@ -1084,7 +1084,7 @@ fn temp_chain_query_resolves_to_arg_coi_and_validates() {
     // to `Not(acc == (count&1==1))` so the cone-of-influence keeps exactly
     // {acc, count[0]} (2 latches) and IC3 finds `acc <=> count[0]`.
     let problem = bv_temp_chain_parity_problem(1);
-    let lowering = lower_loop(&problem).expect("temp-chain CHC should map");
+    let lowering = lower_loop_default(&problem).expect("temp-chain CHC should map");
     assert_eq!(
         lowering.ts.num_state_vars, 2,
         "query temp-chain must resolve to args so the COI is {{acc, count[0]}}"
@@ -1174,7 +1174,7 @@ fn real_obl2_thread_split_is_declined() {
         "obl2 collapses to a single arity-2 header"
     );
     assert!(
-        lower_loop(&problem).is_none(),
+        lower_loop_default(&problem).is_none(),
         "coi-empty guard must decline the fail-closed obligation"
     );
     assert!(
@@ -1322,7 +1322,7 @@ fn branching_body_safe_loop_maps_and_proves() {
 
     // (Edit 3) the relaxed gate lets the multi-transition CHC MAP.
     assert!(
-        lower_loop(&problem).is_some(),
+        lower_loop_default(&problem).is_some(),
         "branching-body single loop must now map (relaxed ==1 gate)"
     );
 
@@ -1378,7 +1378,7 @@ fn single_transition_still_maps_and_proves() {
     // still map and prove Safe through the disjunctive path (chain collapses to the
     // prior stuttering single-update).
     let problem = count_parity_problem(1);
-    let lowering = lower_loop(&problem).expect("1-transition count-parity must still map");
+    let lowering = lower_loop_default(&problem).expect("1-transition count-parity must still map");
     // COI slice still keeps exactly {acc, count[0]} — unchanged by the new encoding.
     assert_eq!(lowering.ts.num_state_vars, 2);
     let mut solver = Ic3Solver::new(lowering.ts, false);

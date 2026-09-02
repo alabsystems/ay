@@ -9,11 +9,12 @@
 //! or one dropped premise, so a widening of the lane fails the suite instead of
 //! passing it.
 
-use ay_core::{Sort, TermId, TermStore};
+use ay_core::{Sort, Symbol, TermId, TermStore};
 use num_bigint::BigInt;
 use num_traits::{One, Zero};
 
 use super::super::{authenticate_bv_lia_unsat_query, BvLiaUnsatAuthenticationError};
+use super::MAX_RESIDUE_SCHEMAS;
 
 /// The measured `deductive-checks` length-companion obligation at carrier width `width`
 /// with the Int-side upper limit `limit`.
@@ -98,6 +99,276 @@ fn length_companion_bound_without_its_guard_premise_is_not_authenticated() {
     let error = authenticate_bv_lia_unsat_query(&terms, &roots[1..], None)
         .expect_err("a negative length satisfies both guarded clauses");
     assert!(error.is_capability_decline());
+}
+
+/// The first source-derived residue target. `0 <= n < 2^w-1` puts `n+1`
+/// exactly in the no-wrap interval, so `1 <= int2bv_w(n+1)` in unsigned order.
+/// The Int range is far beyond finite enumeration at both production widths.
+#[test]
+fn affine_int2bv_unsigned_order_authenticates_at_32_and_64_bits() {
+    for width in [32_u32, 64] {
+        let mut terms = TermStore::new();
+        let n = terms.mk_var(format!("affine_no_wrap_{width}"), Sort::Int);
+        let zero = terms.mk_int(BigInt::zero());
+        let one = terms.mk_int(BigInt::one());
+        let maximum = terms.mk_int((BigInt::one() << width) - BigInt::one());
+        let nonnegative = terms.mk_le(zero, n);
+        let below_maximum = terms.mk_lt(n, maximum);
+        let successor = terms.mk_add(vec![n, one]);
+        let converted = terms.mk_int2bv(width, successor);
+        let one_bv = terms.mk_bitvec(BigInt::one(), width);
+        let ordered = terms.mk_app(Symbol::named("bvule"), [one_bv, converted], Sort::Bool);
+        let negated_order = terms.mk_not_raw(ordered);
+
+        authenticate_bv_lia_unsat_query(&terms, &[nonnegative, below_maximum, negated_order], None)
+            .unwrap_or_else(|error| {
+                panic!("width-{width} affine no-wrap order must authenticate: {error}")
+            });
+    }
+}
+
+/// UPPER-WRAP CANARY. At `n = 2^w-1`, `n+1` converts to zero, so the negated
+/// `1 <=u int2bv(n+1)` goal is satisfiable. Omitting the upper guard from the
+/// generated round-trip would forge UNSAT here.
+#[test]
+fn affine_int2bv_upper_wrap_is_satisfiable_at_32_and_64_bits() {
+    for width in [32_u32, 64] {
+        let mut terms = TermStore::new();
+        let n = terms.mk_var(format!("affine_upper_wrap_{width}"), Sort::Int);
+        let maximum_value = (BigInt::one() << width) - BigInt::one();
+        let maximum = terms.mk_int(maximum_value);
+        let pin = terms.mk_eq(n, maximum);
+        let one = terms.mk_int(BigInt::one());
+        let successor = terms.mk_add(vec![n, one]);
+        let converted = terms.mk_int2bv(width, successor);
+        let one_bv = terms.mk_bitvec(BigInt::one(), width);
+        let ordered = terms.mk_app(Symbol::named("bvule"), [one_bv, converted], Sort::Bool);
+        let negated_order = terms.mk_not_raw(ordered);
+
+        let error = authenticate_bv_lia_unsat_query(&terms, &[pin, negated_order], None)
+            .expect_err("the upper-wrap value maps to zero and satisfies the negated order");
+        assert!(
+            error.is_capability_decline()
+                || matches!(error, BvLiaUnsatAuthenticationError::Satisfiable),
+            "width-{width} upper-wrap canary was unexpectedly authenticated: {error}"
+        );
+    }
+}
+
+/// LOWER-WRAP CANARY. At `n = -2`, `n+1 = -1` converts to all ones, so it is
+/// not below one. Omitting the lower guard would identify its unsigned value
+/// with `-1` and manufacture a contradiction.
+#[test]
+fn affine_int2bv_lower_wrap_is_satisfiable_at_32_and_64_bits() {
+    for width in [32_u32, 64] {
+        let mut terms = TermStore::new();
+        let n = terms.mk_var(format!("affine_lower_wrap_{width}"), Sort::Int);
+        let minus_two = terms.mk_int(BigInt::from(-2_i8));
+        let pin = terms.mk_eq(n, minus_two);
+        let one = terms.mk_int(BigInt::one());
+        let successor = terms.mk_add(vec![n, one]);
+        let converted = terms.mk_int2bv(width, successor);
+        let one_bv = terms.mk_bitvec(BigInt::one(), width);
+        let below_one = terms.mk_app(Symbol::named("bvult"), [converted, one_bv], Sort::Bool);
+        let not_below_one = terms.mk_not_raw(below_one);
+
+        let error = authenticate_bv_lia_unsat_query(&terms, &[pin, not_below_one], None)
+            .expect_err("minus one converts to all ones and is not below one unsigned");
+        assert!(
+            error.is_capability_decline()
+                || matches!(error, BvLiaUnsatAuthenticationError::Satisfiable),
+            "width-{width} lower-wrap canary was unexpectedly authenticated: {error}"
+        );
+    }
+}
+
+/// Strict/non-strict and polarity table, kept as RAW applications so TermStore
+/// reflexivity folding cannot hide an off-by-one error in the interval reader.
+#[test]
+fn unsigned_order_polarities_preserve_reflexive_boundaries() {
+    for (name, polarity, unsatisfiable) in [
+        ("bvult", true, true),
+        ("bvult", false, false),
+        ("bvule", true, false),
+        ("bvule", false, true),
+    ] {
+        let mut terms = TermStore::new();
+        let value = terms.mk_var(format!("{name}_{polarity}"), Sort::bitvec(64));
+        let comparison = terms.mk_app(Symbol::named(name), [value, value], Sort::Bool);
+        let root = if polarity {
+            comparison
+        } else {
+            terms.mk_not_raw(comparison)
+        };
+        let result = authenticate_bv_lia_unsat_query(&terms, &[root], None);
+        if unsatisfiable {
+            result.unwrap_or_else(|error| {
+                panic!("{name} polarity {polarity} reflexive contradiction: {error}")
+            });
+        } else {
+            let error = result.expect_err("a reflexive unsigned-order truth is satisfiable");
+            assert!(
+                error.is_capability_decline()
+                    || matches!(error, BvLiaUnsatAuthenticationError::Satisfiable),
+                "{name} polarity {polarity} truth was unexpectedly authenticated: {error}"
+            );
+        }
+    }
+}
+
+/// Exercise both orientations of strict unsigned order on a converted affine
+/// term. Reflexive boundary pins above catch the polarity table's off-by-one,
+/// while these cases require the guarded no-wrap equality to connect the BV
+/// view back to authored Int bounds.
+#[test]
+fn affine_int2bv_strict_unsigned_order_authenticates_in_both_orientations() {
+    for width in [32_u32, 64] {
+        let mut terms = TermStore::new();
+        let n = terms.mk_var(format!("strict_no_wrap_{width}"), Sort::Int);
+        let zero = terms.mk_int(BigInt::zero());
+        let one = terms.mk_int(BigInt::one());
+        let maximum = terms.mk_int((BigInt::one() << width) - BigInt::one());
+        let nonnegative = terms.mk_le(zero, n);
+        let below_maximum = terms.mk_lt(n, maximum);
+        let successor = terms.mk_add(vec![n, one]);
+        let converted = terms.mk_int2bv(width, successor);
+        let zero_bv = terms.mk_bitvec(BigInt::zero(), width);
+        let one_bv = terms.mk_bitvec(BigInt::one(), width);
+
+        let below_one = terms.mk_app(Symbol::named("bvult"), [converted, one_bv], Sort::Bool);
+        authenticate_bv_lia_unsat_query(&terms, &[nonnegative, below_maximum, below_one], None)
+            .unwrap_or_else(|error| {
+                panic!("width-{width} converted successor cannot be below one: {error}")
+            });
+
+        let zero_below = terms.mk_app(Symbol::named("bvult"), [zero_bv, converted], Sort::Bool);
+        let not_zero_below = terms.mk_not_raw(zero_below);
+        authenticate_bv_lia_unsat_query(
+            &terms,
+            &[nonnegative, below_maximum, not_zero_below],
+            None,
+        )
+        .unwrap_or_else(|error| {
+            panic!("width-{width} zero must be below the converted successor: {error}")
+        });
+    }
+}
+
+/// A no-wrap-looking bound inside a satisfiable disjunction is not an
+/// unconditional premise. Here `flag = true` and `e = 2^w` satisfy the bound
+/// clause while `int2bv_w(e)` wraps to zero and satisfies the negated goal.
+#[test]
+fn disjunctive_pseudo_bound_does_not_authorize_no_wrap() {
+    for width in [32_u32, 64] {
+        let mut terms = TermStore::new();
+        let source = terms.mk_var(format!("pseudo_bound_source_{width}"), Sort::Int);
+        let flag = terms.mk_var(format!("pseudo_bound_flag_{width}"), Sort::Bool);
+        let modulus_value = BigInt::one() << width;
+        let modulus = terms.mk_int(modulus_value);
+        let source_pin = terms.mk_eq(source, modulus);
+        let below_modulus = terms.mk_lt(source, modulus);
+        let pseudo_bound = terms.mk_or(vec![below_modulus, flag]);
+        let converted = terms.mk_int2bv(width, source);
+        let one_bv = terms.mk_bitvec(BigInt::one(), width);
+        let ordered = terms.mk_app(Symbol::named("bvule"), [one_bv, converted], Sort::Bool);
+        let negated_order = terms.mk_not_raw(ordered);
+
+        let error = authenticate_bv_lia_unsat_query(
+            &terms,
+            &[source_pin, pseudo_bound, negated_order],
+            None,
+        )
+        .expect_err("the flag makes the pseudo-bound clause true at the wrapping source value");
+        assert!(
+            error.is_capability_decline()
+                || matches!(error, BvLiaUnsatAuthenticationError::Satisfiable),
+            "width-{width} disjunctive pseudo-bound was unexpectedly authenticated: {error}"
+        );
+    }
+}
+
+/// The generated-theorem cap is a fail-closed lane boundary. Packing one more
+/// relevant `int2bv` view into a single authored conjunction stays below the
+/// public root/node caps, but must decline before any generated prefix reaches
+/// propagation.
+#[test]
+fn residue_schema_cap_declines_before_propagation() {
+    let mut terms = TermStore::new();
+    let zero_bv = terms.mk_bitvec(BigInt::zero(), 32);
+    let mut comparisons = Vec::with_capacity(MAX_RESIDUE_SCHEMAS + 1);
+    for index in 0..=MAX_RESIDUE_SCHEMAS {
+        let source = terms.mk_var(format!("schema_cap_source_{index}"), Sort::Int);
+        let converted = terms.mk_int2bv(32, source);
+        comparisons.push(terms.mk_app(Symbol::named("bvule"), [zero_bv, converted], Sort::Bool));
+    }
+    let root = terms.mk_and(comparisons);
+    let error = authenticate_bv_lia_unsat_query(&terms, &[root], None)
+        .expect_err("crossing the generated residue-schema cap must decline");
+    assert!(error.is_capability_decline(), "unexpected result: {error}");
+}
+
+/// Signed order denotes the two's-complement value, not the unsigned view.
+/// `x <s 0` is satisfiable for a 64-bit value with its sign bit set; treating
+/// it as `bvult x 0` would unsoundly authenticate this query.
+#[test]
+fn signed_order_stays_outside_the_unsigned_interval_bridge() {
+    let mut terms = TermStore::new();
+    let value = terms.mk_var("signed_order_value", Sort::bitvec(64));
+    let zero = terms.mk_bitvec(BigInt::zero(), 64);
+    let signed_negative = terms.mk_app(Symbol::named("bvslt"), [value, zero], Sort::Bool);
+    let error = authenticate_bv_lia_unsat_query(&terms, &[signed_negative], None)
+        .expect_err("a negative two's-complement witness satisfies signed x < 0");
+    assert!(error.is_capability_decline());
+}
+
+/// Scalar projection of the byte-exact DEDUCTIVE_CHECKS length-frame shape: three
+/// pushes derive length three, contradicting the negated `1 <=u int2bv(len)`
+/// precondition at both target widths. The adjacent length-one/threshold-five
+/// query is the captured satisfiable control.
+#[test]
+fn deductive_checks_length_chain_crosses_int2bv_unsigned_order() {
+    for width in [32_u32, 64] {
+        let mut terms = TermStore::new();
+        let len2 = terms.mk_var(format!("fixture_len2_{width}"), Sort::Int);
+        let len3 = terms.mk_var(format!("fixture_len3_{width}"), Sort::Int);
+        let len4 = terms.mk_var(format!("fixture_len4_{width}"), Sort::Int);
+        let one = terms.mk_int(BigInt::one());
+        let len2_pin = terms.mk_eq(len2, one);
+        let len2_successor = terms.mk_add(vec![len2, one]);
+        let len3_pin = terms.mk_eq(len3, len2_successor);
+        let len3_successor = terms.mk_add(vec![len3, one]);
+        let len4_pin = terms.mk_eq(len4, len3_successor);
+        let converted = terms.mk_int2bv(width, len4);
+        let one_bv = terms.mk_bitvec(BigInt::one(), width);
+        let required = terms.mk_app(Symbol::named("bvule"), [one_bv, converted], Sort::Bool);
+        let negated_required = terms.mk_not_raw(required);
+
+        authenticate_bv_lia_unsat_query(
+            &terms,
+            &[len2_pin, len3_pin, len4_pin, negated_required],
+            None,
+        )
+        .unwrap_or_else(|error| {
+            panic!("width-{width} DEDUCTIVE_CHECKS scalar length chain must authenticate: {error}")
+        });
+
+        let mut sat_terms = TermStore::new();
+        let len = sat_terms.mk_var(format!("fixture_sat_len_{width}"), Sort::Int);
+        let one = sat_terms.mk_int(BigInt::one());
+        let pin = sat_terms.mk_eq(len, one);
+        let converted = sat_terms.mk_int2bv(width, len);
+        let five_bv = sat_terms.mk_bitvec(BigInt::from(5_u8), width);
+        let five_at_most_len =
+            sat_terms.mk_app(Symbol::named("bvule"), [five_bv, converted], Sort::Bool);
+        let negated = sat_terms.mk_not_raw(five_at_most_len);
+        let error = authenticate_bv_lia_unsat_query(&sat_terms, &[pin, negated], None)
+            .expect_err("length one satisfies the captured negated five-at-most-length goal");
+        assert!(
+            error.is_capability_decline()
+                || matches!(error, BvLiaUnsatAuthenticationError::Satisfiable),
+            "width-{width} DEDUCTIVE_CHECKS satisfiable control was authenticated: {error}"
+        );
+    }
 }
 
 /// Positive coefficients tighten through FLOOR division: `3n <= 7` gives

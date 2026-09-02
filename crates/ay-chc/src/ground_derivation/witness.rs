@@ -33,8 +33,11 @@
 //! deadline returns Unknown before solving at all. That is the "~97ms whatever
 //! timeout" signature: a budget artifact read as a theory failure.
 //!
-//! [`crate::smt::deadline::ScopedSmtDeadlineOverride`] is what lets this solve
-//! actually receive the tens of milliseconds it needs.
+//! [`crate::smt::deadline::ScopedSmtDeadlineOverride`] lets this solve receive
+//! its witness slice instead of inheriting a narrower nested-engine deadline.
+//! A bounded landing supplies its authoritative absolute deadline to
+//! [`ScopedWitnessChainBudget`], and the override is clamped to that boundary;
+//! it can never reopen an expired caller route.
 //!
 //! # Soundness
 //!
@@ -51,9 +54,10 @@
 use super::is_concrete;
 use crate::clause::HornClause;
 use crate::smt::SmtValue;
-use crate::{ChcExpr, ChcSort, ChcVar};
+use crate::{CancellationToken, ChcExpr, ChcSort, ChcVar};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
-use std::cell::Cell;
+use ay_core::time::Instant;
+use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 /// Per-witness-solve wall-clock budget.
@@ -84,6 +88,10 @@ fn witness_enabled() -> bool {
 thread_local! {
     /// Wall-clock already spent on witness solves in the current chain.
     static CHAIN_SPENT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    /// Absolute caller-tightened wall boundary for the current chain.
+    static CHAIN_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// Caller cancellation observed by every witness solve in the chain.
+    static CHAIN_CANCELLATION: RefCell<Option<CancellationToken>> = const { RefCell::new(None) };
 }
 
 /// RAII guard resetting the per-chain witness budget for one back-translation.
@@ -91,26 +99,56 @@ thread_local! {
 /// Installed at the back-translation landing sites so each attempt gets its own
 /// chain budget and a previous attempt's spend cannot starve it. Restores the
 /// enclosing chain's spend on drop so nested chains compose.
-pub(crate) struct ScopedWitnessChainBudget(Duration);
+pub(crate) struct ScopedWitnessChainBudget {
+    previous_spent: Duration,
+    previous_deadline: Option<Instant>,
+    previous_cancellation: Option<CancellationToken>,
+}
 
 impl ScopedWitnessChainBudget {
-    pub(crate) fn new() -> Self {
-        Self(CHAIN_SPENT.with(|cell| cell.replace(Duration::ZERO)))
+    pub(crate) fn new_bounded(
+        caller_deadline: Option<Instant>,
+        cancellation: CancellationToken,
+    ) -> Self {
+        let local_deadline = Instant::now() + witness_chain_budget();
+        let deadline = caller_deadline.map_or(local_deadline, |caller| caller.min(local_deadline));
+        Self {
+            previous_spent: CHAIN_SPENT.with(|cell| cell.replace(Duration::ZERO)),
+            previous_deadline: CHAIN_DEADLINE.with(|cell| cell.replace(Some(deadline))),
+            previous_cancellation: CHAIN_CANCELLATION
+                .with(|cell| cell.borrow_mut().replace(cancellation)),
+        }
     }
 }
 
 impl Drop for ScopedWitnessChainBudget {
     fn drop(&mut self) {
-        CHAIN_SPENT.with(|cell| cell.set(self.0));
+        CHAIN_SPENT.with(|cell| cell.set(self.previous_spent));
+        CHAIN_DEADLINE.with(|cell| cell.set(self.previous_deadline));
+        CHAIN_CANCELLATION.with(|cell| {
+            *cell.borrow_mut() = self.previous_cancellation.take();
+        });
     }
 }
 
 /// Remaining chain budget, or `None` when it is exhausted.
 fn chain_remaining() -> Option<Duration> {
+    if CHAIN_CANCELLATION.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    }) {
+        return None;
+    }
     let spent = CHAIN_SPENT.with(Cell::get);
-    witness_chain_budget()
+    let quota = witness_chain_budget()
         .checked_sub(spent)
-        .filter(|r| !r.is_zero())
+        .filter(|remaining| !remaining.is_zero())?;
+    let wall = CHAIN_DEADLINE
+        .with(Cell::get)
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(quota);
+    (!wall.is_zero()).then_some(quota.min(wall))
 }
 
 /// Turn a concrete [`SmtValue`] into a literal of `sort`, when the two agree.
@@ -121,8 +159,13 @@ fn chain_remaining() -> Option<Duration> {
 fn value_to_literal(value: &SmtValue, sort: &ChcSort) -> Option<ChcExpr> {
     match (sort, value) {
         (ChcSort::Int, SmtValue::Int(i)) => Some(ChcExpr::int(*i)),
+        (ChcSort::Int, SmtValue::BigInt(i)) => Some(ChcExpr::from_bigint(i.as_ref().clone())),
         (ChcSort::Bool, SmtValue::Bool(b)) => Some(ChcExpr::Bool(*b)),
-        (ChcSort::BitVec(w), SmtValue::BitVec(v, vw)) if w == vw => Some(ChcExpr::BitVec(*v, *w)),
+        (ChcSort::BitVec(w), value @ (SmtValue::BitVec(_, vw) | SmtValue::BigBitVec(_, vw)))
+            if w == vw =>
+        {
+            value.bitvec_to_chc_expr()
+        }
         _ => None,
     }
 }
@@ -144,7 +187,7 @@ fn value_fits_sort(value: &SmtValue, sort: &ChcSort) -> bool {
     match (sort, value) {
         (ChcSort::Int, SmtValue::Int(_) | SmtValue::BigInt(_)) => true,
         (ChcSort::Bool, SmtValue::Bool(_)) => true,
-        (ChcSort::BitVec(w), SmtValue::BitVec(_, vw)) => w == vw,
+        (ChcSort::BitVec(w), SmtValue::BitVec(_, vw) | SmtValue::BigBitVec(_, vw)) => w == vw,
         (ChcSort::Real, SmtValue::Real(_) | SmtValue::Int(_)) => true,
         (ChcSort::Datatype { constructors, .. }, SmtValue::Datatype(ctor, fields)) => constructors
             .iter()
@@ -184,6 +227,10 @@ pub(crate) fn witness_unbound_vars(
         return 0;
     };
     let budget = witness_budget().min(remaining);
+    let witness_deadline = CHAIN_DEADLINE
+        .with(Cell::get)
+        .map(|chain| chain.min(Instant::now() + budget))
+        .unwrap_or_else(|| Instant::now() + budget);
 
     // Pin every variable the environment already determined. Only concrete
     // values of a matching sort become pins; anything else is simply left
@@ -223,10 +270,10 @@ pub(crate) fn witness_unbound_vars(
 
     let started = ay_core::time::Instant::now();
     let result = {
-        // Replace the (exhausted) enclosing BMC-probe deadline: see the module
-        // note. Verdict-neutral -- this only buys wall-clock for a terminal,
-        // re-validated side computation.
-        let _deadline = crate::smt::deadline::ScopedSmtDeadlineOverride::install(budget);
+        // Replace a narrower enclosing engine deadline, but never the absolute
+        // caller boundary installed in `witness_deadline`: see the module note.
+        let _deadline =
+            crate::smt::deadline::ScopedSmtDeadlineOverride::install_until(witness_deadline);
         // The no-progress breaker is THREAD-local, not per-context, and its only
         // other production reset is in the PDR main loop; on this (BMC/adaptive)
         // lane a trip anywhere would otherwise latch every later check_sat on
@@ -243,6 +290,9 @@ pub(crate) fn witness_unbound_vars(
     };
     let elapsed = started.elapsed();
     CHAIN_SPENT.with(|cell| cell.set(cell.get().saturating_add(elapsed)));
+    if chain_remaining().is_none() {
+        return 0;
+    }
 
     let model = match result {
         crate::smt::SmtResult::Sat(model) => model,
@@ -316,6 +366,23 @@ mod tests {
                 },
             ]),
         }
+    }
+
+    #[test]
+    fn witness_chain_never_reopens_cancelled_or_expired_caller_boundary() {
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        {
+            let _scope = ScopedWitnessChainBudget::new_bounded(
+                Some(Instant::now() + Duration::from_secs(1)),
+                cancelled,
+            );
+            assert!(chain_remaining().is_none());
+        }
+
+        let _scope =
+            ScopedWitnessChainBudget::new_bounded(Some(Instant::now()), CancellationToken::new());
+        assert!(chain_remaining().is_none());
     }
 
     /// The regression this module's second fix is about: a datatype-sorted

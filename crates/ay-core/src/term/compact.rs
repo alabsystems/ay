@@ -32,6 +32,10 @@ use crate::sort::Sort;
 
 use super::{TermData, TermEntry, TermId, TermStore, GLOBAL_TERM_BYTES};
 
+/// Capacity-hint clamp for arena-scale scratch vectors; larger arenas just
+/// grow past the hint.
+const MAX_PREALLOC_TERMS: usize = 1 << 20;
+
 /// Translation table from pre-compaction [`TermId`]s to post-compaction
 /// [`TermId`]s produced by [`TermStore::mark_and_compact`].
 ///
@@ -141,7 +145,7 @@ impl Remappable for TermId {
 
 impl<T: Remappable> Remappable for Vec<T> {
     fn remap(&mut self, f: &dyn Fn(TermId) -> TermId) {
-        for item in self {
+        for item in self.as_mut_slice() {
             item.remap(f);
         }
     }
@@ -149,7 +153,7 @@ impl<T: Remappable> Remappable for Vec<T> {
 
 impl<T: Remappable> Remappable for Option<T> {
     fn remap(&mut self, f: &dyn Fn(TermId) -> TermId) {
-        if let Some(inner) = self {
+        if let Some(inner) = self.as_mut() {
             inner.remap(f);
         }
     }
@@ -204,30 +208,48 @@ impl TermStore {
     /// `kissat_finalize_compacting` for the rebuild of auxiliary
     /// structures (analogous to our hash-cons rebuild).
     pub fn mark_and_compact(&mut self, roots: &[TermId]) -> RemapTable {
-        let old_len = self.terms.len();
-
+        // Each phase lives in its own function: one flat body's VC generation
+        // sits at the edge of Trust's per-function wall-clock budget.
         // Compaction can shrink the arena and later appends can restore the old
         // length with different terms. Retire length-keyed structural snapshots
         // (and pre-compaction rollback checkpoints) before rewriting anything,
         // so that sequence can never alias the old term universe.
         self.advance_structural_generation();
 
+        let reachable = self.compact_mark_reachable(roots);
+        let (remap, new_heap_data_bytes) = self.compact_rebuild_arena(&reachable);
+        self.compact_remap_pins(&remap);
+        self.compact_rebuild_hash_cons();
+        self.compact_refresh_memory_accounting(new_heap_data_bytes);
+        remap
+    }
+
+    /// Compaction phases 1-2: pin caller roots, sentinels, and named terms,
+    /// then mark everything reachable with an iterative DFS.
+    fn compact_mark_reachable(&self, roots: &[TermId]) -> Vec<bool> {
+        let old_len = self.terms.len();
         // Phase 1: collect roots. In addition to caller-supplied
         // roots, we pin:
         //   * the `true` and `false` sentinels (always live)
         //   * every `TermId` held in `self.names` (user-visible names,
         //     per §3.1 of the design doc)
-        let mut stack: Vec<TermId> = Vec::with_capacity(roots.len() + 2 + self.names.len());
+        let stack_hint = roots
+            .len()
+            .saturating_add(2)
+            .saturating_add(self.names.len())
+            .min(MAX_PREALLOC_TERMS);
+        let mut stack: Vec<TermId> = Vec::with_capacity(stack_hint);
         let mut reachable: Vec<bool> = vec![false; old_len];
 
         let push_root = |id: TermId, stack: &mut Vec<TermId>, reachable: &mut Vec<bool>| {
             if id.is_sentinel() {
                 return;
             }
-            let idx = id.index();
-            if idx < reachable.len() && !reachable[idx] {
-                reachable[idx] = true;
-                stack.push(id);
+            if let Some(seen) = reachable.get_mut(id.index()) {
+                if !*seen {
+                    *seen = true;
+                    stack.push(id);
+                }
             }
         };
 
@@ -248,7 +270,12 @@ impl TermStore {
         // recursive walk is a stack-overflow hazard as called out in
         // the design doc).
         while let Some(id) = stack.pop() {
-            let entry = &self.terms[id.index()];
+            // Every stacked id passed push_root's bounds check against
+            // `reachable`, whose length is `self.terms.len()`; skipping an
+            // out-of-range id mirrors push_root's own policy.
+            let Some(entry) = self.terms.get(id.index()) else {
+                continue;
+            };
             Self::for_each_child(&entry.term, |child| {
                 push_root(child, &mut stack, &mut reachable);
             });
@@ -262,6 +289,15 @@ impl TermStore {
             }
         }
 
+        reachable
+    }
+
+    /// Compaction phases 3-4: emit surviving entries in increasing old-id
+    /// order (a valid topological order), swap in the compacted arena, and
+    /// recover the synthesis watermark. Returns the remap table and the
+    /// surviving heap payload size.
+    fn compact_rebuild_arena(&mut self, reachable: &[bool]) -> (RemapTable, usize) {
+        let old_len = reachable.len();
         // Phase 3: build the old → new mapping in topological order
         // (children before parents). A post-order traversal from the
         // marked roots guarantees that when we emit a parent, its
@@ -274,22 +310,27 @@ impl TermStore {
         // iterates in index order.
         let mut mapping: Vec<Option<TermId>> = vec![None; old_len];
         let live_count: usize = reachable.iter().filter(|b| **b).count();
-        let mut new_terms: Vec<TermEntry> = Vec::with_capacity(live_count);
+        let mut new_terms: Vec<TermEntry> = Vec::with_capacity(live_count.min(MAX_PREALLOC_TERMS));
         let mut new_heap_data_bytes: usize = 0;
 
-        for old_idx in 0..old_len {
-            if !reachable[old_idx] {
+        for (old_idx, (slot, &live)) in self.terms.iter_mut().zip(reachable.iter()).enumerate() {
+            if !live {
                 continue;
             }
+            // `mapping` was created above with `reachable`'s length, which
+            // bounds `old_idx`; the skip is unreachable.
+            let Some(map_slot) = mapping.get_mut(old_idx) else {
+                continue;
+            };
             let new_id = TermId(new_terms.len() as u32);
-            mapping[old_idx] = Some(new_id);
+            *map_slot = Some(new_id);
 
             // Move the entry out of the old arena to avoid cloning
             // the potentially-large TermData payload. We replace the
             // slot with a placeholder that we'll discard at the end.
-            let placeholder_stamp = self.terms[old_idx].stamp;
+            let placeholder_stamp = slot.stamp;
             let mut entry = std::mem::replace(
-                &mut self.terms[old_idx],
+                slot,
                 TermEntry {
                     term: TermData::Not(TermId(0)),
                     sort: Sort::Bool,
@@ -300,7 +341,9 @@ impl TermStore {
             // Rewrite every child TermId inside the term payload.
             Self::remap_term_children(&mut entry.term, &mapping);
 
-            new_heap_data_bytes += Self::heap_size(&entry.term);
+            // Saturating: memory accounting, same policy as the global
+            // counter in compact_refresh_memory_accounting.
+            new_heap_data_bytes = new_heap_data_bytes.saturating_add(Self::heap_size(&entry.term));
             new_terms.push(entry);
         }
 
@@ -330,6 +373,12 @@ impl TermStore {
             self.synthesis_watermark = Some(surviving_original);
         }
         let remap = RemapTable { mapping };
+        (remap, new_heap_data_bytes)
+    }
+
+    /// Compaction phase 5: move every TermStore-owned pin (sentinels, names,
+    /// memo caches, quantifier/skolem side tables) into the new id universe.
+    fn compact_remap_pins(&mut self, remap: &RemapTable) {
         if let Some(t) = self.true_term.as_mut() {
             *t = remap.remap(*t);
         }
@@ -339,10 +388,14 @@ impl TermStore {
         // `names` values: rewrite each (TermId, Sort) pair. We replace
         // the map wholesale because KaniHashMap does not expose
         // value_mut for every backend uniformly.
+        // Every rebuild below re-adds entries via single-entry `extend`, not
+        // `insert`: identical overwrite semantics, but the panic-freedom of a
+        // callee named `insert` is unmodeled (it is matched against the
+        // index-panicking `insert` family).
         let old_names = std::mem::take(&mut self.names);
         for (name, (id, sort)) in old_names {
             if let Some(new_id) = remap.get(id) {
-                self.names.insert(name, (new_id, sort));
+                self.names.extend(std::iter::once((name, (new_id, sort))));
             }
             // Names pointing at reclaimed terms CANNOT exist because
             // we pinned every named TermId above — but if a caller
@@ -362,35 +415,37 @@ impl TermStore {
         let old_not_cache = std::mem::take(&mut self.not_cache);
         for (arg, negated) in old_not_cache {
             if let (Some(new_arg), Some(new_negated)) = (remap.get(arg), remap.get(negated)) {
-                self.not_cache.insert(new_arg, new_negated);
+                self.not_cache
+                    .extend(std::iter::once((new_arg, new_negated)));
             }
         }
 
         let old_no_mbqi = std::mem::take(&mut self.no_mbqi);
         for old_id in old_no_mbqi {
             if let Some(new_id) = remap.get(old_id) {
-                self.no_mbqi.insert(new_id);
+                self.no_mbqi.extend(std::iter::once(new_id));
             }
         }
 
         let old_quantifier_id = std::mem::take(&mut self.quantifier_id);
         for (old_id, qid) in old_quantifier_id {
             if let Some(new_id) = remap.get(old_id) {
-                self.quantifier_id.insert(new_id, qid);
+                self.quantifier_id.extend(std::iter::once((new_id, qid)));
             }
         }
 
         let old_skolem_id = std::mem::take(&mut self.skolem_id);
         for (old_id, skid) in old_skolem_id {
             if let Some(new_id) = remap.get(old_id) {
-                self.skolem_id.insert(new_id, skid);
+                self.skolem_id.extend(std::iter::once((new_id, skid)));
             }
         }
 
         let old_quantifier_weight = std::mem::take(&mut self.quantifier_weight);
         for (old_id, weight) in old_quantifier_weight {
             if let Some(new_id) = remap.get(old_id) {
-                self.quantifier_weight.insert(new_id, weight);
+                self.quantifier_weight
+                    .extend(std::iter::once((new_id, weight)));
             }
         }
 
@@ -403,7 +458,8 @@ impl TermStore {
                 .into_iter()
                 .map(|no_pattern| remap.remap(no_pattern))
                 .collect();
-            self.quantifier_no_patterns.insert(new_id, no_patterns);
+            self.quantifier_no_patterns
+                .extend(std::iter::once((new_id, no_patterns)));
         }
 
         // Skolem-choice provenance is keyed by witness TermId and holds a body
@@ -421,9 +477,13 @@ impl TermStore {
                 continue;
             };
             choice.body = new_body;
-            self.skolem_choice.insert(new_witness, choice);
+            self.skolem_choice
+                .extend(std::iter::once((new_witness, choice)));
         }
+    }
 
+    /// Compaction phase 6: rebuild the hash-cons map from the live arena.
+    fn compact_rebuild_hash_cons(&mut self) {
         // Phase 6: rebuild the hash-cons map from scratch. This is
         // O(live_terms) — cheaper than patching the stale map,
         // because dead entries were bloating every bucket.
@@ -436,25 +496,33 @@ impl TermStore {
                 .push(TermId(idx as u32));
         }
         self.hash_cons = new_hash_cons;
+    }
 
+    /// Compaction phase 7: recompute memory accounting against the compacted
+    /// arena and release the freed bytes from the global counter.
+    fn compact_refresh_memory_accounting(&mut self, new_heap_data_bytes: usize) {
         // Phase 7: update memory accounting. The old counters
         // tracked pre-compaction allocation. After compaction the
         // real instance footprint is the sum of surviving entries'
         // heap + the new hash-cons bucket capacities + names.
+        // All accounting arithmetic saturates — same policy as the
+        // global-counter CAS below.
         let names_string_heap: usize = self
             .names
             .iter()
-            .map(|(name, _)| name.capacity() + size_of::<(TermId, Sort)>())
-            .sum();
+            .map(|(name, _)| name.capacity().saturating_add(size_of::<(TermId, Sort)>()))
+            .fold(0, usize::saturating_add);
         let bucket_capacity_bytes: usize = self
             .hash_cons
             .values()
-            .map(|v| v.capacity() * size_of::<TermId>())
-            .sum();
-        let entries_bytes = self.terms.len() * size_of::<TermEntry>();
+            .map(|v| v.capacity().saturating_mul(size_of::<TermId>()))
+            .fold(0, usize::saturating_add);
+        let entries_bytes = self.terms.len().saturating_mul(size_of::<TermEntry>());
 
-        let new_total =
-            entries_bytes + new_heap_data_bytes + names_string_heap + bucket_capacity_bytes;
+        let new_total = entries_bytes
+            .saturating_add(new_heap_data_bytes)
+            .saturating_add(names_string_heap)
+            .saturating_add(bucket_capacity_bytes);
         let old_total = self.instance_term_bytes;
 
         // Decrement the global counter by the freed amount. Use a
@@ -479,14 +547,12 @@ impl TermStore {
         }
 
         self.instance_term_bytes = new_total;
-        self.heap_data_bytes = new_heap_data_bytes + names_string_heap;
+        self.heap_data_bytes = new_heap_data_bytes.saturating_add(names_string_heap);
         self.bucket_capacity_bytes = bucket_capacity_bytes;
         // Invalidate the true_memory_bytes cache so the next pressure
         // check recomputes against the compacted arena.
         self.true_memory_cache.set(0);
         self.true_memory_cache_at.set(0);
-
-        remap
     }
 
     /// Call `f` on every `TermId` child referenced by `term`.
@@ -533,8 +599,10 @@ impl TermStore {
             if old.is_sentinel() {
                 return TermId::SENTINEL;
             }
-            mapping[old.index()]
-                .expect("mark_and_compact: child not marked — bug in for_each_child")
+            match mapping.get(old.index()) {
+                Some(&Some(new_id)) => new_id,
+                _ => panic!("mark_and_compact: child not marked — bug in for_each_child"),
+            }
         };
         match term {
             TermData::Const(_) | TermData::Var(_, _) => {}

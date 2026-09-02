@@ -6,7 +6,10 @@
 //! Portfolio solver tests — validation, solving, engine-specific, panic/spawn, BV regression.
 
 use super::engines::translate_trl_singleloop_safe_model;
-use super::schedule::FORCE_SOLVER_THREAD_SPAWN_FAILURE;
+use super::schedule::{
+    FORCE_SOLVER_THREAD_SPAWN_FAILURE, PARALLEL_TEST_DISABLE_LANE_TIMER,
+    PARALLEL_TEST_PREPARE_DELAY,
+};
 use super::*;
 use crate::bmc::BmcConfig;
 use crate::cegar::{CegarConfig, CegarResult};

@@ -69,6 +69,12 @@ impl TpaSolver {
             }
 
             let power_start = ay_core::time::Instant::now();
+            // `check_power` invokes interpolation helpers that contain plain
+            // `check_sat` calls in addition to the explicitly timed TPA
+            // queries. Keep every nested SMT call inside this power's declared
+            // budget so exact arithmetic can observe the same hard deadline.
+            let _power_deadline =
+                crate::smt::ScopedSmtDeadline::install(self.config.timeout_per_power);
             let power_result = self.check_power(power);
             if self.config.verbose_level > 0 {
                 safe_eprintln!("TPA: power {} took {:?}", power, power_start.elapsed());
@@ -135,7 +141,10 @@ impl TpaSolver {
 
         // Check if init and query overlap (immediate counterexample)
         let init_and_query = ChcExpr::and(ts.init.clone(), ts.query.clone());
-        match self.smt.check_sat(&init_and_query) {
+        match self
+            .smt
+            .check_sat_with_timeout(&init_and_query, self.config.timeout_per_power)
+        {
             SmtResult::Sat(model) => {
                 // Immediate counterexample: init state satisfies query
                 let trace = self.extract_trace_from_model(&model, ts);

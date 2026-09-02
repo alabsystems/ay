@@ -9,7 +9,7 @@
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 
 use crate::transition_system::TransitionSystem;
-use crate::{ChcExpr, ChcVar, SmtValue};
+use crate::{ChcExpr, ChcSort, ChcVar, SmtValue};
 
 use super::solver::TpaSolver;
 
@@ -106,35 +106,45 @@ fn extract_state_from_model(
             } else {
                 ChcVar::new(format!("{}_{to_time}", var.name), var.sort.clone())
             };
-            let eq = match value {
-                SmtValue::Int(i) => ChcExpr::eq(ChcExpr::var(target_var), ChcExpr::int(*i)),
+            let eq = match (&var.sort, value) {
+                (ChcSort::Int, SmtValue::Int(i)) => {
+                    ChcExpr::eq(ChcExpr::var(target_var), ChcExpr::int(*i))
+                }
                 // Beyond-i128 witness: exact Horner encoding (never wraps).
-                SmtValue::BigInt(b) => ChcExpr::eq(
+                (ChcSort::Int, SmtValue::BigInt(b)) => ChcExpr::eq(
                     ChcExpr::var(target_var),
                     ChcExpr::from_bigint(b.as_ref().clone()),
                 ),
-                SmtValue::Bool(b) => {
+                (ChcSort::Bool, SmtValue::Bool(b)) => {
                     if *b {
                         ChcExpr::var(target_var)
                     } else {
                         ChcExpr::not(ChcExpr::var(target_var))
                     }
                 }
-                SmtValue::Real(r) => {
+                (ChcSort::Real, SmtValue::Real(r)) => {
                     use num_traits::ToPrimitive;
-                    let n = r.numer().to_i64().unwrap_or(0);
-                    let d = r.denom().to_i64().unwrap_or(1);
+                    let Some(n) = r.numer().to_i64() else {
+                        continue;
+                    };
+                    let Some(d) = r.denom().to_i64() else {
+                        continue;
+                    };
                     ChcExpr::eq(ChcExpr::var(target_var), ChcExpr::Real(n, d))
                 }
                 // #5523: Preserve bitvector sort to avoid BV→Int sort mismatches.
-                SmtValue::BitVec(v, w) => {
-                    ChcExpr::eq(ChcExpr::var(target_var), ChcExpr::BitVec(*v, *w))
+                (
+                    ChcSort::BitVec(expected_width),
+                    value @ (SmtValue::BitVec(_, actual_width)
+                    | SmtValue::BigBitVec(_, actual_width)),
+                ) if expected_width == actual_width => {
+                    let Some(literal) = value.bitvec_to_chc_expr() else {
+                        continue;
+                    };
+                    ChcExpr::eq(ChcExpr::var(target_var), literal)
                 }
                 // Array, DT, and opaque values skipped — no scalar equality representation.
-                SmtValue::Opaque(_)
-                | SmtValue::ConstArray(_)
-                | SmtValue::ArrayMap { .. }
-                | SmtValue::Datatype(..) => continue,
+                _ => continue,
             };
             conjuncts.push(eq);
         }

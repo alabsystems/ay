@@ -139,7 +139,8 @@ impl TermStore {
         };
         let zero = BigInt::zero();
         let one = BigInt::one();
-        let sign_threshold = BigInt::one() << (width - 1);
+        // Saturating: width >= 1 is guaranteed by prepare_bv_binary_op (get_bv_width).
+        let sign_threshold = BigInt::one() << width.saturating_sub(1);
 
         // Constant folding (includes div-by-zero)
         if let (Some((v1, w1)), Some((v2, _))) = (self.get_bitvec(a), self.get_bitvec(b)) {

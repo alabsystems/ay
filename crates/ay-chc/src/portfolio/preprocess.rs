@@ -292,6 +292,15 @@ fn condense_stage(problem: ChcProblem, verbose: bool) -> TransformationResult {
 }
 
 fn condense_stage_uncached(problem: ChcProblem, verbose: bool) -> TransformationResult {
+    condense_stage_uncached_with_boundary(problem, verbose, None, None)
+}
+
+fn condense_stage_uncached_with_boundary(
+    problem: ChcProblem,
+    verbose: bool,
+    deadline: Option<ay_core::time::Instant>,
+    cancellation: Option<&crate::CancellationToken>,
+) -> TransformationResult {
     let condense = condense_enabled();
     // SPLIT-SYM (item #9) runs right after the condense fixpoint: condense
     // folds/pins constants first, then the symbol splitter clones predicates
@@ -311,6 +320,10 @@ fn condense_stage_uncached(problem: ChcProblem, verbose: bool) -> Transformation
     pipeline = pipeline.with(PcSplitter::new().with_verbose(verbose));
     if condense {
         let mut condense = CondenseSuperpass::new().with_verbose(verbose);
+        if deadline.is_some() || cancellation.is_some() {
+            condense =
+                condense.with_caller_boundary(deadline, cancellation.cloned().unwrap_or_default());
+        }
         // Mirror `portfolio_clause_inliner`: only pure-Int problems need the
         // query-body predicates preserved for Unsafe witness reconstruction.
         if !(problem.has_bv_sorts()
@@ -405,6 +418,28 @@ impl PreprocessSummary {
         Self::build_with_graph_collapse(problem, verbose, graph_collapse_enabled())
     }
 
+    /// Deadline/cancellation-aware standard preprocessing.
+    ///
+    /// Each completed transform stage is a cooperative stop boundary. A single
+    /// transform is still synchronous, but once it returns no later stage is
+    /// launched after cancellation/deadline. `None` means the caller must fail
+    /// closed and must not start an engine on a partially prepared problem.
+    pub(crate) fn build_with_limits(
+        problem: ChcProblem,
+        verbose: bool,
+        deadline: Option<ay_core::time::Instant>,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Option<Self> {
+        let (summary, exhausted) = Self::build_with_graph_collapse_bounded(
+            problem,
+            verbose,
+            graph_collapse_enabled(),
+            deadline,
+            Some(cancellation),
+        );
+        (!exhausted).then_some(summary)
+    }
+
     /// [`build`](Self::build) with the graph-collapse stage made explicit so
     /// tests can exercise both paths without mutating process environment.
     pub(crate) fn build_with_graph_collapse(
@@ -412,10 +447,49 @@ impl PreprocessSummary {
         verbose: bool,
         graph_collapse: bool,
     ) -> Self {
+        Self::build_with_graph_collapse_bounded(problem, verbose, graph_collapse, None, None).0
+    }
+
+    fn build_with_graph_collapse_bounded(
+        problem: ChcProblem,
+        verbose: bool,
+        graph_collapse: bool,
+        deadline: Option<ay_core::time::Instant>,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> (Self, bool) {
+        macro_rules! stop_if_exhausted {
+            () => {
+                if cancellation.is_some_and(|token| token.is_cancelled())
+                    || deadline.is_some_and(|limit| ay_core::time::Instant::now() >= limit)
+                {
+                    return (
+                        Self::from_parts(
+                            problem.clone(),
+                            problem,
+                            Box::new(IdentityBackTranslator),
+                            false,
+                        ),
+                        true,
+                    );
+                }
+            };
+        }
+
+        stop_if_exhausted!();
         // Stage -1: fixpoint condense superpass on the ORIGINAL problem
         // (--chc-no-condense disables). Collapses predicate chains
         // before bit-blasting multiplies argument counts.
-        let condense_result = condense_stage(problem.clone(), verbose);
+        // A bounded construction cannot safely wait on or populate the global
+        // condense cache: lock contention is not cancellable, and a
+        // best-so-far prefix produced at the boundary must not become an
+        // unbounded cache entry. Run the exact stage uncached while threading
+        // the caller boundary into the cooperative superpass.
+        let condense_result = if deadline.is_some() || cancellation.is_some() {
+            condense_stage_uncached_with_boundary(problem.clone(), verbose, deadline, cancellation)
+        } else {
+            condense_stage(problem.clone(), verbose)
+        };
+        stop_if_exhausted!();
 
         // Stage 0: forward array store chains (item 4a; cheap no-op without
         // stores, and covers problems the condense clause-count cap skipped),
@@ -426,6 +500,7 @@ impl PreprocessSummary {
             .with(GroundTableReadConcretizer::new().with_verbose(verbose))
             .with(DeadParamEliminator::new().with_verbose(verbose));
         let pre_result = pre_pipeline.transform(condense_result.problem);
+        stop_if_exhausted!();
 
         // Stage 0.5: Flatten DT-sorted predicate args to scalars (#8288).
         // Must run before BvToBool/BvToInt so DT fields containing BV sorts
@@ -433,11 +508,13 @@ impl PreprocessSummary {
         let dt_pipeline =
             TransformationPipeline::new().with(DtFlattener::new().with_verbose(verbose));
         let dt_result = dt_pipeline.transform(pre_result.problem);
+        stop_if_exhausted!();
 
         // Stage 1: BvToBool (exact bit-blasting) on pre-cleaned problem
         let bvtobool_pipeline =
             TransformationPipeline::new().with(BvToBoolBitBlaster::new().with_verbose(verbose));
         let bvtobool_result = bvtobool_pipeline.transform(dt_result.problem);
+        stop_if_exhausted!();
 
         // BvToBool is exact: if it eliminated all BV sorts, the problem is
         // faithfully represented in Bool domain. BvToInt (stage 2) only
@@ -458,6 +535,7 @@ impl PreprocessSummary {
         // harder BV benchmarks (nested4, simple) requires native BV theory in
         // PDR (like Z3 Spacer) rather than a routing change.
         let result = cleanup_pipeline.transform(bvtobool_result.problem);
+        stop_if_exhausted!();
 
         // (#7048) Mod/div expansion is done per-engine (PDR) rather than at portfolio
         // level, because Euclidean axioms add fresh variables that can hurt PDKind/TPA
@@ -483,6 +561,7 @@ impl PreprocessSummary {
         } else {
             (result.problem, None)
         };
+        stop_if_exhausted!();
 
         // Symbol splitting runs after the condense fixpoint, and later
         // inlining/graph collapse can leave a split clone in a query body with
@@ -491,6 +570,7 @@ impl PreprocessSummary {
         let reachability_result = TransformationPipeline::new()
             .with(UnreachableClauseEliminator::new().with_verbose(verbose))
             .transform(transformed_problem);
+        stop_if_exhausted!();
         let transformed_problem = reachability_result.problem;
 
         // Compose back-translators in reverse transform order: final
@@ -546,7 +626,10 @@ impl PreprocessSummary {
                 );
             }
         }
-        Self::from_parts(problem, transformed_problem, back_translator, bv_abstracted)
+        (
+            Self::from_parts(problem, transformed_problem, back_translator, bv_abstracted),
+            false,
+        )
     }
 
     /// Whether the BvToInt transform used UF fallback for any variable-variable
@@ -566,8 +649,44 @@ impl PreprocessSummary {
     /// TPA/PDR/PDKIND, while BvToBool works for problems needing bit-level
     /// reasoning (#5877).
     pub(crate) fn build_int_only(problem: ChcProblem, verbose: bool) -> Self {
+        Self::build_int_only_bounded(problem, verbose, None, None)
+            .expect("unbounded BvToInt preprocessing cannot be cancelled")
+    }
+
+    /// Absolute-deadline/cancellation-aware exact BvToInt preprocessing.
+    /// An interrupted transform prefix is discarded by the caller.
+    pub(crate) fn build_int_only_with_limits(
+        problem: ChcProblem,
+        verbose: bool,
+        deadline: Option<ay_core::time::Instant>,
+        cancellation: &crate::CancellationToken,
+    ) -> Option<Self> {
+        Self::build_int_only_bounded(problem, verbose, deadline, Some(cancellation))
+    }
+
+    fn build_int_only_bounded(
+        problem: ChcProblem,
+        verbose: bool,
+        deadline: Option<ay_core::time::Instant>,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Option<Self> {
+        let boundary_open = || {
+            !cancellation.is_some_and(crate::CancellationToken::is_cancelled)
+                && deadline.is_none_or(|limit| ay_core::time::Instant::now() < limit)
+        };
+        if !boundary_open() {
+            return None;
+        }
+
         // Stage -1: fixpoint condense superpass (--chc-no-condense disables)
-        let condense_result = condense_stage(problem.clone(), verbose);
+        let condense_result = if deadline.is_some() || cancellation.is_some() {
+            condense_stage_uncached_with_boundary(problem.clone(), verbose, deadline, cancellation)
+        } else {
+            condense_stage(problem.clone(), verbose)
+        };
+        if !boundary_open() {
+            return None;
+        }
 
         // Stage 0: forward array store chains (item 4a), concretize read-only
         // ground-pin table arrays (item 4 Stage 1), then remove dead params
@@ -577,11 +696,17 @@ impl PreprocessSummary {
             .with(GroundTableReadConcretizer::new().with_verbose(verbose))
             .with(DeadParamEliminator::new().with_verbose(verbose));
         let pre_result = pre_pipeline.transform(condense_result.problem);
+        if !boundary_open() {
+            return None;
+        }
 
         // Stage 0.5: Flatten DT-sorted predicate args (#8288)
         let dt_pipeline =
             TransformationPipeline::new().with(DtFlattener::new().with_verbose(verbose));
         let dt_result = dt_pipeline.transform(pre_result.problem);
+        if !boundary_open() {
+            return None;
+        }
 
         // Use exact BvToInt here so Safe results remain sound in the original
         // BV domain. The relaxed encoding is unsound under signed overflow
@@ -597,6 +722,9 @@ impl PreprocessSummary {
             .with(DeadParamEliminator::new().with_verbose(verbose))
             .with(portfolio_clause_inliner(&problem, verbose));
         let result = pipeline.transform(dt_result.problem);
+        if !boundary_open() {
+            return None;
+        }
         if verbose {
             let orig_clauses = problem.clauses().len();
             let new_clauses = result.problem.clauses().len();
@@ -617,7 +745,8 @@ impl PreprocessSummary {
                 condense_result.back_translator,
             ],
         });
-        Self::from_parts(problem, result.problem, back_translator, bv_abstracted)
+        let summary = Self::from_parts(problem, result.problem, back_translator, bv_abstracted);
+        boundary_open().then_some(summary)
     }
 
     /// Build a relaxed BvToInt preprocessing pipeline (no modular wrapping).
@@ -631,20 +760,58 @@ impl PreprocessSummary {
     /// Callers MUST validate Safe results against the original BV problem before
     /// accepting them. Invalid invariants (where overflow matters) will fail
     /// validation and fall through to the exact path.
-    pub(crate) fn build_int_relaxed(problem: ChcProblem, verbose: bool) -> Self {
+    ///
+    /// Absolute-deadline/cancellation-aware relaxed BvToInt preprocessing.
+    /// An interrupted transform prefix is discarded by the caller.
+    pub(crate) fn build_int_relaxed_with_limits(
+        problem: ChcProblem,
+        verbose: bool,
+        deadline: Option<ay_core::time::Instant>,
+        cancellation: &crate::CancellationToken,
+    ) -> Option<Self> {
+        Self::build_int_relaxed_bounded(problem, verbose, deadline, Some(cancellation))
+    }
+
+    fn build_int_relaxed_bounded(
+        problem: ChcProblem,
+        verbose: bool,
+        deadline: Option<ay_core::time::Instant>,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Option<Self> {
+        let boundary_open = || {
+            !cancellation.is_some_and(crate::CancellationToken::is_cancelled)
+                && deadline.is_none_or(|limit| ay_core::time::Instant::now() < limit)
+        };
+        if !boundary_open() {
+            return None;
+        }
+
         // Stage -1: fixpoint condense superpass (--chc-no-condense disables)
-        let condense_result = condense_stage(problem.clone(), verbose);
+        let condense_result = if deadline.is_some() || cancellation.is_some() {
+            condense_stage_uncached_with_boundary(problem.clone(), verbose, deadline, cancellation)
+        } else {
+            condense_stage(problem.clone(), verbose)
+        };
+        if !boundary_open() {
+            return None;
+        }
 
         // Stage 0 (+ item 4a array store forwarding, cheap no-op without stores)
         let pre_pipeline = TransformationPipeline::new()
             .with(ArrayStoreForwarder::new().with_verbose(verbose))
             .with(DeadParamEliminator::new().with_verbose(verbose));
         let pre_result = pre_pipeline.transform(condense_result.problem);
+        if !boundary_open() {
+            return None;
+        }
 
         // Stage 0.5: Flatten DT-sorted predicate args (#8288)
         let dt_pipeline =
             TransformationPipeline::new().with(DtFlattener::new().with_verbose(verbose));
         let dt_result = dt_pipeline.transform(pre_result.problem);
+        if !boundary_open() {
+            return None;
+        }
 
         let pipeline = TransformationPipeline::new()
             .with(
@@ -656,6 +823,9 @@ impl PreprocessSummary {
             .with(DeadParamEliminator::new().with_verbose(verbose))
             .with(portfolio_clause_inliner(&problem, verbose));
         let result = pipeline.transform(dt_result.problem);
+        if !boundary_open() {
+            return None;
+        }
         if verbose {
             safe_eprintln!(
                 "Portfolio: BvToInt-relaxed preprocessing: {} clauses -> {}",
@@ -672,7 +842,8 @@ impl PreprocessSummary {
                 condense_result.back_translator,
             ],
         });
-        Self::from_parts(problem, result.problem, back_translator, bv_abstracted)
+        let summary = Self::from_parts(problem, result.problem, back_translator, bv_abstracted);
+        boundary_open().then_some(summary)
     }
 
     /// Build a BV-native preprocessing pipeline (no BV transforms at all).
@@ -689,6 +860,35 @@ impl PreprocessSummary {
     /// results do not require confirmation against the original problem since
     /// the solver operates in the original domain.
     pub(crate) fn build_bv_native(problem: ChcProblem, verbose: bool) -> Self {
+        Self::build_bv_native_bounded(problem, verbose, None, None)
+            .expect("unbounded BV-native preprocessing cannot be cancelled")
+    }
+
+    /// Absolute-deadline/cancellation-aware BV-native preprocessing.
+    /// An interrupted transform prefix is discarded by the caller.
+    pub(crate) fn build_bv_native_with_limits(
+        problem: ChcProblem,
+        verbose: bool,
+        deadline: Option<ay_core::time::Instant>,
+        cancellation: &crate::CancellationToken,
+    ) -> Option<Self> {
+        Self::build_bv_native_bounded(problem, verbose, deadline, Some(cancellation))
+    }
+
+    fn build_bv_native_bounded(
+        problem: ChcProblem,
+        verbose: bool,
+        deadline: Option<ay_core::time::Instant>,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Option<Self> {
+        let boundary_open = || {
+            !cancellation.is_some_and(crate::CancellationToken::is_cancelled)
+                && deadline.is_none_or(|limit| ay_core::time::Instant::now() < limit)
+        };
+        if !boundary_open() {
+            return None;
+        }
+
         // #5877: For BV-native single-predicate problems with large transition
         // relations (e.g., bist_cell has 10000 nodes), the preprocessing
         // transforms (LocalVarEliminator, DeadParamEliminator, ClauseInliner)
@@ -705,12 +905,13 @@ impl PreprocessSummary {
                     problem.clauses().len()
                 );
             }
-            return Self::from_parts(
+            let summary = Self::from_parts(
                 problem.clone(),
                 problem,
                 Box::new(IdentityBackTranslator),
                 false,
             );
+            return boundary_open().then_some(summary);
         }
 
         let is_large_bv_array_dag = problem.predicates().len() > 128
@@ -732,18 +933,33 @@ impl PreprocessSummary {
             // only the bounded-cost forwarding pass runs, plus ONE trailing
             // DeadParamEliminator (arity slicing) when forwarding actually
             // changed something and the slicer's cost bound holds.
-            return Self::build_array_forwarding_only(problem, verbose);
+            return Self::build_array_forwarding_only_bounded(
+                problem,
+                verbose,
+                deadline,
+                cancellation,
+            );
         }
 
         let _t_total = ay_core::time::Instant::now();
 
         // Stage -1: fixpoint condense superpass (--chc-no-condense disables)
-        let condense_result = condense_stage(problem.clone(), verbose);
+        let condense_result = if deadline.is_some() || cancellation.is_some() {
+            condense_stage_uncached_with_boundary(problem.clone(), verbose, deadline, cancellation)
+        } else {
+            condense_stage(problem.clone(), verbose)
+        };
+        if !boundary_open() {
+            return None;
+        }
 
         // Stage 0.5: Flatten DT-sorted predicate args (#8288)
         let dt_pipeline =
             TransformationPipeline::new().with(DtFlattener::new().with_verbose(verbose));
         let dt_result = dt_pipeline.transform(condense_result.problem);
+        if !boundary_open() {
+            return None;
+        }
 
         let pipeline = TransformationPipeline::new()
             .with(ArrayStoreForwarder::new().with_verbose(verbose))
@@ -751,6 +967,9 @@ impl PreprocessSummary {
             .with(DeadParamEliminator::new().with_verbose(verbose))
             .with(portfolio_clause_inliner(&problem, verbose));
         let result = pipeline.transform(dt_result.problem);
+        if !boundary_open() {
+            return None;
+        }
         if verbose {
             let orig_clauses = problem.clauses().len();
             let new_clauses = result.problem.clauses().len();
@@ -764,7 +983,7 @@ impl PreprocessSummary {
         // bv_abstracted is false: the problem retains original BV sorts.
         // Unsafe results are already in the original domain — no confirmation
         // against the original problem is needed.
-        Self::from_parts(
+        let summary = Self::from_parts(
             problem,
             result.problem,
             Box::new(CompositeBackTranslator {
@@ -775,7 +994,8 @@ impl PreprocessSummary {
                 ],
             }),
             false,
-        )
+        );
+        boundary_open().then_some(summary)
     }
 
     /// Bounded-cost forwarding-only preprocessing (item 4, heavy-memory
@@ -798,21 +1018,55 @@ impl PreprocessSummary {
     /// fail-closed (`transform_memory.is_identity_grade()` is `false` for any
     /// real rewrite).
     pub(crate) fn build_array_forwarding_only(problem: ChcProblem, verbose: bool) -> Self {
+        Self::build_array_forwarding_only_bounded(problem, verbose, None, None)
+            .expect("unbounded array-forwarding preprocessing cannot be cancelled")
+    }
+
+    /// Absolute-deadline/cancellation-aware form used by authoritative BMC-only
+    /// calls. Cancellation is checked before and after every constituent pass;
+    /// an interrupted prefix is discarded and the caller must return Unknown.
+    pub(crate) fn build_array_forwarding_only_with_limits(
+        problem: ChcProblem,
+        verbose: bool,
+        deadline: Option<ay_core::time::Instant>,
+        cancellation: &crate::CancellationToken,
+    ) -> Option<Self> {
+        Self::build_array_forwarding_only_bounded(problem, verbose, deadline, Some(cancellation))
+    }
+
+    fn build_array_forwarding_only_bounded(
+        problem: ChcProblem,
+        verbose: bool,
+        deadline: Option<ay_core::time::Instant>,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Option<Self> {
+        let boundary_open = || {
+            !cancellation.is_some_and(crate::CancellationToken::is_cancelled)
+                && deadline.is_none_or(|limit| ay_core::time::Instant::now() < limit)
+        };
+        if !boundary_open() {
+            return None;
+        }
         // The kill switch disables the WHOLE lane (forwarder AND trailing
         // slicer), restoring the raw-problem behavior of the acyclic lanes.
         if !problem.has_array_sorts() || !crate::transform::array_store_forwarding_enabled() {
-            return Self::from_parts(
-                problem.clone(),
-                problem,
-                Box::new(IdentityBackTranslator),
-                false,
-            );
+            return boundary_open().then(|| {
+                Self::from_parts(
+                    problem.clone(),
+                    problem,
+                    Box::new(IdentityBackTranslator),
+                    false,
+                )
+            });
         }
 
         let t_start = ay_core::time::Instant::now();
         let forward_result = TransformationPipeline::new()
             .with(ArrayStoreForwarder::new().with_verbose(verbose))
             .transform(problem.clone());
+        if !boundary_open() {
+            return None;
+        }
         let forwarding_changed = !forward_result.transform_memory().is_identity_grade();
         // Item 4 Stage 1: concretize read-only ground-pin table arrays right
         // after forwarding so the trailing slicer can drop the (now dead)
@@ -821,6 +1075,9 @@ impl PreprocessSummary {
         let conc_result = TransformationPipeline::new()
             .with(GroundTableReadConcretizer::new().with_verbose(verbose))
             .transform(forward_result.problem);
+        if !boundary_open() {
+            return None;
+        }
         let concretization_changed = !conc_result.transform_memory().is_identity_grade();
         // Item 4 Stage 4 wiring: flatten DT-sorted predicate args AFTER the
         // concretizer and BEFORE the arity slicer. The model-checker-consumer coroutine
@@ -838,18 +1095,25 @@ impl PreprocessSummary {
         } else {
             TransformationPipeline::new().transform(conc_result.problem)
         };
+        if !boundary_open() {
+            return None;
+        }
         let dt_changed = !dt_result.transform_memory().is_identity_grade();
         let rewrote_something = forwarding_changed || concretization_changed || dt_changed;
-        if !dead_param_cost_bounded(&dt_result.problem) {
+        let run_dead_param = dead_param_cost_bounded(&dt_result.problem);
+        if !boundary_open() {
+            return None;
+        }
+        if !run_dead_param {
             if !rewrote_something {
-                return Self::from_parts(
+                return Some(Self::from_parts(
                     problem.clone(),
                     problem,
                     Box::new(IdentityBackTranslator),
                     false,
-                );
+                ));
             }
-            return Self::from_parts(
+            return Some(Self::from_parts(
                 problem,
                 dt_result.problem,
                 Box::new(CompositeBackTranslator {
@@ -860,7 +1124,7 @@ impl PreprocessSummary {
                     ],
                 }),
                 false,
-            );
+            ));
         }
         // The trailing cost-bounded arity slicer runs even when forwarding was
         // a no-op: select-only threaded-memory encodings (zero stores, e.g.
@@ -870,14 +1134,17 @@ impl PreprocessSummary {
         let slice_result = TransformationPipeline::new()
             .with(DeadParamEliminator::new().with_verbose(verbose))
             .transform(dt_result.problem);
+        if !boundary_open() {
+            return None;
+        }
         let slicing_changed = !slice_result.transform_memory().is_identity_grade();
         if !rewrote_something && !slicing_changed {
-            return Self::from_parts(
+            return Some(Self::from_parts(
                 problem.clone(),
                 problem,
                 Box::new(IdentityBackTranslator),
                 false,
-            );
+            ));
         }
         let summary = Self::from_parts(
             problem,
@@ -917,7 +1184,7 @@ impl PreprocessSummary {
                 t_start.elapsed()
             );
         }
-        summary
+        boundary_open().then_some(summary)
     }
 
     /// Build a BvToInt pipeline with a custom bit-decomposition width limit.
@@ -929,23 +1196,65 @@ impl PreprocessSummary {
     /// (#8289). Phase 1 tries UF approximation first; if the solver returns
     /// Unknown and `had_bitwise_uf_fallback()` is true, Phase 2 re-runs with
     /// full bit-decomposition for improved precision.
-    pub(crate) fn build_int_with_decompose_limit(
+    ///
+    /// Absolute-deadline/cancellation-aware refined BvToInt preprocessing.
+    /// An interrupted transform prefix is discarded by the caller.
+    pub(crate) fn build_int_with_decompose_limit_with_limits(
         problem: ChcProblem,
         verbose: bool,
         decompose_limit: u32,
-    ) -> Self {
+        deadline: Option<ay_core::time::Instant>,
+        cancellation: &crate::CancellationToken,
+    ) -> Option<Self> {
+        Self::build_int_with_decompose_limit_bounded(
+            problem,
+            verbose,
+            decompose_limit,
+            deadline,
+            Some(cancellation),
+        )
+    }
+
+    fn build_int_with_decompose_limit_bounded(
+        problem: ChcProblem,
+        verbose: bool,
+        decompose_limit: u32,
+        deadline: Option<ay_core::time::Instant>,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> Option<Self> {
+        let boundary_open = || {
+            !cancellation.is_some_and(crate::CancellationToken::is_cancelled)
+                && deadline.is_none_or(|limit| ay_core::time::Instant::now() < limit)
+        };
+        if !boundary_open() {
+            return None;
+        }
+
         // Stage -1: fixpoint condense superpass (--chc-no-condense disables)
-        let condense_result = condense_stage(problem.clone(), verbose);
+        let condense_result = if deadline.is_some() || cancellation.is_some() {
+            condense_stage_uncached_with_boundary(problem.clone(), verbose, deadline, cancellation)
+        } else {
+            condense_stage(problem.clone(), verbose)
+        };
+        if !boundary_open() {
+            return None;
+        }
 
         // Stage 0 (+ item 4a array store forwarding, cheap no-op without stores)
         let pre_pipeline = TransformationPipeline::new()
             .with(ArrayStoreForwarder::new().with_verbose(verbose))
             .with(DeadParamEliminator::new().with_verbose(verbose));
         let pre_result = pre_pipeline.transform(condense_result.problem);
+        if !boundary_open() {
+            return None;
+        }
 
         let dt_pipeline =
             TransformationPipeline::new().with(DtFlattener::new().with_verbose(verbose));
         let dt_result = dt_pipeline.transform(pre_result.problem);
+        if !boundary_open() {
+            return None;
+        }
 
         let pipeline = TransformationPipeline::new()
             .with(
@@ -958,6 +1267,9 @@ impl PreprocessSummary {
             .with(DeadParamEliminator::new().with_verbose(verbose))
             .with(portfolio_clause_inliner(&problem, verbose));
         let result = pipeline.transform(dt_result.problem);
+        if !boundary_open() {
+            return None;
+        }
         if verbose {
             safe_eprintln!(
                 "Portfolio: BvToInt (decompose_limit={}) preprocessing: {} clauses -> {}",
@@ -975,7 +1287,8 @@ impl PreprocessSummary {
                 condense_result.back_translator,
             ],
         });
-        Self::from_parts(problem, result.problem, back_translator, bv_abstracted)
+        let summary = Self::from_parts(problem, result.problem, back_translator, bv_abstracted);
+        boundary_open().then_some(summary)
     }
 }
 
@@ -983,6 +1296,90 @@ impl PreprocessSummary {
 mod tests {
     use super::*;
     use crate::transform::TransformObligation;
+
+    #[test]
+    fn array_forwarding_limits_reject_pre_cancelled_preprocessing() {
+        let cancellation = crate::CancellationToken::new();
+        cancellation.cancel();
+        assert!(PreprocessSummary::build_array_forwarding_only_with_limits(
+            ChcProblem::new(),
+            false,
+            None,
+            &cancellation,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn exact_and_native_bv_limits_reject_closed_boundaries() {
+        let cancelled = crate::CancellationToken::new();
+        cancelled.cancel();
+        assert!(PreprocessSummary::build_int_only_with_limits(
+            ChcProblem::new(),
+            false,
+            None,
+            &cancelled,
+        )
+        .is_none());
+        assert!(PreprocessSummary::build_bv_native_with_limits(
+            ChcProblem::new(),
+            false,
+            None,
+            &cancelled,
+        )
+        .is_none());
+        assert!(PreprocessSummary::build_int_relaxed_with_limits(
+            ChcProblem::new(),
+            false,
+            None,
+            &cancelled,
+        )
+        .is_none());
+        assert!(
+            PreprocessSummary::build_int_with_decompose_limit_with_limits(
+                ChcProblem::new(),
+                false,
+                64,
+                None,
+                &cancelled,
+            )
+            .is_none()
+        );
+
+        let observer = crate::CancellationToken::new();
+        let expired = ay_core::time::Instant::now();
+        assert!(PreprocessSummary::build_int_only_with_limits(
+            ChcProblem::new(),
+            false,
+            Some(expired),
+            &observer,
+        )
+        .is_none());
+        assert!(PreprocessSummary::build_bv_native_with_limits(
+            ChcProblem::new(),
+            false,
+            Some(expired),
+            &observer,
+        )
+        .is_none());
+        assert!(PreprocessSummary::build_int_relaxed_with_limits(
+            ChcProblem::new(),
+            false,
+            Some(expired),
+            &observer,
+        )
+        .is_none());
+        assert!(
+            PreprocessSummary::build_int_with_decompose_limit_with_limits(
+                ChcProblem::new(),
+                false,
+                64,
+                Some(expired),
+                &observer,
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn shared_condense_translator_delegates_ground_translation() {

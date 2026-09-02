@@ -6,6 +6,12 @@
 //!
 //! Evaluates BV expressions to concrete `(value, width)` pairs for use in
 //! Array MBP index comparison, select-store reduction, and Ackermannization.
+//!
+//! This helper is deliberately the allocation-free `u128` MBP lane. It returns
+//! `None` for zero-width, wider-than-128, or otherwise malformed values. Wide
+//! reconstruction and fully concrete evaluation use the canonical BigUint-
+//! backed evaluator; BV projection treats `None` as inapplicability and falls
+//! back to exact model-value substitution.
 
 use crate::bv_util::{bv_apply_mask, bv_mask, bv_to_signed};
 use crate::{ChcExpr, ChcOp, ChcSort, SmtValue};
@@ -16,6 +22,7 @@ use super::Mbp;
 impl Mbp {
     /// Evaluate a bitvector expression under a model.
     /// Returns `(value, width)` where `value` is masked to `width` bits.
+    /// Deliberately declines widths outside `1..=128`.
     pub(crate) fn eval_bv(
         &self,
         expr: &ChcExpr,
@@ -24,13 +31,16 @@ impl Mbp {
         crate::expr::maybe_grow_expr_stack(|| {
             let _g = crate::expr::ExprDepthGuard::check()?;
             match expr {
-                ChcExpr::BitVec(v, w) => Some((*v, *w)),
+                ChcExpr::BitVec(v, w) if *w != 0 && *w <= 128 => Some((bv_apply_mask(*v, *w), *w)),
                 ChcExpr::Var(v) => match &v.sort {
-                    ChcSort::BitVec(_) => {
-                        if let Some(SmtValue::BitVec(val, w)) = model.get(&v.name) {
-                            Some((*val, *w))
-                        } else {
-                            None
+                    ChcSort::BitVec(expected_width)
+                        if *expected_width != 0 && *expected_width <= 128 =>
+                    {
+                        match model.get(&v.name) {
+                            Some(SmtValue::BitVec(val, w)) if w == expected_width => {
+                                Some((bv_apply_mask(*val, *w), *w))
+                            }
+                            _ => None,
                         }
                     }
                     _ => None,
@@ -62,6 +72,9 @@ impl Mbp {
     ) -> Option<(u128, u32)> {
         let (a, wa) = self.eval_bv(lhs, model)?;
         let (b, wb) = self.eval_bv(rhs, model)?;
+        if !matches!(op, ChcOp::BvConcat) && wa != wb {
+            return None;
+        }
         match op {
             ChcOp::BvAdd => {
                 debug_assert_eq!(wa, wb);
@@ -198,10 +211,11 @@ impl Mbp {
                 Some((if a == b { 1 } else { 0 }, 1))
             }
             ChcOp::BvConcat => {
-                let total_width = wa + wb;
+                let total_width = wa.checked_add(wb)?;
                 // Can only fold if result fits in u128 (#7040)
                 if total_width <= 128 {
-                    let result = (a << wb) | b;
+                    let shifted = if wb == 128 { 0 } else { a << wb };
+                    let result = shifted | b;
                     Some((bv_apply_mask(result, total_width), total_width))
                 } else {
                     None
@@ -228,17 +242,24 @@ impl Mbp {
                 Some((bv_apply_mask(v.wrapping_neg(), w), w))
             }
             ChcOp::BvExtract(hi, lo) => {
-                let (v, _w) = self.eval_bv(arg, model)?;
-                let width = hi - lo + 1;
-                Some(((v >> lo) & bv_mask(width), width))
+                let (v, input_width) = self.eval_bv(arg, model)?;
+                if hi < lo || *hi >= input_width {
+                    return None;
+                }
+                let width = hi.checked_sub(*lo)?.checked_add(1)?;
+                Some(((v >> *lo) & bv_mask(width), width))
             }
             ChcOp::BvZeroExtend(n) => {
                 let (v, w) = self.eval_bv(arg, model)?;
-                Some((v, w + n))
+                let new_w = w.checked_add(*n)?;
+                (new_w <= 128).then_some((v, new_w))
             }
             ChcOp::BvSignExtend(n) => {
                 let (v, w) = self.eval_bv(arg, model)?;
-                let new_w = w + n;
+                let new_w = w.checked_add(*n)?;
+                if new_w > 128 {
+                    return None;
+                }
                 let sa = bv_to_signed(v, w);
                 Some((bv_apply_mask(sa as u128, new_w), new_w))
             }
@@ -268,8 +289,8 @@ impl Mbp {
             }
             ChcOp::BvRepeat(n) => {
                 let (v, w) = self.eval_bv(arg, model)?;
-                let total = w * n;
-                if total > 128 {
+                let total = w.checked_mul(*n)?;
+                if *n == 0 || total == 0 || total > 128 {
                     return None;
                 }
                 let mut result = 0u128;

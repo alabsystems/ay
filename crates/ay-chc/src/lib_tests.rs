@@ -2446,3 +2446,75 @@ fn filtered_head_must_not_certify_a_non_inductive_model() {
          can be valid here; acceptance means a weakened head was used as a certificate."
     );
 }
+
+// ---------------------------------------------------------------------------
+// Unknown-reason attribution: body-forall over-approximation
+// ---------------------------------------------------------------------------
+
+fn overapproximation_reason_fixture() -> ChcProblem {
+    ChcParser::parse(
+        r#"(set-logic HORN)
+(declare-fun Inv (Int) Bool)
+(assert (forall ((x Int)) (=> (= x 0) (Inv x))))
+(assert (forall ((x Int)) (=> (and (Inv x) (= x 0)) false)))
+(check-sat)
+"#,
+    )
+    .expect("over-approximation reason fixture should parse")
+}
+
+#[test]
+fn overapproximated_refutation_is_reported_specifically_but_stays_unknown() {
+    let problem = overapproximation_reason_fixture();
+    let unsafe_result = VerifiedChcResult::Unsafe(VerifiedCounterexample::from_validated(
+        engine_result::skeleton_counterexample(&problem, 0),
+    ));
+
+    let downgraded = engines::downgrade_unsafe_if_overapproximated(unsafe_result, true);
+
+    assert!(downgraded.is_unknown());
+    assert_eq!(
+        downgraded.unknown_reason(),
+        Some(VerifiedUnknownReason::OverApproximatedRefutation)
+    );
+    assert_eq!(
+        downgraded.unknown_reason().map(|reason| reason.code()),
+        Some("overapproximated_refutation")
+    );
+}
+
+#[test]
+fn overapproximation_guard_leaves_every_other_verdict_and_reason_unchanged() {
+    let problem = overapproximation_reason_fixture();
+
+    let unsafe_without_flag = engines::downgrade_unsafe_if_overapproximated(
+        VerifiedChcResult::Unsafe(VerifiedCounterexample::from_validated(
+            engine_result::skeleton_counterexample(&problem, 0),
+        )),
+        false,
+    );
+    assert!(unsafe_without_flag.is_unsafe());
+
+    let safe_with_flag = engines::downgrade_unsafe_if_overapproximated(
+        VerifiedChcResult::Safe(VerifiedInvariant::from_validated(InvariantModel::new())),
+        true,
+    );
+    assert!(safe_with_flag.is_safe());
+
+    for original in [
+        VerifiedChcResult::from_validated(
+            engine_result::ChcEngineResult::Unknown,
+            engine_result::ValidationEvidence::FullVerification,
+        ),
+        VerifiedChcResult::from_validated(
+            engine_result::ChcEngineResult::NotApplicable,
+            engine_result::ValidationEvidence::FullVerification,
+        ),
+        VerifiedChcResult::unknown_candidate_not_admitted(),
+    ] {
+        let reason = original.unknown_reason();
+        let guarded = engines::downgrade_unsafe_if_overapproximated(original, true);
+        assert!(guarded.is_unknown());
+        assert_eq!(guarded.unknown_reason(), reason);
+    }
+}

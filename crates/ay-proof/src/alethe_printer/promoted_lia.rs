@@ -162,12 +162,18 @@ impl AlethePrinter<'_> {
             self.terms, &conflict, farkas,
         )
         .unwrap_or_else(|| farkas.coefficients.clone());
-        let printed_atoms: Vec<(String, bool)> = conflict
+        // Resolve signs from the complete effective clause literals, exactly
+        // like the publication replay. An override may be keyed on the outer
+        // `Not(equality)` and reverse the printed equality even though the
+        // stripped internal atom is unchanged. Carcara negates each clause
+        // literal while checking `la_generic`, hence the uniform `false`
+        // polarity here.
+        let printed_literals: Vec<(String, bool)> = clause
             .iter()
-            .map(|literal| (self.format_term(literal.term), literal.value))
+            .map(|&literal| (self.format_term(literal), false))
             .collect();
         crate::la_generic_signs::resolve_printed_la_generic_coefficients(
-            &printed_atoms,
+            &printed_literals,
             &existing,
             &farkas.coefficients,
         )

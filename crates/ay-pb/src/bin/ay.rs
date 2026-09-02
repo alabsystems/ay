@@ -40,15 +40,26 @@ const NONLINEAR_OPT_FRONTEND_TIMEOUT_RESERVE_MS: u64 = 600;
 // logging, and native conclusions land early or never — hence the small slice.
 // Values mirror the HUGE_OPT_STATS_TELEMETRY_SKIP_* magnitudes but stay
 // decoupled (proof-logging I/O dominates on huge instances).
-const OPT_CERT_NATIVE_SLICE_DIV: u32 = 6;
-const OPT_CERT_NATIVE_SLICE_DIV_HUGE: u32 = 12;
-const OPT_CERT_NATIVE_CEIL_DIV: u32 = 3;
-const OPT_CERT_NATIVE_CEIL_DIV_HUGE: u32 = 6;
-const OPT_CERT_IMPROVE_GRACE_DIV: u32 = 12;
-const OPT_CERT_IMPROVE_GRACE_MAX_MS: u64 = 30_000;
-const OPT_CERT_CERTIFY_RESERVE_DIV: u32 = 8;
-const OPT_CERT_CERTIFY_RESERVE_MIN_MS: u64 = 10_000;
-const OPT_CERT_CERTIFY_RESERVE_MAX_MS: u64 = 300_000;
+// The nine constants that size that slice and the reserve behind it are NOT
+// defined here. They live with the split in `ay_pb::proof` (module
+// `opt_budget`), because this file and `crates/ay/src/cmd_pb.rs` each carried a
+// verbatim copy of all of them PLUS `CertOptBudgetSplit`,
+// `compute_cert_opt_budget_split`, `certify_reserve`, `native_cap_expired`,
+// `extend_native_deadline` and a near-identical test for each — and the two
+// copies had already drifted apart in three ways. The two that are genuinely
+// per-binary are this binary's FLAGS (`--no-opt-cert-portfolio`,
+// `--cert-native-cap-ms`); they are passed in as `CertOptBudgetPolicy` rather
+// than forked into a second implementation.
+// `certify_reserve` is deliberately NOT imported here any more: the portfolio's
+// certification reserve is applied inside `ay_pb::opt_fallback`, with the search
+// it reserves against, so neither frontend can compute a different one.
+use ay_pb::proof::{
+    compute_cert_opt_budget_split, extend_native_deadline, native_cap_expired,
+    proof_slice_cut_note, CertOptBudgetPolicy, OPT_CERT_NATIVE_SLICE_DIV,
+};
+
+/// Minimum tail worth re-entering the native phase for. This one IS local: the
+/// native-tail retry it guards exists only in this binary.
 const OPT_CERT_NATIVE_TAIL_MIN_MS: u64 = 2_000;
 // The certificate chain's per-route budget is NOT configured here. It moved
 // into the chain itself (`ay_pb::proof::certify_opt_lin_any_interruptible`),
@@ -56,8 +67,6 @@ const OPT_CERT_NATIVE_TAIL_MIN_MS: u64 = 2_000;
 // its `CertRouteBudget`, and when the ladder was factored into the library the
 // budget stayed behind, so the library chain's three search rungs went back to
 // sharing one deadline for every other caller.
-const OPT_CERT_HUGE_MIN_VARS: u32 = 900_000;
-const OPT_CERT_HUGE_MIN_CONSTRAINTS: usize = 1_000_000;
 
 // MEMLIMIT enforcement allocator. `apply_memory_limit` sets the process memory
 // budget from the competition `MEMLIMIT`, and the solver consults
@@ -538,7 +547,7 @@ fn usage() -> String {
     concat!(
         "usage:\n",
         "  ay-pb pb solve  [--timeout MS] [--proof FILE] [--stats] [--stats-json]\n",
-        "                  [--cert-debug] FILE\n",
+        "                  [--cert-debug] [--memory-mb MB] FILE\n",
         "  ay-pb pb verify [--z3|--no-z3|--require-z3] [--z3-timeout SEC] INSTANCE.opb [SOLUTION]\n",
         "                  (SOLUTION is a solver-output file; omit to read it from stdin)"
     )
@@ -1181,7 +1190,7 @@ fn solve_opb<W: Write>(
                 out,
             )?;
             return solve_optimization_with_proof(
-                instance,
+                instance_arc,
                 objective,
                 proof_path,
                 timeout_dur,
@@ -2170,6 +2179,7 @@ fn solve_decision_with_proof(
 ) -> Result<PbSolveOutcome, String> {
     let temp_proof_path = prepare_proof_temp(proof_path)?;
     let split_enabled = dec_cert_portfolio_enabled() && timeout_dur.is_some();
+    let mut native_slice = Duration::ZERO;
     let native_deadline: Option<Instant> = if split_enabled {
         let remaining = timeout_dur
             .map(|timeout| timeout.saturating_sub(start.elapsed()))
@@ -2179,6 +2189,7 @@ fn solve_decision_with_proof(
         } else {
             remaining / OPT_CERT_NATIVE_SLICE_DIV
         };
+        native_slice = slice;
         Some(Instant::now() + slice)
     } else {
         None
@@ -2254,6 +2265,22 @@ fn solve_decision_with_proof(
         }
 
         if split_enabled {
+            // VISIBILITY GUARD. If PHASE N1 stopped because ITS OWN SLICE ran
+            // out while the caller's declared budget still had time on it, then
+            // any certificate miss this run reports is a property of the BUDGET
+            // SPLIT and not of the deadline. That was previously silent — the
+            // run just exits `s UNKNOWN` at the declared budget, indistinguishable
+            // from an honest timeout, which is what let a budget-indexed census
+            // read as a statement about the certificate machinery when it was a
+            // statement about the divisor. Diagnostic only: nothing branches on
+            // it and it cannot change a verdict.
+            if let Some(note) =
+                proof_slice_cut_note(native_slice, native_deadline, timeout_dur, start)
+            {
+                eprintln!("warning: {note}");
+                println!("c {note}");
+            }
+
             // Release the native proof-writer handle so the fallback phases
             // can overwrite the temp file (the partial proof is unusable).
             drop(solver);
@@ -2317,11 +2344,37 @@ fn solve_decision_with_proof(
                         let proof_file = File::create(&temp_proof_path).map_err(|e| {
                             format!("failed to create '{}': {e}", temp_proof_path.display())
                         })?;
-                        let mut tail_solver = PbCdclSolver::with_proof_writer_interruptible(
-                            instance,
-                            BufWriter::new(proof_file),
-                            native_cap(None),
-                        )
+                        // PHASE N2 must use the SAME writer as PHASE N1. It
+                        // hardcoded the legacy synchronous CpConstraint path
+                        // while N1 honoured `proof_tap_enabled()`, so the only
+                        // fallback able to produce a refutation ran on the
+                        // slower of the two engines — and it is much slower.
+                        // MEASURED on `normalized-50-750-false-45-90-4-8000opt`
+                        // (decision form), frozen `ay-pb-R2`, one input:
+                        //   dense tap, 66.7 s slice  -> 13065906 bytes in 40.9 s
+                        //   legacy,   300.0 s slice  -> 0 bytes, s UNKNOWN at 400 s
+                        // The legacy writer, handed 4.5x the slice the tap
+                        // needed, emitted nothing. So after N1 was cut by the
+                        // budget split the run spent the remaining 5/6 of its
+                        // budget in a phase that could not finish, which is why
+                        // a 60 s run reported `s UNKNOWN` on an instance the
+                        // tap refutes in 17 s. Honouring the flag here makes N2
+                        // a real fallback. Soundness is untouched: both writers
+                        // are fail-closed through `conclude_proof`, and every
+                        // emission is re-checked by the pinned VeriPB.
+                        let mut tail_solver = if proof_tap_enabled() {
+                            PbCdclSolver::with_proof_tap_interruptible(
+                                instance,
+                                BufWriter::with_capacity(1 << 20, proof_file),
+                                native_cap(None),
+                            )
+                        } else {
+                            PbCdclSolver::with_proof_writer_interruptible(
+                                instance,
+                                BufWriter::new(proof_file),
+                                native_cap(None),
+                            )
+                        }
                         .map_err(|e| format!("failed to initialize proof writer: {e}"))?;
                         tail_solver.set_native_code_helper_validation_enabled(
                             collect_native_helper_applications,
@@ -2374,106 +2427,6 @@ fn solve_decision_with_proof(
         cleanup_proof_temp(proof_path, &temp_proof_path);
     }
     result
-}
-
-/// Budget split for the certified-optimization pipeline. `None` deadlines mean
-/// the pipeline is ineligible and the native proof run is fully uncapped
-/// (today's behavior).
-struct CertOptBudgetSplit {
-    native_deadline: Option<Instant>,
-    native_hard_limit: Option<Instant>,
-    improve_grace: Duration,
-}
-
-impl CertOptBudgetSplit {
-    fn eligible(&self) -> bool {
-        self.native_deadline.is_some()
-    }
-}
-
-/// Decides whether the certified-optimization budget split applies and sizes
-/// the native slice. Eligibility: the kill switch is on, a timeout exists (an
-/// unbounded run keeps today's unbounded-native semantics), the objective is
-/// single-literal linear (the certification helpers' domain), and the
-/// objective range fits the optimizer (the portfolio bails Unsupported
-/// instantly on overflow, which would discard the whole fallback budget).
-fn compute_cert_opt_budget_split(
-    instance: &PbInstance,
-    objective: &ay_pb::PbObjective,
-    timeout_dur: Option<Duration>,
-    start: Instant,
-) -> CertOptBudgetSplit {
-    let uncapped = CertOptBudgetSplit {
-        native_deadline: None,
-        native_hard_limit: None,
-        improve_grace: Duration::ZERO,
-    };
-    let Some(timeout) = timeout_dur else {
-        return uncapped;
-    };
-    if !opt_cert_portfolio_enabled()
-        || !objective.terms.iter().all(|term| term.lits.len() == 1)
-        || !ay_pb::objective_range_fits_i64(objective)
-    {
-        return uncapped;
-    }
-
-    let now = Instant::now();
-    let remaining = timeout.saturating_sub(start.elapsed());
-    if let Some(cap_ms) = cert_native_cap_ms_override() {
-        let cap = Duration::from_millis(cap_ms);
-        return CertOptBudgetSplit {
-            native_deadline: Some(now + cap),
-            native_hard_limit: Some(now + cap),
-            improve_grace: Duration::ZERO,
-        };
-    }
-
-    let huge = instance.num_vars >= OPT_CERT_HUGE_MIN_VARS
-        || instance.constraints.len() >= OPT_CERT_HUGE_MIN_CONSTRAINTS;
-    let (slice_div, ceil_div) = if huge {
-        (
-            OPT_CERT_NATIVE_SLICE_DIV_HUGE,
-            OPT_CERT_NATIVE_CEIL_DIV_HUGE,
-        )
-    } else {
-        (OPT_CERT_NATIVE_SLICE_DIV, OPT_CERT_NATIVE_CEIL_DIV)
-    };
-    CertOptBudgetSplit {
-        native_deadline: Some(now + remaining / slice_div),
-        native_hard_limit: Some(now + remaining / ceil_div),
-        improve_grace: (remaining / OPT_CERT_IMPROVE_GRACE_DIV)
-            .min(Duration::from_millis(OPT_CERT_IMPROVE_GRACE_MAX_MS)),
-    }
-}
-
-fn native_cap_expired(deadline: &Cell<Option<Instant>>) -> bool {
-    deadline.get().is_some_and(|dl| Instant::now() >= dl)
-}
-
-/// Extends the native slice after a verified incumbent improvement: monotone,
-/// clamped at the hard ceiling, no-op when uncapped or grace-free.
-fn extend_native_deadline(deadline: &Cell<Option<Instant>>, split: &CertOptBudgetSplit) {
-    let (Some(current), Some(hard)) = (deadline.get(), split.native_hard_limit) else {
-        return;
-    };
-    if split.improve_grace.is_zero() {
-        return;
-    }
-    let extended = (Instant::now() + split.improve_grace).min(hard);
-    if extended > current {
-        deadline.set(Some(extended));
-    }
-}
-
-/// Reserve kept for the out-of-band certification re-solve after the fallback
-/// portfolio: `remaining/8` clamped to `[10s, 300s]`, never more than half of
-/// what is left.
-fn certify_reserve(remaining: Duration) -> Duration {
-    (remaining / OPT_CERT_CERTIFY_RESERVE_DIV)
-        .max(Duration::from_millis(OPT_CERT_CERTIFY_RESERVE_MIN_MS))
-        .min(Duration::from_millis(OPT_CERT_CERTIFY_RESERVE_MAX_MS))
-        .min(remaining / 2)
 }
 
 /// Streams a verified strictly-improving incumbent (o line + cache) exactly
@@ -2544,7 +2497,7 @@ enum OptCertFallbackOutcome {
 /// the caller's native tail is the only compliant UNSAT-proof source.
 #[allow(clippy::too_many_arguments)]
 fn try_opt_lin_cert_fallback(
-    instance: &PbInstance,
+    instance_arc: &Arc<PbInstance>,
     objective: &ay_pb::PbObjective,
     proof_path: &Path,
     temp_proof_path: &Path,
@@ -2554,78 +2507,32 @@ fn try_opt_lin_cert_fallback(
     best_solution: &Mutex<Option<PbExactSolution>>,
     on_improve: &mut dyn FnMut(i128, &[bool]),
 ) -> Result<OptCertFallbackOutcome, String> {
-    // The OPT-LIN-CERT helpers only handle single-literal (linear) objective
-    // terms (also enforced by the eligibility gate).
-    if objective.terms.iter().any(|term| term.lits.len() != 1) {
-        return Ok(OptCertFallbackOutcome::Declined(None));
-    }
-
-    // Portfolio deadline leaves the certification reserve; the certify stop
-    // closure below runs to the FULL timeout (absolute deadlines, so unused
-    // portfolio time rolls into certification).
-    let portfolio_timeout = timeout_dur.map(|timeout| {
-        let remaining = timeout.saturating_sub(start.elapsed());
-        timeout.saturating_sub(certify_reserve(remaining))
-    });
-    let portfolio_result = portfolio::solve_optimization_portfolio_with_timings(
-        instance,
+    // ALL the policy — which search runs, which candidate is admitted, which
+    // certificate rung fires — is in `ay_pb::opt_fallback`, shared verbatim with
+    // `crates/ay/src/cmd_pb.rs`. What is left here is this frontend's I/O.
+    // See that module's header for why there is no second copy any more.
+    let outcome = ay_pb::opt_fallback::run_opt_lin_cert_fallback(
+        instance_arc,
         objective,
-        portfolio_timeout,
+        timeout_dur,
         start,
         term_flag,
+        best_solution,
         on_improve,
     );
-    let timings = Some(portfolio_result.timings);
-    let portfolio_solution = portfolio_result.solution;
 
-    // Only a proven optimum is certifiable. Candidate WIDENING: check the
-    // portfolio's own OptimumFound first (so an opt-in strict policy can never
-    // narrow the candidate set), then try the checked optimum-upgrade gate.
-    // Either way the candidate is only a CANDIDATE — the certification
-    // helpers re-derive both bounds themselves.
-    let candidate = if portfolio_solution.status == PbStatus::OptimumFound {
-        portfolio_solution
-    } else {
-        let upgraded =
-            portfolio::finalize_optimum_verdict(portfolio_solution, instance, objective, &|| {
-                term_flag.load(Ordering::SeqCst)
-                    || timeout_expired(timeout_dur, start)
-                    || ay_sys::process_memory_exceeded()
-            });
-        if upgraded.status != PbStatus::OptimumFound {
+    let (pbp, route, solution, timings) = match outcome {
+        ay_pb::opt_fallback::OptLinCertFallback::Declined { timings } => {
             return Ok(OptCertFallbackOutcome::Declined(timings));
         }
-        upgraded
-    };
-    let Some(optimum) = candidate.objective else {
-        return Ok(OptCertFallbackOutcome::Declined(timings));
-    };
-    let incumbent = candidate.assignment;
-    if incumbent.len() != instance.num_vars as usize {
-        return Ok(OptCertFallbackOutcome::Declined(timings));
-    }
-
-    let should_stop = || {
-        term_flag.load(Ordering::SeqCst)
-            || timeout_expired(timeout_dur, start)
-            || ay_sys::process_memory_exceeded()
+        ay_pb::opt_fallback::OptLinCertFallback::Certified {
+            pbp,
+            route,
+            solution,
+            timings,
+        } => (pbp, route, solution, timings),
     };
 
-    // THE WHOLE CHAIN, cheapest-first, from the ONE library definition shared
-    // with the CLI (`crates/ay/src/cmd_pb.rs`). This site used to be a
-    // hand-written `.or_else(...)` ladder plus its own `CertRouteBudget`, and
-    // the CLI's copy of the same ladder is what drifted to two rungs while this
-    // one grew to eight. The per-route budget now lives WITH the chain, so a
-    // caller cannot get one without the other.
-    let Some((pbp, route)) = ay_pb::proof::certify_opt_lin_any_interruptible(
-        instance,
-        &incumbent,
-        optimum,
-        timeout_dur.map(|timeout| start + timeout),
-        &should_stop,
-    ) else {
-        return Ok(OptCertFallbackOutcome::Declined(timings));
-    };
     if ay_core::misc_cli_flags().cert_debug {
         eprintln!("c opt-lin-cert route: {} (fallback)", route.as_str());
     }
@@ -2635,11 +2542,6 @@ fn try_opt_lin_cert_fallback(
     commit_or_remove_proof(proof_path, temp_proof_path, true)?;
 
     // Cache the exact incumbent so downstream reporting can surface it.
-    let solution = PbSolution {
-        status: PbStatus::OptimumFound,
-        assignment: incumbent,
-        objective: Some(optimum),
-    };
     cache_exact_solution(
         best_solution,
         exact_solution_from_result(&solution, objective),
@@ -2722,7 +2624,7 @@ fn commit_certified_known_optimum(
 }
 
 fn solve_optimization_with_proof<W: Write>(
-    instance: &PbInstance,
+    instance_arc: &Arc<PbInstance>,
     objective: &ay_pb::PbObjective,
     proof_path: &Path,
     timeout_dur: Option<Duration>,
@@ -2732,8 +2634,25 @@ fn solve_optimization_with_proof<W: Write>(
     out: &mut PbOutputWriter<W>,
     best_solution: &Mutex<Option<PbExactSolution>>,
 ) -> Result<PbSolveOutcome, String> {
+    // Borrowed view for the body; the `Arc` is threaded on so the shared
+    // fallback (`ay_pb::opt_fallback`) has the SAME signature here as in the
+    // CLI. Wiring the two frontends identically is the point: the last
+    // regression in this area was one frontend learning a search route the
+    // other never got.
+    let instance: &PbInstance = instance_arc;
     let temp_proof_path = prepare_proof_temp(proof_path)?;
-    let split = compute_cert_opt_budget_split(instance, objective, timeout_dur, start);
+    // This binary's two flags are POLICY, handed to the one shared computation
+    // rather than forked into a second copy of it.
+    let split = compute_cert_opt_budget_split(
+        instance,
+        objective,
+        timeout_dur,
+        start,
+        CertOptBudgetPolicy {
+            enabled: opt_cert_portfolio_enabled(),
+            native_cap_ms: cert_native_cap_ms_override(),
+        },
+    );
     let native_deadline = Cell::new(split.native_deadline);
     let result = (|| {
         // PHASE N1: native proof-logging CDCL, capped at the split's slice
@@ -2813,6 +2732,26 @@ fn solve_optimization_with_proof<W: Write>(
             drop(solver);
             let mut portfolio_timings = None;
 
+            // VISIBILITY GUARD — see the decision path for the full argument.
+            // This is the arm the budget-indexed PB-certificate census measures,
+            // so an OPT-LIN row that misses because the SLICE (budget/6, ceiling
+            // budget/3) ran out rather than because the declared budget did must
+            // say so on its own line. Diagnostic only.
+            // The LIVE deadline, not `split.native_deadline`: an improvement
+            // grace may have extended it, and the note must report the slice
+            // the phase actually got, not the one it was first handed.
+            if let Some(note) = native_deadline.get().and_then(|dl| {
+                proof_slice_cut_note(
+                    dl.saturating_duration_since(start),
+                    Some(dl),
+                    timeout_dur,
+                    start,
+                )
+            }) {
+                eprintln!("warning: {note}");
+                let _ = out.write_comment(&note);
+            }
+
             if split.eligible() {
                 // PHASE P + C: portfolio (streaming through the same monotone
                 // bar) + out-of-band certification.
@@ -2829,7 +2768,7 @@ fn solve_optimization_with_proof<W: Write>(
                     );
                 };
                 match try_opt_lin_cert_fallback(
-                    instance,
+                    instance_arc,
                     objective,
                     proof_path,
                     &temp_proof_path,
@@ -5888,8 +5827,15 @@ mod tests {
         )
     }
 
+    // THE BUDGET SPLIT'S OWN TESTS ARE NOT HERE. They moved to
+    // `ay_pb::proof::opt_budget` with the implementation. This file and
+    // `crates/ay/src/cmd_pb.rs` each carried a copy of the code AND a copy of
+    // the tests, so the drift between the two implementations passed both
+    // suites. What is left here is the part that is genuinely this binary's:
+    // that its two FLAGS actually reach the shared computation.
+
     #[test]
-    fn test_cert_opt_budget_split_tiers_and_gates() {
+    fn test_cert_opt_budget_policy_plumbing() {
         let _serial = lock_env();
         let _cert = clear_cert_env();
 
@@ -5898,101 +5844,61 @@ mod tests {
         )
         .expect("fixture should parse");
         let objective = small.objective.clone().expect("objective present");
+        let budget = Some(Duration::from_mins(10));
 
-        // Eligible: capped slice strictly inside the budget, grace bounded.
+        // Default policy: eligible, slice ~R/6 strictly inside the budget.
         let split = compute_cert_opt_budget_split(
             &small,
             &objective,
-            Some(Duration::from_mins(10)),
+            budget,
             Instant::now(),
+            CertOptBudgetPolicy {
+                enabled: opt_cert_portfolio_enabled(),
+                native_cap_ms: cert_native_cap_ms_override(),
+            },
         );
         assert!(split.eligible());
-        let now = Instant::now();
-        let slice = split.native_deadline.unwrap() - now;
-        let ceiling = split.native_hard_limit.unwrap() - now;
-        assert!(
-            slice <= Duration::from_secs(101),
-            "slice ~R/6, got {slice:?}"
-        );
-        assert!(
-            ceiling <= Duration::from_secs(201),
-            "ceiling ~R/3, got {ceiling:?}"
-        );
-        assert!(slice < ceiling);
-        assert_eq!(split.improve_grace, Duration::from_secs(30)); // min(R/12, 30s)
+        assert!(split.native_deadline.unwrap() < split.native_hard_limit.unwrap());
 
-        // No timeout => fully uncapped (unbounded-native semantics preserved).
-        let unbounded = compute_cert_opt_budget_split(&small, &objective, None, Instant::now());
-        assert!(!unbounded.eligible());
-        assert!(unbounded.native_hard_limit.is_none());
+        // `--no-opt-cert-portfolio` must reach the split and make it ineligible.
+        {
+            let _off = set_opt_cert_portfolio(false);
+            let split = compute_cert_opt_budget_split(
+                &small,
+                &objective,
+                budget,
+                Instant::now(),
+                CertOptBudgetPolicy {
+                    enabled: opt_cert_portfolio_enabled(),
+                    native_cap_ms: cert_native_cap_ms_override(),
+                },
+            );
+            assert!(
+                !split.eligible(),
+                "--no-opt-cert-portfolio must restore native-only behaviour"
+            );
+        }
 
-        // Multi-literal (non-linear) objective term => ineligible.
-        let product_objective = ay_pb::PbObjective {
-            terms: vec![ay_pb::PbTerm {
-                coeff: 1,
-                lits: vec![
-                    ay_pb::PbLit {
-                        var: 1,
-                        negated: false,
-                    },
-                    ay_pb::PbLit {
-                        var: 2,
-                        negated: false,
-                    },
-                ],
-            }],
-        };
-        let nonlinear = compute_cert_opt_budget_split(
-            &small,
-            &product_objective,
-            Some(Duration::from_mins(10)),
-            Instant::now(),
-        );
-        assert!(!nonlinear.eligible());
-    }
-
-    #[test]
-    fn test_certify_reserve_clamps() {
-        // remaining/8 clamped to [10s, 300s], never more than remaining/2.
-        assert_eq!(
-            certify_reserve(Duration::from_secs(10)),
-            Duration::from_secs(5)
-        );
-        assert_eq!(
-            certify_reserve(Duration::from_secs(800)),
-            Duration::from_secs(100)
-        );
-        assert_eq!(
-            certify_reserve(Duration::from_mins(50)),
-            Duration::from_mins(5)
-        );
-    }
-
-    #[test]
-    fn test_extend_native_deadline_monotone_and_clamped() {
-        let now = Instant::now();
-        let split = CertOptBudgetSplit {
-            native_deadline: Some(now + Duration::from_secs(10)),
-            native_hard_limit: Some(now + Duration::from_secs(20)),
-            improve_grace: Duration::from_mins(1),
-        };
-        let cell = Cell::new(split.native_deadline);
-        extend_native_deadline(&cell, &split);
-        // Grace (60s) clamps at the 20s hard ceiling.
-        assert_eq!(cell.get(), split.native_hard_limit);
-        // Monotone: a second extension cannot move it backwards or past.
-        extend_native_deadline(&cell, &split);
-        assert_eq!(cell.get(), split.native_hard_limit);
-
-        // Uncapped split: extension is a no-op.
-        let uncapped = CertOptBudgetSplit {
-            native_deadline: None,
-            native_hard_limit: None,
-            improve_grace: Duration::from_mins(1),
-        };
-        let free = Cell::new(None);
-        extend_native_deadline(&free, &uncapped);
-        assert_eq!(free.get(), None);
+        // `--cert-native-cap-ms` must reach the split and pin slice == ceiling.
+        {
+            let _cap = set_cert_native_cap_ms(1_500);
+            let split = compute_cert_opt_budget_split(
+                &small,
+                &objective,
+                budget,
+                Instant::now(),
+                CertOptBudgetPolicy {
+                    enabled: opt_cert_portfolio_enabled(),
+                    native_cap_ms: cert_native_cap_ms_override(),
+                },
+            );
+            assert!(split.eligible());
+            assert_eq!(
+                split.native_deadline, split.native_hard_limit,
+                "--cert-native-cap-ms pins the ceiling to the slice"
+            );
+            assert_eq!(split.improve_grace, Duration::ZERO);
+        }
     }
 
     #[test]

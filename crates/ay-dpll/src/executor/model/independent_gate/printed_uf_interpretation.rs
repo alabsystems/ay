@@ -4,6 +4,8 @@
 
 //! Construction of reconciled printed-UF interpretations.
 
+use ay_core::kani_compat::DetHashSet;
+
 use super::*;
 
 impl IndependentModelView<'_> {

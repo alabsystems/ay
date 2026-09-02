@@ -22,7 +22,7 @@ impl Tseitin<'_> {
                 if positive {
                     var
                 } else {
-                    -var
+                    Self::negate(var)
                 }
             }
             TermData::Const(Constant::Bool(false)) => {
@@ -30,11 +30,15 @@ impl Tseitin<'_> {
                 // annotate the unit with the strict-validated `false` tautology
                 // ([(not false)] is a 0-var tautology) (#verification-route).
                 let var = self.get_var(term_id) as i32;
-                self.add_clause_with_proof(CnfClause::unit(-var), AletheRule::False, term_id);
+                self.add_clause_with_proof(
+                    CnfClause::unit(Self::negate(var)),
+                    AletheRule::False,
+                    term_id,
+                );
                 if positive {
                     var
                 } else {
-                    -var
+                    Self::negate(var)
                 }
             }
             TermData::Const(_) => {
@@ -94,12 +98,12 @@ impl Tseitin<'_> {
 
         // v -> ite(c, t, e): ite_pos2 and ite_pos1
         self.add_clause_with_proof(
-            CnfClause::ternary(Self::negate(c_lit), -v, t_lit),
+            CnfClause::ternary(Self::negate(c_lit), Self::negate(v), t_lit),
             AletheRule::ItePos2,
             term_id,
         );
         self.add_clause_with_proof(
-            CnfClause::ternary(c_lit, -v, e_lit),
+            CnfClause::ternary(c_lit, Self::negate(v), e_lit),
             AletheRule::ItePos1,
             term_id,
         );
@@ -119,12 +123,12 @@ impl Tseitin<'_> {
         // Since encoding is complete, cache both polarities so later encodes
         // don't duplicate clauses under the opposite polarity.
         self.encoded.insert((term_id, true), v);
-        self.encoded.insert((term_id, false), -v);
+        self.encoded.insert((term_id, false), Self::negate(v));
 
         if positive {
             v
         } else {
-            -v
+            Self::negate(v)
         }
     }
 
@@ -166,7 +170,7 @@ impl Tseitin<'_> {
             // ([(and)] is the degenerate n=0 and_neg tautology) (#verification-route).
             let var = self.get_var(term_id) as i32;
             self.add_clause_with_proof(CnfClause::unit(var), AletheRule::AndNeg, term_id);
-            return if positive { var } else { -var };
+            return if positive { var } else { Self::negate(var) };
         }
 
         if args.len() == 1 {
@@ -184,7 +188,7 @@ impl Tseitin<'_> {
         // v → ai for each i: and_pos(i) tautology
         for (i, &a_lit) in arg_lits.iter().enumerate() {
             self.add_clause_with_proof(
-                CnfClause::binary(-v, a_lit),
+                CnfClause::binary(Self::negate(v), a_lit),
                 AletheRule::AndPos(i as u32),
                 term_id,
             );
@@ -198,7 +202,7 @@ impl Tseitin<'_> {
         if positive {
             v
         } else {
-            -v
+            Self::negate(v)
         }
     }
 
@@ -207,8 +211,12 @@ impl Tseitin<'_> {
             // empty (or) = false. Register var->term + strict or_pos annotation
             // ([(not (or))] is the degenerate or_pos tautology) (#verification-route).
             let var = self.get_var(term_id) as i32;
-            self.add_clause_with_proof(CnfClause::unit(-var), AletheRule::OrPos(0), term_id);
-            return if positive { var } else { -var };
+            self.add_clause_with_proof(
+                CnfClause::unit(Self::negate(var)),
+                AletheRule::OrPos(0),
+                term_id,
+            );
+            return if positive { var } else { Self::negate(var) };
         }
 
         if args.len() == 1 {
@@ -224,7 +232,7 @@ impl Tseitin<'_> {
         let arg_lits: Vec<CnfLit> = args.iter().map(|&a| self.encode(a, true)).collect();
 
         // v → (a1 ∨ ... ∨ an): or_pos tautology
-        let mut clause_lits = vec![-v];
+        let mut clause_lits = vec![Self::negate(v)];
         clause_lits.extend(arg_lits.iter().copied());
         self.add_clause_with_proof(CnfClause::new(clause_lits), AletheRule::OrPos(0), term_id);
 
@@ -241,7 +249,7 @@ impl Tseitin<'_> {
         if positive {
             v
         } else {
-            -v
+            Self::negate(v)
         }
     }
 
@@ -261,13 +269,13 @@ impl Tseitin<'_> {
 
             // (¬v ∨ ¬a ∨ b): equiv_pos2
             self.add_clause_with_proof(
-                CnfClause::ternary(-v, Self::negate(a_lit), b_lit),
+                CnfClause::ternary(Self::negate(v), Self::negate(a_lit), b_lit),
                 AletheRule::EquivPos2,
                 term_id,
             );
             // (¬v ∨ a ∨ ¬b): equiv_pos1
             self.add_clause_with_proof(
-                CnfClause::ternary(-v, a_lit, Self::negate(b_lit)),
+                CnfClause::ternary(Self::negate(v), a_lit, Self::negate(b_lit)),
                 AletheRule::EquivPos1,
                 term_id,
             );
@@ -287,7 +295,7 @@ impl Tseitin<'_> {
             if positive {
                 v
             } else {
-                -v
+                Self::negate(v)
             }
         } else {
             // Theory equality - create a variable
@@ -310,13 +318,13 @@ impl Tseitin<'_> {
 
         // (¬v ∨ a ∨ b): xor_pos1
         self.add_clause_with_proof(
-            CnfClause::ternary(-v, a_lit, b_lit),
+            CnfClause::ternary(Self::negate(v), a_lit, b_lit),
             AletheRule::XorPos1,
             term_id,
         );
         // (¬v ∨ ¬a ∨ ¬b): xor_pos2
         self.add_clause_with_proof(
-            CnfClause::ternary(-v, Self::negate(a_lit), Self::negate(b_lit)),
+            CnfClause::ternary(Self::negate(v), Self::negate(a_lit), Self::negate(b_lit)),
             AletheRule::XorPos2,
             term_id,
         );
@@ -336,7 +344,7 @@ impl Tseitin<'_> {
         if positive {
             v
         } else {
-            -v
+            Self::negate(v)
         }
     }
 }

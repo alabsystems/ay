@@ -483,17 +483,23 @@ fn test_cross_theory_euf_lia_conflict_split() {
         !proof_text.contains(":rule hole"),
         "no step of this refutation may be degraded to a hole:\n{proof_text}"
     );
-    // EXACT WIRE TEXT. `(> (f b) 5)` is the authored spelling of the atom AY
-    // interned as `(< 5 (f b))` (`mk_gt` swaps and converses), so the printed
-    // clause IS the validated clause. Pinning the whole step keeps that
-    // specific: re-canonicalizing the surface, dropping the `:args`, or
-    // reordering the literals fails here, not merely in `contains` above.
+    // EXACT WIRE TEXT. `(> (f b) 5)` is confined to its authored assume, then
+    // a checked `comp_simplify` bridge derives AY's canonical `(< 5 (f b))`.
+    // The Farkas step consumes that canonical unit and carries the exact
+    // checked coefficient vector. Pinning both steps prevents either an
+    // unbridged source rewrite or a coefficient-free/holey arithmetic leaf.
     assert!(
-        proof_text.contains("(assume t2 (> (f b) 5))")
+        proof_text.contains("(assume t2.a (> (f b) 5))")
+            && proof_text.contains(
+                "(step t2.n (cl (= (> (f b) 5) (< 5 (f b)))) :rule trans :premises (t2.n.s0 t2.n.s1))"
+            )
+            && proof_text.contains(
+                "(step t2 (cl (< 5 (f b))) :rule resolution :premises (t2.e t2.n t2.a))"
+            )
             && proof_text
-                .contains("(cl (not (= 5 (f b))) (not (> (f b) 5))) :rule la_generic :args (1 1)"),
-        "the assume must keep the problem's spelling and the la_generic must \
-         carry that same orientation with its coefficients:\n{proof_text}"
+                .contains("(cl (not (= 5 (f b))) (not (< 5 (f b)))) :rule la_generic :args (1 1)"),
+        "the authored comparison must bridge to the canonical Farkas row with \
+         its checked coefficients:\n{proof_text}"
     );
     assert_last_unsat_proof_is_strict(&exec);
 }

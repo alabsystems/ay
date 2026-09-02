@@ -137,6 +137,28 @@ impl GlobalSoundFloor {
     pub(crate) fn from_structural_constraint_floor(value: i128) -> Self {
         Self { value }
     }
+
+    /// AUDITED SOURCE: `crate::proof::recovered_structural_search_floor` —
+    /// the certifier-recovery structural floors (FLOORS AS BOUNDS; today only
+    /// `odd-cycle-cover`).
+    ///
+    /// The value is the packing bound of the SAME fail-closed recovery the
+    /// `odd-cycle-cover` certificate route re-runs at emission: on the
+    /// (structurally verified) pure-vertex-cover family, vertex-disjoint odd
+    /// cycles contribute `ceil(L/2)` each and residual matched edges `1` each,
+    /// so the sum lower-bounds `Σ_v x_v` over ALL feasible points — the full
+    /// counting argument and its audit trail (1,282-case brute-force fuzz,
+    /// zero overshoots; byte-identical independent reimplementation) live on
+    /// `odd_cycle_cover::recovered_floor`. The floor is global-sound by that
+    /// argument alone; the emission it mirrors is additionally re-proved by
+    /// the pinned external checker every time the certificate route fires.
+    ///
+    /// Consumers apply it exactly like the constraint floor above: monotone
+    /// `max` on the bus, and any OPTIMUM upgrade it licenses re-verifies the
+    /// incumbent from raw bits first (`shared_bounds_optimum_upgrade`).
+    pub(crate) fn from_certifier_recovery(value: i128) -> Self {
+        Self { value }
+    }
 }
 
 /// The parallel-portfolio bound bus (design §3.1). See the module docs for the

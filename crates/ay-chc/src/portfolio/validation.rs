@@ -8,7 +8,8 @@
 //! per-engine result types into the unified `PortfolioResult`.
 
 use super::preprocess::sort_contains_recursive_bv;
-use super::{EngineResult, PortfolioResult, PortfolioSolver};
+use super::types::EngineResult;
+use super::{PortfolioResult, PortfolioSolver};
 use crate::pdr::{
     CexVerificationResult, Counterexample, InvariantModel, PdrConfig, PdrSolver,
     PredicateInterpretation,
@@ -40,20 +41,43 @@ const VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// The returned ground derivation is still only candidate evidence: every
 /// acceptance site re-validates it on the clauses it owns.
+/// `cancellation` is the portfolio/caller authority already governing that
+/// acceptance path; witness completion must not create an unrelated token.
 pub(crate) fn backtranslate_counterexample_with_ground_evidence(
     back_translator: &dyn BackTranslator,
     original_problem: &ChcProblem,
     cex: &Counterexample,
+    cancellation: &crate::CancellationToken,
 ) -> Counterexample {
+    let boundary_closed = || {
+        cancellation.is_cancelled()
+            || crate::smt::current_thread_solve_deadline()
+                .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
+    };
+    if boundary_closed() {
+        let mut untranslated = cex.clone();
+        untranslated.ground_derivation = None;
+        return untranslated;
+    }
     let mut translated = back_translator.translate_invalidity(cex.clone());
+    if boundary_closed() {
+        translated.ground_derivation = None;
+        return translated;
+    }
     let Some(transformed_derivation) = &cex.ground_derivation else {
         return translated;
     };
 
-    let _witness_budget = crate::ground_derivation::witness::ScopedWitnessChainBudget::new();
+    let _witness_budget = crate::ground_derivation::witness::ScopedWitnessChainBudget::new_bounded(
+        crate::smt::current_thread_solve_deadline(),
+        cancellation.clone(),
+    );
     translated.ground_derivation = back_translator
         .translate_ground_derivation(transformed_derivation)
         .and_then(|candidate| {
+            if boundary_closed() {
+                return None;
+            }
             match crate::ground_derivation::validate_ground_derivation(original_problem, &candidate)
             {
                 Ok(()) => Some(candidate),
@@ -65,6 +89,9 @@ pub(crate) fn backtranslate_counterexample_with_ground_evidence(
                 }
             }
         });
+    if boundary_closed() {
+        translated.ground_derivation = None;
+    }
     translated
 }
 
@@ -207,6 +234,9 @@ impl PortfolioSolver {
         &self,
         model: &InvariantModel,
     ) -> Result<InvariantModel, String> {
+        if self.cancellation_token.is_cancelled() || self.construction_boundary_exhausted() {
+            return Err("portfolio boundary closed before Safe-model back-translation".to_string());
+        }
         // Back-translate the model to the original problem vocabulary
         if self.config.verbose {
             for (pid, interp) in model.iter() {
@@ -225,6 +255,9 @@ impl PortfolioSolver {
         let profile = accept_profile_enabled();
         let t_translate = ay_core::time::Instant::now();
         let mut translated_model = self.back_translator.translate_validity(model.clone());
+        if self.cancellation_token.is_cancelled() || self.construction_boundary_exhausted() {
+            return Err("portfolio boundary closed during Safe-model back-translation".to_string());
+        }
         if profile {
             safe_eprintln!(
                 "[ACCEPT-PROF] back_translate_safe_model dt={:.3}s",
@@ -597,6 +630,7 @@ impl PortfolioSolver {
             self.back_translator.as_ref(),
             &self.original_problem,
             cex,
+            &self.cancellation_token,
         );
 
         // Defense in depth for #6047/#6293: after back-translation, witness instances for

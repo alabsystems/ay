@@ -5,6 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 use super::*;
 use crate::smt::SmtValue;
+use num_bigint::BigUint;
 
 fn bv_var(name: &str, width: u32) -> Arc<ChcExpr> {
     Arc::new(ChcExpr::var(ChcVar::new(name, ChcSort::BitVec(width))))
@@ -32,6 +33,51 @@ fn test_bv_concat_sort_adds_widths() {
     let b = bv_var("b", 8);
     let concat = ChcExpr::Op(ChcOp::BvConcat, vec![a, b]);
     assert_eq!(concat.sort(), ChcSort::BitVec(16));
+}
+
+#[test]
+fn exact_biguint_bitvector_constructor_preserves_wide_literals() {
+    let value =
+        (BigUint::from(1_u8) << 255) | (BigUint::from(1_u8) << 128) | BigUint::from(0x5a_u8);
+    let expr = ChcExpr::bitvec_from_biguint(&value, 256)
+        .expect("a positive bit-vector width should be accepted");
+
+    assert_eq!(expr.sort(), ChcSort::BitVec(256));
+    assert_eq!(
+        evaluate_expr(&expr, &FxHashMap::default()),
+        Some(SmtValue::bitvec_from_biguint(value, 256))
+    );
+}
+
+#[test]
+fn exact_biguint_bitvector_constructor_uses_smt_modulo_semantics() {
+    let value = (BigUint::from(1_u8) << 200) | BigUint::from(7_u8);
+    let expr = ChcExpr::bitvec_from_biguint(&value, 129)
+        .expect("a positive bit-vector width should be accepted");
+
+    assert_eq!(expr.sort(), ChcSort::BitVec(129));
+    assert_eq!(
+        evaluate_expr(&expr, &FxHashMap::default()),
+        Some(SmtValue::bitvec_from_biguint(BigUint::from(7_u8), 129))
+    );
+    assert!(matches!(
+        ChcExpr::bitvec_from_biguint(&BigUint::from(0_u8), 0),
+        Err(crate::ChcError::InvalidBitVectorWidth { width: 0, .. })
+    ));
+    assert!(matches!(
+        ChcExpr::bitvec_from_biguint(&BigUint::from(0_u8), crate::MAX_BITVECTOR_WIDTH + 1),
+        Err(crate::ChcError::InvalidBitVectorWidth { .. })
+    ));
+
+    let decimal: BigUint = (BigUint::from(1_u8) << 128_usize) | BigUint::from(3_u8);
+    let parsed = ChcExpr::bitvec_from_str_radix(&decimal.to_str_radix(10), 10, 129)
+        .expect("a typed frontend's decimal wide literal should parse exactly");
+    assert_eq!(
+        evaluate_expr(&parsed, &FxHashMap::default()),
+        Some(SmtValue::bitvec_from_biguint(decimal, 129))
+    );
+    assert!(ChcExpr::bitvec_from_str_radix("not-a-number", 10, 129).is_err());
+    assert!(ChcExpr::bitvec_from_str_radix("1", 1, 129).is_err());
 }
 
 #[test]

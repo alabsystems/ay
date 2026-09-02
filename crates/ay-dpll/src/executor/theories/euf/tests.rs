@@ -4,7 +4,7 @@
 
 use super::ArrayAxiomMode;
 use crate::Executor;
-use ay_core::{Sort, TermData};
+use ay_core::{Sort, TermData, TermId, TermStore};
 use ay_frontend::parse;
 
 fn run_script(input: &str) -> Vec<String> {
@@ -12,6 +12,23 @@ fn run_script(input: &str) -> Vec<String> {
     let mut exec = Executor::new();
     exec.execute_all(&commands)
         .expect("SMT-LIB script should execute")
+}
+
+/// First unary application of `name` to `arg` in the term store, if any.
+///
+/// Constructor and selector applications carry no user-visible name to
+/// `lookup`, so a structural scan is the only way to observe that a pass BUILT
+/// one.
+fn unary_application(terms: &TermStore, name: &str, arg: TermId) -> Option<TermId> {
+    (0..terms.len())
+        .map(|idx| TermId(idx as u32))
+        .find(|&term| {
+            matches!(
+                terms.get(term),
+                TermData::App(sym, args)
+                    if sym.name() == name && args.len() == 1 && args[0] == arg
+            )
+        })
 }
 
 fn prepare_executor(input: &str) -> Executor {
@@ -1144,6 +1161,96 @@ fn array_extensionality_skips_skolem_with_select_alias_witness_8785() {
     );
 }
 
+/// The TOP-LEVEL datatype-disequality bridge must keep reaching NON-array
+/// pairs after `add_array_extensionality_axioms_up_to` stopped feeding it
+/// ARRAY-sorted ones.
+///
+/// `(distinct x y)` is the spelling that reaches the bridge at all. Eager
+/// single-constructor destructuring rewrites `(not (= x y))` all the way down
+/// to its FIELD pair `(not (= x!g y!g))`, which is array-sorted and belongs to
+/// the extensionality generator's own loop; `(distinct x y)` instead leaves a
+/// disequality between the two CONSTRUCTOR APPLICATIONS at the datatype sort,
+/// and only this bridge serves that. So the array skip is placed at the
+/// depth-0 entry point ONLY: a datatype-sorted pair must still get the
+/// single-constructor exhaustiveness+injectivity clause
+/// `(= x y) OR not (= (g x) (g y))`, and the ARRAY-sorted constructor FIELD
+/// the descent then uncovers must still get its own fresh difference witness
+/// plus the field-level extensionality clause — neither of which the
+/// generator's loop can produce, because `(= (g x) (g y))` does not exist in
+/// the term store until this bridge builds it. Widening the array skip past
+/// depth 0 deletes both, and that is the regression this pins.
+#[test]
+fn top_level_datatype_disequality_bridge_reaches_array_field() {
+    let mut exec = prepare_executor(
+        r#"
+        (set-logic ALL)
+        (declare-datatype U1 ((mk (g (Array Int Bool)))))
+        (declare-const x U1)
+        (declare-const y U1)
+        (assert (distinct x y))
+    "#,
+    );
+
+    // Eager destructuring names the FIELD, not the constant; the datatype-sorted
+    // term the assertion actually mentions is the constructor application.
+    let x_field = exec.ctx.terms.lookup("x!g").expect("x's field declared");
+    let y_field = exec.ctx.terms.lookup("y!g").expect("y's field declared");
+    let x = unary_application(&exec.ctx.terms, "mk", x_field).expect("x is mk(x!g)");
+    let y = unary_application(&exec.ctx.terms, "mk", y_field).expect("y is mk(y!g)");
+    assert_eq!(
+        exec.ctx.terms.sort(x),
+        &Sort::Uninterpreted("U1".to_string()),
+        "the top-level pair this bridge owns must be datatype-sorted, not array-sorted"
+    );
+
+    exec.add_array_extensionality_axioms();
+
+    let g_x = unary_application(&exec.ctx.terms, "g", x)
+        .expect("the bridge must build the `g` field of x");
+    let g_y = unary_application(&exec.ctx.terms, "g", y)
+        .expect("the bridge must build the `g` field of y");
+
+    let eq_xy = exec.ctx.terms.mk_eq(x, y);
+    let eq_fields = exec.ctx.terms.mk_eq(g_x, g_y);
+    let not_eq_fields = exec.ctx.terms.mk_not(eq_fields);
+    let injectivity = exec.ctx.terms.mk_or(vec![eq_xy, not_eq_fields]);
+    assert!(
+        exec.ctx.assertions.contains(&injectivity),
+        "a single-constructor datatype disequality must force the field pair apart"
+    );
+    assert!(
+        exec.dt_solver_added_axiom_terms.contains(&injectivity),
+        "the generated datatype theorem must carry validator provenance"
+    );
+
+    // A clause with the same broad Boolean shape but an unrelated selector
+    // comparison is not a datatype theorem. Authority is exact generator
+    // provenance, never shape-based recognition.
+    let reflexive_field_eq = exec.ctx.terms.mk_eq(g_x, g_x);
+    let false_field_literal = exec.ctx.terms.mk_not(reflexive_field_eq);
+    let unauthenticated_lookalike = exec.ctx.terms.mk_or(vec![eq_xy, false_field_literal]);
+    assert!(
+        !exec
+            .dt_solver_added_axiom_terms
+            .contains(&unauthenticated_lookalike),
+        "a non-generated lookalike must not gain datatype-axiom authority"
+    );
+
+    let witness = exec
+        .array_ext_witness_cache
+        .pair_witness(&exec.ctx.terms, g_x, g_y)
+        .expect("the array-sorted constructor field needs its own difference witness");
+    let sel_x = exec.ctx.terms.mk_select(g_x, witness);
+    let sel_y = exec.ctx.terms.mk_select(g_y, witness);
+    let sel_eq = exec.ctx.terms.mk_eq(sel_x, sel_y);
+    let not_sel_eq = exec.ctx.terms.mk_not(sel_eq);
+    let field_ext = exec.ctx.terms.mk_or(vec![eq_fields, not_sel_eq]);
+    assert!(
+        exec.ctx.assertions.contains(&field_ext),
+        "the field-level extensionality clause must be asserted, not merely cached"
+    );
+}
+
 #[test]
 fn array_extensionality_skips_top_level_positive_array_equality_8785() {
     let mut exec = prepare_executor(
@@ -1365,7 +1472,7 @@ fn storechain_colliding_indices_axiom_debug_7654() {
 
     // Dump all terms
     for idx in 0..exec.ctx.terms.len() {
-        let tid = ay_core::TermId(idx as u32);
+        let tid = TermId(idx as u32);
         eprintln!(
             "  term[{:?}]: {:?}  sort={:?}",
             tid,

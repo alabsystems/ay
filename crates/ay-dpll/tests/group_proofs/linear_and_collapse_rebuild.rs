@@ -52,6 +52,7 @@ fn strict_quality(exec: &Executor) -> ProofQuality {
 fn test_let_conjunction_cancelling_conjunct_rebuilds_strict() {
     let script = r#"
         (set-option :produce-proofs true)
+        (set-option :check-proofs-strict true)
         (set-logic QF_LIA)
         (declare-fun x0 () Int)
         (declare-fun x1 () Int)
@@ -62,6 +63,10 @@ fn test_let_conjunction_cancelling_conjunct_rebuilds_strict() {
     "#;
     let (exec, alethe) = solve_unsat(script);
     let quality = strict_quality(&exec);
+    assert!(
+        !exec.unsat_proof_has_known_wire_gap(),
+        "the source-exact certified let bridge must pass the terminal wire gate"
+    );
     assert_eq!(quality.trust_count, 0, "no trust steps: {quality}");
     assert_eq!(quality.hole_count, 0, "no hole steps: {quality}");
     assert!(

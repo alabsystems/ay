@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 mod milp_lane;
+pub mod opt_fallback;
 
 // Preserve every root-level type, function, and public module from the former
 // monolithic crate. The explicit `portfolio`/`dev_tools` modules below shadow

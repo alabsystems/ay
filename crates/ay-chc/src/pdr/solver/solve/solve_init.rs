@@ -235,7 +235,7 @@ impl PdrSolver {
         let mut config = crate::BmcConfig::with_engine_config(
             max_depth,
             false,
-            self.config.cancellation_token.clone(),
+            self.config.effective_cancellation_token(),
         );
         config.per_depth_timeout = Some(std::time::Duration::from_millis(250));
         config.time_budget = Some(std::time::Duration::from_secs(2));

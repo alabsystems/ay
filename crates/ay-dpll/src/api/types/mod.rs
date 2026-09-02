@@ -220,3 +220,7 @@ pub use verification::{
     AY_SOLVE_DECISION_PROFILE_MODEL_CONSUMER_SCHEMA_VERSION,
     AY_SOLVE_DECISION_PROFILE_SUMMARY_SCHEMA, AY_SOLVE_DECISION_PROFILE_SUMMARY_SCHEMA_VERSION,
 };
+// Attributed reason a refutation carries no derivation. Re-exported beside
+// `VerificationSummary` because `VerificationSummary::unsat_proof_decline`
+// returns it and consumers must be able to name the type. Diagnostic only.
+pub use crate::executor::ProofDeclineMechanism;

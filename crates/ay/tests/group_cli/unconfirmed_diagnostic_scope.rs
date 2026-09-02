@@ -83,16 +83,30 @@ fn a_corroborating_probe_does_not_report_its_own_non_certification() {
 /// The guard is scoped to nested discharge solves only. If it ever silenced the
 /// user's own query, an uncertified verdict would ship unannounced -- strictly
 /// worse than the noise it removes.
+///
+/// FIXTURE HISTORY: the original fixture (a `forall` over `f` refuted by one
+/// ground instance) was chosen because AY could compute its UNSAT but not
+/// certify it. The #quant-unit-authority campaign (c674b5e43 and successors)
+/// deliberately taught the exact-fragment builder to certify precisely that
+/// `forall_inst` chain, so the old fixture now publishes a trust-free,
+/// self-checkable certificate and no longer exercises this announcement at
+/// all. Today's fixture contradicts two `mod` constraints -- `x = 3 (mod 4)`
+/// forces `x` odd while `x = 0 (mod 2)` forces it even -- which AY refutes
+/// internally but cannot back with a fully-checked refutation proof, so
+/// `--self-check` withholds the verdict through the same funnel
+/// (`check_sat.rs` self-check gate -> `record_model_validation_unknown_diagnostic`).
+/// If THIS fixture ever certifies too, replace it with another genuinely
+/// uncertifiable query rather than deleting the assertions: the announcement
+/// itself is what is under test.
 #[test]
 #[timeout(30_000)]
 fn a_user_level_non_certification_is_still_announced() {
     let (_, stdout, stderr) = run(
         &["--self-check"],
-        "(set-logic QF_UFLIA)\n\
-         (declare-fun f (Int) Int)\n\
-         (declare-const a Int)\n\
-         (assert (forall ((x Int)) (> (f x) 0)))\n\
-         (assert (< (f a) 0))\n\
+        "(set-logic QF_LIA)\n\
+         (declare-const x Int)\n\
+         (assert (= (mod x 4) 3))\n\
+         (assert (= (mod x 2) 0))\n\
          (check-sat)\n",
     );
 

@@ -3324,6 +3324,8 @@ impl Executor {
             }
         }
 
+        self.bridge_top_level_datatype_disequalities(&should_stop);
+
         // For each unique array pair with a negation, create extensionality axiom
         let mut seen_pairs: HashSet<(TermId, TermId)> = HashSet::default();
         for (eq_term, lhs, rhs, _index_sort) in array_eq_pairs {
@@ -3456,7 +3458,14 @@ impl Executor {
                     witness_bindings,
                 );
                 self.push_array_axiom_assertion_site(ext_clause, "deep_ext_axiom");
-                self.array_ext_shadow.record(eq_term, lhs, rhs, not_sel_eq);
+                self.array_ext_shadow.record(
+                    &self.ctx.terms,
+                    ext_clause,
+                    eq_term,
+                    lhs,
+                    rhs,
+                    not_sel_eq,
+                );
                 continue;
             }
 
@@ -3499,7 +3508,14 @@ impl Executor {
             // so the finalizer can correlate it against the DEMANDED set (pairs
             // whose `(= a b)` atom the search actually forced false). Measurement
             // only — the eager emission above stays authoritative.
-            self.array_ext_shadow.record(eq_term, lhs, rhs, not_sel_eq);
+            self.array_ext_shadow.record(
+                &self.ctx.terms,
+                ext_clause,
+                eq_term,
+                lhs,
+                rhs,
+                not_sel_eq,
+            );
 
             // #dt-array-element-ext: an element literal at a SINGLE-CONSTRUCTOR
             // datatype sort is unwitnessable on its own — push it into the
@@ -3617,6 +3633,99 @@ impl Executor {
     /// fresh-witness conservative extension (2), so the pass can only PRUNE
     /// spurious models — it can never refute a satisfiable problem, and it
     /// leaves the caller's own extensionality clause untouched.
+    /// Give every TOP-LEVEL datatype disequality the injectivity bridge.
+    ///
+    /// `(distinct x y)` and `(not (= x y))` over a datatype are the SAME formula
+    /// -- `mk_distinct` lowers a 2-ary distinct to exactly `Not(Eq)` -- yet
+    /// NEITHER got the reverse injectivity direction. (F1) in
+    /// `dt_axioms/selector.rs` fires only for a POSITIVELY asserted
+    /// `(= C(a) C(b))` (`if !base_assertions.contains(&term) { continue }`) and
+    /// even then emits only "terms equal => fields equal". Under a disequality
+    /// nothing fired, so for a single-constructor datatype the model builder
+    /// gave both sides the one value it could construct and the model soundness
+    /// gate refuted the result.
+    ///
+    /// [`Self::bridge_datatype_element_extensionality`] already emits exactly
+    /// the missing clause and already self-filters -- it skips `a == b`,
+    /// mismatched sorts, multi-constructor datatypes and zero-field (singleton)
+    /// constructors, dedups on ordered pairs, and caps recursion at
+    /// `DT_ELEMENT_EXT_MAX_DEPTH`. It simply had ONE caller, on the
+    /// array-element path. This is the second.
+    ///
+    /// FIXED HERE RATHER THAN BY FOLDING `distinct` IN THE FRONTEND, which was
+    /// the obvious-looking repair and is wrong three ways: it would leave the
+    /// solver hole reachable through ~15 internal `mk_distinct` call sites plus
+    /// the native API and the C FFI, none of which pass through elaboration; it
+    /// would break `proof_trust_surgery`, which requires a surface `distinct` to
+    /// elaborate to an `and` of exactly `Not(App("=", [x_i, x_j]))` in i<j order
+    /// and FAILS CLOSED otherwise -- trading certificates for verdicts, which is
+    /// backwards for this project; and it is spelling whack-a-mole, since n-ary
+    /// `(= x y z)` over datatypes is unfolded by the same `len() == 2` guard.
+    /// Term shapes reaching the checker are unchanged by this approach.
+    ///
+    /// The `and` descent is load-bearing for n >= 3: `mk_distinct` lowers
+    /// `(distinct x y z)` to a CONJUNCTION of pairwise disequalities, while
+    /// [`Self::collect_top_level_disequalities`] matches only an assertion that
+    /// IS a bare `Not(=)`. Without the descent the 3-or-more case stays broken.
+    fn bridge_top_level_datatype_disequalities(&mut self, should_stop: &impl Fn() -> bool) {
+        fn diseq_of(terms: &ay_core::TermStore, term: TermId) -> Option<(TermId, TermId)> {
+            let TermData::Not(inner) = terms.get(term) else {
+                return None;
+            };
+            let TermData::App(sym, args) = terms.get(*inner) else {
+                return None;
+            };
+            (sym.name() == "=" && args.len() == 2 && args[0] != args[1]).then(|| (args[0], args[1]))
+        }
+
+        let mut pairs: Vec<(TermId, TermId)> = Vec::new();
+        for &assertion in &self.ctx.assertions {
+            if let Some(pair) = diseq_of(&self.ctx.terms, assertion) {
+                pairs.push(pair);
+            }
+            if let TermData::App(sym, args) = self.ctx.terms.get(assertion) {
+                if sym.name() == "and" {
+                    for conjunct in args.clone() {
+                        if let Some(pair) = diseq_of(&self.ctx.terms, conjunct) {
+                            pairs.push(pair);
+                        }
+                    }
+                }
+            }
+        }
+        for (a, b) in pairs {
+            if should_stop() {
+                return;
+            }
+            // ARRAY-sorted top-level pairs are NOT this bridge's to serve, and
+            // taking them here is unsound in the verdict sense rather than
+            // merely wasteful. A top-level `not (= a b)` over arrays is
+            // exactly the input the enclosing
+            // [`Self::add_array_extensionality_axioms_up_to`] loop consumes a
+            // few lines below, and that loop is the ONLY place the suppression
+            // ladder lives: `term_in_array_scope`, the already-asserted
+            // positive equality, active exact finite coverage,
+            // [`Self::has_explicit_select_disequality_witness`] (Z3's
+            // `already_diseq`) and the deep-chain substitution behind
+            // [`Self::nested_array_outer_ext_redundant`]. This bridge runs
+            // BEFORE all of them and can see none of them, so minting a
+            // witness for an array pair here both duplicates the clause the
+            // loop is about to emit and RESURRECTS the outer `__ay_ext_diff`
+            // Skolem those guards exist to keep out of the formula -- the
+            // documented #8741 / #r3-nested-arrayext shape whose index
+            // equalities unit-force a spurious level-0 conflict.
+            //
+            // The DATATYPE reach this bridge was added for is untouched: only
+            // the depth-0 entry point is filtered, so an array-sorted
+            // constructor FIELD uncovered by the recursive descent still gets
+            // its own difference witness one level down.
+            if matches!(self.ctx.terms.sort(a), Sort::Array(_)) {
+                continue;
+            }
+            self.bridge_datatype_element_extensionality(a, b);
+        }
+    }
+
     fn bridge_datatype_element_extensionality(&mut self, elem_a: TermId, elem_b: TermId) {
         let mut queue: Vec<(TermId, TermId, usize)> = vec![(elem_a, elem_b, 0)];
         let mut seen: HashSet<(TermId, TermId)> = HashSet::default();
@@ -3708,6 +3817,19 @@ impl Executor {
                 children.push((field_a, field_b));
             }
             let clause = self.ctx.terms.mk_or(literals);
+            // This exact clause was constructed above from the registered
+            // single-constructor signature, so it is a datatype-theory
+            // tautology: two values are equal, or at least one corresponding
+            // selector field differs.  Preserve that generator provenance for
+            // the in-loop model validator.  Without it, the
+            // #dt-embedded-cycle guard quite correctly treats the compound
+            // selector/equality shape as unauthenticated and degrades a genuine
+            // SAT model to `unknown`.
+            //
+            // Register only the exact generated TermId here.  Shape-based
+            // acceptance would be unsound for partial clauses that omit a
+            // field of a multi-field constructor.
+            self.dt_solver_added_axiom_terms.insert(clause);
             self.push_array_axiom_assertion_site(clause, "dt_element_ext_injectivity");
             for (field_a, field_b) in children {
                 queue.push((field_a, field_b, depth + 1));

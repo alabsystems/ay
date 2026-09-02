@@ -692,6 +692,21 @@ impl Executor {
             return EvalValue::Unknown;
         }
 
+        // A wholly unobserved array-valued datatype field is deliberately not
+        // materialized as an independent ArrayModel row: its exact value lives
+        // inside the current stamped datatype certificate. Project it before
+        // consulting any retained array row, so stale/generated rows cannot
+        // disagree with the whole-datatype value. Explicit store/const syntax
+        // and definitions above remain stronger, as required by ROW1/ROW2.
+        if let Some(projected) =
+            self.authenticated_unobserved_array_select(model, current_array, &index_val)
+        {
+            return projected;
+        }
+        if self.unobserved_array_field_authority_claim(model, current_array) {
+            return EvalValue::Unknown;
+        }
+
         // Base array: first honor explicit model stores, then exact
         // bit-blasted select terms, and only then array defaults. QF_ABV array
         // extraction uses a zero default for model completion; letting that
@@ -2443,7 +2458,7 @@ impl Executor {
     /// one arbitrary equality in that case can make model completion oscillate
     /// instead of failing closed.  A unique constructor definition, however,
     /// is safe to use ahead of a completion fallback entry.
-    fn unique_array_constructor_definition_excluding(
+    pub(super) fn unique_array_constructor_definition_excluding(
         &self,
         var: TermId,
         def_visited: &HashSet<TermId>,

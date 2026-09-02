@@ -7,8 +7,9 @@
 //!
 //! # Idea
 //!
-//! For every predicate argument of sort `(Array Int V)`, append `n` ghost
-//! scalar pairs `(idx_k : Int, val_k : V)` to the predicate signature. The
+//! For every predicate argument of sort `(Array K V)`, where `K` is `Int` or
+//! a 1..=64-bit bit-vector sort, append `n` ghost scalar pairs
+//! `(idx_k : K, val_k : V)` to the predicate signature. The
 //! intended (semantic) coupling is `val_k = select(arr, idx_k)`:
 //!
 //! - **Head occurrences** `P(args)` become `P(args, f_1, select(arr, f_1), ...)`
@@ -71,7 +72,18 @@
 //! trigger-based body instantiation) — reimplemented from scratch; see
 //! the development design notes (Eldarica #6).
 
+mod candidate;
+mod candidate_flow;
+mod candidate_houdini;
+mod candidate_model;
+mod candidate_names;
+mod candidate_pool;
+mod candidate_query;
+mod candidate_substitute;
+mod candidate_support;
+mod candidate_usage;
 mod certify;
+mod ghost_tuple_flow;
 
 use crate::{
     ChcExpr, ChcOp, ChcProblem, ChcSort, ChcVar, ClauseBody, ClauseHead, HornClause,
@@ -80,43 +92,63 @@ use crate::{
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 use ay_core::kani_compat::DetHashSet as FxHashSet;
 
+use crate::smt::executor_adapter::collect_uninterpreted_function_declarations_for_exprs;
+
 use super::{
     BackTranslator, InvalidityWitness, TransformMemoryReport, TransformationResult, Transformer,
     ValidityWitness,
 };
 
+pub(crate) use candidate_houdini::{try_query_anchored_and_seal, QueryAnchoredSeal};
 pub(crate) use certify::{
     ghost_pair_replay_obligations, recheck_ghost_pair_certificate, GhostPairCertificate,
 };
 
-/// Maximum number of instantiated copies of one body atom.
-const BODY_INSTANCE_CAP: usize = 8;
-
-/// Maximum number of clause index terms considered as triggers.
-const INDEX_TERM_CAP: usize = 6;
-
 /// Maximum ghost slots (index/value pairs) added to a single predicate.
 const MAX_SLOTS_PER_PREDICATE: usize = 8;
 
+/// Maximum number of instantiated copies of one body atom. Identity + seed +
+/// one reserved alternate for every allowed slot must all fit.
+const BODY_INSTANCE_CAP: usize = MAX_SLOTS_PER_PREDICATE + 2;
+
+/// Maximum number of clause index terms considered as triggers. Two full
+/// predicate layouts allow heterogeneous head/body key sorts to coexist.
+const INDEX_TERM_CAP: usize = MAX_SLOTS_PER_PREDICATE * 2;
+
 /// Ghost layout for one predicate.
 #[derive(Debug, Clone)]
-pub(crate) struct GhostPredSpec {
+struct GhostPredSpec {
     /// Arity of the predicate BEFORE ghost extension.
-    pub(crate) original_arity: usize,
-    /// Positions (into the original argument list) of `(Array Int V)`
+    original_arity: usize,
+    /// Positions (into the original argument list) of `(Array K V)`
     /// arguments that received ghost pairs, in ascending order.
-    pub(crate) array_positions: Vec<usize>,
+    array_positions: Vec<usize>,
+    /// Index sort for each entry in `array_positions`.
+    index_sorts: Vec<ChcSort>,
 }
 
 impl GhostPredSpec {
     /// Number of ghost slots (index/value pairs) with `n` pairs per array.
-    pub(crate) fn slots(&self, n: usize) -> usize {
+    fn slots(&self, n: usize) -> usize {
         self.array_positions.len() * n
     }
 
     /// Original argument position of the array probed by ghost slot `s`.
-    pub(crate) fn array_position_of_slot(&self, s: usize, n: usize) -> usize {
-        self.array_positions[s / n]
+    fn array_position_of_slot(&self, s: usize, n: usize) -> Option<usize> {
+        self.array_positions.get(s.checked_div(n)?).copied()
+    }
+
+    /// Index sort of ghost slot `s` when there are `n` pairs per array.
+    fn index_sort_of_slot(&self, s: usize, n: usize) -> Option<&ChcSort> {
+        self.index_sorts.get(s.checked_div(n)?)
+    }
+
+    /// Index sorts of all ghost slots in transformed argument order.
+    fn slot_index_sorts(&self, n: usize) -> Vec<ChcSort> {
+        self.index_sorts
+            .iter()
+            .flat_map(|sort| std::iter::repeat_n(sort.clone(), n))
+            .collect()
     }
 }
 
@@ -128,39 +160,45 @@ impl GhostPredSpec {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GhostPairSpec {
     /// Ghost pairs per array argument.
-    pub(crate) n: usize,
-    /// Per-predicate ghost layout. Predicates without Int-indexed array
+    n: usize,
+    /// Per-predicate ghost layout. Predicates without supported-index array
     /// arguments are absent and keep their original signature.
-    pub(crate) preds: FxHashMap<PredicateId, GhostPredSpec>,
+    preds: FxHashMap<PredicateId, GhostPredSpec>,
 }
 
 impl GhostPairSpec {
     /// Compute the ghost layout for `problem` with `n` pairs per array arg.
     ///
-    /// Only `(Array Int V)` arguments with a non-array, non-datatype value
-    /// sort are instrumented. Predicates whose ghost slot count would exceed
-    /// [`MAX_SLOTS_PER_PREDICATE`] are left uninstrumented.
+    /// Only `(Array K V)` arguments with `K = Int | BitVec(1..=64)` and a
+    /// non-array, non-datatype value sort are instrumented. Predicates whose
+    /// ghost slot count would exceed [`MAX_SLOTS_PER_PREDICATE`] are left
+    /// uninstrumented.
     pub(crate) fn analyze(problem: &ChcProblem, n: usize) -> Self {
+        let n = n.max(1);
         let mut preds = FxHashMap::default();
         for pred in problem.predicates() {
-            let array_positions: Vec<usize> = pred
+            let arrays: Vec<(usize, ChcSort)> = pred
                 .arg_sorts
                 .iter()
                 .enumerate()
                 .filter_map(|(i, sort)| match sort {
                     ChcSort::Array(key, value)
-                        if **key == ChcSort::Int
+                        if is_supported_index_sort(key)
                             && !matches!(
                                 **value,
                                 ChcSort::Array(_, _) | ChcSort::Datatype { .. }
                             ) =>
                     {
-                        Some(i)
+                        Some((i, (**key).clone()))
                     }
                     _ => None,
                 })
                 .collect();
-            if array_positions.is_empty() || array_positions.len() * n > MAX_SLOTS_PER_PREDICATE {
+            let (array_positions, index_sorts): (Vec<_>, Vec<_>) = arrays.into_iter().unzip();
+            let Some(slot_count) = array_positions.len().checked_mul(n) else {
+                continue;
+            };
+            if array_positions.is_empty() || slot_count > MAX_SLOTS_PER_PREDICATE {
                 continue;
             }
             preds.insert(
@@ -168,6 +206,7 @@ impl GhostPairSpec {
                 GhostPredSpec {
                     original_arity: pred.arity(),
                     array_positions,
+                    index_sorts,
                 },
             );
         }
@@ -180,24 +219,29 @@ impl GhostPairSpec {
     }
 
     /// Extended argument sorts for predicate `pred_id` (original sorts plus
-    /// one `(Int, value_sort)` pair per ghost slot).
-    fn extended_sorts(&self, pred_id: PredicateId, orig_sorts: &[ChcSort]) -> Vec<ChcSort> {
+    /// one `(key_sort, value_sort)` pair per ghost slot).
+    fn extended_sorts(&self, pred_id: PredicateId, orig_sorts: &[ChcSort]) -> Option<Vec<ChcSort>> {
         let Some(spec) = self.preds.get(&pred_id) else {
-            return orig_sorts.to_vec();
+            return Some(orig_sorts.to_vec());
         };
+        if orig_sorts.len() != spec.original_arity {
+            return None;
+        }
         let mut sorts = orig_sorts.to_vec();
-        for &pos in &spec.array_positions {
-            let value_sort = match &orig_sorts[pos] {
-                ChcSort::Array(_, value) => (**value).clone(),
-                // analyze() only records Array positions.
-                other => other.clone(),
+        for (array_index, &pos) in spec.array_positions.iter().enumerate() {
+            let expected_index_sort = spec.index_sorts.get(array_index)?;
+            let (key_sort, value_sort) = match orig_sorts.get(pos) {
+                Some(ChcSort::Array(key, value)) if key.as_ref() == expected_index_sort => {
+                    ((**key).clone(), (**value).clone())
+                }
+                _ => return None,
             };
             for _ in 0..self.n {
-                sorts.push(ChcSort::Int);
+                sorts.push(key_sort.clone());
                 sorts.push(value_sort.clone());
             }
         }
-        sorts
+        Some(sorts)
     }
 
     /// Extend a predicate application's arguments with ghost pairs probed at
@@ -207,22 +251,39 @@ impl GhostPairSpec {
         pred_id: PredicateId,
         args: &[ChcExpr],
         idx_terms: &[ChcExpr],
-    ) -> Vec<ChcExpr> {
+    ) -> Option<Vec<ChcExpr>> {
         let Some(spec) = self.preds.get(&pred_id) else {
-            return args.to_vec();
+            return Some(args.to_vec());
         };
-        debug_assert_eq!(idx_terms.len(), spec.slots(self.n));
+        if args.len() != spec.original_arity || idx_terms.len() != spec.slots(self.n) {
+            return None;
+        }
         let mut out = args.to_vec();
         for (s, idx) in idx_terms.iter().enumerate() {
-            let array_pos = spec.array_position_of_slot(s, self.n);
+            let array_pos = spec.array_position_of_slot(s, self.n)?;
+            let expected_index_sort = spec.index_sort_of_slot(s, self.n)?;
+            if &idx.sort() != expected_index_sort {
+                return None;
+            }
+            let array = args.get(array_pos)?.clone();
+            let ChcSort::Array(key_sort, _) = array.sort() else {
+                return None;
+            };
+            if key_sort.as_ref() != expected_index_sort {
+                return None;
+            }
             out.push(idx.clone());
-            out.push(ChcExpr::select(args[array_pos].clone(), idx.clone()));
+            out.push(ChcExpr::select(array, idx.clone()));
         }
-        out
+        Some(out)
     }
 }
 
-/// Collect candidate trigger terms: the Int-sorted index expressions of every
+fn is_supported_index_sort(sort: &ChcSort) -> bool {
+    matches!(sort, ChcSort::Int | ChcSort::BitVec(1..=64))
+}
+
+/// Collect candidate trigger terms: the supported index expressions of every
 /// `select`/`store` occurring in the clause (constraint + all atom arguments).
 pub(crate) fn collect_index_terms(clause: &HornClause, cap: usize) -> Vec<ChcExpr> {
     let mut terms: Vec<ChcExpr> = Vec::new();
@@ -245,9 +306,47 @@ pub(crate) fn collect_index_terms(clause: &HornClause, cap: usize) -> Vec<ChcExp
     terms
 }
 
+/// Whether any array access in this clause uses a supported, non-literal key.
+/// This is an existential admission check, so it deliberately scans past the
+/// bounded candidate vocabulary used later by the transformer.
+pub(crate) fn clause_has_symbolic_index(clause: &HornClause) -> bool {
+    let mut expressions: Vec<&ChcExpr> = Vec::new();
+    if let Some(constraint) = &clause.body.constraint {
+        expressions.push(constraint);
+    }
+    for (_, args) in &clause.body.predicates {
+        expressions.extend(args);
+    }
+    if let ClauseHead::Predicate(_, args) = &clause.head {
+        expressions.extend(args);
+    }
+    expressions.into_iter().any(expr_has_symbolic_index)
+}
+
+fn expr_has_symbolic_index(expr: &ChcExpr) -> bool {
+    crate::expr::maybe_grow_expr_stack(|| {
+        if let ChcExpr::Op(ChcOp::Select | ChcOp::Store, args) = expr {
+            if let Some(index) = args.get(1).map(AsRef::as_ref) {
+                if is_supported_index_sort(&index.sort())
+                    && !matches!(index, ChcExpr::Int(_) | ChcExpr::BitVec(_, _))
+                {
+                    return true;
+                }
+            }
+        }
+        match expr {
+            ChcExpr::Op(_, args)
+            | ChcExpr::PredicateApp(_, _, args)
+            | ChcExpr::FuncApp(_, _, args) => args.iter().any(|arg| expr_has_symbolic_index(arg)),
+            ChcExpr::ConstArray(_, value) => expr_has_symbolic_index(value),
+            _ => false,
+        }
+    })
+}
+
 fn collect_index_terms_in(expr: &ChcExpr, out: &mut Vec<ChcExpr>, cap: usize) {
     crate::expr::maybe_grow_expr_stack(|| {
-        if out.len() >= cap {
+        if cap == 0 {
             return;
         }
         if let ChcExpr::Op(op, args) = expr {
@@ -256,8 +355,8 @@ fn collect_index_terms_in(expr: &ChcExpr, out: &mut Vec<ChcExpr>, cap: usize) {
                 _ => None,
             };
             if let Some(idx) = idx_arg {
-                if idx.sort() == ChcSort::Int && !out.iter().any(|t| t == idx.as_ref()) {
-                    out.push(idx.as_ref().clone());
+                if is_supported_index_sort(&idx.sort()) {
+                    push_index_term_fair(out, idx, cap);
                 }
             }
         }
@@ -275,25 +374,53 @@ fn collect_index_terms_in(expr: &ChcExpr, out: &mut Vec<ChcExpr>, cap: usize) {
     });
 }
 
-/// Instantiation tuples for a body atom with `slots` ghost index slots.
+/// Keep the bounded trigger vocabulary sort-fair: a later key sort may replace
+/// a duplicate from an earlier sort, but never the sole representative of one.
+fn push_index_term_fair(out: &mut Vec<ChcExpr>, term: &ChcExpr, cap: usize) {
+    if out.contains(term) {
+        return;
+    }
+    if out.len() < cap {
+        out.push(term.clone());
+        return;
+    }
+    let term_sort = term.sort();
+    if out.iter().any(|existing| existing.sort() == term_sort) {
+        return;
+    }
+    let replace = (0..out.len()).rev().find(|&candidate| {
+        let candidate_sort = out[candidate].sort();
+        out.iter()
+            .filter(|existing| existing.sort() == candidate_sort)
+            .count()
+            > 1
+    });
+    if let Some(replace) = replace {
+        out[replace] = term.clone();
+    }
+}
+
+/// Instantiation tuples for a body atom with typed ghost index slots.
 ///
 /// Tuple sources, in priority order:
 /// 1. the identity tuple (the head's fresh ghost variables, pass-through) when
-///    the slot counts line up — this is the frame/transition instantiation,
-/// 2. diagonal tuples `[t, t, ..]` for each fresh head ghost and each clause
-///    index term — the "same cell in every probe" instantiation,
-/// 3. for `slots == 2`, ordered pairs of distinct candidates — needed to relate
-///    two probes at different indices (copy with offsets, sortedness, n=2).
+///    the slot sorts line up — this is the frame/transition instantiation,
+/// 2. a typed seed assembled from the first compatible trigger for each slot
+///    (or a typed zero when none exists),
+/// 3. per-slot replacements in that seed, which cover heterogeneous tuples of
+///    arbitrary arity without an exponential Cartesian product,
+/// 4. homogeneous diagonals and, for two slots, ordered pairs retained for
+///    same-index and adjacent-index relations.
 ///
 /// Any choice here is sound (see module docs); the set only affects which
 /// invariants become expressible/provable.
 pub(crate) fn instantiation_tuples(
-    slots: usize,
+    slot_sorts: &[ChcSort],
     fresh: &[ChcExpr],
     cands: &[ChcExpr],
     cap: usize,
 ) -> Vec<Vec<ChcExpr>> {
-    if slots == 0 {
+    if slot_sorts.is_empty() || cap == 0 {
         return Vec::new();
     }
     let mut tuples: Vec<Vec<ChcExpr>> = Vec::new();
@@ -302,27 +429,97 @@ pub(crate) fn instantiation_tuples(
             tuples.push(tuple);
         }
     };
-    if fresh.len() == slots {
+    if tuple_has_sorts(fresh, slot_sorts) {
         push(fresh.to_vec(), &mut tuples);
     }
-    for t in fresh.iter().chain(cands.iter()) {
-        push(vec![t.clone(); slots], &mut tuples);
+
+    // Clause triggers take precedence in the seed: the exact fresh tuple is
+    // already retained above, while the seed should expose observed accesses.
+    let sources: Vec<&ChcExpr> = cands.iter().chain(fresh.iter()).collect();
+    let Some(seed): Option<Vec<ChcExpr>> = slot_sorts
+        .iter()
+        .map(|sort| {
+            sources
+                .iter()
+                .find(|term| term.sort() == *sort)
+                .map(|term| (**term).clone())
+                .or_else(|| zero_index(sort))
+        })
+        .collect()
+    else {
+        return Vec::new();
+    };
+    push(seed.clone(), &mut tuples);
+
+    // Reserve one distinct, type-compatible alternate for every slot before
+    // spending the remaining cap on the wider trigger vocabulary.
+    for (slot, sort) in slot_sorts.iter().enumerate() {
+        let mut alternate = None;
+        for term in &sources {
+            if term.sort() == *sort && *term != &seed[slot] {
+                alternate = Some(*term);
+                break;
+            }
+        }
+        let Some(term) = alternate else {
+            continue;
+        };
+        let mut tuple = seed.clone();
+        tuple[slot] = term.clone();
+        push(tuple, &mut tuples);
     }
-    if slots == 2 {
-        let pool: Vec<&ChcExpr> = fresh.iter().chain(cands.iter()).collect();
-        for a in &pool {
-            for b in &pool {
-                if a != b {
-                    push(vec![(*a).clone(), (*b).clone()], &mut tuples);
+
+    // Vary one slot at a time around the fully typed seed. Iterating sources
+    // first gives every compatible slot a bounded opportunity before moving
+    // to the next trigger and avoids starving later slots of a shared sort.
+    for term in &sources {
+        for (slot, sort) in slot_sorts.iter().enumerate() {
+            if term.sort() != *sort {
+                continue;
+            }
+            let mut tuple = seed.clone();
+            let Some(entry) = tuple.get_mut(slot) else {
+                continue;
+            };
+            *entry = (**term).clone();
+            push(tuple, &mut tuples);
+        }
+    }
+
+    for t in &sources {
+        if slot_sorts.iter().all(|sort| t.sort() == *sort) {
+            push(vec![(**t).clone(); slot_sorts.len()], &mut tuples);
+        }
+    }
+    if let [first_sort, second_sort] = slot_sorts {
+        for a in &sources {
+            if a.sort() != *first_sort {
+                continue;
+            }
+            for b in &sources {
+                if b.sort() == *second_sort && a != b {
+                    push(vec![(**a).clone(), (**b).clone()], &mut tuples);
                 }
             }
         }
     }
-    if tuples.is_empty() {
-        // No triggers at all in this clause: probe an arbitrary constant cell.
-        tuples.push(vec![ChcExpr::Int(0); slots]);
-    }
     tuples
+}
+
+fn tuple_has_sorts(tuple: &[ChcExpr], sorts: &[ChcSort]) -> bool {
+    tuple.len() == sorts.len()
+        && tuple
+            .iter()
+            .zip(sorts)
+            .all(|(term, sort)| term.sort() == *sort)
+}
+
+fn zero_index(sort: &ChcSort) -> Option<ChcExpr> {
+    match sort {
+        ChcSort::Int => Some(ChcExpr::Int(0)),
+        ChcSort::BitVec(width @ 1..=64) => Some(ChcExpr::BitVec(0, *width)),
+        _ => None,
+    }
 }
 
 /// Build the trigger tuple that a false-head property clause actually
@@ -332,9 +529,8 @@ pub(crate) fn instantiation_tuples(
 /// `c[bc + 4*i] = a[ba + 4*i] + b[bb + 4*i]`, and for `n=2` it misses
 /// adjacent-cell properties such as `a[k - 1] <= a[k]`. Trigger-based array
 /// encodings instantiate each array slot at the select/store terms that refer
-/// to that specific array argument. Repeating the sole observed index is a
-/// harmless fallback when a predicate requests multiple pairs but the clause
-/// observes only one cell.
+/// to that specific array argument. Slots without an observed access receive
+/// a type-correct zero without discarding accesses observed in other slots.
 fn observed_access_tuple(
     pred_spec: &GhostPredSpec,
     n: usize,
@@ -342,13 +538,24 @@ fn observed_access_tuple(
     constraint: &ChcExpr,
 ) -> Option<Vec<ChcExpr>> {
     let mut tuple = Vec::with_capacity(pred_spec.slots(n));
-    for &array_position in &pred_spec.array_positions {
+    for (array_index, &array_position) in pred_spec.array_positions.iter().enumerate() {
         let array = atom_args.get(array_position)?;
+        let index_sort = pred_spec.index_sorts.get(array_index)?;
         let mut indices = Vec::new();
-        collect_access_indices_for_array(constraint, array, &mut indices, INDEX_TERM_CAP);
-        let first = indices.first()?.clone();
+        collect_access_indices_for_array(
+            constraint,
+            array,
+            index_sort,
+            &mut indices,
+            INDEX_TERM_CAP,
+        );
         for slot in 0..n {
-            tuple.push(indices.get(slot).cloned().unwrap_or_else(|| first.clone()));
+            tuple.push(
+                indices
+                    .get(slot)
+                    .cloned()
+                    .or_else(|| zero_index(index_sort))?,
+            );
         }
     }
     Some(tuple)
@@ -357,6 +564,7 @@ fn observed_access_tuple(
 fn collect_access_indices_for_array(
     expr: &ChcExpr,
     array: &ChcExpr,
+    index_sort: &ChcSort,
     out: &mut Vec<ChcExpr>,
     cap: usize,
 ) {
@@ -371,7 +579,7 @@ fn collect_access_indices_for_array(
                     .is_some_and(|candidate| candidate.as_ref() == array)
             {
                 if let Some(index) = args.get(1).map(|index| index.as_ref()) {
-                    if index.sort() == ChcSort::Int && !out.contains(index) {
+                    if index.sort() == *index_sort && !out.contains(index) {
                         out.push(index.clone());
                     }
                 }
@@ -382,11 +590,11 @@ fn collect_access_indices_for_array(
             | ChcExpr::PredicateApp(_, _, args)
             | ChcExpr::FuncApp(_, _, args) => {
                 for arg in args {
-                    collect_access_indices_for_array(arg, array, out, cap);
+                    collect_access_indices_for_array(arg, array, index_sort, out, cap);
                 }
             }
             ChcExpr::ConstArray(_, value) => {
-                collect_access_indices_for_array(value, array, out, cap);
+                collect_access_indices_for_array(value, array, index_sort, out, cap);
             }
             _ => {}
         }
@@ -408,25 +616,49 @@ fn fresh_var(prefix: &str, sort: ChcSort, used: &mut FxHashSet<String>) -> ChcVa
     }
 }
 
-/// Allocate `count` fresh Int variables whose names collide with nothing in
-/// `used` (which is extended with the new names).
-pub(crate) fn fresh_int_vars(
+/// Allocate fresh variables of the requested sorts whose names collide with
+/// nothing in `used` (which is extended with the new names).
+pub(crate) fn fresh_index_vars(
     prefix: &str,
-    count: usize,
+    sorts: &[ChcSort],
     used: &mut FxHashSet<String>,
 ) -> Vec<ChcVar> {
-    let mut vars = Vec::with_capacity(count);
+    let mut vars = Vec::with_capacity(sorts.len());
     let mut counter = 0usize;
-    while vars.len() < count {
-        let name = format!("{prefix}{counter}");
-        counter += 1;
-        if used.contains(&name) {
-            continue;
+    for sort in sorts {
+        loop {
+            let name = format!("{prefix}{counter}");
+            counter += 1;
+            if used.contains(&name) {
+                continue;
+            }
+            used.insert(name.clone());
+            vars.push(ChcVar::new(name, sort.clone()));
+            break;
         }
-        used.insert(name.clone());
-        vars.push(ChcVar::new(name, ChcSort::Int));
     }
     vars
+}
+
+/// Reserve source UF symbols before allocating ghost variables. SMT-LIB uses
+/// one term namespace for bound variables and nullary functions, so a fresh
+/// ghost name must not shadow a source function application.
+fn reserve_clause_function_names(clause: &HornClause, used: &mut FxHashSet<String>) -> Option<()> {
+    let mut expressions = Vec::new();
+    expressions.extend(clause.body.constraint.iter());
+    expressions.extend(
+        clause
+            .body
+            .predicates
+            .iter()
+            .flat_map(|(_, args)| args.iter()),
+    );
+    if let ClauseHead::Predicate(_, args) = &clause.head {
+        expressions.extend(args);
+    }
+    let declarations = collect_uninterpreted_function_declarations_for_exprs(expressions).ok()?;
+    used.extend(declarations.into_iter().map(|declaration| declaration.name));
+    Some(())
 }
 
 /// Ghost index/value pair transformer (Eldarica `-arrayQuans:n` analog).
@@ -449,9 +681,11 @@ impl ArrayGhostPairTransformer {
         self
     }
 
-    fn rewrite_clause(&self, clause: &HornClause, spec: &GhostPairSpec) -> HornClause {
+    fn rewrite_clause(&self, clause: &HornClause, spec: &GhostPairSpec) -> Option<HornClause> {
         let cands = collect_index_terms(clause, INDEX_TERM_CAP);
-        let mut used: FxHashSet<String> = clause.vars().into_iter().map(|v| v.name).collect();
+        let clause_vars = certify::exact_clause_vars(clause)?;
+        let mut used: FxHashSet<String> = clause_vars.into_iter().map(|var| var.name).collect();
+        reserve_clause_function_names(clause, &mut used)?;
 
         // Head: append fresh, implicitly-universal ghost probes. Head
         // arguments stay variables (`idx_s`, `val_s`); the semantic coupling
@@ -462,21 +696,27 @@ impl ArrayGhostPairTransformer {
         let (new_head, fresh_exprs) = match &clause.head {
             ClauseHead::Predicate(pred_id, args) => match spec.preds.get(pred_id) {
                 Some(pred_spec) => {
-                    let slots = pred_spec.slots(spec.n);
-                    let fresh_idx = fresh_int_vars("__gpi", slots, &mut used);
+                    if args.len() != pred_spec.original_arity {
+                        return None;
+                    }
+                    let slot_sorts = pred_spec.slot_index_sorts(spec.n);
+                    let fresh_idx = fresh_index_vars("__gpi", &slot_sorts, &mut used);
                     let fresh_exprs: Vec<ChcExpr> =
                         fresh_idx.iter().cloned().map(ChcExpr::var).collect();
                     let mut new_args = args.clone();
                     for (s, idx_expr) in fresh_exprs.iter().enumerate() {
-                        let array_pos = pred_spec.array_position_of_slot(s, spec.n);
-                        let value_sort = match args[array_pos].sort() {
-                            ChcSort::Array(_, value) => *value,
-                            other => other,
+                        let array_pos = pred_spec.array_position_of_slot(s, spec.n)?;
+                        let array = args.get(array_pos)?.clone();
+                        let ChcSort::Array(key_sort, value_sort) = array.sort() else {
+                            return None;
                         };
-                        let val_var = fresh_var("__gpv", value_sort, &mut used);
+                        if key_sort.as_ref() != pred_spec.index_sort_of_slot(s, spec.n)? {
+                            return None;
+                        }
+                        let val_var = fresh_var("__gpv", *value_sort, &mut used);
                         coupling.push(ChcExpr::eq(
                             ChcExpr::var(val_var.clone()),
-                            ChcExpr::select(args[array_pos].clone(), idx_expr.clone()),
+                            ChcExpr::select(array, idx_expr.clone()),
                         ));
                         new_args.push(idx_expr.clone());
                         new_args.push(ChcExpr::var(val_var));
@@ -490,7 +730,7 @@ impl ArrayGhostPairTransformer {
 
         // Body: instantiate each ghost-carrying atom at exactly ONE tuple —
         // the pass-through tuple (the head's fresh ghost variables) when the
-        // slot counts line up, otherwise the best trigger diagonal. Emitting
+        // slot counts line up, otherwise the best typed trigger tuple. Emitting
         // multiple instantiated copies (Eldarica's encoding) would make the
         // clause NONLINEAR (several body atoms of the same predicate), which
         // this PDR core cannot push lemmas through — it stalls at frame 1.
@@ -502,28 +742,15 @@ impl ArrayGhostPairTransformer {
         for (pred_id, args) in &clause.body.predicates {
             match spec.preds.get(pred_id) {
                 Some(pred_spec) => {
-                    let observed = if matches!(&clause.head, ClauseHead::False) {
-                        clause.body.constraint.as_ref().and_then(|constraint| {
-                            observed_access_tuple(pred_spec, spec.n, args, constraint)
-                        })
-                    } else {
-                        None
-                    };
-                    let tuple = observed.or_else(|| {
-                        // instantiation_tuples orders the pass-through tuple
-                        // first when available and always has a fallback.
-                        instantiation_tuples(
-                            pred_spec.slots(spec.n),
-                            &fresh_exprs,
-                            &cands,
-                            BODY_INSTANCE_CAP,
-                        )
-                        .into_iter()
-                        .next()
-                    });
-                    if let Some(tuple) = tuple {
-                        new_body_preds.push((*pred_id, spec.extend_args(*pred_id, args, &tuple)));
-                    }
+                    let tuple = ghost_tuple_flow::preferred_body_ghost_indices(
+                        clause,
+                        spec,
+                        pred_spec,
+                        args,
+                        &fresh_exprs,
+                        &cands,
+                    )?;
+                    new_body_preds.push((*pred_id, spec.extend_args(*pred_id, args, &tuple)?));
                 }
                 None => new_body_preds.push((*pred_id, args.clone())),
             }
@@ -541,16 +768,17 @@ impl ArrayGhostPairTransformer {
         let mut new_clause =
             HornClause::new(ClauseBody::new(new_body_preds, new_constraint), new_head);
         new_clause.action_id = clause.action_id;
-        new_clause
+        Some(new_clause)
     }
 }
 
 impl Transformer for ArrayGhostPairTransformer {
     fn transform(self: Box<Self>, problem: ChcProblem) -> TransformationResult {
         let spec = GhostPairSpec::analyze(&problem, self.n);
-        // Datatype metadata is not carried over by the rebuild below; ghost
-        // instrumentation is gated to datatype-free problems by the route.
-        if spec.is_empty() || !problem.datatype_defs().is_empty() {
+        // Active datatype terms are outside this transform's semantic scope.
+        // A declaration-only prelude is inert, however, and is common in
+        // MODEL_CHECKER_CONSUMER output; preserving it must not suppress array ghosting.
+        if spec.is_empty() || problem.uses_datatype_features() {
             return TransformationResult {
                 problem,
                 back_translator: Box::new(super::IdentityBackTranslator),
@@ -558,13 +786,36 @@ impl Transformer for ArrayGhostPairTransformer {
         }
 
         let mut new_problem = ChcProblem::new();
+        if problem.has_stripped_body_forall() {
+            new_problem.mark_stripped_body_forall();
+        }
+        // Preserve the complete declaration tables before copying clauses:
+        // action ids are positional, and later preprocessing/SMT contexts
+        // expect even unused datatype prelude metadata to remain available.
+        for name in problem.action_names() {
+            new_problem.declare_action(name.clone());
+        }
+        for (name, constructors) in problem.datatype_defs() {
+            new_problem.add_datatype_def(name.clone(), constructors.clone());
+        }
         for pred in problem.predicates() {
-            let id = new_problem
-                .declare_predicate(&pred.name, spec.extended_sorts(pred.id, &pred.arg_sorts));
+            let Some(sorts) = spec.extended_sorts(pred.id, &pred.arg_sorts) else {
+                return TransformationResult {
+                    problem,
+                    back_translator: Box::new(super::IdentityBackTranslator),
+                };
+            };
+            let id = new_problem.declare_predicate(&pred.name, sorts);
             debug_assert_eq!(id, pred.id, "ghost transform must preserve predicate ids");
         }
         for clause in problem.clauses() {
-            new_problem.add_clause(self.rewrite_clause(clause, &spec));
+            let Some(rewritten) = self.rewrite_clause(clause, &spec) else {
+                return TransformationResult {
+                    problem,
+                    back_translator: Box::new(super::IdentityBackTranslator),
+                };
+            };
+            new_problem.add_clause(rewritten);
         }
         if problem.is_fixedpoint_format() {
             new_problem.set_fixedpoint_format();

@@ -430,6 +430,7 @@ pub(in crate::pdr) fn augment_model_from_equalities(
         let Some(int_value) = (match value {
             SmtValue::Int(n) => Some(*n),
             SmtValue::BitVec(n, _w) => i128::try_from(*n).ok(),
+            SmtValue::BigBitVec(n, _w) => num_traits::ToPrimitive::to_i128(n.as_ref()),
             SmtValue::Real(r) => {
                 // Use integer part if denominator is 1
                 if r.denom().is_one() {

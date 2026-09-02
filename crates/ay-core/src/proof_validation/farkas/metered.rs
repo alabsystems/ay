@@ -33,6 +33,9 @@ pub use classification::{farkas_progress_row_kind, FarkasProgressRowKind};
 const RATIONAL_SCRATCH_COPIES: usize = 32;
 const RATIONAL_SCRATCH_HEADERS: usize =
     RATIONAL_SCRATCH_COPIES * (size_of::<BigInt>() + size_of::<BigRational>());
+const BIGINT_PAIR_HEADERS: usize = 2 * size_of::<BigInt>();
+const RATIONAL_CLONE_HEADERS: usize = BIGINT_PAIR_HEADERS + size_of::<BigRational>();
+const I64_PAIR_RATIONAL_BYTES: usize = RATIONAL_CLONE_HEADERS + 2 * size_of::<u64>();
 
 struct ProgressMeter<'a> {
     progress: &'a mut dyn FnMut(usize, usize) -> bool,
@@ -87,7 +90,7 @@ impl<'a> ProgressMeter<'a> {
     fn charge_rational_clone(&mut self, value: &BigRational) -> Result<(), FarkasValidationError> {
         let bits = rational_bits(value)?;
         let bytes = rational_payload_bytes(value)?
-            .checked_add(2 * size_of::<BigInt>() + size_of::<BigRational>())
+            .checked_add(RATIONAL_CLONE_HEADERS)
             .ok_or(FarkasValidationError::ResourceLimit)?;
         self.charge(bit_limb_work(bits), bytes)
     }
@@ -132,7 +135,7 @@ impl<'a> ProgressMeter<'a> {
             .checked_add(bigint_payload_bytes(1)?)
             .ok_or(FarkasValidationError::ResourceLimit)?;
         let bytes = payload
-            .checked_add(2 * size_of::<BigInt>())
+            .checked_add(BIGINT_PAIR_HEADERS)
             .ok_or(FarkasValidationError::ResourceLimit)?;
         self.charge(bit_limb_work(bits), bytes)?;
         Ok(BigRational::from(value.clone()))
@@ -142,8 +145,7 @@ impl<'a> ProgressMeter<'a> {
         &mut self,
         value: &Rational64,
     ) -> Result<BigRational, FarkasValidationError> {
-        let bytes = 2 * size_of::<BigInt>() + size_of::<BigRational>() + 2 * size_of::<u64>();
-        self.charge(1, bytes)?;
+        self.charge(1, I64_PAIR_RATIONAL_BYTES)?;
         Ok(BigRational::new(
             BigInt::from(*value.numer()),
             BigInt::from(*value.denom()),
@@ -243,14 +245,19 @@ fn normalize_inequality(
     let TermData::App(Symbol::Named(predicate), args) = terms.get(term) else {
         return Err(FarkasValidationError::NonArithmeticLiteral { term });
     };
-    if args.len() != 2 || !matches!(predicate.as_str(), "<" | "<=" | ">" | ">=") {
+    let mut operands = args.iter();
+    let (Some(&first), Some(&second), None) = (operands.next(), operands.next(), operands.next())
+    else {
+        return Err(FarkasValidationError::NonArithmeticLiteral { term });
+    };
+    if !matches!(predicate.as_str(), "<" | "<=" | ">" | ">=") {
         return Err(FarkasValidationError::NonArithmeticLiteral { term });
     }
     let reverse = matches!(predicate.as_str(), ">" | ">=");
     let (left, right) = if reverse {
-        (args[1], args[0])
+        (second, first)
     } else {
-        (args[0], args[1])
+        (first, second)
     };
     let mut expression = parse_linear_expr(terms, left, meter)?;
     let right = parse_linear_expr(terms, right, meter)?;

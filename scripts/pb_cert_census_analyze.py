@@ -24,11 +24,21 @@ a certificate" are very nearly the same event, and dividing one by the other
 would report a coverage near 100% that means nothing. The DENOMINATOR comes from
 the no-proof arm, which is that binary's honest answer at that budget.
 
+THE DENOMINATOR RULE (audit-corrected, 2026-08-30)
+--------------------------------------------------
+An instance counts in the denominator when the no-proof arm DECIDES it:
+`s OPTIMUM FOUND` or `s UNSATISFIABLE`. The pre-audit rule counted optima
+only, which silently dropped the UNSAT decisions from the denominator AND
+their checker-accepted refutations from the numerator (5 s cli: 89/144
+under the old rule, 101/159 restated). Both rules are printed, labeled, in
+the summary -- the corrected rule is the headline, the optimum-only rule is
+kept under `legacy_optimum_only` so the two can never be conflated silently.
+
 THE MISS TAXONOMY, operationally
 --------------------------------
-A MISS is an instance the no-proof arm solves to OPTIMUM at budget B and for
-which the pinned checker does not accept a matching certificate from the proof
-arm of the SAME binary.
+A MISS is an instance the no-proof arm decides (OPTIMUM or UNSAT) at budget B
+and for which the pinned checker does not accept a matching certificate from
+the proof arm of the SAME binary.
 
   DELIVERY          the derivation exists but was not produced in budget --
                     MEASURED, not assumed. Either the escalation probe
@@ -72,7 +82,16 @@ FIELDS = [
     "path", "arm", "budget_ms", "status", "objective", "wall_ms",
     "proof_bytes", "proof_lines", "proof_sha256", "route",
     "checker_exit", "checker_verdict", "want_verdict", "score",
+    "load1_start", "load1_end",
 ]
+
+# Rows written before the load columns existed have 14 fields, not 16. They are
+# still readable -- the two load columns are an ANNOTATION, appended at the end
+# precisely so old rows stay parseable -- but they carry no load, and a row with
+# no load cannot be audited for starvation. They are admitted with load "-" and
+# counted, so a mixed directory reports honestly how much of itself predates the
+# load protocol rather than silently looking fully annotated.
+LEGACY_FIELD_COUNT = len(FIELDS) - 2
 
 BINARIES = ("cli", "aypb")
 
@@ -125,9 +144,13 @@ def load(path):
             if not line:
                 continue
             parts = line.split("\t")
-            if len(parts) != len(FIELDS):
+            if len(parts) == LEGACY_FIELD_COUNT:
+                parts = parts + ["-", "-"]
+            elif len(parts) != len(FIELDS):
                 raise SystemExit(
-                    f"ERROR: {path}: expected {len(FIELDS)} fields, got {len(parts)}"
+                    f"ERROR: {path}: expected {len(FIELDS)} fields "
+                    f"(or {LEGACY_FIELD_COUNT} pre-load-protocol), "
+                    f"got {len(parts)}"
                 )
             row = dict(zip(FIELDS, parts))
             rows[row["path"]] = row
@@ -200,10 +223,10 @@ def main():
         score = pf["score"]
         if score in ("REJECT", "WRONG-CONCLUSION"):
             return "SOUNDNESS-ALARM", score
-        if npf["status"] != "OPTIMUM FOUND":
+        if npf["status"] not in ("OPTIMUM FOUND", "UNSATISFIABLE"):
             if score == "VERIFIED":
-                return "CERTIFIED-BUT-UNSOLVED-IN-NOPROOF-ARM", None
-            return "NOT-SOLVED", None
+                return "CERTIFIED-BUT-UNDECIDED-IN-NOPROOF-ARM", None
+            return "NOT-DECIDED", None
         if score == "VERIFIED":
             return "COVERED", None
         if pf["status"] == "UNSUPPORTED" or npf["status"] == "UNSUPPORTED":
@@ -242,6 +265,7 @@ def main():
 
     for b in BINARIES:
         cls, cause = Counter(), Counter()
+        dec_split, cov_split = Counter(), Counter()
         for rec in rows:
             c, why = classify(rec, b)
             rec[f"class_{b}"] = c
@@ -249,33 +273,54 @@ def main():
             cls[c] += 1
             if why:
                 cause[why] += 1
-        solved = cls["COVERED"] + cls["MISS"] + cls["SOUNDNESS-ALARM"]
+            if c in ("COVERED", "MISS", "SOUNDNESS-ALARM"):
+                st = rec[f"{b}_noproof"]["status"]
+                dec_split[st] += 1
+                if c == "COVERED":
+                    cov_split[st] += 1
+        decided = cls["COVERED"] + cls["MISS"] + cls["SOUNDNESS-ALARM"]
         s = OrderedDict()
         s["binary"] = ("ay pb solve (shipped CLI, crates/ay)" if b == "cli"
                        else "ay-pb (competition binary, crates/ay-pb)")
         s["corpus"] = total
         s["measured"] = total - cls["UNMEASURED"]
-        s["solved_to_optimum_noproof_arm"] = solved
+        s["decided_in_noproof_arm"] = decided
+        s["decided_split"] = OrderedDict(sorted(dec_split.items()))
         s["certificate_accepted_by_pinned_checker"] = cls["COVERED"]
+        s["certificate_accepted_split"] = OrderedDict(sorted(cov_split.items()))
         s["soundness_alarms"] = cls["SOUNDNESS-ALARM"]
         s["misses"] = cls["MISS"]
-        s["not_solved_to_optimum"] = cls["NOT-SOLVED"]
-        s["certified_but_unsolved_in_noproof_arm"] = cls[
-            "CERTIFIED-BUT-UNSOLVED-IN-NOPROOF-ARM"]
+        s["not_decided_in_noproof_arm"] = cls["NOT-DECIDED"]
+        s["certified_but_undecided_in_noproof_arm"] = cls[
+            "CERTIFIED-BUT-UNDECIDED-IN-NOPROOF-ARM"]
         s["unmeasured"] = cls["UNMEASURED"]
-        s["coverage_of_solved"] = f"{cls['COVERED']}/{solved}" if solved else "0/0"
-        s["coverage_of_solved_pct"] = (
-            round(100.0 * cls["COVERED"] / solved, 1) if solved else None)
+        s["coverage_of_decided"] = (
+            f"{cls['COVERED']}/{decided}" if decided else "0/0")
+        s["coverage_of_decided_pct"] = (
+            round(100.0 * cls["COVERED"] / decided, 1) if decided else None)
         # The census runs the corpus in a FIXED-SEED SHUFFLED order, so any
         # prefix is an unbiased random sample of it and a partial run is a
         # sample statistic rather than a truncated fact. The interval is Wilson
         # (it does not collapse at 0 or 1 the way the normal approximation
         # does). When the run is complete this is a census, not a sample, and
         # the interval is reported as exact.
-        s["coverage_of_solved_ci95"] = (
+        s["coverage_of_decided_ci95"] = (
             "exact (complete census)" if not missing
-            else wilson(cls["COVERED"], solved))
+            else wilson(cls["COVERED"], decided))
         s["coverage_of_measured_corpus"] = f"{cls['COVERED']}/{s['measured']}"
+        # The pre-audit headline rule, printed and LABELED so the restatement
+        # is checkable in one place and the two rules are never conflated.
+        n_opt = dec_split["OPTIMUM FOUND"]
+        c_opt = cov_split["OPTIMUM FOUND"]
+        legacy = OrderedDict()
+        legacy["rule"] = (
+            "optimum-only (pre-audit-2026-08-30 headline): UNSATISFIABLE "
+            "decisions and their checker-accepted refutations excluded from "
+            "both sides of the ratio")
+        legacy["coverage_of_solved"] = f"{c_opt}/{n_opt}" if n_opt else "0/0"
+        legacy["coverage_of_solved_pct"] = (
+            round(100.0 * c_opt / n_opt, 1) if n_opt else None)
+        s["legacy_optimum_only"] = legacy
         s["miss_causes"] = OrderedDict(sorted(cause.items(), key=lambda kv: -kv[1]))
         summary[b] = s
 

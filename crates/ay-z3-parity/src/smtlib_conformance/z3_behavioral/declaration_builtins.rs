@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Closed semantic witnesses for Z3 5.0.0 declaration-plugin builtins.
+//! Closed semantic witnesses for Z3 5.1.0 declaration-plugin builtins.
 //!
 //! Each predicate below is true under the public semantics and contains the
 //! owner spelling it witnesses.  The behavioral validator wraps a predicate
@@ -10,7 +10,7 @@
 //! cataloging a spelling therefore cannot satisfy the owner row.
 
 /// Public declaration-plugin builtins for which AY has a closed semantic
-/// differential witness against the exact Z3 5.0.0 oracle.
+/// differential witness against the exact Z3 5.1.0 oracle.
 ///
 /// Keep this table sorted by owner. Internal totalization helpers and legacy
 /// implementation names (`bvudiv0`, `bvudiv_i`, `bit0`, `mkbv`, and peers) are
@@ -275,7 +275,7 @@ pub(super) fn semantic_owner_names() -> impl Iterator<Item = &'static str> {
         .map(|&(name, _)| name)
 }
 
-/// Whether the owner belongs to Z3 5.0.0's legacy no-logic basic signature.
+/// Whether the owner belongs to Z3 5.1.0's legacy no-logic basic signature.
 /// Selecting a logic removes these spellings, except that `if` is also
 /// registered unconditionally; its no-logic witness still exercises the exact
 /// declaration owner without relying on the duplicate registration path.
@@ -284,7 +284,7 @@ pub(super) fn semantic_requires_no_logic(owner: &str) -> bool {
 }
 
 /// Commands required before the declaration registry is populated for an
-/// otherwise-public owner. Z3 5.0.0 conditionally registers `divisible` behind
+/// otherwise-public owner. Z3 5.1.0 conditionally registers `divisible` behind
 /// its SMT-LIB-compliance option. Enabling print-success as well makes the
 /// resulting Z3 and AY transcripts byte-identical instead of hiding commands.
 pub(super) fn semantic_prelude(owner: &str) -> &'static str {

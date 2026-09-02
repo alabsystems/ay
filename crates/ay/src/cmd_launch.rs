@@ -1104,11 +1104,28 @@ fn run_evidence_gate(
 ) -> Result<()> {
     println!("[evidence] START {name}");
     quote_command(argv);
-    let status = ProcessCommand::new(argv[0])
+    let status = match ProcessCommand::new(argv[0])
         .args(&argv[1..])
         .current_dir(repo_root)
         .status()
-        .with_context(|| format!("run evidence gate {name}"))?;
+    {
+        Ok(status) => status,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Shell semantics: a missing command is exit 127 and one counted
+            // evidence-gate failure, never an aborted gate run — the remaining
+            // gates still execute and the summary JSON is still written.
+            eprintln!(
+                "[evidence] FAIL  {name} exit=127 (command not found: {})",
+                argv[0]
+            );
+            state.evidence_gate_failures += 1;
+            println!();
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("run evidence gate {name}"));
+        }
+    };
     if status.success() {
         println!("[evidence] PASS  {name}");
     } else {
@@ -1140,13 +1157,37 @@ fn run_evidence_gate_capture_inner(
 ) -> Result<String> {
     println!("[evidence] START {name}");
     quote_command(argv);
-    let output = ProcessCommand::new(argv[0])
+    let output = match ProcessCommand::new(argv[0])
         .args(&argv[1..])
         .current_dir(repo_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .with_context(|| format!("run evidence gate {name}"))?;
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Shell semantics: a missing command is exit 127; the gate run
+            // continues and downstream parsing of the (empty) captured output
+            // stays fail-closed.
+            if fail_closes {
+                eprintln!(
+                    "[evidence] FAIL  {name} exit=127 (command not found: {})",
+                    argv[0]
+                );
+                state.evidence_gate_failures += 1;
+            } else {
+                eprintln!(
+                    "[evidence] INFO  {name} exit=127 (command not found: {}; parsed as fail-closed inventory)",
+                    argv[0]
+                );
+            }
+            println!();
+            return Ok(String::new());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("run evidence gate {name}"));
+        }
+    };
     io::stdout().write_all(&output.stdout)?;
     io::stderr().write_all(&output.stderr)?;
     let combined = format!(

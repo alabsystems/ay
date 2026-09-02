@@ -131,6 +131,13 @@
 #[macro_use]
 extern crate ay_core;
 
+/// Largest bit-vector width accepted by the public CHC API and SMT-LIB parser.
+///
+/// Bit-vector widths directly size bit-blasting state and exact literal/model
+/// reconstruction. Keeping one shared bound prevents typed frontends from
+/// bypassing the parser's resource limit with a programmatically-built literal.
+pub const MAX_BITVECTOR_WIDTH: u32 = 1 << 20;
+
 // CHC debug channels (#8832): route through the unified CLI-aware
 // `debug_channel_active()` resolver so `--debug prop,chc-smt,algebraic` on the
 // command line actually enable these gates. The previous `cached_env_flag!`
@@ -163,6 +170,7 @@ mod adaptive_houdini;
 mod adaptive_multi_pred;
 mod adaptive_multi_pred_complex;
 mod adaptive_prestage_budget;
+mod adaptive_route_admission;
 mod adaptive_validation;
 mod adt_array_nullary;
 pub(crate) mod algebraic_invariant;
@@ -242,9 +250,12 @@ pub use expr::{ChcDtConstructor, ChcDtSelector, ChcExpr, ChcSort, ChcVar};
 // (get-interpolant / compute-interpolant) Craig interpolation command support.
 pub use interpolant_command::{compute_smt_interpolant, InterpolantError, SortResolver};
 pub use predicate::Predicate;
-pub use problem::ChcProblem;
+pub use problem::{ChcProblem, ChcQueryObligation, ChcQueryObligationId};
 
 // Core types used by integration tests for problem construction
+pub use adaptive_decision_log::{
+    AdaptiveSolveReport, AdaptiveSolveTrace, AdaptiveStrategyObservation, AdaptiveStrategyOutcome,
+};
 pub use clause::{ActionId, ClauseBody, ClauseHead};
 pub use expr::ChcOp;
 pub use predicate::PredicateId;
@@ -262,10 +273,11 @@ pub use proof_metadata::{
     ChcProofQueryCacheLookupStatus, ChcProofQueryCacheMetrics, ChcProofRunArtifact,
     ChcProofRunArtifactBundleValidationError, ChcProofRunArtifactBundleValidationErrorReason,
     ChcProofRunArtifactValidationError, ChcProofRunArtifactValidationErrorReason,
-    ChcProofRunArtifacts, ChcProofSolverIdentity, ChcProofTranscriptConsumerEvidence,
-    ChcProofTranscriptMetadata, ChcReplayCheckResult, ChcReplayCheckerIdentity, ChcReplayEvidence,
-    ChcReplayObligationArtifact, ChcTraceAssignmentEvidence, ChcTraceStepEvidence,
-    ChcUnsafeTraceEvidence, CHC_BMC_UNSAFE_TRACE_ASSIGNMENT_COMPLETENESS_SCHEMA,
+    ChcProofRunArtifacts, ChcProofRunStopReason, ChcProofRunWithBudgetReport,
+    ChcProofSolverIdentity, ChcProofTranscriptConsumerEvidence, ChcProofTranscriptMetadata,
+    ChcReplayCheckResult, ChcReplayCheckerIdentity, ChcReplayEvidence, ChcReplayObligationArtifact,
+    ChcTraceAssignmentEvidence, ChcTraceStepEvidence, ChcUnsafeTraceEvidence,
+    CHC_BMC_UNSAFE_TRACE_ASSIGNMENT_COMPLETENESS_SCHEMA,
     CHC_BMC_UNSAFE_TRACE_ASSIGNMENT_CONTRACT_SCHEMA, CHC_CHECKED_REPLAY_MANIFEST_BINDING_SCHEMA,
     CHC_CHECKED_REPLAY_SUMMARY_SCHEMA, CHC_EVIDENCE_MANIFEST_SCHEMA,
     CHC_IN_PROCESS_REPLAY_CHECKER_NAME, CHC_PROOF_ARTIFACT_DIGEST_SCHEMA,
@@ -288,7 +300,7 @@ pub use qf_invariant_artifact::{
 };
 
 // Public engine API — consumed by ay binary, fuzz targets, examples, integration tests
-pub use adaptive::{AdaptiveConfig, AdaptivePortfolio};
+pub use adaptive::{AdaptiveConfig, AdaptiveExecutionMode, AdaptivePortfolio};
 pub use bmc::{BmcConfig, BmcSolver};
 pub use cancellation::{CancellationGuard, CancellationToken};
 pub use chc_statistics::ChcStatistics;
@@ -382,21 +394,45 @@ pub mod engines {
     ///   `VerifiedChcResult::Unknown`;
     /// - `Unknown` metadata is always `accepted_as_proof == false`.
     pub fn solve_pdr_proof(problem: ChcProblem, config: PdrConfig) -> ChcResult<ChcPdrProofRun> {
+        let solve_deadline = config
+            .solve_timeout
+            .map(|timeout| ay_core::time::Instant::now() + timeout);
         // Install a thread-wide solve deadline so EVERY check_sat on this thread
         // (main PDR context, startup discovery, the fresh re-validation verifier,
         // and any portfolio engine) is bounded by solve_timeout — closing the gap
         // where a fresh context never received a per-context deadline and a query
         // handed `timeout = None` could spin past the deadline (the integer-modulo
         // hang). Restored on drop.
-        let _solve_deadline = crate::smt::ScopedSolveDeadline::new(
-            config
-                .solve_timeout
-                .map(|timeout| ay_core::time::Instant::now() + timeout),
-        );
+        let _solve_deadline = crate::smt::ScopedSolveDeadline::new(solve_deadline);
         ay_core::catch_ay_panics(
-            AssertUnwindSafe(|| Ok(solve_pdr_proof_unchecked(problem, config))),
+            AssertUnwindSafe(|| Ok(solve_pdr_proof_unchecked(problem, config, solve_deadline))),
             |reason| Err(ChcError::Internal(reason)),
         )
+    }
+
+    /// Run the exact proof-grade PDR entry point and atomically bind whole-run
+    /// timing, stop classification, and a direct-PDR strategy observation to
+    /// its problem-bound result.
+    ///
+    /// This is the reporting counterpart of [`solve_pdr_proof`]; it does not
+    /// substitute the adaptive portfolio or perform a diagnostic re-run.
+    pub fn solve_pdr_proof_with_budget_report(
+        problem: ChcProblem,
+        config: PdrConfig,
+    ) -> ChcResult<ChcProofRunWithBudgetReport> {
+        let configured_budget = config.solve_timeout;
+        let cancellation = config.cancellation_token.clone();
+        let started = ay_core::time::Instant::now();
+        let proof_run = solve_pdr_proof(problem, config)?;
+        let elapsed = started.elapsed();
+        let cancellation_requested_at_return =
+            cancellation.is_some_and(|token| token.is_cancelled());
+        Ok(ChcProofRunWithBudgetReport::from_direct_pdr(
+            proof_run,
+            configured_budget,
+            elapsed,
+            cancellation_requested_at_return,
+        ))
     }
 
     /// Run proof-grade PDR/IC3 and then attempt a budget-capped CHECKED replay
@@ -444,7 +480,11 @@ pub mod engines {
         ay_core::catch_ay_panics(
             AssertUnwindSafe(|| {
                 let problem = ChcParser::parse(input)?;
-                Ok(solve_pdr_proof_unchecked(problem, config))
+                let solve_deadline = config
+                    .solve_timeout
+                    .map(|timeout| ay_core::time::Instant::now() + timeout);
+                let _solve_deadline = crate::smt::ScopedSolveDeadline::new(solve_deadline);
+                Ok(solve_pdr_proof_unchecked(problem, config, solve_deadline))
             }),
             |reason| Err(ChcError::Internal(reason)),
         )
@@ -459,13 +499,21 @@ pub mod engines {
             AssertUnwindSafe(|| {
                 let input = std::fs::read_to_string(path)?;
                 let problem = ChcParser::parse(&input)?;
-                Ok(solve_pdr_proof_unchecked(problem, config))
+                let solve_deadline = config
+                    .solve_timeout
+                    .map(|timeout| ay_core::time::Instant::now() + timeout);
+                let _solve_deadline = crate::smt::ScopedSolveDeadline::new(solve_deadline);
+                Ok(solve_pdr_proof_unchecked(problem, config, solve_deadline))
             }),
             |reason| Err(ChcError::Internal(reason)),
         )
     }
 
-    fn solve_pdr_proof_unchecked(problem: ChcProblem, mut config: PdrConfig) -> ChcPdrProofRun {
+    fn solve_pdr_proof_unchecked(
+        problem: ChcProblem,
+        mut config: PdrConfig,
+        solve_deadline: Option<ay_core::time::Instant>,
+    ) -> ChcPdrProofRun {
         config.strict_proofs = true;
         // Proof-grade solving must construct an invariant for the exact
         // caller-supplied clauses. The ordinary solve-time nullary-fail
@@ -490,12 +538,40 @@ pub mod engines {
                 ChcEngineResult::Safe(InvariantModel::default()),
                 ValidationEvidence::ScalarAcyclicBmcExhaustive { max_depth: depth },
             );
+            let result = enforce_pdr_proof_return_boundary(result, &config, solve_deadline);
             return ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME);
         }
 
         let raw = PdrSolver::solve_problem(&problem, config.clone());
         let result = validate_pdr_proof_result(&problem, raw, &config);
+        let result = enforce_pdr_proof_return_boundary(result, &config, solve_deadline);
         ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME)
+    }
+
+    fn enforce_pdr_proof_return_boundary(
+        result: VerifiedChcResult,
+        config: &PdrConfig,
+        solve_deadline: Option<ay_core::time::Instant>,
+    ) -> VerifiedChcResult {
+        let cancelled = config
+            .cancellation_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled);
+        let deadline_expired =
+            solve_deadline.is_some_and(|deadline| ay_core::time::Instant::now() >= deadline);
+        if (cancelled || deadline_expired)
+            && matches!(
+                &result,
+                VerifiedChcResult::Safe(_) | VerifiedChcResult::Unsafe(_)
+            )
+        {
+            VerifiedChcResult::from_validated(
+                ChcEngineResult::Unknown,
+                ValidationEvidence::FullVerification,
+            )
+        } else {
+            result
+        }
     }
 
     fn validation_config(base: &PdrConfig) -> PdrConfig {
@@ -625,10 +701,7 @@ pub mod engines {
             // Candidate rejected — emit a NON-accepted run. Mirrors the Unknown
             // arm of `validate_pdr_proof_result`: the full clause check ran and
             // did not confirm the model, so no proof-grade Safe is emitted.
-            let result = VerifiedChcResult::from_validated(
-                ChcEngineResult::Unknown,
-                ValidationEvidence::FullVerification,
-            );
+            let result = VerifiedChcResult::unknown_candidate_not_admitted();
             return Ok(ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME));
         }
 
@@ -947,10 +1020,7 @@ pub mod engines {
                         ValidationEvidence::FullVerification,
                     )
                 } else {
-                    VerifiedChcResult::from_validated(
-                        ChcEngineResult::Unknown,
-                        ValidationEvidence::FullVerification,
-                    )
+                    VerifiedChcResult::unknown_candidate_not_admitted()
                 }
             }
             PdrResult::Unsafe(cex) => {
@@ -964,10 +1034,7 @@ pub mod engines {
                         ValidationEvidence::CounterexampleVerification,
                     )
                 } else {
-                    VerifiedChcResult::from_validated(
-                        ChcEngineResult::Unknown,
-                        ValidationEvidence::CounterexampleVerification,
-                    )
+                    VerifiedChcResult::unknown_candidate_not_admitted()
                 }
             }
             PdrResult::Unknown => VerifiedChcResult::from_validated(
@@ -1031,14 +1098,14 @@ pub mod engines {
     /// body-`forall` stripping. `Safe` and `Unknown` pass through untouched:
     /// the ONLY legal transition here is `Unsafe -> Unknown`, so this can never
     /// gain or lose a proof.
-    fn downgrade_unsafe_if_overapproximated(
+    pub(crate) fn downgrade_unsafe_if_overapproximated(
         result: VerifiedChcResult,
         overapproximated: bool,
     ) -> VerifiedChcResult {
         match result {
-            VerifiedChcResult::Unsafe(_) if overapproximated => {
-                VerifiedChcResult::Unknown(crate::engine_result::VerifiedUnknownMarker::new())
-            }
+            VerifiedChcResult::Unsafe(_) if overapproximated => VerifiedChcResult::Unknown(
+                crate::engine_result::VerifiedUnknownMarker::overapproximated_refutation(),
+            ),
             other => other,
         }
     }

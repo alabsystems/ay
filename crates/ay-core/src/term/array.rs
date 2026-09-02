@@ -17,17 +17,17 @@ impl TermStore {
     /// Create array select with read-over-write simplification: (select a i)
     pub fn mk_select(&mut self, array: TermId, index: TermId) -> TermId {
         // Get the element sort from the array sort
-        let elem_sort = match self.sort(array) {
-            Sort::Array(arr) => {
+        let elem_sort = match self.sort(array).array_element() {
+            Some(elem_sort) => {
                 debug_assert!(
-                    self.sort(index) == &arr.index_sort,
+                    self.sort(array).array_index() == Some(self.sort(index)),
                     "BUG: mk_select index sort mismatch: expected {:?}, got {:?}",
-                    arr.index_sort,
+                    self.sort(array).array_index(),
                     self.sort(index)
                 );
-                arr.element_sort.clone()
+                elem_sort.clone()
             }
-            _ => {
+            None => {
                 // Sort mismatch: caller passed a non-Array term.
                 // CHC solver paths (algebraic invariant validation, portfolio
                 // query-only verification) can hit this when back-translated
@@ -85,27 +85,27 @@ impl TermStore {
 
         // Read-over-write simplification: select(store(a, i, v), i) → v
         if let TermData::App(Symbol::Named(name), args) = self.get(array) {
-            if name == "store" && args.len() == 3 {
-                let store_index = args[1];
-                let store_value = args[2];
-                let inner_array = args[0];
-
-                // If indices are identical, return the stored value
-                if store_index == index {
-                    return store_value;
-                }
-
-                // If both indices are constants and different, look through
-                if let (Some(idx1), Some(idx2)) = (self.get_int(index), self.get_int(store_index)) {
-                    if idx1 != idx2 {
-                        return self.mk_select(inner_array, index);
+            if name == "store" {
+                if let &[inner_array, store_index, store_value] = args.as_slice() {
+                    // If indices are identical, return the stored value
+                    if store_index == index {
+                        return store_value;
                     }
-                }
-                if let (Some((val1, _)), Some((val2, _))) =
-                    (self.get_bitvec(index), self.get_bitvec(store_index))
-                {
-                    if val1 != val2 {
-                        return self.mk_select(inner_array, index);
+
+                    // If both indices are constants and different, look through
+                    if let (Some(idx1), Some(idx2)) =
+                        (self.get_int(index), self.get_int(store_index))
+                    {
+                        if idx1 != idx2 {
+                            return self.mk_select(inner_array, index);
+                        }
+                    }
+                    if let (Some((val1, _)), Some((val2, _))) =
+                        (self.get_bitvec(index), self.get_bitvec(store_index))
+                    {
+                        if val1 != val2 {
+                            return self.mk_select(inner_array, index);
+                        }
                     }
                 }
             }
@@ -138,20 +138,18 @@ impl TermStore {
                 array_sort,
             );
         }
-        if let Sort::Array(arr) = self.sort(array) {
-            debug_assert!(
-                self.sort(index) == &arr.index_sort,
-                "BUG: mk_store index sort mismatch: expected {:?}, got {:?}",
-                arr.index_sort,
-                self.sort(index)
-            );
-            debug_assert!(
-                self.sort(value) == &arr.element_sort,
-                "BUG: mk_store value sort mismatch: expected {:?}, got {:?}",
-                arr.element_sort,
-                self.sort(value)
-            );
-        }
+        debug_assert!(
+            self.sort(array).array_index() == Some(self.sort(index)),
+            "BUG: mk_store index sort mismatch: expected {:?}, got {:?}",
+            self.sort(array).array_index(),
+            self.sort(index)
+        );
+        debug_assert!(
+            self.sort(array).array_element() == Some(self.sort(value)),
+            "BUG: mk_store value sort mismatch: expected {:?}, got {:?}",
+            self.sort(array).array_element(),
+            self.sort(value)
+        );
         let array_sort = self.sort(array).clone();
 
         // store(const-array(v), i, v) -> const-array(v)
@@ -162,45 +160,49 @@ impl TermStore {
 
         // Identity store elimination: store(a, i, select(a, i)) → a (#6282)
         if let TermData::App(Symbol::Named(n), a) = self.get(value) {
-            if n == "select" && a.len() == 2 && a[0] == array && a[1] == index {
+            if n == "select" && *a == [array, index] {
                 return array;
             }
         }
 
         // Store-over-store and sort/squash rewrites require inner store
         if let TermData::App(Symbol::Named(name), args) = self.get(array) {
-            if name == "store" && args.len() == 3 {
-                let inner_index = args[1];
-                let inner_array = args[0];
-                let inner_value = args[2];
-
-                if inner_index == index {
-                    return self.mk_store(inner_array, index, value);
-                }
-
-                let rewrite = if self.store_chain_contains_index(inner_array, index) {
-                    // #8785: if the outer index already occurs deeper in the
-                    // chain, keep the raw topology instead of commuting the
-                    // outer store inward until it collapses onto that older
-                    // write. This narrows the concrete sort-store rewrite to
-                    // non-duplicate concrete prefixes.
-                    StoreIndexRewrite::Keep
-                } else {
-                    self.store_index_rewrite(index, inner_index)
-                };
-
-                match rewrite {
-                    StoreIndexRewrite::Keep => {}
-                    StoreIndexRewrite::SwapDistinct => {
-                        let new_inner = self.mk_store(inner_array, index, value);
-                        return self.mk_store(new_inner, inner_index, inner_value);
-                    }
-                }
-
-                if let Some(squashed) =
-                    self.squash_store(index, value, inner_array, inner_index, inner_value)
+            if name == "store" {
+                // Arity-exact destructure via iterator: a `&[_, _, _]` slice
+                // pattern here carries slice-bounds obligations the verifier
+                // cannot discharge through the `Vec` deref (trust L0).
+                let mut it = args.iter();
+                if let (Some(&inner_array), Some(&inner_index), Some(&inner_value), None) =
+                    (it.next(), it.next(), it.next(), it.next())
                 {
-                    return squashed;
+                    if inner_index == index {
+                        return self.mk_store(inner_array, index, value);
+                    }
+
+                    let rewrite = if self.store_chain_contains_index(inner_array, index) {
+                        // #8785: if the outer index already occurs deeper in the
+                        // chain, keep the raw topology instead of commuting the
+                        // outer store inward until it collapses onto that older
+                        // write. This narrows the concrete sort-store rewrite to
+                        // non-duplicate concrete prefixes.
+                        StoreIndexRewrite::Keep
+                    } else {
+                        self.store_index_rewrite(index, inner_index)
+                    };
+
+                    match rewrite {
+                        StoreIndexRewrite::Keep => {}
+                        StoreIndexRewrite::SwapDistinct => {
+                            let new_inner = self.mk_store(inner_array, index, value);
+                            return self.mk_store(new_inner, inner_index, inner_value);
+                        }
+                    }
+
+                    if let Some(squashed) =
+                        self.squash_store(index, value, inner_array, inner_index, inner_value)
+                    {
+                        return squashed;
+                    }
                 }
             }
         }
@@ -262,11 +264,17 @@ impl TermStore {
 
         while depth < MAX_DEPTH {
             match self.get(array) {
-                TermData::App(Symbol::Named(name), args) if name == "store" && args.len() == 3 => {
-                    if args[1] == index {
+                TermData::App(Symbol::Named(name), args) if name == "store" => {
+                    let mut it = args.iter();
+                    let (Some(&base), Some(&chain_index), Some(_), None) =
+                        (it.next(), it.next(), it.next(), it.next())
+                    else {
+                        return false;
+                    };
+                    if chain_index == index {
                         return true;
                     }
-                    array = args[0];
+                    array = base;
                     depth += 1;
                 }
                 _ => return false,
@@ -377,23 +385,21 @@ impl TermStore {
             return None;
         }
         if let TermData::App(Symbol::Named(name), args) = self.get(term) {
-            if args.len() == 2 {
-                match name.as_str() {
-                    "+" => {
-                        if let Some(val) = self.get_int(args[1]) {
-                            return Some((args[0], val.clone()));
-                        }
-                        if let Some(val) = self.get_int(args[0]) {
-                            return Some((args[1], val.clone()));
-                        }
+            match (name.as_str(), args.as_slice()) {
+                ("+", &[lhs, rhs]) => {
+                    if let Some(val) = self.get_int(rhs) {
+                        return Some((lhs, val.clone()));
                     }
-                    "-" => {
-                        if let Some(val) = self.get_int(args[1]) {
-                            return Some((args[0], -val.clone()));
-                        }
+                    if let Some(val) = self.get_int(lhs) {
+                        return Some((rhs, val.clone()));
                     }
-                    _ => {}
                 }
+                ("-", &[lhs, rhs]) => {
+                    if let Some(val) = self.get_int(rhs) {
+                        return Some((lhs, -val.clone()));
+                    }
+                }
+                _ => {}
             }
         }
         Some((term, BigInt::from(0u8)))
@@ -426,23 +432,23 @@ impl TermStore {
 
         match self.get(term) {
             TermData::App(Symbol::Named(name), args) if args.len() == 2 => {
-                match name.as_str() {
-                    "bvadd" => {
+                match (name.as_str(), args.as_slice()) {
+                    ("bvadd", &[lhs, rhs]) => {
                         // bvadd(base, const) or bvadd(const, base)
-                        if let Some((val, _)) = self.get_bitvec(args[1]) {
-                            Some((args[0], val.clone(), width))
-                        } else if let Some((val, _)) = self.get_bitvec(args[0]) {
-                            Some((args[1], val.clone(), width))
+                        if let Some((val, _)) = self.get_bitvec(rhs) {
+                            Some((lhs, val.clone(), width))
+                        } else if let Some((val, _)) = self.get_bitvec(lhs) {
+                            Some((rhs, val.clone(), width))
                         } else {
                             None
                         }
                     }
-                    "bvsub" => {
+                    ("bvsub", &[lhs, rhs]) => {
                         // bvsub(base, const) -> base + (-const mod 2^w)
-                        if let Some((val, _)) = self.get_bitvec(args[1]) {
+                        if let Some((val, _)) = self.get_bitvec(rhs) {
                             let modulus = BigInt::from(1u8) << width;
                             let neg_val = ((&modulus - val) % &modulus + &modulus) % &modulus;
-                            Some((args[0], neg_val, width))
+                            Some((lhs, neg_val, width))
                         } else {
                             None
                         }
@@ -489,10 +495,11 @@ impl TermStore {
     /// Check if a term is a constant array, returning the default value if so
     pub fn get_const_array(&self, term: TermId) -> Option<TermId> {
         match self.get(term) {
-            TermData::App(Symbol::Named(name), args)
-                if name == "const-array" && args.len() == 1 =>
-            {
-                Some(args[0])
+            TermData::App(Symbol::Named(name), args) if name == "const-array" => {
+                match args.as_slice() {
+                    &[value] => Some(value),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -522,10 +529,11 @@ impl TermStore {
     /// Check if a term is a lambda array, returning `(var_term, body)` if so.
     pub fn get_lambda_array(&self, term: TermId) -> Option<(TermId, TermId)> {
         match self.get(term) {
-            TermData::App(Symbol::Named(name), args)
-                if name == "lambda-array" && args.len() == 2 =>
-            {
-                Some((args[0], args[1]))
+            TermData::App(Symbol::Named(name), args) if name == "lambda-array" => {
+                match args.as_slice() {
+                    &[var_term, body] => Some((var_term, body)),
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -893,8 +901,7 @@ impl TermStore {
         if let Some((func_name, arrays)) = self.get_array_map(array) {
             let func_name = func_name.to_string();
             let arrays = arrays.to_vec();
-            if let Sort::Array(arr) = self.sort(array) {
-                let elem_sort = arr.element_sort.clone();
+            if let Some(elem_sort) = self.sort(array).array_element().cloned() {
                 let defaults = arrays
                     .into_iter()
                     .map(|arg| self.mk_array_default(arg))
@@ -927,9 +934,9 @@ impl TermStore {
             }
         }
 
-        let elem_sort = match self.sort(array) {
-            Sort::Array(arr) => arr.element_sort.clone(),
-            _ => {
+        let elem_sort = match self.sort(array).array_element() {
+            Some(elem_sort) => elem_sort.clone(),
+            None => {
                 // Sort mismatch — return a dummy term (similar to mk_select fallback).
                 return self.intern(
                     TermData::App(Symbol::named("default"), vec![array]),
@@ -983,10 +990,13 @@ impl TermStore {
     /// Check if a term is an array default term, returning the array argument if so.
     pub fn get_array_default(&self, term: TermId) -> Option<TermId> {
         match self.get(term) {
-            TermData::App(Symbol::Named(name), args) if name == "default" && args.len() == 1 => {
+            TermData::App(Symbol::Named(name), args) if name == "default" => {
+                let &[arg] = args.as_slice() else {
+                    return None;
+                };
                 // Only return if the argument has Array sort
-                if matches!(self.sort(args[0]), Sort::Array(_)) {
-                    Some(args[0])
+                if matches!(self.sort(arg), Sort::Array(_)) {
+                    Some(arg)
                 } else {
                     None
                 }
@@ -1023,12 +1033,10 @@ impl TermStore {
     /// and the array arguments if so.
     pub fn get_array_map(&self, term: TermId) -> Option<(&str, &[TermId])> {
         match self.get(term) {
-            TermData::App(Symbol::Named(name), args)
-                if name.starts_with("map[") && name.ends_with(']') =>
-            {
-                let func_name = &name[4..name.len() - 1];
-                Some((func_name, args))
-            }
+            TermData::App(Symbol::Named(name), args) => name
+                .strip_prefix("map[")
+                .and_then(|s| s.strip_suffix(']'))
+                .map(|func_name| (func_name, args.as_slice())),
             _ => None,
         }
     }

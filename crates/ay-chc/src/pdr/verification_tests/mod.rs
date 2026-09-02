@@ -221,7 +221,7 @@ fn test_smt_value_to_chc_expr_for_sort_canonicalizes_recursive_dt_backedge_9692(
     );
 
     let expr = super::smt_value_to_chc_expr_for_sort(&value, &list_sort);
-    let ChcExpr::FuncApp(ctor, sort, args) = &expr else {
+    let Some(ChcExpr::FuncApp(ctor, sort, args)) = &expr else {
         panic!("expected cons constructor expression");
     };
     assert_eq!(ctor, "conslistOfInt");
@@ -1536,6 +1536,27 @@ fn test_instance_subst_var_and_value_declared_sort_overrides_inferred_6249() {
     assert_ne!(
         var_no_decl, clause_var,
         "inferred Int sort must not match BitVec(8)"
+    );
+}
+
+#[test]
+fn instance_substitution_reconstructs_bv129_from_bigint() {
+    let bits: num_bigint::BigInt = (num_bigint::BigInt::from(1_u8) << 128_usize) + 5_u8;
+    let value = SmtValue::int_from_bigint(bits.clone());
+    let mut saw_unknown = false;
+    let (var, expr) = super::instance_subst_var_and_value(
+        "wide",
+        &value,
+        Some(&ChcSort::BitVec(129)),
+        false,
+        &mut saw_unknown,
+    );
+    assert_eq!(var.sort, ChcSort::BitVec(129));
+    assert!(!saw_unknown);
+    assert_eq!(
+        crate::expr::evaluate_expr(&expr, &FxHashMap::default())
+            .and_then(|value| value.bitvec_to_biguint()),
+        Some(((num_bigint::BigUint::from(1_u8) << 128) + 5_u8, 129))
     );
 }
 

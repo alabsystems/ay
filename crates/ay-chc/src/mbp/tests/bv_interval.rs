@@ -85,6 +85,38 @@ fn test_bv_mbp_interval_resolution() {
     );
 }
 
+#[test]
+fn test_bv_mbp_wide_interval_falls_back_to_exact_model_substitution() {
+    let mbp = Mbp::new();
+    let width = 129;
+    let x = ChcVar::new("wide_x", ChcSort::BitVec(width));
+    let base = num_bigint::BigUint::from(1_u8) << 128;
+    let lower = ChcExpr::bitvec_from_biguint(&base, width).expect("bounded BV129 literal");
+    let upper_value = &base + num_bigint::BigUint::from(10_u8);
+    let upper = ChcExpr::bitvec_from_biguint(&upper_value, width).expect("bounded BV129 literal");
+    let formula = ChcExpr::and(
+        ChcExpr::Op(
+            ChcOp::BvUGe,
+            vec![Arc::new(ChcExpr::var(x.clone())), Arc::new(lower)],
+        ),
+        ChcExpr::Op(
+            ChcOp::BvULe,
+            vec![Arc::new(ChcExpr::var(x.clone())), Arc::new(upper)],
+        ),
+    );
+    let mut model = FxHashMap::default();
+    model.insert(
+        x.name.clone(),
+        SmtValue::bitvec_from_biguint(base + num_bigint::BigUint::from(5_u8), width),
+    );
+
+    let projected = mbp.project(&formula, &[x], &model);
+    assert!(
+        !projected.contains_var_name("wide_x"),
+        "wide interval projection must use the exact model literal fallback: {projected:?}"
+    );
+}
+
 /// BV MBP: one-sided bound with unhandled literal.
 /// Project bv_x from `bvule(bv_x, 50) AND bvult(bv_y, bv_x)`.
 /// Upper bound on bv_x; `bvult(bv_y, bv_x)` gives lower bound `bv_x >_u bv_y`.

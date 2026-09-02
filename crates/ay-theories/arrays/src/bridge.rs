@@ -456,6 +456,18 @@ impl ArraySolver<'_> {
             return;
         }
 
+        self.queue_array_equality_events(a, b);
+        self.record_array_var_merge(a, b);
+    }
+
+    /// Re-derive the event work implied by one active array equality without
+    /// recording or applying another `array_vars` merge.
+    ///
+    /// Structural term registration can happen after `notify_equality()`. The
+    /// incremental cache layer replays this half for the existing merge log so
+    /// newly registered selects/stores receive the same cross-equality work as
+    /// structure that existed at notification time.
+    pub(crate) fn queue_array_equality_events(&mut self, a: TermId, b: TermId) {
         let a_data = self.array_vars.get(&a).cloned();
         let b_data = self.array_vars.get(&b).cloned();
 
@@ -618,34 +630,25 @@ impl ArraySolver<'_> {
                 }
             }
         }
+    }
 
-        // Merge b's data into a's ArrayVarData (append-only). Record an
-        // invertible undo entry (target + pre-merge vec lengths) so this merge
-        // can be reversed by truncation on pop(), letting `array_vars` persist
-        // across backtracks instead of being wiped and rebuilt (M1).
-        if b_data.is_some() {
-            let (stores_len, selects_len, parent_stores_len, prev_prop_upward) = self
-                .array_vars
-                .get(&a)
-                .map(|d| {
-                    (
-                        d.stores_as_result.len() as u32,
-                        d.parent_selects.len() as u32,
-                        d.parent_stores.len() as u32,
-                        d.prop_upward,
-                    )
-                })
-                .unwrap_or((0, 0, 0, false));
-            self.array_var_merge_log.push((a, b));
-            self.array_var_merge_undo.push(ArrayVarMergeUndo {
-                target: a,
-                stores_len,
-                selects_len,
-                parent_stores_len,
-                prev_prop_upward,
-            });
-            Self::merge_array_var_data(&mut self.array_vars, a, b);
+    /// Record and apply the append-only `array_vars` merge for an active array
+    /// equality. Array-sorted sources are logged even before they acquire
+    /// structural data: later term growth must be able to replay the equality
+    /// when a select or store first makes that source visible to the theory.
+    fn record_array_var_merge(&mut self, a: TermId, b: TermId) {
+        debug_assert_eq!(
+            self.terms.sort(a),
+            self.terms.sort(b),
+            "arrays: equality merge endpoints must have the same sort"
+        );
+        if !matches!(self.terms.sort(a), Sort::Array(_))
+            || !matches!(self.terms.sort(b), Sort::Array(_))
+        {
+            return;
         }
+        self.array_var_merge_log.push((a, b));
+        self.apply_array_var_merge(a, b);
     }
 
     /// Enable deferred expensive checks mode (#6282 Packet 2).

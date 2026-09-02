@@ -9,7 +9,8 @@ use crate::auto::DecisionSource;
 use crate::features::{InstanceClass, SatFeatures};
 use crate::proof_capability::ProofMode;
 use crate::variant::{
-    SolverVariant, VariantConfig, VariantProofMode, VariantRouteProfile, BVE_SPARSE_MAX_DENSITY,
+    SolverVariant, VariantConfig, VariantProofMode, VariantRouteProfile,
+    BVE_SMALL_CIRCUIT_MAX_DENSITY, BVE_SMALL_CIRCUIT_MAX_VARS, BVE_SPARSE_MAX_DENSITY,
     BVE_SPARSE_MAX_VARS,
 };
 
@@ -119,9 +120,17 @@ fn bve_env_source(config: &VariantConfig) -> Option<(DecisionSource, String)> {
     let max_vars = max_vars_env.unwrap_or(BVE_SPARSE_MAX_VARS);
     let max_density = max_density_env.unwrap_or(BVE_SPARSE_MAX_DENSITY);
     let default_vars_admitted = num_vars <= BVE_SPARSE_MAX_VARS;
-    let default_density_admitted = density <= BVE_SPARSE_MAX_DENSITY;
+    // Mirror of the real gate's fixed-edge small-circuit arm (variant.rs
+    // `sparse_band_bve_unlock_active`, 14bd679a6): a small, sparse instance is
+    // re-admitted after the tunable density check fails. The arm is identical
+    // in the default and configured worlds — fixed edges, no env knob — so it
+    // can never make the tunables look decisive, which is exactly what this
+    // provenance mirror exists to report truthfully.
+    let small_circuit_admitted =
+        num_vars <= BVE_SMALL_CIRCUIT_MAX_VARS && density <= BVE_SMALL_CIRCUIT_MAX_DENSITY;
+    let default_density_admitted = density <= BVE_SPARSE_MAX_DENSITY || small_circuit_admitted;
     let configured_vars_admitted = num_vars <= max_vars;
-    let configured_density_admitted = density <= max_density;
+    let configured_density_admitted = density <= max_density || small_circuit_admitted;
     let kill_present = ay_core::sat_ab_switches().no_bve_sparse;
     let vars_present = max_vars_env.is_some();
     let density_present = max_density_env.is_some();

@@ -9,6 +9,7 @@ mod cert;
 mod context;
 mod drat_lift;
 mod koops;
+mod opt_budget;
 mod optimum_check;
 mod refutation_check;
 mod reified_encoding;
@@ -18,16 +19,28 @@ pub(crate) mod tap;
 mod veripb;
 
 pub use self::cert::{
-    certify_decision_unsat, certify_decision_unsat_interruptible,
+    certified_bb_diagnosis, certify_decision_unsat, certify_decision_unsat_interruptible,
     certify_opt_lin_any_interruptible, certify_opt_lin_bounds, certify_opt_lin_bounds_compact,
     certify_opt_lin_bounds_compact_interruptible, certify_opt_lin_bounds_interruptible,
     certify_opt_lin_bounds_pb, certify_opt_lin_bounds_pb_interruptible,
-    certify_opt_lin_clique_coloring, certify_opt_lin_direct_aggregation_floor,
-    certify_opt_lin_frustrated_cycle, certify_opt_lin_knapsack_cardinality,
-    certify_opt_lin_lp_dual_floor, certify_opt_lin_trivial_zero_floor, lp_dual_floor_diagnosis,
-    solution_only_sat_proof, OptLinCertRoute,
+    certify_opt_lin_certified_bb, certify_opt_lin_clique_coloring,
+    certify_opt_lin_direct_aggregation_floor, certify_opt_lin_frustrated_cycle,
+    certify_opt_lin_handshake_parity, certify_opt_lin_knapsack_cardinality,
+    certify_opt_lin_layered_pebbling, certify_opt_lin_lp_dual_floor,
+    certify_opt_lin_odd_cycle_cover, certify_opt_lin_trivial_zero_floor,
+    layered_pebbling_constructed_optimum, lp_dual_floor_diagnosis,
+    recovered_structural_search_floor, solution_only_sat_proof, OptLinCertRoute,
 };
 pub use self::drat_lift::{emit_decision_unsat_proof, parse_aux_free_drat};
+pub use self::opt_budget::proof_slice_cut_note;
+pub use self::opt_budget::{
+    certify_reserve, compute_cert_opt_budget_split, extend_native_deadline, native_cap_expired,
+    CertOptBudgetPolicy, CertOptBudgetSplit, OPT_CERT_CERTIFY_RESERVE_DIV,
+    OPT_CERT_CERTIFY_RESERVE_MAX_MS, OPT_CERT_CERTIFY_RESERVE_MIN_MS,
+    OPT_CERT_HUGE_MIN_CONSTRAINTS, OPT_CERT_HUGE_MIN_VARS, OPT_CERT_IMPROVE_GRACE_DIV,
+    OPT_CERT_IMPROVE_GRACE_MAX_MS, OPT_CERT_NATIVE_CEIL_DIV, OPT_CERT_NATIVE_CEIL_DIV_HUGE,
+    OPT_CERT_NATIVE_SLICE_DIV, OPT_CERT_NATIVE_SLICE_DIV_HUGE,
+};
 #[cfg(test)]
 pub(crate) use self::optimum_check::FLOOR_CERT_CALLS;
 pub use self::optimum_check::{

@@ -9,10 +9,30 @@ impl QueryChecker<'_> {
     // Interval evaluation
     // -----------------------------------------------------------------------
 
-    /// The interval a term's SHAPE entails, independently of any assertion.
-    fn shape_interval(&mut self, term: TermId) -> Result<Interval, BvLiaUnsatAuthenticationError> {
+    /// The interval an atom's SHAPE entails, independently of any assertion.
+    fn shape_interval(
+        &mut self,
+        atom: LinearAtom,
+    ) -> Result<Interval, BvLiaUnsatAuthenticationError> {
         self.meter.charge(1)?;
         let terms = self.terms;
+        if let LinearAtom::UnsignedBv(term) = atom {
+            let Sort::BitVec(width) = terms.sort(term) else {
+                return Ok(Interval::default());
+            };
+            let width = width.width;
+            if width == 0 || width > 64 {
+                return Ok(Interval::default());
+            }
+            self.meter.charge(u64::from(width).div_ceil(64).max(1))?;
+            return Ok(Interval {
+                lower: Some(BigInt::zero()),
+                upper: Some((BigInt::one() << width) - BigInt::one()),
+            });
+        }
+        let LinearAtom::Int(term) = atom else {
+            return Ok(Interval::default());
+        };
         // Every shape bound below is a theorem about an Int-sorted application.
         // `validate_fragment_sorting` has already rejected ill-sorted nodes;
         // re-checking here keeps the theorem local to this function.
@@ -253,7 +273,7 @@ impl QueryChecker<'_> {
         {
             return Ok(AssumeOutcome::Conflict);
         }
-        let unbounded: Vec<TermId> = interval
+        let unbounded: Vec<LinearAtom> = interval
             .contributions
             .iter()
             .filter(|(_, _, low)| low.is_none())
@@ -323,7 +343,7 @@ impl QueryChecker<'_> {
 
     fn tighten_upper(
         &mut self,
-        atom: TermId,
+        atom: LinearAtom,
         bound: BigInt,
         state: &mut IntervalState,
     ) -> Result<AssumeOutcome, BvLiaUnsatAuthenticationError> {
@@ -349,7 +369,7 @@ impl QueryChecker<'_> {
 
     fn tighten_lower(
         &mut self,
-        atom: TermId,
+        atom: LinearAtom,
         bound: BigInt,
         state: &mut IntervalState,
     ) -> Result<AssumeOutcome, BvLiaUnsatAuthenticationError> {
@@ -375,7 +395,7 @@ impl QueryChecker<'_> {
 
     fn store_interval(
         &mut self,
-        atom: TermId,
+        atom: LinearAtom,
         existing: Interval,
         updated: Interval,
         state: &mut IntervalState,

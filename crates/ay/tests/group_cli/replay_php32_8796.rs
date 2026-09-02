@@ -63,10 +63,20 @@ fn php_3_2_drat_replay_matches_cold_solve() {
     }
 
     // Stage 1: fresh cold solve, emitting DRAT.
+    //
+    // The consumer here is `SequentialReplayer`, a RUP-only checker, so the
+    // solve must declare a RUP/RAT checker. Under the default declaration
+    // (dsr-trim) the aux-free symmetry SR route — default-on for one-shot
+    // solves since f660402bf — writes SR-witnessed `AddPr` a-lines into the
+    // stream, which a RUP-only replayer fails closed on. The declared-checker
+    // axis (94a40e2aa) exists precisely so a run whose downstream checker
+    // cannot consume witnessed steps gates those routes off at emission.
     let cold_start = Instant::now();
     let out = Command::new(ay_bin)
         .arg("--drat")
         .arg(&proof_path)
+        .arg("--proof-checker")
+        .arg("drat-trim")
         .arg(&cnf_path)
         .output_timeout(Duration::from_secs(55))
         .expect("spawn ay");

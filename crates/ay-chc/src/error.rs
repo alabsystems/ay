@@ -29,6 +29,9 @@ pub enum ChcError {
     #[error("sort mismatch: expected {expected:?}, got {actual:?}")]
     SortMismatch { expected: String, actual: String },
 
+    #[error("bit-vector width {width} is outside the supported range 1..={max}")]
+    InvalidBitVectorWidth { width: u32, max: u32 },
+
     #[error("no query clause found")]
     NoQuery,
 

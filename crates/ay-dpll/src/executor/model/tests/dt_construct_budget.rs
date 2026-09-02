@@ -5,10 +5,13 @@
 //! Boundary controls for opaque datatype construction work accounting.
 
 use super::super::dt_construct::eval_to_mv;
-use super::super::dt_construct_budget::{OpaqueDtCollectionBudget, OpaqueDtConstructionBudget};
+use super::super::dt_construct_budget::{
+    OpaqueDtCollectionBudget, OpaqueDtConstructionBudget, MAX_DT_FIELD_SCAN_COMPARISONS,
+    MAX_DT_FIELD_SCAN_FIELDS, MAX_DT_FIELD_SCAN_ROWS,
+};
 use super::super::EvalValue;
 use ay_core::Sort;
-use ay_model_check::ModelValue;
+use ay_model_check::{ArrayValue, ModelValue};
 use num_bigint::BigInt;
 
 #[test]
@@ -51,6 +54,42 @@ fn canonical_render_is_charged_before_allocation_at_exact_length() {
 }
 
 #[test]
+fn canonical_render_charges_arrays_nested_in_datatypes() {
+    let value = ModelValue::Datatype {
+        ctor: "K".to_string(),
+        args: vec![ModelValue::Array(Box::new(ArrayValue {
+            default: ModelValue::Bool(false),
+            store: vec![(ModelValue::Bool(true), ModelValue::Bool(false))],
+        }))],
+    };
+    let mut exact = OpaqueDtConstructionBudget::with_limit(29);
+    assert!(exact.charge_render(&value));
+    assert!(!exact.charge_bytes(1));
+
+    let mut short = OpaqueDtConstructionBudget::with_limit(28);
+    assert!(!short.charge_render(&value));
+    assert!(short.exhausted());
+}
+
+#[test]
+fn canonical_render_charges_escaped_strings_nested_in_arrays() {
+    let value = ModelValue::Datatype {
+        ctor: "K".to_string(),
+        args: vec![ModelValue::Array(Box::new(ArrayValue {
+            default: ModelValue::Str("\"\t\\u{61}".to_string()),
+            store: Vec::new(),
+        }))],
+    };
+    let mut exact = OpaqueDtConstructionBudget::with_limit(31);
+    assert!(exact.charge_render(&value));
+    assert!(!exact.charge_bytes(1));
+
+    let mut short = OpaqueDtConstructionBudget::with_limit(30);
+    assert!(!short.charge_render(&value));
+    assert!(short.exhausted());
+}
+
+#[test]
 fn distinct_collection_counts_raw_arity_and_aggregate_pairs() {
     let mut oversized = OpaqueDtCollectionBudget::new();
     assert!(!oversized.record_distinct(1025));
@@ -69,6 +108,30 @@ fn field_selector_scan_is_precharged_multiplicatively() {
     let mut exact = OpaqueDtConstructionBudget::with_limit(4 * 3 * 272);
     assert!(exact.charge_field_scans(4, 2, 1));
     assert!(!exact.charge_field_scans(1, 1, 0));
+}
+
+#[test]
+fn native_field_scan_budget_is_unconditional_and_aggregate() {
+    let mut native = OpaqueDtConstructionBudget::new(0).expect("native budget exists");
+    for _ in 0..(MAX_DT_FIELD_SCAN_COMPARISONS / MAX_DT_FIELD_SCAN_ROWS) {
+        assert!(native.charge_field_scans(1, MAX_DT_FIELD_SCAN_ROWS, 0));
+    }
+    let remainder = MAX_DT_FIELD_SCAN_COMPARISONS % MAX_DT_FIELD_SCAN_ROWS;
+    assert!(native.charge_field_scans(1, remainder, 0));
+    assert!(!native.charge_field_scans(1, 1, 0));
+    assert!(native.exhausted());
+
+    let mut overflow = OpaqueDtConstructionBudget::new(0).expect("native budget exists");
+    assert!(!overflow.charge_field_scans(usize::MAX, 2, 0));
+    assert!(overflow.exhausted());
+
+    let mut fields = OpaqueDtConstructionBudget::new(0).expect("native budget exists");
+    assert!(fields.charge_field_scans(MAX_DT_FIELD_SCAN_FIELDS, 0, 0));
+    assert!(!fields.charge_field_scans(MAX_DT_FIELD_SCAN_FIELDS + 1, 0, 0));
+
+    let mut rows = OpaqueDtConstructionBudget::new(0).expect("native budget exists");
+    assert!(rows.charge_field_scans(0, MAX_DT_FIELD_SCAN_ROWS, 0));
+    assert!(!rows.charge_field_scans(0, MAX_DT_FIELD_SCAN_ROWS + 1, 0));
 }
 
 #[test]

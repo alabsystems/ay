@@ -16,6 +16,17 @@ const MAX_AFFINE_EQS: usize = 64;
 const MAX_AFFINE_DISEQS: usize = 64;
 const MAX_AFFINE_VARS: usize = 64;
 
+/// Match the established exact-RREF guard used by direct enumeration.  The
+/// affine check is only an UNSAT accelerator, so declining inputs or
+/// intermediates above this bound is complete-safe and prevents a single
+/// `BigRational` normalization from monopolizing a cancelled worker.
+const MAX_AFFINE_COEFF_BITS: u64 = 256;
+
+/// A shared budget for the base and augmented rank computations.  Under the
+/// 64-row/64-variable structural bounds, both Gauss-Jordan passes require
+/// fewer than 300,000 cell updates in total.
+const AFFINE_RANK_FUEL: usize = 300_000;
+
 /// Fuel budget (BigRational cell operations) for one minimal-core extraction
 /// (#23 Stage 2). The structural bounds above cap the elimination at
 /// 64 rows x (65 + 64) tracked columns, so this is generous; it exists as a
@@ -58,6 +69,9 @@ impl LiaSolver<'_> {
         &mut self,
         debug: bool,
     ) -> Option<TheoryConflict> {
+        if self.should_timeout() {
+            return None;
+        }
         let view = self.assertion_view();
         if view.positive_equalities.is_empty() && self.shared_equalities.is_empty()
             || view.negative_equalities.is_empty() && self.shared_disequalities.is_empty()
@@ -82,6 +96,9 @@ impl LiaSolver<'_> {
 
         let mut equations = Vec::with_capacity(positive_literals.len());
         for literal in positive_literals {
+            if self.should_timeout() {
+                return None;
+            }
             if let Some((coeffs, constant)) = self.parse_arithmetic_equality(literal) {
                 equations.push(AffineEquation {
                     coeffs,
@@ -93,6 +110,9 @@ impl LiaSolver<'_> {
             }
         }
         for (lhs, rhs, reasons) in &self.shared_equalities {
+            if self.should_timeout() {
+                return None;
+            }
             if reasons.is_empty() {
                 continue;
             }
@@ -128,6 +148,9 @@ impl LiaSolver<'_> {
         let mut negative_literals = view.negative_equalities.clone();
         negative_literals.sort_by_key(|term| term.0);
         for literal in negative_literals {
+            if self.should_timeout() {
+                return None;
+            }
             if let Some((coeffs, constant)) = self.parse_arithmetic_equality(literal) {
                 disequalities.push(AffineDisequality {
                     coeffs,
@@ -137,6 +160,9 @@ impl LiaSolver<'_> {
             }
         }
         for (lhs, rhs, reasons) in &self.shared_disequalities {
+            if self.should_timeout() {
+                return None;
+            }
             if reasons.is_empty() {
                 continue;
             }
@@ -150,6 +176,9 @@ impl LiaSolver<'_> {
         }
 
         for disequality in disequalities {
+            if self.should_timeout() {
+                return None;
+            }
             let target_coeffs = disequality.coeffs;
             let target_constant = disequality.constant;
 
@@ -190,15 +219,22 @@ impl LiaSolver<'_> {
                 // actually participate in implying the target. The candidate
                 // core comes from multiplier tracking during Gaussian
                 // elimination and is only used after RE-VERIFYING — with the
-                // unchanged trusted `rational_rank` test — that the subset
+                // same bounded exact `rational_rank` test — that the subset
                 // alone still implies the target. Any failure (fuel,
-                // verification) falls back to the baseline fat conflict.
+                // coefficient growth, cancellation, verification) falls
+                // back to the baseline fat conflict unless cancelled.
                 // Minimal-core affine conflict narrowing (#23 Stage 2) is
                 // always on (former `AY_AFFINE_MIN_CORE` kill-switch removed;
                 // enabled was the default). A `None` core falls back to the
                 // baseline fat-conflict path below.
                 let core =
                     self.affine_minimal_core(&equations, &target_coeffs, &target_constant, debug);
+                // Optional core extraction may have observed cancellation
+                // after the baseline implication proof completed. Honour it
+                // instead of publishing a late (albeit sound) fat conflict.
+                if self.should_timeout() {
+                    return None;
+                }
                 let mut conflict: Vec<TheoryLit> = match &core {
                     Some(entries) => entries
                         .iter()
@@ -440,9 +476,28 @@ impl LiaSolver<'_> {
         target_coeffs: &HashMap<TermId, BigInt>,
         target_constant: &BigInt,
     ) -> bool {
+        if self.should_timeout()
+            || !Self::integer_is_bounded(target_constant)
+            || target_coeffs
+                .values()
+                .any(|coefficient| !Self::integer_is_bounded(coefficient))
+            || equations.iter().any(|equation| {
+                !Self::integer_is_bounded(&equation.constant)
+                    || equation
+                        .coeffs
+                        .values()
+                        .any(|coefficient| !Self::integer_is_bounded(coefficient))
+            })
+        {
+            return false;
+        }
+
         let mut vars: Vec<TermId> = Vec::new();
         let mut seen: HashSet<TermId> = HashSet::default();
         for eq in equations {
+            if self.should_timeout() {
+                return false;
+            }
             for &var in eq.coeffs.keys() {
                 if seen.insert(var) {
                     vars.push(var);
@@ -450,6 +505,9 @@ impl LiaSolver<'_> {
             }
         }
         for &var in target_coeffs.keys() {
+            if self.should_timeout() {
+                return false;
+            }
             if seen.insert(var) {
                 vars.push(var);
             }
@@ -461,12 +519,25 @@ impl LiaSolver<'_> {
 
         let mut rows = Vec::with_capacity(equations.len());
         for eq in equations {
+            if self.should_timeout() {
+                return false;
+            }
             rows.push(Self::affine_row(&vars, &eq.coeffs, &eq.constant));
         }
         let mut rows_with_target = rows.clone();
         rows_with_target.push(Self::affine_row(&vars, target_coeffs, target_constant));
 
-        Self::rational_rank(rows) == Self::rational_rank(rows_with_target)
+        let mut fuel = AFFINE_RANK_FUEL;
+        let mut should_abort = || self.should_timeout();
+        let Some(rank) = Self::rational_rank(rows, &mut fuel, &mut should_abort) else {
+            return false;
+        };
+        let Some(rank_with_target) =
+            Self::rational_rank(rows_with_target, &mut fuel, &mut should_abort)
+        else {
+            return false;
+        };
+        rank == rank_with_target
     }
 
     /// Minimal-core extraction for an affine implication conflict (#23 Stage 2).
@@ -478,11 +549,11 @@ impl LiaSolver<'_> {
     /// whose rows alone still imply the target, with the tracked Gaussian
     /// multipliers satisfying `target == Σ multiplier_i · row_i` (#rank-4
     /// increment 2: the multipliers ARE the Farkas coefficients) — only when
-    /// the candidate subset has been RE-VERIFIED with the unchanged trusted
+    /// the candidate subset has been RE-VERIFIED with the same bounded exact
     /// `rational_rank` equality test. Returns `None` on any failure (fuel
-    /// exhaustion, tracking failure, verification failure); the caller then
-    /// falls back to the baseline fat conflict, byte-identical to the
-    /// pre-Stage-2 behavior.
+    /// exhaustion, cancellation, coefficient growth, tracking failure,
+    /// verification failure); the caller then falls back to the baseline fat
+    /// conflict unless cancellation was observed.
     fn affine_minimal_core(
         &mut self,
         equations: &[AffineEquation],
@@ -520,13 +591,32 @@ impl LiaSolver<'_> {
         let target = Self::affine_row(&vars, target_coeffs, target_constant);
 
         let mut fuel = MIN_CORE_FUEL;
-        let candidate = Self::affine_core_candidate_with_multipliers(&rows, &target, &mut fuel)?;
+        let candidate = {
+            let mut should_abort = || self.should_timeout();
+            Self::affine_core_candidate_with_multipliers_bounded(
+                &rows,
+                &target,
+                &mut fuel,
+                &mut should_abort,
+            )?
+        };
         let candidate_indices: Vec<usize> = candidate.iter().map(|&(index, _)| index).collect();
 
         // SOUNDNESS GATE: only accept the candidate if the exact subset alone
         // still implies the target, judged by the same trusted rank routine
         // the fat path uses. Anything else falls back to the fat conflict.
-        if !Self::affine_core_verified(&rows, &target, &candidate_indices) {
+        let verified = {
+            let mut fuel = AFFINE_RANK_FUEL;
+            let mut should_abort = || self.should_timeout();
+            Self::affine_core_verified_bounded(
+                &rows,
+                &target,
+                &candidate_indices,
+                &mut fuel,
+                &mut should_abort,
+            )
+        };
+        if !verified {
             if debug {
                 safe_eprintln!(
                     "[LIA Affine] min-core candidate of {} rows FAILED re-verification; using fat conflict",
@@ -576,22 +666,27 @@ impl LiaSolver<'_> {
         target: &[BigRational],
         fuel: &mut usize,
     ) -> Option<Vec<(usize, BigRational)>> {
+        let mut never_abort = || false;
+        Self::affine_core_candidate_with_multipliers_bounded(rows, target, fuel, &mut never_abort)
+    }
+
+    fn affine_core_candidate_with_multipliers_bounded<F: FnMut() -> bool>(
+        rows: &[Vec<BigRational>],
+        target: &[BigRational],
+        fuel: &mut usize,
+        should_abort: &mut F,
+    ) -> Option<Vec<(usize, BigRational)>> {
         let row_count = rows.len();
-        if row_count == 0 {
+        if should_abort() || row_count == 0 {
             return None;
         }
         let width = target.len();
-        if rows.iter().any(|row| row.len() != width) {
+        if rows.iter().any(|row| row.len() != width)
+            || !target.iter().all(Self::rational_is_bounded)
+            || !rows.iter().flatten().all(Self::rational_is_bounded)
+        {
             return None;
         }
-
-        let spend = |fuel: &mut usize, cost: usize| -> bool {
-            if *fuel < cost {
-                return false;
-            }
-            *fuel -= cost;
-            true
-        };
 
         // Each work row is (data, combo) with the invariant
         // `data == Σ combo[j] * rows[j]` over the ORIGINAL rows.
@@ -611,6 +706,9 @@ impl LiaSolver<'_> {
 
         let mut rank = 0;
         for col in 0..width {
+            if should_abort() {
+                return None;
+            }
             let Some(pivot) = (rank..row_count).find(|&row| !work[row].0[col].is_zero()) else {
                 continue;
             };
@@ -621,22 +719,25 @@ impl LiaSolver<'_> {
             {
                 let (data, combo) = &mut work[rank];
                 for cell in data.iter_mut().skip(col) {
-                    if !spend(fuel, 1) {
+                    if !Self::affine_step_allowed(fuel, should_abort) {
                         return None;
                     }
-                    *cell = cell.clone() / pivot_value.clone();
+                    *cell = Self::bounded_rational_div(cell, &pivot_value)?;
                 }
                 for cell in combo.iter_mut() {
-                    if !spend(fuel, 1) {
+                    if !Self::affine_step_allowed(fuel, should_abort) {
                         return None;
                     }
-                    *cell = cell.clone() / pivot_value.clone();
+                    *cell = Self::bounded_rational_div(cell, &pivot_value)?;
                 }
             }
             let (pivot_data, pivot_combo) = work[rank].clone();
 
             // Eliminate the pivot column from the rows below (echelon form).
             for row in (rank + 1)..row_count {
+                if should_abort() {
+                    return None;
+                }
                 let factor = work[row].0[col].clone();
                 if factor.is_zero() {
                     continue;
@@ -644,16 +745,16 @@ impl LiaSolver<'_> {
                 let (data, combo) = &mut work[row];
                 for (cell, pivot_cell) in data.iter_mut().skip(col).zip(pivot_data.iter().skip(col))
                 {
-                    if !spend(fuel, 1) {
+                    if !Self::affine_step_allowed(fuel, should_abort) {
                         return None;
                     }
-                    *cell = cell.clone() - factor.clone() * pivot_cell.clone();
+                    *cell = Self::bounded_rational_scaled_sub(cell, &factor, pivot_cell)?;
                 }
                 for (cell, pivot_cell) in combo.iter_mut().zip(pivot_combo.iter()) {
-                    if !spend(fuel, 1) {
+                    if !Self::affine_step_allowed(fuel, should_abort) {
                         return None;
                     }
-                    *cell = cell.clone() - factor.clone() * pivot_cell.clone();
+                    *cell = Self::bounded_rational_scaled_sub(cell, &factor, pivot_cell)?;
                 }
             }
 
@@ -663,16 +764,16 @@ impl LiaSolver<'_> {
                 for (cell, pivot_cell) in
                     t_data.iter_mut().skip(col).zip(pivot_data.iter().skip(col))
                 {
-                    if !spend(fuel, 1) {
+                    if !Self::affine_step_allowed(fuel, should_abort) {
                         return None;
                     }
-                    *cell = cell.clone() - t_factor.clone() * pivot_cell.clone();
+                    *cell = Self::bounded_rational_scaled_sub(cell, &t_factor, pivot_cell)?;
                 }
                 for (cell, pivot_cell) in t_combo.iter_mut().zip(pivot_combo.iter()) {
-                    if !spend(fuel, 1) {
+                    if !Self::affine_step_allowed(fuel, should_abort) {
                         return None;
                     }
-                    *cell = cell.clone() + t_factor.clone() * pivot_cell.clone();
+                    *cell = Self::bounded_rational_scaled_add(cell, &t_factor, pivot_cell)?;
                 }
             }
 
@@ -696,21 +797,48 @@ impl LiaSolver<'_> {
     }
 
     /// Trusted re-verification: does the exact subset `core` of `rows` alone
-    /// still imply `target`? Uses the UNCHANGED `rational_rank` equality test
-    /// (the same routine the fat path trusts).
+    /// still imply `target`? Any bounded-elimination abort rejects the
+    /// candidate; the caller retains the already-proved fat conflict.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn affine_core_verified(
         rows: &[Vec<BigRational>],
         target: &[BigRational],
         core: &[usize],
     ) -> bool {
-        if core.iter().any(|&index| index >= rows.len()) {
+        let mut fuel = AFFINE_RANK_FUEL;
+        let mut never_abort = || false;
+        Self::affine_core_verified_bounded(rows, target, core, &mut fuel, &mut never_abort)
+    }
+
+    fn affine_core_verified_bounded<F: FnMut() -> bool>(
+        rows: &[Vec<BigRational>],
+        target: &[BigRational],
+        core: &[usize],
+        fuel: &mut usize,
+        should_abort: &mut F,
+    ) -> bool {
+        if should_abort()
+            || core.iter().any(|&index| index >= rows.len())
+            || !target.iter().all(Self::rational_is_bounded)
+            || core
+                .iter()
+                .flat_map(|&index| rows[index].iter())
+                .any(|value| !Self::rational_is_bounded(value))
+        {
             return false;
         }
         let core_rows: Vec<Vec<BigRational>> =
             core.iter().map(|&index| rows[index].clone()).collect();
         let mut core_rows_with_target = core_rows.clone();
         core_rows_with_target.push(target.to_vec());
-        Self::rational_rank(core_rows) == Self::rational_rank(core_rows_with_target)
+        let Some(rank) = Self::rational_rank(core_rows, fuel, should_abort) else {
+            return false;
+        };
+        let Some(rank_with_target) = Self::rational_rank(core_rows_with_target, fuel, should_abort)
+        else {
+            return false;
+        };
+        rank == rank_with_target
     }
 
     fn affine_row(
@@ -728,16 +856,100 @@ impl LiaSolver<'_> {
         row
     }
 
-    fn rational_rank(mut rows: Vec<Vec<BigRational>>) -> usize {
+    fn integer_is_bounded(value: &BigInt) -> bool {
+        value.bits() <= MAX_AFFINE_COEFF_BITS
+    }
+
+    fn rational_is_bounded(value: &BigRational) -> bool {
+        value.numer().bits() <= MAX_AFFINE_COEFF_BITS
+            && value.denom().bits() <= MAX_AFFINE_COEFF_BITS
+    }
+
+    fn affine_step_allowed<F: FnMut() -> bool>(fuel: &mut usize, should_abort: &mut F) -> bool {
+        if *fuel == 0 || should_abort() {
+            return false;
+        }
+        *fuel -= 1;
+        true
+    }
+
+    fn bounded_rational_div(dividend: &BigRational, divisor: &BigRational) -> Option<BigRational> {
+        if divisor.is_zero()
+            || !Self::rational_is_bounded(dividend)
+            || !Self::rational_is_bounded(divisor)
+        {
+            return None;
+        }
+        let result = dividend / divisor;
+        Self::rational_is_bounded(&result).then_some(result)
+    }
+
+    fn bounded_rational_scaled_sub(
+        value: &BigRational,
+        factor: &BigRational,
+        pivot: &BigRational,
+    ) -> Option<BigRational> {
+        if !Self::rational_is_bounded(value)
+            || !Self::rational_is_bounded(factor)
+            || !Self::rational_is_bounded(pivot)
+        {
+            return None;
+        }
+        let product = factor * pivot;
+        if !Self::rational_is_bounded(&product) {
+            return None;
+        }
+        let result = value - &product;
+        Self::rational_is_bounded(&result).then_some(result)
+    }
+
+    fn bounded_rational_scaled_add(
+        value: &BigRational,
+        factor: &BigRational,
+        pivot: &BigRational,
+    ) -> Option<BigRational> {
+        if !Self::rational_is_bounded(value)
+            || !Self::rational_is_bounded(factor)
+            || !Self::rational_is_bounded(pivot)
+        {
+            return None;
+        }
+        let product = factor * pivot;
+        if !Self::rational_is_bounded(&product) {
+            return None;
+        }
+        let result = value + &product;
+        Self::rational_is_bounded(&result).then_some(result)
+    }
+
+    /// Exact Gauss-Jordan rank with cooperative cancellation, cell-operation
+    /// fuel, and a coefficient-size invariant. `None` means "rank not proved"
+    /// and must never be mapped to a numeric rank or used to emit a conflict.
+    fn rational_rank<F: FnMut() -> bool>(
+        mut rows: Vec<Vec<BigRational>>,
+        fuel: &mut usize,
+        should_abort: &mut F,
+    ) -> Option<usize> {
+        if should_abort() {
+            return None;
+        }
         if rows.is_empty() {
-            return 0;
+            return Some(0);
         }
 
         let row_count = rows.len();
         let col_count = rows[0].len();
+        if rows.iter().any(|row| row.len() != col_count)
+            || !rows.iter().flatten().all(Self::rational_is_bounded)
+        {
+            return None;
+        }
         let mut rank = 0;
 
         for col in 0..col_count {
+            if should_abort() {
+                return None;
+            }
             let Some(pivot) = (rank..row_count).find(|&row| !rows[row][col].is_zero()) else {
                 continue;
             };
@@ -745,11 +957,17 @@ impl LiaSolver<'_> {
 
             let pivot_value = rows[rank][col].clone();
             for cell in rows[rank].iter_mut().take(col_count).skip(col) {
-                *cell = cell.clone() / pivot_value.clone();
+                if !Self::affine_step_allowed(fuel, should_abort) {
+                    return None;
+                }
+                *cell = Self::bounded_rational_div(cell, &pivot_value)?;
             }
             let pivot_tail: Vec<_> = rows[rank][col..col_count].to_vec();
 
             for (row, row_values) in rows.iter_mut().enumerate().take(row_count) {
+                if should_abort() {
+                    return None;
+                }
                 if row == rank || row_values[col].is_zero() {
                     continue;
                 }
@@ -760,7 +978,10 @@ impl LiaSolver<'_> {
                     .skip(col)
                     .zip(&pivot_tail)
                 {
-                    *cell = cell.clone() - factor.clone() * pivot_cell.clone();
+                    if !Self::affine_step_allowed(fuel, should_abort) {
+                        return None;
+                    }
+                    *cell = Self::bounded_rational_scaled_sub(cell, &factor, pivot_cell)?;
                 }
             }
 
@@ -770,6 +991,6 @@ impl LiaSolver<'_> {
             }
         }
 
-        rank
+        Some(rank)
     }
 }

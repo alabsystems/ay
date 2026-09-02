@@ -76,12 +76,12 @@ impl PdrSolver {
             SmtValue::BigInt(b) => ChcExpr::from_bigint(b.as_ref().clone()),
             SmtValue::Real(r) => {
                 use num_traits::ToPrimitive;
-                let n = r.numer().to_i64().unwrap_or(0);
-                let d = r.denom().to_i64().unwrap_or(1);
+                let n = r.numer().to_i64()?;
+                let d = r.denom().to_i64()?;
                 ChcExpr::Real(n, d)
             }
             // #5523: Preserve bitvector sort to avoid BV→Int sort mismatches.
-            SmtValue::BitVec(v, w) => ChcExpr::BitVec(*v, *w),
+            SmtValue::BitVec(..) | SmtValue::BigBitVec(..) => val.bitvec_to_chc_expr()?,
             // #7016: DT constructor applications for counterexample concretization.
             SmtValue::Datatype(ctor, fields) => {
                 let field_exprs: Vec<Arc<ChcExpr>> = fields

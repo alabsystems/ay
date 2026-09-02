@@ -43,6 +43,13 @@ pub(super) fn from_flags(
     if flags.has("no-emit-cert") && require != Require::Full && tree_cert_leaves.is_none() {
         opts = opts.with_tree_cert_leaves(0);
     }
+    // The emission self-verify stays on by default (fail-closed); a caller
+    // that independently re-verifies the emitted certificate opts out. The
+    // certificate bytes are identical either way — only a duplicate CHECK is
+    // skipped.
+    if flags.has("skip-finalize-reverify") {
+        opts = opts.with_skip_finalize_reverify(true);
+    }
     if let Some(value) = flag_or_env(flags, "threads", "AY_MILP_THREADS") {
         match value.parse::<u32>() {
             Ok(threads) if threads > 1 => {

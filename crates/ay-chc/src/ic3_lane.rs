@@ -3,7 +3,8 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Additive IC3 portfolio lane (#8211 wiring): lower a single-loop CHC into the
-//! bit-level [`BitLevelTransitionSystem`], run the clause-level [`Ic3Solver`]
+//! bit-level [`BitLevelTransitionSystem`], run the clause-level
+//! [`crate::ic3::solver::Ic3Solver`]
 //! (with CTG generalization), and on `Safe` reconstruct a *candidate*
 //! word-level [`InvariantModel`].
 //!
@@ -34,9 +35,9 @@
 //!     is eliminated, so no endpoint is lost.)
 //!
 //! (b) BIT-BLAST — each predicate argument sort becomes a fixed number of
-//!     Boolean latches: `Bool` -> 1, `Int` -> [`INT_WIDTH`], `BitVec(w)` ->
-//!     [`blast_width`]`(w)` (the natural bit-vector target; capped so the latch
-//!     count and IC3 work stay small). Little-endian.
+//!     Boolean latches: `Bool` -> 1, `Int` -> the current widening rung, and
+//!     `BitVec(w)` -> `min(w, rung)` (the natural bit-vector target, up to the
+//!     resource-capped original width). Little-endian.
 //!
 //! (c) Bv* OPS — the transition/guard constraints encode word ops over those
 //!     latches: `BvAdd`/`BvSub` as ripple-carry adders, `BvNeg`/`BvNot` and the
@@ -44,7 +45,7 @@
 //!     per-bit, `BvULt`/`BvULe`/`BvUGt`/`BvUGe` as ripple comparators,
 //!     `BvExtract`/`BvShl`/`BvLShr` by constant as bit slices, and bit-vector
 //!     equality as a per-bit XNOR/AND tree. Integer `+`/`-`/`mod 2^k`/`div 2^k`
-//!     are handled the same way at [`INT_WIDTH`].
+//!     are handled at the current widening rung.
 //!
 //! IC3 synthesises an invariant over the bits; the back-translation reconstructs
 //! a word-level candidate (`Bool` bit -> the parameter; `Int` bit `i` ->
@@ -60,134 +61,19 @@ use std::time::Duration;
 use ay_sat::{Literal, Variable};
 
 use crate::clause::{ClauseBody, ClauseHead, HornClause};
-use crate::ic3::solver::{Ic3Result, Ic3Solver};
 use crate::ic3::transition_system::BitLevelTransitionSystem;
 use crate::pdr::model::{InvariantModel, PredicateInterpretation};
 use crate::{ChcExpr, ChcOp, ChcProblem, ChcSort, ChcVar, PredicateId};
 
-/// Bit-blast width for `Int` predicate arguments.
-///
-/// This is the (untrusted) modelling width used by the bit-level engine only.
-/// It does NOT bound the loop iteration count — IC3 induction handles unbounded
-/// loop *length*; the width is the integer type width for the blast. Any
-/// candidate IC3 finds is re-checked word-level by the trusted validator, so a
-/// too-narrow width can only cause a missed proof, never an unsound one. Kept
-/// modest so the latch count (and IC3 work) stays small; parity-style bit-0
-/// invariants are found at any width >= 1.
-const INT_WIDTH: usize = 8;
+#[cfg(test)]
+use crate::ic3::solver::{Ic3Result, Ic3Solver};
 
-/// Maximum number of latches used to model a `BitVec(w)` argument.
-///
-/// Real targo-lowered `u64` loops carry `BitVec(64)` state. Blasting the full
-/// 64 bits is *sound* (a bit-vector is finite, so the bit-level model is exact)
-/// but heavy. Because the lane is a candidate generator whose output is
-/// re-validated word-level, we may model at a smaller width without risking a
-/// false proof: a too-narrow blast can only miss a candidate. The cap keeps the
-/// latch count and IC3 work small; bit-0 (parity) invariants are found at any
-/// width >= 1.
-const BV_BLAST_CAP: usize = 8;
+mod back_translation;
+mod widening;
 
-/// Number of latches used to model a `BitVec(w)` value (see [`BV_BLAST_CAP`]).
-fn blast_width(w: u32) -> usize {
-    (w as usize).clamp(1, BV_BLAST_CAP)
-}
-
-/// Try to prove a single-loop CHC (Boolean, bit-blasted `Int`, and/or
-/// `BitVec(w)` arguments; possibly a multi-block CFG that is first linearized to
-/// one recursive predicate) with the bit-level IC3 engine. Returns a *candidate*
-/// invariant model on `Safe`, or `None` if the problem is outside the mappable
-/// fragment or IC3 did not converge to `Safe`.
-///
-/// The result is UNTRUSTED — the caller re-validates it via the word-level
-/// validator. See the module docs.
-pub fn try_prove_chc_loop(problem: &ChcProblem, timeout: Duration) -> Option<InvariantModel> {
-    let dbg = ay_core::misc_cli_flags().ic3_lane_debug;
-    if let Some(path) = ay_core::misc_cli_flags().ic3_lane_dump.as_deref() {
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let _ = writeln!(
-                f,
-                "=== IC3_LANE_DUMP preds={} clauses={} ===\n{:#?}\n",
-                problem.predicates().len(),
-                problem.clauses().len(),
-                problem
-            );
-        }
-    }
-    let low = lower_loop(problem);
-    if dbg {
-        eprintln!(
-            "IC3_LANE: lower_loop={} (preds={})",
-            if low.is_some() { "Some" } else { "None" },
-            problem.predicates().len()
-        );
-    }
-    let Lowering {
-        ts,
-        pred,
-        params,
-        latches,
-        orig_header,
-    } = low?;
-    // Honor the caller's timeout: convert it to an absolute deadline the IC3
-    // engine checks at its loop heads. On expiry solve() returns Unknown, which
-    // the `_ => None` arm below maps to "no candidate" -- sound (a resource-out
-    // can never fabricate a proof), and no longer an unbounded spin.
-    let deadline = ay_core::time::Instant::now() + timeout;
-    let mut solver = Ic3Solver::new(ts, false).with_deadline(Some(deadline));
-    let res = solver.solve();
-    let safe = matches!(res, Ic3Result::Safe { .. });
-    if dbg {
-        eprintln!("IC3_LANE: solve_safe={safe}");
-    }
-    match res {
-        Ic3Result::Safe { invariant_level } => {
-            let clauses = solver.invariant_clauses(invariant_level);
-            let bt = back_translate(pred, &params, &latches, &clauses);
-            if dbg {
-                eprintln!(
-                    "IC3_LANE: back_translate={}",
-                    if bt.is_some() { "Some" } else { "None" }
-                );
-            }
-            let model = bt?;
-            match orig_header {
-                None => Some(model),
-                Some(header) => {
-                    // The CFG was collapsed by linearization: `model` is the loop
-                    // header invariant expressed over the COLLAPSED predicate, but
-                    // the trusted re-validator runs against the ORIGINAL
-                    // multi-predicate problem and needs an interpretation for
-                    // EVERY original predicate. Lift the header invariant onto all
-                    // original predicates by forward-image propagation (the header
-                    // keeps the IC3-found invariant; the other blocks get its image
-                    // along each CFG edge). Still UNTRUSTED — the caller
-                    // re-validates the full model on the original transition.
-                    let interp = model.get(&pred)?;
-                    let lifted = lift_header_to_full_model(
-                        problem,
-                        header,
-                        &interp.vars,
-                        &interp.formula,
-                        timeout,
-                    );
-                    if dbg {
-                        eprintln!(
-                            "IC3_LANE: lift_header_to_full_model={}",
-                            if lifted.is_some() { "Some" } else { "None" }
-                        );
-                    }
-                    lifted
-                }
-            }
-        }
-        _ => None,
-    }
-}
+use back_translation::back_translate;
+pub use widening::try_prove_chc_loop;
+use widening::{BlastWidth, INT_WIDTH, MAX_IC3_STATE_LATCHES};
 
 /// Lift a collapsed loop-header invariant onto EVERY original predicate of a
 /// multi-block CFG, producing a full multi-predicate candidate model that the
@@ -983,9 +869,9 @@ struct LatchMeaning {
 }
 
 /// A bit-blasted value flowing through the encoder: either a single Boolean
-/// literal or a little-endian vector of bit literals (an `Int` at [`INT_WIDTH`]
-/// or a `BitVec(w)` at the width [`blast_width`] gives for `w`; the width is
-/// the vector length).
+/// literal or a little-endian vector of bit literals (an `Int` at the current
+/// widening rung or a `BitVec(w)` at `min(w, rung)`; the width is the vector
+/// length).
 enum Val {
     Bool(Literal),
     Int(Vec<Literal>),
@@ -993,6 +879,7 @@ enum Val {
 
 /// Mutable CNF builder over a flat SAT variable space.
 struct Builder {
+    blast: BlastWidth,
     next: u32,
     init: Vec<Vec<Literal>>,
     trans: Vec<Vec<Literal>>,
@@ -1045,17 +932,67 @@ enum Target {
     Both,
 }
 
-/// Number of latches the given sort occupies.
-fn sort_width(sort: &ChcSort) -> Option<usize> {
-    match sort {
-        ChcSort::Bool => Some(1),
-        ChcSort::Int => Some(INT_WIDTH),
-        ChcSort::BitVec(w) => Some(blast_width(*w)),
-        _ => None,
-    }
+#[cfg(test)]
+fn lower_loop_default(problem: &ChcProblem) -> Option<Lowering> {
+    lower_loop(problem, BlastWidth::new(INT_WIDTH))
 }
 
-fn lower_loop(problem: &ChcProblem) -> Option<Lowering> {
+struct LatchLayout {
+    arg_offset: Vec<usize>,
+    arg_width: Vec<usize>,
+    latches: Vec<LatchMeaning>,
+}
+
+fn build_latch_layout(
+    arg_sorts: &[ChcSort],
+    blast: BlastWidth,
+    debug: bool,
+) -> Option<LatchLayout> {
+    let mut arg_offset = Vec::with_capacity(arg_sorts.len());
+    let mut arg_width = Vec::with_capacity(arg_sorts.len());
+    let mut total_latches = 0usize;
+    for sort in arg_sorts {
+        let Some(width) = blast.sort(sort) else {
+            if debug {
+                eprintln!("IC3_LANE: unblastable arg sort {sort:?}");
+            }
+            return None;
+        };
+        let Some(next_total) = total_latches.checked_add(width) else {
+            return None;
+        };
+        if next_total > MAX_IC3_STATE_LATCHES {
+            if debug {
+                eprintln!(
+                    "IC3_LANE: state-latch cap exceeded ({next_total}>{MAX_IC3_STATE_LATCHES})"
+                );
+            }
+            return None;
+        }
+        arg_offset.push(total_latches);
+        arg_width.push(width);
+        total_latches = next_total;
+    }
+
+    let mut latches = Vec::with_capacity(total_latches);
+    for (arg, (sort, width)) in arg_sorts.iter().zip(&arg_width).enumerate() {
+        if matches!(sort, ChcSort::Bool) {
+            latches.push(LatchMeaning { arg, bit: None });
+        } else {
+            latches.extend((0..*width).map(|bit| LatchMeaning {
+                arg,
+                bit: Some(bit),
+            }));
+        }
+    }
+    Some(LatchLayout {
+        arg_offset,
+        arg_width,
+        latches,
+    })
+}
+
+fn lower_loop(problem: &ChcProblem, blast: BlastWidth) -> Option<Lowering> {
     // (a) LINEARIZE: collapse a multi-block CFG to a single recursive predicate.
     // A single-predicate problem is already in the driven form.
     let dbg = ay_core::misc_cli_flags().ic3_lane_debug;
@@ -1099,33 +1036,11 @@ fn lower_loop(problem: &ChcProblem) -> Option<Lowering> {
 
     // Latch layout: contiguous per argument. `arg_offset[i]` is the first
     // current-state latch of argument `i`; `arg_width[i]` its latch count.
-    let mut arg_offset = Vec::with_capacity(arity);
-    let mut arg_width = Vec::with_capacity(arity);
-    let mut latches: Vec<LatchMeaning> = Vec::new();
-    for (i, sort) in pred.arg_sorts.iter().enumerate() {
-        let w = match sort_width(sort) {
-            Some(w) => w,
-            None => {
-                if dbg {
-                    eprintln!("IC3_LANE: unblastable arg sort {sort:?}");
-                }
-                return None;
-            }
-        };
-        arg_offset.push(latches.len());
-        arg_width.push(w);
-        if matches!(sort, ChcSort::Bool) {
-            latches.push(LatchMeaning { arg: i, bit: None });
-        } else {
-            // Int / BitVec: one latch per (little-endian) bit.
-            for bit in 0..w {
-                latches.push(LatchMeaning {
-                    arg: i,
-                    bit: Some(bit),
-                });
-            }
-        }
-    }
+    let LatchLayout {
+        arg_offset,
+        arg_width,
+        latches,
+    } = build_latch_layout(&pred.arg_sorts, blast, dbg)?;
     let total_latches = latches.len();
 
     // Partition clauses.
@@ -1199,6 +1114,7 @@ fn lower_loop(problem: &ChcProblem) -> Option<Lowering> {
         .map(Variable::new)
         .collect();
     let mut b = Builder {
+        blast,
         next: 2 * total_latches as u32,
         init: Vec::new(),
         trans: Vec::new(),
@@ -1305,7 +1221,14 @@ fn lower_loop(problem: &ChcProblem) -> Option<Lowering> {
                 return None;
             }
             let mut env: HashMap<String, Val> = HashMap::new();
-            bind_in_args(in_args, &state_vars, &arg_offset, &arg_width, &mut env)?;
+            bind_in_args(
+                in_args,
+                &state_vars,
+                &arg_offset,
+                &arg_width,
+                blast,
+                &mut env,
+            )?;
             let guard = match constraint {
                 // Resolve any loaded-cell temps back onto this transition's in-args so
                 // the guard is over current-state latches, not freshly-minted free bits.
@@ -1349,7 +1272,7 @@ fn lower_loop(problem: &ChcProblem) -> Option<Lowering> {
             return None;
         }
         let mut env: HashMap<String, Val> = HashMap::new();
-        bind_in_args(args, &state_vars, &arg_offset, &arg_width, &mut env)?;
+        bind_in_args(args, &state_vars, &arg_offset, &arg_width, blast, &mut env)?;
         let lit = match constraint {
             // Resolve the assert-condition temp chain (`la == acc`, `lc == count`,
             // `Not(la == (lc & 1 == 1))`) down onto the query's arg vars so `bad`
@@ -1391,8 +1314,8 @@ fn lower_loop(problem: &ChcProblem) -> Option<Lowering> {
     // --- CONE-OF-INFLUENCE SLICE of the state latches ---
     //
     // The linearized header carries EVERY block-live variable as a latch (a real
-    // targo-lowered `u64` loop blasts each `BitVec(64)` arg to BV_BLAST_CAP
-    // latches across several CFG blocks). IC3 generalises/propagates cubes over
+    // targo-lowered `u64` loop may blast each `BitVec(64)` arg to the current
+    // widening cap across several CFG blocks). IC3 generalises/propagates cubes over
     // the STATE-latch set, so an over-wide state space (e.g. count[1..7] plus dead
     // block state) prevents convergence even though the bad property `acc XOR
     // count[0]` only reads `{acc, count[0]}`. We restrict the IC3 state set to the
@@ -1834,12 +1757,13 @@ fn bind_in_args(
     state_vars: &[Variable],
     arg_offset: &[usize],
     arg_width: &[usize],
+    blast: BlastWidth,
     env: &mut HashMap<String, Val>,
 ) -> Option<()> {
     for (i, a) in args.iter().enumerate() {
         match a {
             ChcExpr::Var(v) => {
-                let w = sort_width(&v.sort)?;
+                let w = blast.sort(&v.sort)?;
                 if w != arg_width[i] {
                     return None;
                 }
@@ -2156,24 +2080,21 @@ fn encode(
     b: &mut Builder,
     target: Target,
 ) -> Option<Val> {
+    let int_width = b.blast.cap;
     match expr {
         ChcExpr::Bool(v) => Some(Val::Bool(mk_const(b, target, *v))),
-        ChcExpr::Int(c) => Some(Val::Int(int_const_bits(b, target, *c, INT_WIDTH))),
-        ChcExpr::BitVec(value, width) => Some(Val::Int(bv_const_bits(
-            b,
-            target,
-            *value,
-            blast_width(*width),
-        ))),
+        ChcExpr::Int(c) => Some(Val::Int(int_const_bits(b, target, *c, int_width))),
+        ChcExpr::BitVec(value, width) => {
+            let width = b.blast.bitvec(*width);
+            Some(Val::Int(bv_const_bits(b, target, *value, width)))
+        }
         ChcExpr::Var(var) => match &var.sort {
             ChcSort::Bool => Some(Val::Bool(lookup_or_fresh_bool(&var.name, env, b))),
-            ChcSort::Int => Some(Val::Int(lookup_or_fresh_bits(&var.name, INT_WIDTH, env, b))),
-            ChcSort::BitVec(w) => Some(Val::Int(lookup_or_fresh_bits(
-                &var.name,
-                blast_width(*w),
-                env,
-                b,
-            ))),
+            ChcSort::Int => Some(Val::Int(lookup_or_fresh_bits(&var.name, int_width, env, b))),
+            ChcSort::BitVec(w) => {
+                let width = b.blast.bitvec(*w);
+                Some(Val::Int(lookup_or_fresh_bits(&var.name, width, env, b)))
+            }
             _ => None,
         },
         ChcExpr::Op(op, args) => encode_op(*op, args, env, b, target),
@@ -2558,94 +2479,5 @@ fn coi_state_latches(
 
 // ---------------------------------------------------------------------------
 // Back-translation.
-// ---------------------------------------------------------------------------
-
-/// Translate the bit-level inductive invariant (CNF over current-state latches)
-/// back into a word-level [`InvariantModel`] over `P`'s formal parameters.
-///
-/// Each blocked clause is a disjunction over latch literals; each latch maps to
-/// a word-level Boolean atom (`Bool` argument -> the parameter; `Int` bit `i`
-/// -> `(= (mod (div c 2^i) 2) 1)`; `BitVec` bit `i` -> `(= ((_ extract i i) c)
-/// #b1)`). The model formula is the conjunction of the clauses. The result is a
-/// CANDIDATE — the caller re-validates it.
-fn back_translate(
-    pred: PredicateId,
-    params: &[ChcVar],
-    latches: &[LatchMeaning],
-    clauses: &[Vec<Literal>],
-) -> Option<InvariantModel> {
-    let mut conjuncts: Vec<ChcExpr> = Vec::new();
-    for clause in clauses {
-        let mut disjuncts: Vec<ChcExpr> = Vec::new();
-        for lit in clause {
-            let idx = lit.variable().index();
-            let meaning = latches.get(idx)?; // invariant must be over state latches only
-            let atom = latch_to_expr(meaning, params)?;
-            if lit.is_positive() {
-                disjuncts.push(atom);
-            } else {
-                disjuncts.push(ChcExpr::Op(ChcOp::Not, vec![Arc::new(atom)]));
-            }
-        }
-        let clause_expr = match disjuncts.len() {
-            0 => ChcExpr::Bool(false),
-            1 => disjuncts.pop().unwrap(),
-            _ => ChcExpr::Op(ChcOp::Or, disjuncts.into_iter().map(Arc::new).collect()),
-        };
-        conjuncts.push(clause_expr);
-    }
-
-    let formula = match conjuncts.len() {
-        0 => ChcExpr::Bool(true),
-        1 => conjuncts.pop().unwrap(),
-        _ => ChcExpr::Op(ChcOp::And, conjuncts.into_iter().map(Arc::new).collect()),
-    };
-
-    let mut model = InvariantModel::new();
-    model.set(pred, PredicateInterpretation::new(params.to_vec(), formula));
-    Some(model)
-}
-
-/// Word-level Boolean atom for a single latch.
-fn latch_to_expr(meaning: &LatchMeaning, params: &[ChcVar]) -> Option<ChcExpr> {
-    let param = params.get(meaning.arg)?;
-    match (meaning.bit, &param.sort) {
-        (None, _) => Some(ChcExpr::Var(param.clone())),
-        (Some(bit), ChcSort::BitVec(_)) => {
-            // bit i of bv `c` is set iff ((_ extract i i) c) == #b1.
-            let var = ChcExpr::Var(param.clone());
-            let ext = ChcExpr::Op(
-                ChcOp::BvExtract(bit as u32, bit as u32),
-                vec![Arc::new(var)],
-            );
-            Some(ChcExpr::Op(
-                ChcOp::Eq,
-                vec![Arc::new(ext), Arc::new(ChcExpr::BitVec(1, 1))],
-            ))
-        }
-        (Some(bit), _) => {
-            // bit i of integer `c` is set iff (c div 2^i) mod 2 == 1.
-            let var = ChcExpr::Var(param.clone());
-            let shifted = if bit == 0 {
-                var
-            } else {
-                let two_pow = 1i128 << bit;
-                ChcExpr::Op(
-                    ChcOp::Div,
-                    vec![Arc::new(var), Arc::new(ChcExpr::Int(two_pow))],
-                )
-            };
-            let modulo = ChcExpr::Op(
-                ChcOp::Mod,
-                vec![Arc::new(shifted), Arc::new(ChcExpr::Int(2))],
-            );
-            Some(ChcExpr::Op(
-                ChcOp::Eq,
-                vec![Arc::new(modulo), Arc::new(ChcExpr::Int(1))],
-            ))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests;

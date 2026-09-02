@@ -6,7 +6,7 @@
 //! This module deliberately separates three things that are easy to conflate:
 //!
 //! * the normative SMT-LIB 2.7 language and registry,
-//! * Z3 5.0.0's extensions and observable behavior, and
+//! * Z3 5.1.0's extensions and observable behavior, and
 //! * evidence that this exact AY build implements either surface.
 //!
 //! A passing corpus is evidence for rows in a contract; it is never allowed to
@@ -46,7 +46,7 @@ mod z3_source_inventory;
 const MANIFEST_SCHEMA: &str = "ay-smtlib-conformance-contract/v1";
 const VALIDATOR_RECEIPT_SCHEMA: &str = "ay-smtlib-validator-receipt/v2";
 const CHECK_RECEIPT_SCHEMA: &str = "ay-smtlib-conformance-check-receipt/v1";
-const PROFILE_ID: &str = "smtlib-2.7+z3-5.0.0";
+const PROFILE_ID: &str = "smtlib-2.7+z3-5.1.0";
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_VALIDATOR_RECEIPT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DIMENSIONS: usize = 64;
@@ -195,9 +195,9 @@ const DIMENSIONS: [DimensionSpec; 12] = [
         validator_kind: ValidatorKind::UnknownPolicy,
     },
     DimensionSpec {
-        id: "overlay.z3-5.0.0",
-        title: "Exact Z3 5.0.0 overlay",
-        definition: "All Z3 5.0.0 commands, aliases, extensions, diagnostics, options, tactics, probes, and transcript quirks are source-inventoried and differentially validated.",
+        id: "overlay.z3-5.1.0",
+        title: "Exact Z3 5.1.0 overlay",
+        definition: "All Z3 5.1.0 commands, aliases, extensions, diagnostics, options, tactics, probes, and transcript quirks are source-inventoried and differentially validated.",
         validator_kind: ValidatorKind::Z3Differential,
     },
     DimensionSpec {
@@ -654,14 +654,14 @@ fn canonical_profile() -> Profile {
         },
         z3_overlay: Z3Target {
             product: "Z3".to_string(),
-            version: "5.0.0".to_string(),
+            version: "5.1.0".to_string(),
             source_repository: "https://github.com/Z3Prover/z3.git".to_string(),
-            source_tag: "z3-5.0.0".to_string(),
-            source_commit: "8e3402b215a810a4154eb183a7dfc4e853eb2f52".to_string(),
-            tracked_source_file_count: 2_761,
+            source_tag: "z3-5.1.0".to_string(),
+            source_commit: "0b6cdcdbc65da25ef0f73ac9da210574d0f66cf8".to_string(),
+            tracked_source_file_count: 2_756,
             tracked_source_tree_digest_kind: "sorted-path-git-blob-size-manifest/v1".to_string(),
             tracked_source_tree_sha256:
-                "1abb6b6f933a1ff92c3207729330372c6df46ad62c7c4d20d01c60262573c65a".to_string(),
+                "df491d15649b581936f8422fbd704b0694831c160c01d1d339164c8a1441939b".to_string(),
             reference_executable: ReferenceExecutable {
                 // NOTE: this public path is writable by anything on the machine,
                 // and on 2026-07-20 it WAS overwritten -- a hand-built Z3 5.0.0
@@ -677,14 +677,14 @@ fn canonical_profile() -> Profile {
                 // a silently wrong differential.
                 path: "/opt/homebrew/bin/z3".to_string(),
                 architecture: "aarch64".to_string(),
-                version_output: "Z3 version 5.0.0 - 64 bit".to_string(),
-                sha256: "ac9f4265e04c10e5a57b2c0c91955e58bcc640bfc0d6da16e631b46eca6b6633"
+                version_output: "Z3 version 5.1.0 - 64 bit".to_string(),
+                sha256: "8b61a8bc0b7a4e14dfb119910502ef808b055df636b25c8b67b96ae630fbc29c"
                     .to_string(),
             },
             reference_shared_library: ReferenceSharedLibrary {
-                path: "/opt/homebrew/lib/python3.14/site-packages/z3/lib/libz3.dylib".to_string(),
-                full_version: "Z3 5.0.0.0".to_string(),
-                sha256: "51886523b1f83dfcb8edf6e9aa36d2c57eb11b983627bd2b20e1c8ab67e56810"
+                path: "/opt/homebrew/opt/z3/lib/libz3.dylib".to_string(),
+                full_version: "5.1.0.0".to_string(),
+                sha256: "45344d6a38b6f75304433c2458d6fa16bc4907d426c96e2bedf0a90603460422"
                     .to_string(),
             },
         },
@@ -768,7 +768,7 @@ fn requirements_for(spec: DimensionSpec) -> Vec<Requirement> {
                     Classification::Standard,
                     format!("Implement the SMT-LIB 2.7 `{name}` command production"),
                     expectation(
-                        Some("accept every well-formed standard production; accepted non-standard forms must be owned by the exact Z3 5.0.0 overlay, and all other malformed arity or delimiter forms are rejected"),
+                        Some("accept every well-formed standard production; accepted non-standard forms must be owned by the exact Z3 5.1.0 overlay, and all other malformed arity or delimiter forms are rejected"),
                         None,
                         Some("apply the command's normative preconditions, effects, and output behavior"),
                         None,
@@ -867,13 +867,13 @@ fn requirements_for(spec: DimensionSpec) -> Vec<Requirement> {
             ),
             "the unknown-reason registry and artifact-revocation matrix are not exhaustively validated",
         )],
-        "overlay.z3-5.0.0" => vec![
+        "overlay.z3-5.1.0" => vec![
             requirement(
                 format!("{}.c-abi", spec.id),
                 SourceCohort::Z3Source,
-                "exact-11-header-z3-5.0.0-include-graph;clang-c11-declaration-manifest;authenticated-libz3-5.0.0-export-table;live-stock-c-api-probes;per-symbol-semantic-contracts",
+                "exact-11-header-z3-5.1.0-include-graph;clang-c11-declaration-manifest;authenticated-libz3-5.1.0-export-table;live-stock-c-api-probes;per-symbol-semantic-contracts",
                 Classification::ExactOverlay,
-                "Require the exact 805-declaration Z3 5.0.0 C header/signature surface, resolution of all 807 exports, all 99 scoped observations, and authenticated executed-call plus exhaustive semantic-contract evidence for every declaration",
+                "Require the exact 805-declaration Z3 5.1.0 C header/signature surface, resolution of all 807 exports, all 99 scoped observations, and authenticated executed-call plus exhaustive semantic-contract evidence for every declaration",
                 expectation(
                     None,
                     Some("all 805 header declarations and signatures match, all 807 required export names resolve, all 99 scoped observations match, and all 805 declarations pass executed-call and exhaustive semantic-contract differentials"),
@@ -888,22 +888,22 @@ fn requirements_for(spec: DimensionSpec) -> Vec<Requirement> {
                 SourceCohort::Z3Source,
                 "scripts/VERSION.txt;src/util/z3_version.h.in;live CLI/library identity",
                 Classification::ExactOverlay,
-                "Authenticate the pinned Z3 executable bytes and require AY's Z3-mode CLI identity transcript to report exactly Z3 5.0.0",
+                "Authenticate the pinned Z3 executable bytes and require AY's Z3-mode CLI identity transcript to report exactly Z3 5.1.0",
                 expectation(
                     None,
                     None,
                     None,
-                    Some("every oracle and differential receipt reports exactly Z3 5.0.0"),
+                    Some("every oracle and differential receipt reports exactly Z3 5.1.0"),
                     "the transcript is evidence only for the authenticated executable; source and shared-library closure remain separate profile and inventory obligations",
                 ),
-                "the exact Z3 5.0.0 executable and AY identity transcript have not been validated for one closed campaign",
+                "the exact Z3 5.1.0 executable and AY identity transcript have not been validated for one closed campaign",
             ),
             requirement(
                 format!("{}.source-inventory", spec.id),
                 SourceCohort::Z3Source,
                 "source-tree:commands,logics,theories,options,tactics,probes,extensions",
                 Classification::ExactOverlay,
-                "Extract every Z3 5.0.0 extension and alias that is observable through the CLI",
+                "Extract every Z3 5.1.0 extension and alias that is observable through the CLI",
                 expectation(
                     Some("all accepted Z3-only syntax and commands are owned by one overlay row"),
                     Some("all Z3-only signature and coercion behavior is explicit"),
@@ -911,14 +911,14 @@ fn requirements_for(spec: DimensionSpec) -> Vec<Requirement> {
                     None,
                     "nothing discovered in the pinned source or live registries is unclassified",
                 ),
-                "the Z3 5.0.0 observable source inventory is not closed",
+                "the Z3 5.1.0 observable source inventory is not closed",
             ),
             requirement(
                 format!("{}.behavioral-transcripts", spec.id),
                 SourceCohort::Z3Source,
                 "live-oracle:exact-cli-transcript-matrix",
                 Classification::ExactOverlay,
-                "Differentially validate exit status, stdout, stderr, diagnostics, streaming, and stateful transcript behavior against the pinned Z3 5.0.0 binary",
+                "Differentially validate exit status, stdout, stderr, diagnostics, streaming, and stateful transcript behavior against the pinned Z3 5.1.0 binary",
                 expectation(
                     Some("accepted and rejected transcript forms match their declared comparator"),
                     None,
@@ -1002,7 +1002,7 @@ fn starter_inventory_granularity(spec: DimensionSpec) -> InventoryGranularity {
         | "gate.integrity"
         | "language.lexical-and-grammar"
         | "language.commands"
-        | "overlay.z3-5.0.0"
+        | "overlay.z3-5.1.0"
         | "registry.logics"
         | "registry.theories"
         | "semantics.command-state-machine"
@@ -1253,12 +1253,12 @@ fn validate_contract(
         verify_reference_artifact(
             &contract.profile.z3_overlay.reference_executable.path,
             &contract.profile.z3_overlay.reference_executable.sha256,
-            "Z3 5.0.0 executable",
+            "Z3 5.1.0 executable",
         )?;
         verify_reference_artifact(
             &contract.profile.z3_overlay.reference_shared_library.path,
             &contract.profile.z3_overlay.reference_shared_library.sha256,
-            "Z3 5.0.0 shared library",
+            "Z3 5.1.0 shared library",
         )?;
     }
     Ok(AuditReport {
@@ -1311,7 +1311,7 @@ fn validate_requirement(requirement: &Requirement, spec: DimensionSpec) -> Resul
         }
     }
     let expected_classification = match spec.id {
-        "overlay.z3-5.0.0" => Classification::ExactOverlay,
+        "overlay.z3-5.1.0" => Classification::ExactOverlay,
         "results.sat-models"
         | "results.unsat-proofs"
         | "results.unknown-policy"
@@ -1542,7 +1542,7 @@ fn validate_validator_receipt(
             .sha256;
         if receipt.z3_binary_sha256.as_deref() != Some(expected) {
             return Err(format!(
-                "{} evidence is not bound to the pinned Z3 5.0.0 executable",
+                "{} evidence is not bound to the pinned Z3 5.1.0 executable",
                 context.dimension.id
             ));
         }
@@ -1558,7 +1558,7 @@ fn validate_validator_receipt(
             .sha256;
         if receipt.z3_shared_library_sha256.as_deref() != Some(expected) {
             return Err(
-                "builtin.z3-abi-5.0.v1 is not bound to the pinned Z3 5.0.0 shared library"
+                "builtin.z3-abi-5.0.v1 is not bound to the pinned Z3 5.1.0 shared library"
                     .to_string(),
             );
         }
@@ -1810,8 +1810,8 @@ fn validate_registered_validator(
     match receipt.validator.id.as_str() {
         "builtin.target-identity.v1" => {
             if receipt.validator.kind != ValidatorKind::Z3Differential
-                || context.dimension.id != "overlay.z3-5.0.0"
-                || receipt.requirement_ids != ["overlay.z3-5.0.0.target-identity".to_string()]
+                || context.dimension.id != "overlay.z3-5.1.0"
+                || receipt.requirement_ids != ["overlay.z3-5.1.0.target-identity".to_string()]
                 || !receipt.exhaustive
                 || receipt.z3_shared_library_sha256.is_some()
                 || !receipt.reference_inputs.is_empty()
@@ -1823,7 +1823,7 @@ fn validate_registered_validator(
                 );
             }
             let expected_input = sha256_bytes(b"(get-info :name)\n(get-info :version)\n(exit)\n");
-            let expected_stdout = "(:name \"Z3\")\n(:version \"5.0.0\")\n";
+            let expected_stdout = "(:name \"Z3\")\n(:version \"5.1.0\")\n";
             let expected_ids = ["ay.identity", "z3.identity"];
             if receipt.case_results.len() != expected_ids.len() {
                 return Err(
@@ -1905,8 +1905,8 @@ fn validate_z3_abi_receipt_shape(
     context: EvidenceContext<'_>,
 ) -> Result<(), String> {
     if receipt.validator.kind != ValidatorKind::Z3Differential
-        || context.dimension.id != "overlay.z3-5.0.0"
-        || receipt.requirement_ids != ["overlay.z3-5.0.0.c-abi".to_string()]
+        || context.dimension.id != "overlay.z3-5.1.0"
+        || receipt.requirement_ids != ["overlay.z3-5.1.0.c-abi".to_string()]
         || !receipt.exhaustive
         || !receipt.reference_inputs.is_empty()
         || !receipt.auxiliary_tools.is_empty()
@@ -1977,7 +1977,7 @@ fn validate_z3_abi_receipt_shape(
             crate::z3_abi_500::Z3_500_FULL_VERSION.to_string(),
         ),
         (
-            "abi.manifest.z3-5.0.0".to_string(),
+            "abi.manifest.z3-5.1.0".to_string(),
             format!(
                 "count={};sha256={}",
                 crate::z3_abi_500::REQUIRED_SYMBOL_COUNT,
@@ -2086,7 +2086,7 @@ fn validate_z3_abi_receipt_shape(
             if !symbol.starts_with("Z3_") {
                 return Err(format!("ABI symbol case is not a Z3 symbol: {symbol:?}"));
             }
-            if row.expected != "required Z3 5.0.0 symbol is dlsym-resolvable in AY" {
+            if row.expected != "required Z3 5.1.0 symbol is dlsym-resolvable in AY" {
                 return Err(format!("{} has a forged symbol expectation", row.id));
             }
             if row.outcome == ValidatorCaseOutcome::Pass && row.observed != "present" {
@@ -2108,7 +2108,7 @@ fn validate_z3_abi_receipt_shape(
                 "abi.identity.ay-library" => format!("sha256={ay_sha256}"),
                 "abi.identity.z3-library" => format!("sha256={z3_sha256}"),
                 "abi.identity.z3-version" => crate::z3_abi_500::Z3_500_FULL_VERSION.to_string(),
-                "abi.manifest.z3-5.0.0" => format!(
+                "abi.manifest.z3-5.1.0" => format!(
                     "count={};sha256={};dlsym={}",
                     crate::z3_abi_500::REQUIRED_SYMBOL_COUNT,
                     crate::z3_abi_500::REQUIRED_SYMBOL_MANIFEST_SHA256,
@@ -2665,7 +2665,7 @@ ay-z3-parity smtlib-conformance <command> [options]
 
 COMMANDS:
   profile [--out <path>]
-      Print the immutable SMT-LIB 2.7 + Z3 5.0.0 source and oracle profile, or
+      Print the immutable SMT-LIB 2.7 + Z3 5.1.0 source and oracle profile, or
       publish it to a new file.
 
   init <manifest> [--campaign <id>] [--ay-executable <path>]
@@ -2690,8 +2690,8 @@ COMMANDS:
       Git blob object IDs, byte sizes, and the profile's selection SHA-256.
 
   z3-source-snapshot <git-checkout> --out <path>
-      Authenticate tag z3-5.0.0 and its exact commit, then retain the complete
-      sorted 2,761-row path/Git-blob/size manifest plus only the 43 UTF-8 source
+      Authenticate tag z3-5.1.0 and its exact commit, then retain the complete
+      sorted 2,756-row path/Git-blob/size manifest plus only the 43 UTF-8 source
       blobs needed to replay shell, SMT2 command, and registry extraction.
 
   official-corpus-manifest <corpus-root> --archive-root <path>
@@ -2760,14 +2760,14 @@ COMMANDS:
       copy of the manifest-bound AY executable. It binds the exact 32 command
       productions from the pinned language snapshot to a closed, sorted
       positive/missing/trailing/malformed catalog, including explicitly owned
-      Z3 5.0.0 arity extensions. Every child runs sequentially under one
+      Z3 5.1.0 arity extensions. Every child runs sequentially under one
       `_oom_guard.py` plan; checks re-derive pass/fail from raw transcripts and
       repeat the complete live run.
 
   run target-identity <manifest> --receipt <path> [--ay <path>] [--z3 <path>]
                       [--timeout <seconds>]
       Run the first built-in executable validator: exact CLI identity against
-      the pinned Z3 5.0.0 binary and the manifest-bound AY executable. Z3 and AY
+      the pinned Z3 5.1.0 binary and the manifest-bound AY executable. Z3 and AY
       run sequentially under one `_oom_guard.py` plan. The validator retains
       bounded stdout/stderr and publishes a hash-bound evidence receipt even
       when AY fails; any stale or forged version transcript remains a hard
@@ -2776,7 +2776,7 @@ COMMANDS:
   run z3-abi-5.0 <manifest> --receipt <path> [--ay <path>]
                    [--timeout <seconds>]
       Run `builtin.z3-abi-5.0.v1` against authenticated private copies of the
-      manifest-bound AY shared library and the profile-pinned Z3 5.0.0 shared
+      manifest-bound AY shared library and the profile-pinned Z3 5.1.0 shared
       library. The receipt requires live HEAD at origin/main and a clean AY
       build stamp for that exact full commit; unrelated caller-worktree edits
       do not taint detached clean-build evidence. It authenticates the exact
@@ -2790,9 +2790,9 @@ COMMANDS:
 
   run z3-behavioral <manifest> --receipt <path> --source-snapshot <path>
                     [--ay <path>] [--z3 <path>] [--timeout <seconds>]
-      Run `builtin.z3-behavioral-transcripts-5.0.0.v1` against authenticated
+      Run `builtin.z3-behavioral-transcripts-5.1.0.v1` against authenticated
       private copies of the manifest-bound AY executable and profile-pinned Z3
-      5.0.0. It re-derives the exact 1,508-item observable manifest from the
+      5.1.0. It re-derives the exact 1,518-item observable manifest from the
       authenticated source snapshot and gives every command, tactic, probe,
       simplifier, parameter, parameter module, CLI option/help form, input mode,
       filename extension, declaration builtin, logic-recognizer literal,
@@ -2809,7 +2809,7 @@ COMMANDS:
   run z3-source-inventory <manifest> --receipt <path>
                           --source-snapshot <path> [--timeout <seconds>]
       Run `builtin.z3-source-inventory.v1` against the exact profile-pinned Z3
-      executable under `_oom_guard.py`. The closed catalog binds all 2,761
+      executable under `_oom_guard.py`. The closed catalog binds all 2,756
       source-tree entries, 94 accepted SMT2 commands (86 live-registry plus
       eight parser-native-only names), 118 tactics, 42 probes, 37 simplifiers,
       678 parameters, 21 parameter modules, 33 source CLI options, 27 live help
@@ -2822,8 +2822,8 @@ COMMANDS:
   run z3-reference-inventory <manifest> --receipt <path>
                              --source-snapshot <path>
       Run `builtin.z3-reference-inventory.v1`, the specialized external-source
-      ReferenceExtractor for `overlay.z3-5.0.0`. It binds the exact four overlay
-      rows to the authenticated 2,761-file Z3 5.0.0 tree and retained source
+      ReferenceExtractor for `overlay.z3-5.1.0`. It binds the exact four overlay
+      rows to the authenticated 2,756-file Z3 5.1.0 tree and retained source
       owners without claiming any AY behavior.
 
   run official-corpus-inventory <manifest> --receipt <path>
@@ -2837,7 +2837,7 @@ COMMANDS:
                       --corpus-manifest <path> [--ay <path>] [--z3 <path>]
                       [--timeout <seconds>]
       Run every immutable corpus file and decision query against authenticated
-      AY and exact Z3 5.0.0 under the campaign's one-job `_oom_guard.py`
+      AY and exact Z3 5.1.0 under the campaign's one-job `_oom_guard.py`
       envelope. AY additionally receives the planned `--memory` budget plus
       `--self-check --strict-proofs`. Exact ordered verdict parity, clean
       execution, and a second full archive/member/materialization closure scan
@@ -2904,7 +2904,7 @@ VALIDATOR RECEIPTS:
   using schema `ay-smtlib-validator-receipt/v2`. Each receipt binds one
   campaign, this exact profile, the dimension inventory digest, sorted covered
   requirement IDs, the validator implementation hash, AY artifact hashes, the
-  exact Z3 5.0.0 binary and shared-library hashes when applicable,
+  exact Z3 5.1.0 binary and shared-library hashes when applicable,
   content-addressed replayable source snapshots and auxiliary checker binaries
   when used, source provenance, and an enforced resource envelope. A pass requires
   exhaustive=true, total>0, passed=total, and zero
@@ -2916,11 +2916,11 @@ VALIDATOR RECEIPTS:
   `builtin.standard-commands.v1`,
   `builtin.theory-registry.v1`,
   `builtin.target-identity.v1`, `builtin.z3-abi-5.0.v1`,
-  `builtin.z3-behavioral-transcripts-5.0.0.v1`,
+  `builtin.z3-behavioral-transcripts-5.1.0.v1`,
   `builtin.z3-reference-inventory.v1`,
   `builtin.z3-source-inventory.v1`,
   `builtin.official-corpus-inventory.v1`,
-  `builtin.official-corpus-z3-5.0.0.v1`,
+  `builtin.official-corpus-z3-5.1.0.v1`,
   `builtin.gate-integrity.v1`, `builtin.sat-models.v1`,
   `builtin.unknown-policy.v1`, and
   `builtin.unsat-proofs.v1`. Checks replay
@@ -3416,7 +3416,7 @@ fn execute_target_identity(
     let expected_z3_sha = &contract.profile.z3_overlay.reference_executable.sha256;
     let staged_ay = stage_authenticated_executable(ay_source, &subject_ay.sha256, "AY executable")?;
     let staged_z3 =
-        stage_authenticated_executable(z3_source, expected_z3_sha, "Z3 5.0.0 executable")?;
+        stage_authenticated_executable(z3_source, expected_z3_sha, "Z3 5.1.0 executable")?;
 
     let repo_root = locate_repo_root()?;
     let resources = PlannedResources::plan(
@@ -3440,7 +3440,7 @@ fn execute_target_identity(
     }
 
     let input = b"(get-info :name)\n(get-info :version)\n(exit)\n";
-    let expected_stdout = "(:name \"Z3\")\n(:version \"5.0.0\")\n";
+    let expected_stdout = "(:name \"Z3\")\n(:version \"5.1.0\")\n";
 
     // Keep oracle and subject sequential: two simultaneous children would
     // exceed the single planner-admitted slot.
@@ -3450,7 +3450,7 @@ fn execute_target_identity(
             ["-in"],
             input,
             timeout,
-            "SMT-LIB target identity: Z3 5.0.0",
+            "SMT-LIB target identity: Z3 5.1.0",
         )
         .map_err(|error| error.to_string())?;
     let ay_output = resources
@@ -3608,12 +3608,12 @@ fn run_target_identity(args: &[String]) -> Result<i32, String> {
     let validator_sha = sha256_file(&current_exe, "parity validator")?;
     let timeout = Duration::from_secs(timeout_secs);
     let execution = execute_target_identity(&loaded.contract, &ay, &z3, timeout, None)?;
-    let requirement_id = "overlay.z3-5.0.0.target-identity".to_string();
+    let requirement_id = "overlay.z3-5.1.0.target-identity".to_string();
     let overlay = loaded
         .contract
         .dimensions
         .iter()
-        .find(|dimension| dimension.id == "overlay.z3-5.0.0")
+        .find(|dimension| dimension.id == "overlay.z3-5.1.0")
         .ok_or("closed overlay dimension is missing")?;
     let receipt = ValidatorReceipt {
         schema: VALIDATOR_RECEIPT_SCHEMA.to_string(),
@@ -3663,7 +3663,7 @@ fn run_target_identity(args: &[String]) -> Result<i32, String> {
         receipt_sha
     );
     println!(
-        "attach to overlay.z3-5.0.0.target-identity: \
+        "attach to overlay.z3-5.1.0.target-identity: \
          {{\"path\":\"{target_receipt_relative}\",\"sha256\":\"{receipt_sha}\"}}"
     );
     println!(
@@ -3740,19 +3740,19 @@ fn abi_stock_c_expectation() -> &'static str {
 }
 
 fn abi_callability_coverage_expectation() -> &'static str {
-    "all 805 public Z3 5.0.0 C declarations have an authenticated executed-call marker"
+    "all 805 public Z3 5.1.0 C declarations have an authenticated executed-call marker"
 }
 
 fn abi_callability_expectation() -> &'static str {
-    "at least one authenticated Z3 5.0.0/AY call executed without crash or marker omission"
+    "at least one authenticated Z3 5.1.0/AY call executed without crash or marker omission"
 }
 
 fn abi_semantic_contract_coverage_expectation() -> &'static str {
-    "all 805 public Z3 5.0.0 C declarations have an authenticated exhaustive semantic-contract differential"
+    "all 805 public Z3 5.1.0 C declarations have an authenticated exhaustive semantic-contract differential"
 }
 
 fn abi_semantic_contract_expectation() -> &'static str {
-    "authenticated exhaustive Z3 5.0.0/AY input, state, output, and error-contract differential passed"
+    "authenticated exhaustive Z3 5.1.0/AY input, state, output, and error-contract differential passed"
 }
 
 fn is_expected_ay_abi_stderr(stderr: &[u8]) -> bool {
@@ -4403,7 +4403,7 @@ fn execute_z3_abi(
     let staged_ay =
         stage_authenticated_library(ay_source, &ay_artifact.sha256, "AY shared library")?;
     let staged_z3 =
-        stage_authenticated_library(z3_source, &z3_artifact.sha256, "Z3 5.0.0 shared library")?;
+        stage_authenticated_library(z3_source, &z3_artifact.sha256, "Z3 5.1.0 shared library")?;
 
     let repo_root = locate_repo_root()?;
     let git_before = current_git_main_state(&repo_root)?;
@@ -4431,25 +4431,25 @@ fn execute_z3_abi(
         &staged_z3.path,
         b"",
         timeout,
-        "Z3 5.0.0 ABI reference probe",
+        "Z3 5.1.0 ABI reference probe",
         AbiProbeStderrPolicy::Empty,
     )?;
     let z3_observation = z3_capture.observation.as_ref().ok_or_else(|| {
         format!(
-            "authenticated Z3 5.0.0 ABI probe did not complete: {}",
+            "authenticated Z3 5.1.0 ABI probe did not complete: {}",
             z3_capture.category
         )
     })?;
-    validate_probe_observation_shape(z3_observation, "Z3 5.0.0")?;
+    validate_probe_observation_shape(z3_observation, "Z3 5.1.0")?;
     if !crate::z3_abi_500::required_symbol_set_is_exact(&z3_observation.exported_z3_symbols) {
         return Err(format!(
-            "authenticated Z3 5.0.0 export manifest is not the committed {}-export-name manifest {}",
+            "authenticated Z3 5.1.0 export manifest is not the committed {}-export-name manifest {}",
             crate::z3_abi_500::REQUIRED_SYMBOL_COUNT,
             crate::z3_abi_500::REQUIRED_SYMBOL_MANIFEST_SHA256
         ));
     }
     if z3_observation.required_resolvable_symbols != z3_observation.exported_z3_symbols {
-        return Err("an authenticated Z3 5.0.0 export is not dlsym-resolvable".to_string());
+        return Err("an authenticated Z3 5.1.0 export is not dlsym-resolvable".to_string());
     }
     if z3_observation.full_version.as_deref() != Some(crate::z3_abi_500::Z3_500_FULL_VERSION) {
         return Err(format!(
@@ -4471,7 +4471,7 @@ fn execute_z3_abi(
             })
             .collect::<Vec<_>>();
         return Err(format!(
-            "authenticated Z3 5.0.0 did not establish the canonical finite-set probes: {}",
+            "authenticated Z3 5.1.0 did not establish the canonical finite-set probes: {}",
             mismatches.join("; ")
         ));
     }
@@ -4483,7 +4483,7 @@ fn execute_z3_abi(
         &staged_ay.path,
         &manifest,
         timeout,
-        "AY Z3 5.0.0 ABI probe",
+        "AY Z3 5.1.0 ABI probe",
         AbiProbeStderrPolicy::AyFiniteSetModelDiagnostics,
     )?;
     if let Some(observation) = ay_capture.observation.as_ref() {
@@ -4558,7 +4558,7 @@ fn execute_z3_abi(
         ),
         abi_value_case(
             &binding,
-            "abi.manifest.z3-5.0.0",
+            "abi.manifest.z3-5.1.0",
             format!(
                 "count={};sha256={}",
                 crate::z3_abi_500::REQUIRED_SYMBOL_COUNT,
@@ -4735,7 +4735,7 @@ fn execute_z3_abi(
         rows.push(abi_value_case(
             &binding,
             &format!("abi.symbol.{symbol}"),
-            "required Z3 5.0.0 symbol is dlsym-resolvable in AY".to_string(),
+            "required Z3 5.1.0 symbol is dlsym-resolvable in AY".to_string(),
             if present {
                 "present".to_string()
             } else {
@@ -4925,7 +4925,7 @@ fn run_z3_abi(args: &[String]) -> Result<i32, String> {
         .contract
         .dimensions
         .iter()
-        .find(|dimension| dimension.id == "overlay.z3-5.0.0")
+        .find(|dimension| dimension.id == "overlay.z3-5.1.0")
         .ok_or("closed overlay dimension is missing")?;
     let execution = execute_z3_abi(
         &loaded.contract,
@@ -4943,7 +4943,7 @@ fn run_z3_abi(args: &[String]) -> Result<i32, String> {
         profile_id: PROFILE_ID.to_string(),
         profile_sha256: canonical_profile_sha256()?,
         dimension_id: overlay.id.clone(),
-        requirement_ids: vec!["overlay.z3-5.0.0.c-abi".to_string()],
+        requirement_ids: vec!["overlay.z3-5.1.0.c-abi".to_string()],
         inventory_sha256: overlay.inventory.sha256.clone(),
         validator: ValidatorIdentity {
             id: "builtin.z3-abi-5.0.v1".to_string(),
@@ -4993,7 +4993,7 @@ fn run_z3_abi(args: &[String]) -> Result<i32, String> {
         receipt_sha
     );
     println!(
-        "attach to overlay.z3-5.0.0.c-abi: \
+        "attach to overlay.z3-5.1.0.c-abi: \
          {{\"path\":\"{target_receipt_relative}\",\"sha256\":\"{receipt_sha}\"}}"
     );
     println!(
@@ -5403,7 +5403,7 @@ fn print_utf8(bytes: &[u8]) -> Result<(), String> {
 }
 
 fn print_report(report: &AuditReport) {
-    println!("== SMT-LIB 2.7 + exact Z3 5.0.0 conformance contract ==");
+    println!("== SMT-LIB 2.7 + exact Z3 5.1.0 conformance contract ==");
     println!(
         "dimensions: {} (reference-complete {}, incomplete {})",
         report.summary.dimension_count,
@@ -5537,35 +5537,35 @@ mod tests {
             profile.standard.registry.sha256,
             "506519771cabc1ff0de8b1d6d482659c3fab4432a8c0304a1f50367cd516da04"
         );
-        assert_eq!(profile.z3_overlay.version, "5.0.0");
+        assert_eq!(profile.z3_overlay.version, "5.1.0");
         assert_eq!(
             profile.z3_overlay.source_commit,
-            "8e3402b215a810a4154eb183a7dfc4e853eb2f52"
+            "0b6cdcdbc65da25ef0f73ac9da210574d0f66cf8"
         );
-        assert_eq!(profile.z3_overlay.tracked_source_file_count, 2_761);
+        assert_eq!(profile.z3_overlay.tracked_source_file_count, 2_756);
         assert_eq!(
             profile.z3_overlay.tracked_source_tree_digest_kind,
             "sorted-path-git-blob-size-manifest/v1"
         );
         assert_eq!(
             profile.z3_overlay.tracked_source_tree_sha256,
-            "1abb6b6f933a1ff92c3207729330372c6df46ad62c7c4d20d01c60262573c65a"
+            "df491d15649b581936f8422fbd704b0694831c160c01d1d339164c8a1441939b"
         );
         assert_eq!(
             profile.z3_overlay.reference_executable.version_output,
-            "Z3 version 5.0.0 - 64 bit"
+            "Z3 version 5.1.0 - 64 bit"
         );
         assert_eq!(
             profile.z3_overlay.reference_executable.sha256,
-            "ac9f4265e04c10e5a57b2c0c91955e58bcc640bfc0d6da16e631b46eca6b6633"
+            "8b61a8bc0b7a4e14dfb119910502ef808b055df636b25c8b67b96ae630fbc29c"
         );
         assert_eq!(
             profile.z3_overlay.reference_shared_library.full_version,
-            "Z3 5.0.0.0"
+            "5.1.0.0"
         );
         assert_eq!(
             profile.z3_overlay.reference_shared_library.sha256,
-            "51886523b1f83dfcb8edf6e9aa36d2c57eb11b983627bd2b20e1c8ab67e56810"
+            "45344d6a38b6f75304433c2458d6fa16bc4907d426c96e2bedf0a90603460422"
         );
     }
 
@@ -5963,7 +5963,7 @@ mod tests {
         let overlay = contract
             .dimensions
             .iter()
-            .find(|dimension| dimension.id == "overlay.z3-5.0.0")
+            .find(|dimension| dimension.id == "overlay.z3-5.1.0")
             .expect("overlay");
         let ay_sha256 = "a".repeat(64);
         let validator_sha256 = "b".repeat(64);
@@ -6037,7 +6037,7 @@ mod tests {
                 false,
             ),
             failed_row(
-                "abi.manifest.z3-5.0.0".to_string(),
+                "abi.manifest.z3-5.1.0".to_string(),
                 format!(
                     "count={};sha256={}",
                     crate::z3_abi_500::REQUIRED_SYMBOL_COUNT,
@@ -6059,7 +6059,7 @@ mod tests {
         for symbol in crate::z3_abi_500::required_symbols() {
             rows.push(failed_row(
                 format!("abi.symbol.{symbol}"),
-                "required Z3 5.0.0 symbol is dlsym-resolvable in AY".to_string(),
+                "required Z3 5.1.0 symbol is dlsym-resolvable in AY".to_string(),
                 false,
             ));
         }
@@ -6125,7 +6125,7 @@ mod tests {
             profile_id: PROFILE_ID.to_string(),
             profile_sha256,
             dimension_id: overlay.id.clone(),
-            requirement_ids: vec!["overlay.z3-5.0.0.c-abi".to_string()],
+            requirement_ids: vec!["overlay.z3-5.1.0.c-abi".to_string()],
             inventory_sha256: overlay.inventory.sha256.clone(),
             validator: ValidatorIdentity {
                 id: "builtin.z3-abi-5.0.v1".to_string(),
@@ -6170,14 +6170,14 @@ mod tests {
         let overlay = contract
             .dimensions
             .iter()
-            .find(|dimension| dimension.id == "overlay.z3-5.0.0")
+            .find(|dimension| dimension.id == "overlay.z3-5.1.0")
             .expect("overlay");
         let context = EvidenceContext {
             contract: &contract,
             manifest_dir: Path::new("."),
             dimension: overlay,
             expected_kind: ValidatorKind::Z3Differential,
-            required_requirement_id: Some("overlay.z3-5.0.0.c-abi"),
+            required_requirement_id: Some("overlay.z3-5.1.0.c-abi"),
             exact_requirement_ids: None,
             mode: ValidationMode::Structural,
         };
@@ -6377,7 +6377,7 @@ mod tests {
         .expect("starter");
         contract.campaign_id = "identity-failure".to_string();
         contract.resource_envelope = Some(envelope.clone());
-        let overlay = dimension_mut(&mut contract, "overlay.z3-5.0.0");
+        let overlay = dimension_mut(&mut contract, "overlay.z3-5.1.0");
         let input_sha = sha256_bytes(b"(get-info :name)\n(get-info :version)\n(exit)\n");
         let clean_process = ProcessObservation {
             stdin_complete: true,
@@ -6392,7 +6392,7 @@ mod tests {
             profile_id: PROFILE_ID.to_string(),
             profile_sha256: canonical_profile_sha256().expect("profile sha"),
             dimension_id: overlay.id.clone(),
-            requirement_ids: vec!["overlay.z3-5.0.0.target-identity".to_string()],
+            requirement_ids: vec!["overlay.z3-5.1.0.target-identity".to_string()],
             inventory_sha256: overlay.inventory.sha256.clone(),
             validator: ValidatorIdentity {
                 id: "builtin.target-identity.v1".to_string(),
@@ -6427,7 +6427,7 @@ mod tests {
                 ValidatorCase {
                     id: "ay.identity".to_string(),
                     input_sha256: input_sha.clone(),
-                    expected: "exact Z3 5.0.0 identity".to_string(),
+                    expected: "exact Z3 5.1.0 identity".to_string(),
                     observed: "AY reported 4.15.4".to_string(),
                     stdout: Some("(:name \"Z3\")\n(:version \"4.15.4\")\n".to_string()),
                     stderr: Some(String::new()),
@@ -6438,9 +6438,9 @@ mod tests {
                 ValidatorCase {
                     id: "z3.identity".to_string(),
                     input_sha256: input_sha,
-                    expected: "exact Z3 5.0.0 identity".to_string(),
-                    observed: "Z3 reported 5.0.0".to_string(),
-                    stdout: Some("(:name \"Z3\")\n(:version \"5.0.0\")\n".to_string()),
+                    expected: "exact Z3 5.1.0 identity".to_string(),
+                    observed: "Z3 reported 5.1.0".to_string(),
+                    stdout: Some("(:name \"Z3\")\n(:version \"5.1.0\")\n".to_string()),
                     stderr: Some(String::new()),
                     exit_code: Some(0),
                     process: Some(clean_process),
@@ -6469,7 +6469,7 @@ mod tests {
             .iter_mut()
             .find(|row| row.id == "ay.identity")
             .expect("AY row");
-        forged_ay.stdout = Some("(:name \"Z3\")\n(:version \"5.0.0\")\n".to_string());
+        forged_ay.stdout = Some("(:name \"Z3\")\n(:version \"5.1.0\")\n".to_string());
         forged_ay.observed = "hand-authored passing transcript".to_string();
         forged_ay.outcome = ValidatorCaseOutcome::Pass;
         forged_pass.cases =
@@ -6484,7 +6484,7 @@ mod tests {
         let target = overlay
             .requirements
             .iter_mut()
-            .find(|row| row.id == "overlay.z3-5.0.0.target-identity")
+            .find(|row| row.id == "overlay.z3-5.1.0.target-identity")
             .expect("target identity row");
         target.evidence.push(EvidenceRef {
             path: "identity.json".to_string(),
@@ -6497,7 +6497,7 @@ mod tests {
         assert!(report
             .blockers
             .iter()
-            .any(|blocker| blocker == "overlay.z3-5.0.0.target-identity: semantic evidence gap"));
+            .any(|blocker| blocker == "overlay.z3-5.1.0.target-identity: semantic evidence gap"));
     }
 
     #[test]

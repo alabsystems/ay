@@ -366,7 +366,7 @@ fn flatten_sort(sort: &ChcSort, disc: DiscKind) -> Vec<ChcSort> {
     flatten_sort_with_depth(sort, recursive_dt_flatten_depth(), disc)
 }
 
-fn recursive_dt_flatten_depth() -> usize {
+pub(super) fn recursive_dt_flatten_depth() -> usize {
     // Default preserves the legacy shallow recursive encoding used by existing
     // adaptive routes. The scalar-prefix mode is experimental and opt-in until
     // ADT-LIA target evidence plus original-problem validation justifies

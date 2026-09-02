@@ -4,6 +4,11 @@
 
 use super::*;
 
+const MAX_DATATYPE_FEATURE_SYMBOLS: usize = 32_768;
+const MAX_DATATYPE_FEATURE_NAME_BYTES: usize = 1024 * 1024;
+const MAX_DATATYPE_FEATURE_EXPR_NODES: usize = 1_000_000;
+const MAX_DATATYPE_FEATURE_SORT_NODES: usize = 32_768;
+
 impl ChcProblem {
     /// Create a new empty CHC problem
     pub fn new() -> Self {
@@ -55,6 +60,172 @@ impl ChcProblem {
         if let Some(clause) = self.simplify_clause_body_constants(clause) {
             self.clauses.push(clause);
         }
+    }
+
+    /// Split the active safety queries into exact independent obligations.
+    ///
+    /// Each returned problem contains exactly one false-head query and only
+    /// predicate definitions in that query's backwards dependency cone.  For
+    /// the common fixedpoint encoding
+    ///
+    /// ```text
+    /// error_p0 => error
+    /// error_p1 => error
+    /// error => false
+    /// ```
+    ///
+    /// the nullary `error` marker is unfolded one level, producing separate
+    /// `error_p0 => false` and `error_p1 => false` problems.  This is an exact
+    /// least-fixed-point equivalence: the source problem is Safe iff every
+    /// returned obligation is Safe, and it is Unsafe if any returned
+    /// obligation is Unsafe.
+    ///
+    /// Queries previously removed because their body simplified to `false`
+    /// are already vacuously Safe and have no surviving clause identity, so
+    /// they are not returned.  Such a validated problem returns `Ok([])`.
+    /// Invalid input, including a problem that never had a query, returns its
+    /// typed [`ChcError`](crate::ChcError) instead of an ambiguous empty list.
+    pub fn query_obligations(&self) -> ChcResult<Vec<ChcQueryObligation>> {
+        self.validate()?;
+
+        let mut obligations = Vec::new();
+
+        for (query_index, query) in self.clauses.iter().enumerate() {
+            if !query.is_query() {
+                continue;
+            }
+
+            let marker = match query.body.predicates.as_slice() {
+                [(predicate, arguments)] if arguments.is_empty() => Some(*predicate),
+                _ => None,
+            };
+            // A constrained marker query has variables quantified in a scope
+            // separate from each defining clause.  Combining the two bodies
+            // would require capture-avoiding alpha-renaming.  Keep it as one
+            // direct obligation instead of risking a same-spelling collision.
+            let definitions: Vec<(usize, &HornClause)> = if query.body.constraint.is_none() {
+                marker
+                    .map(|predicate| self.clauses_defining_with_index(predicate).collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            if definitions.is_empty() {
+                let label = marker
+                    .and_then(|predicate| self.get_predicate(predicate))
+                    .map_or_else(
+                        || format!("query_{query_index}"),
+                        |predicate| predicate.name.clone(),
+                    );
+                obligations.push(self.build_query_obligation(
+                    query_index,
+                    None,
+                    label,
+                    query.clone(),
+                ));
+                continue;
+            }
+
+            let Some(marker) = marker else {
+                continue;
+            };
+            for (definition_index, definition) in definitions {
+                let direct_query = HornClause::query(ClauseBody {
+                    predicates: definition.body.predicates.clone(),
+                    constraint: Self::conjoin_optional_constraints(
+                        definition.body.constraint.clone(),
+                        query.body.constraint.clone(),
+                    ),
+                });
+                let label =
+                    Self::query_obligation_label(self, &direct_query, marker, definition_index);
+                obligations.push(self.build_query_obligation(
+                    query_index,
+                    Some(definition_index),
+                    label,
+                    direct_query,
+                ));
+            }
+        }
+
+        Ok(obligations)
+    }
+
+    fn build_query_obligation(
+        &self,
+        query_clause_index: usize,
+        defining_clause_index: Option<usize>,
+        label: String,
+        query: HornClause,
+    ) -> ChcQueryObligation {
+        let constraint_only = query.body.predicates.is_empty();
+        let mut problem = self.clone();
+        problem.clauses.retain(|clause| !clause.is_query());
+        problem.pruned_false_queries = 0;
+        problem.clauses.push(query);
+
+        // Backwards slicing is verdict-preserving: every predicate used by a
+        // retained definition also lies in the cone, while a definition whose
+        // head is outside the cone cannot contribute to this query.
+        // A constraint-only query has an empty predicate cone, so no predicate
+        // definition can affect its truth; retain only the query itself.  The
+        // general analysis intentionally returns `None` for this case because
+        // its other callers use `None` as a fail-closed signal.
+        if constraint_only {
+            problem.clauses.retain(HornClause::is_query);
+        } else if let Some(cone) = problem.query_cone_of_influence() {
+            problem.clauses.retain(|clause| {
+                clause.is_query()
+                    || clause
+                        .head
+                        .predicate_id()
+                        .is_some_and(|predicate| cone.contains(&predicate))
+            });
+        }
+
+        let content_sha256 = problem.normalized_input_sha256();
+
+        ChcQueryObligation {
+            id: ChcQueryObligationId {
+                query_clause_index,
+                defining_clause_index,
+                label,
+                content_sha256,
+            },
+            problem,
+        }
+    }
+
+    fn conjoin_optional_constraints(
+        left: Option<ChcExpr>,
+        right: Option<ChcExpr>,
+    ) -> Option<ChcExpr> {
+        match (left, right) {
+            (Some(left), Some(right)) => Some(ChcExpr::and(left, right)),
+            (Some(constraint), None) | (None, Some(constraint)) => Some(constraint),
+            (None, None) => None,
+        }
+    }
+
+    fn query_obligation_label(
+        problem: &Self,
+        query: &HornClause,
+        marker: PredicateId,
+        defining_clause_index: usize,
+    ) -> String {
+        if let [(predicate, arguments)] = query.body.predicates.as_slice() {
+            if arguments.is_empty() {
+                if let Some(predicate) = problem.get_predicate(*predicate) {
+                    return predicate.name.clone();
+                }
+            }
+        }
+
+        let marker = problem
+            .get_predicate(marker)
+            .map_or("query", |predicate| predicate.name.as_str());
+        format!("{marker}_definition_{defining_clause_index}")
     }
 
     /// Eliminate trivial 0-arity Bool "query marker" predicates (e.g. `fail`)
@@ -384,19 +555,193 @@ impl ChcProblem {
     /// Whether any predicate has a Datatype-sorted argument (#7930).
     /// Used to skip Kind engine and cap PDR escalation for DT+BV problems.
     pub fn has_datatype_sorts(&self) -> bool {
-        self.predicates
-            .iter()
-            .any(|p| p.arg_sorts.iter().any(Self::sort_contains_datatype))
+        let mut sort_nodes = 0usize;
+        self.predicates.iter().any(|predicate| {
+            predicate
+                .arg_sorts
+                .iter()
+                .any(|sort| Self::sort_contains_datatype_bounded(sort, &mut sort_nodes))
+        })
     }
 
-    fn sort_contains_datatype(sort: &ChcSort) -> bool {
-        match sort {
-            ChcSort::Datatype { .. } => true,
-            ChcSort::Array(k, v) => {
-                Self::sort_contains_datatype(k) || Self::sort_contains_datatype(v)
-            }
-            _ => false,
+    /// Whether the active predicate signature or clause terms use a declared
+    /// algebraic datatype.
+    ///
+    /// This is deliberately more precise than `has_datatype_sorts()`: a Horn
+    /// clause may bind a datatype only in its constraint while every predicate
+    /// remains scalar. Conversely, MODEL_CHECKER_CONSUMER emits a reusable datatype prelude,
+    /// so a declaration that is never referenced must not admit or suppress a
+    /// datatype-specific engine.
+    pub(crate) fn uses_datatype_features(&self) -> bool {
+        if self.has_datatype_sorts() {
+            return true;
         }
+
+        let mut datatype_functions = FxHashSet::default();
+        let mut datatype_constructors = FxHashSet::default();
+        let mut symbol_count = 0usize;
+        let mut name_bytes = 0usize;
+        for constructors in self.datatype_defs.values() {
+            for (constructor, selectors) in constructors {
+                symbol_count = match symbol_count.checked_add(1) {
+                    Some(count) if count <= MAX_DATATYPE_FEATURE_SYMBOLS => count,
+                    _ => return true,
+                };
+                name_bytes = match name_bytes.checked_add(constructor.len()) {
+                    Some(bytes) if bytes <= MAX_DATATYPE_FEATURE_NAME_BYTES => bytes,
+                    _ => return true,
+                };
+                datatype_functions.insert(constructor.as_str());
+                datatype_constructors.insert(constructor.as_str());
+                for (selector, _) in selectors {
+                    symbol_count = match symbol_count.checked_add(1) {
+                        Some(count) if count <= MAX_DATATYPE_FEATURE_SYMBOLS => count,
+                        _ => return true,
+                    };
+                    name_bytes = match name_bytes.checked_add(selector.len()) {
+                        Some(bytes) if bytes <= MAX_DATATYPE_FEATURE_NAME_BYTES => bytes,
+                        _ => return true,
+                    };
+                    datatype_functions.insert(selector.as_str());
+                }
+            }
+        }
+
+        let mut expr_nodes = 0usize;
+        let mut sort_nodes = 0usize;
+        self.clauses.iter().any(|clause| {
+            clause.body.constraint.as_ref().is_some_and(|constraint| {
+                Self::expr_uses_datatype_features(
+                    constraint,
+                    &datatype_functions,
+                    &datatype_constructors,
+                    &mut expr_nodes,
+                    &mut sort_nodes,
+                )
+            }) || clause
+                .body
+                .predicates
+                .iter()
+                .flat_map(|(_, arguments)| arguments)
+                .any(|argument| {
+                    Self::expr_uses_datatype_features(
+                        argument,
+                        &datatype_functions,
+                        &datatype_constructors,
+                        &mut expr_nodes,
+                        &mut sort_nodes,
+                    )
+                })
+                || match &clause.head {
+                    ClauseHead::Predicate(_, arguments) => arguments.iter().any(|argument| {
+                        Self::expr_uses_datatype_features(
+                            argument,
+                            &datatype_functions,
+                            &datatype_constructors,
+                            &mut expr_nodes,
+                            &mut sort_nodes,
+                        )
+                    }),
+                    ClauseHead::False => false,
+                }
+        })
+    }
+
+    fn expr_uses_datatype_features(
+        root: &ChcExpr,
+        datatype_functions: &FxHashSet<&str>,
+        datatype_constructors: &FxHashSet<&str>,
+        expr_nodes: &mut usize,
+        sort_nodes: &mut usize,
+    ) -> bool {
+        *expr_nodes = match expr_nodes.checked_add(1) {
+            Some(count) if count <= MAX_DATATYPE_FEATURE_EXPR_NODES => count,
+            _ => return true,
+        };
+        let mut stack = vec![root];
+        while let Some(expr) = stack.pop() {
+            match expr {
+                ChcExpr::Bool(_)
+                | ChcExpr::Int(_)
+                | ChcExpr::Real(_, _)
+                | ChcExpr::BitVec(_, _) => {}
+                ChcExpr::Var(var) => {
+                    if Self::sort_contains_datatype_bounded(&var.sort, sort_nodes) {
+                        return true;
+                    }
+                }
+                ChcExpr::Op(_, arguments) | ChcExpr::PredicateApp(_, _, arguments) => {
+                    *expr_nodes = match expr_nodes.checked_add(arguments.len()) {
+                        Some(count) if count <= MAX_DATATYPE_FEATURE_EXPR_NODES => count,
+                        _ => return true,
+                    };
+                    stack.extend(arguments.iter().map(AsRef::as_ref));
+                }
+                ChcExpr::FuncApp(name, sort, arguments) => {
+                    if datatype_functions.contains(name.as_str())
+                        || name
+                            .strip_prefix("is-")
+                            .is_some_and(|constructor| datatype_constructors.contains(constructor))
+                        || Self::sort_contains_datatype_bounded(sort, sort_nodes)
+                    {
+                        return true;
+                    }
+                    *expr_nodes = match expr_nodes.checked_add(arguments.len()) {
+                        Some(count) if count <= MAX_DATATYPE_FEATURE_EXPR_NODES => count,
+                        _ => return true,
+                    };
+                    stack.extend(arguments.iter().map(AsRef::as_ref));
+                }
+                ChcExpr::ConstArrayMarker(sort) => {
+                    if Self::sort_contains_datatype_bounded(sort, sort_nodes) {
+                        return true;
+                    }
+                }
+                ChcExpr::ConstArray(key_sort, value) => {
+                    if Self::sort_contains_datatype_bounded(key_sort, sort_nodes) {
+                        return true;
+                    }
+                    *expr_nodes = match expr_nodes.checked_add(1) {
+                        Some(count) if count <= MAX_DATATYPE_FEATURE_EXPR_NODES => count,
+                        _ => return true,
+                    };
+                    stack.push(value.as_ref());
+                }
+                ChcExpr::IsTesterMarker(_) => return true,
+            }
+        }
+        false
+    }
+
+    /// Return `true` on either a datatype hit or resource exhaustion.  Every
+    /// caller uses this detector as a conservative safety guard, so a bounded
+    /// classification failure must retain datatype handling/downgrades rather
+    /// than silently classify the problem as scalar.
+    fn sort_contains_datatype_bounded(root: &ChcSort, sort_nodes: &mut usize) -> bool {
+        *sort_nodes = match sort_nodes.checked_add(1) {
+            Some(count) if count <= MAX_DATATYPE_FEATURE_SORT_NODES => count,
+            _ => return true,
+        };
+        let mut stack = vec![root];
+        while let Some(sort) = stack.pop() {
+            match sort {
+                ChcSort::Datatype { .. } => return true,
+                ChcSort::Array(key, value) => {
+                    *sort_nodes = match sort_nodes.checked_add(2) {
+                        Some(count) if count <= MAX_DATATYPE_FEATURE_SORT_NODES => count,
+                        _ => return true,
+                    };
+                    stack.push(value.as_ref());
+                    stack.push(key.as_ref());
+                }
+                ChcSort::Bool
+                | ChcSort::Int
+                | ChcSort::Real
+                | ChcSort::BitVec(_)
+                | ChcSort::Uninterpreted(_) => {}
+            }
+        }
+        false
     }
 
     /// Whether any datatype sort reachable in this problem's signature is

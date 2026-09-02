@@ -301,11 +301,9 @@ pub fn propagate_tight_bound_equalities(
         }
 
         // Propagate pairwise equalities between all variables with same value
-        for i in 0..vars.len() {
-            for j in (i + 1)..vars.len() {
-                let (lhs, lhs_reasons) = &vars[i];
-                let (rhs, rhs_reasons) = &vars[j];
-
+        let mut rest = vars.as_slice();
+        while let Some(((lhs, lhs_reasons), tail)) = rest.split_first() {
+            for (rhs, rhs_reasons) in tail {
                 // Cross-sort pairs are ill-sorted — see doc comment (SOUNDNESS).
                 if terms.sort(*lhs) != terms.sort(*rhs) {
                     continue;
@@ -332,6 +330,7 @@ pub fn propagate_tight_bound_equalities(
                     equalities.push(DiscoveredEquality::new(*lhs, *rhs, combined_reasons));
                 }
             }
+            rest = tail;
         }
     }
 

@@ -244,6 +244,139 @@ impl crate::AdaptivePortfolio {
         let result = self.solve();
         ChcPdrProofRun::new(self.problem.clone(), result, "portfolio")
     }
+
+    /// Solve once and atomically return problem-bound evidence together with
+    /// telemetry from that same authoritative invocation.
+    pub fn solve_proof_run_with_budget_report(&self) -> ChcProofRunWithBudgetReport {
+        // AdaptivePortfolio's reporting entry point deliberately invokes the
+        // exact production `solve()` pipeline and publishes only telemetry it
+        // can bind to that invocation. It does not run a second diagnostic
+        // portfolio or select report-only prepasses.
+        let (result, adaptive_report) = self.solve_with_adaptive_report();
+        let (budget_report, adaptive_trace) = adaptive_report.into_parts();
+        // This is a completion-boundary snapshot, not a causal claim: a token
+        // can race with any observation. Definitive evidence takes precedence
+        // below, and the public accessor names the snapshot semantics.
+        let cancellation_requested_at_return = self.cancellation_token.is_cancelled();
+        let configured_budget =
+            (!self.config.time_budget.is_zero()).then_some(self.config.time_budget);
+        let stop_reason = ChcProofRunWithBudgetReport::classify_stop_reason(
+            &result,
+            cancellation_requested_at_return,
+            configured_budget,
+            budget_report.total_elapsed,
+        );
+        ChcProofRunWithBudgetReport {
+            proof_run: ChcPdrProofRun::new(self.problem.clone(), result, "portfolio"),
+            budget_report,
+            adaptive_trace,
+            stop_reason,
+            cancellation_requested_at_return,
+        }
+    }
+}
+
+impl ChcProofRunWithBudgetReport {
+    pub(crate) fn from_direct_pdr(
+        proof_run: ChcPdrProofRun,
+        configured_budget: Option<std::time::Duration>,
+        elapsed: std::time::Duration,
+        cancellation_requested_at_return: bool,
+    ) -> Self {
+        let stop_reason = Self::classify_stop_reason(
+            proof_run.result(),
+            cancellation_requested_at_return,
+            configured_budget,
+            elapsed,
+        );
+        let adaptive_trace = crate::AdaptiveSolveTrace::direct_pdr_proof(
+            configured_budget,
+            elapsed,
+            proof_run.result(),
+        );
+        let mut budget_report = crate::BudgetReport::new();
+        budget_report.total_elapsed = elapsed;
+        Self {
+            proof_run,
+            budget_report,
+            adaptive_trace,
+            stop_reason,
+            cancellation_requested_at_return,
+        }
+    }
+
+    fn classify_stop_reason(
+        result: &VerifiedChcResult,
+        cancellation_requested_at_return: bool,
+        configured_budget: Option<std::time::Duration>,
+        elapsed: std::time::Duration,
+    ) -> ChcProofRunStopReason {
+        if matches!(
+            result,
+            VerifiedChcResult::Safe(_) | VerifiedChcResult::Unsafe(_)
+        ) {
+            ChcProofRunStopReason::Definitive
+        } else if cancellation_requested_at_return {
+            ChcProofRunStopReason::ExternallyCancelled
+        } else if configured_budget.is_some_and(|budget| elapsed >= budget) {
+            ChcProofRunStopReason::BudgetExhausted
+        } else {
+            ChcProofRunStopReason::Inconclusive
+        }
+    }
+
+    /// Exact problem-bound result and proof artifacts.
+    pub fn proof_run(&self) -> &ChcPdrProofRun {
+        &self.proof_run
+    }
+
+    /// Whole-run elapsed-time report from the same invocation.
+    ///
+    /// `entries` is empty because specialized adaptive lanes do not all map to
+    /// concrete engine identities. Use [`adaptive_trace`](Self::adaptive_trace)
+    /// for complete production-dispatch attribution.
+    pub fn budget_report(&self) -> &crate::BudgetReport {
+        &self.budget_report
+    }
+
+    /// Ordered strategy/lane observations from the same authoritative solve.
+    pub fn adaptive_trace(&self) -> &crate::AdaptiveSolveTrace {
+        &self.adaptive_trace
+    }
+
+    /// Whole-run structured stop reason.
+    pub fn stop_reason(&self) -> ChcProofRunStopReason {
+        self.stop_reason
+    }
+
+    /// Whether the embedding caller's cancellation token was set at the
+    /// completion-boundary snapshot.
+    ///
+    /// This does not claim that cancellation caused the verdict: a caller may
+    /// request it concurrently with completion. [`stop_reason`](Self::stop_reason)
+    /// gives definitive evidence precedence over that race.
+    pub fn cancellation_requested_at_return(&self) -> bool {
+        self.cancellation_requested_at_return
+    }
+
+    /// Consume the bundle without discarding any telemetry fields.
+    pub fn into_parts(
+        self,
+    ) -> (
+        ChcPdrProofRun,
+        crate::BudgetReport,
+        crate::AdaptiveSolveTrace,
+        ChcProofRunStopReason,
+        bool,
+    ) {
+        (
+            self.proof_run,
+            self.budget_report,
+            self.adaptive_trace,
+            self.stop_reason,
+            self.cancellation_requested_at_return,
+        )
+    }
 }
 
 fn validate_artifact_bytes(
@@ -444,5 +577,87 @@ mod tests {
         let run = portfolio.solve_proof_run();
         assert_eq!(run.metadata().engine(), "portfolio");
         assert_eq!(run.consumer_evidence().backend_code(), "ay_chc_portfolio");
+    }
+
+    #[test]
+    fn atomic_budget_report_is_bound_to_the_same_proof_run() {
+        let portfolio = crate::AdaptivePortfolio::new(
+            parse_problem("(< x 0)"),
+            crate::AdaptiveConfig::test_default(),
+        );
+        let solved_hash = portfolio.problem().normalized_input_sha256();
+        let report = portfolio.solve_proof_run_with_budget_report();
+
+        assert_eq!(
+            report.proof_run().problem().normalized_input_sha256(),
+            solved_hash
+        );
+        assert_eq!(report.proof_run().metadata().engine(), "portfolio");
+        assert_eq!(report.stop_reason(), ChcProofRunStopReason::Definitive);
+        assert!(!report.cancellation_requested_at_return());
+        assert_eq!(
+            report
+                .adaptive_trace()
+                .observations()
+                .last()
+                .map(|observation| observation.stage),
+            Some("authoritative_solve")
+        );
+    }
+
+    #[test]
+    fn atomic_budget_report_distinguishes_stop_reasons() {
+        let parent = crate::CancellationToken::new();
+        parent.cancel();
+        let cancelled = crate::AdaptivePortfolio::new(
+            parse_problem("(< x 0)"),
+            crate::AdaptiveConfig::test_default()
+                .with_execution_mode(crate::AdaptiveExecutionMode::DeterministicSequential),
+        )
+        .with_cancellation_parent(&parent)
+        .solve_proof_run_with_budget_report();
+        assert!(matches!(
+            cancelled.proof_run().result(),
+            VerifiedChcResult::Unknown(_)
+        ));
+        assert_eq!(
+            cancelled.stop_reason(),
+            ChcProofRunStopReason::ExternallyCancelled
+        );
+        assert!(cancelled.cancellation_requested_at_return());
+
+        let exhausted = crate::AdaptivePortfolio::new(
+            parse_problem("(< x 0)"),
+            crate::AdaptiveConfig::test_default()
+                .with_time_budget(Duration::from_nanos(1))
+                .with_execution_mode(crate::AdaptiveExecutionMode::DeterministicSequential),
+        )
+        .solve_proof_run_with_budget_report();
+        assert!(matches!(
+            exhausted.proof_run().result(),
+            VerifiedChcResult::Unknown(_)
+        ));
+        assert_eq!(
+            exhausted.stop_reason(),
+            ChcProofRunStopReason::BudgetExhausted
+        );
+        assert!(!exhausted.cancellation_requested_at_return());
+
+        let inconclusive = crate::AdaptivePortfolio::new(
+            parse_problem("(< x 0)"),
+            crate::AdaptiveConfig::test_default()
+                .with_max_engines(Some(0))
+                .with_execution_mode(crate::AdaptiveExecutionMode::DeterministicSequential),
+        )
+        .solve_proof_run_with_budget_report();
+        assert!(matches!(
+            inconclusive.proof_run().result(),
+            VerifiedChcResult::Unknown(_)
+        ));
+        assert_eq!(
+            inconclusive.stop_reason(),
+            ChcProofRunStopReason::Inconclusive
+        );
+        assert!(!inconclusive.cancellation_requested_at_return());
     }
 }

@@ -88,10 +88,18 @@ impl Variable {
     ///
     /// ── WHY THERE IS NO `requires` CLAUSE HERE, DESPITE ALL OF THE ABOVE ────
     ///
-    /// There WAS one, as ``, and it never ran: the attribute form needs an
-    /// `--extern trust` overlay, so it fires only in the ratchet lane. A
+    /// There WAS one, as ``, and it never ran: the attribute form needed an
+    /// `--extern trust` overlay, so it fired only in the ratchet lane. A
     /// verified probe made its runtime behavior observable and showed that it
     /// CONTRADICTS this function's tested public behavior.
+    ///
+    /// The overlay half of that story is now obsolete — the default toolchain
+    /// is Trust and the sanctioned spelling is the native clause
+    /// `pub fn new(id: u32) -> Self requires id <= 2_147_483_647`, which needs
+    /// no overlay and fires in EVERY build. That makes the objection below
+    /// stronger, not weaker, and it is why this clause is still absent: the
+    /// decision it records is about the API, not about how the precondition is
+    /// spelled.
     ///
     /// A `requires` clause is not only a static claim. Where a caller cannot
     /// discharge it, the compiler installs a kernel-certified RUNTIME MONITOR,
@@ -331,7 +339,9 @@ impl Literal {
     ///
     /// Panics if `dimacs` is zero, the DIMACS clause terminator.
     #[inline]
-    pub fn from_dimacs(dimacs: i32) -> Self {
+    pub fn from_dimacs(dimacs: i32) -> Self
+        requires dimacs != 0
+    {
         assert_ne!(dimacs, 0, "DIMACS literal 0 is a clause terminator");
         Self::from_nonzero_dimacs(dimacs)
     }
@@ -342,7 +352,9 @@ impl Literal {
     /// ([`Self::from_dimacs`] and [`Self::try_from_dimacs`]) and both are
     /// discharged, so the assumption this body enjoys is paid for, not granted.
     #[inline]
-    fn from_nonzero_dimacs(dimacs: i32) -> Self {
+    fn from_nonzero_dimacs(dimacs: i32) -> Self
+        requires dimacs != 0
+    {
         // This computes `dimacs.unsigned_abs() - 1`, respelled so the encoder
         // keeps the range link. Same class of fix, and the same reason, as
         // `to_dimacs_i64` below.
@@ -489,6 +501,7 @@ impl std::fmt::Display for Literal {
 /// backend), not the standalone `kani` tool. See the
 /// `[[trust-verification-toolchain]]` methodology.
 #[cfg(kani)]
+#[path = "literal/verification.rs"]
 mod verification;
 
 #[cfg(test)]

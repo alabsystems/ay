@@ -25,11 +25,11 @@ use bounds::{
     CanonicalRenderBound,
 };
 
-const MAX_AUTHORED_ASSUME_BRIDGES: usize = 8_192;
+pub(super) const MAX_AUTHORED_ASSUME_BRIDGES: usize = 8_192;
 const MAX_EQUIVALENCE_DEPTH: usize = 64;
 const MAX_EQUIVALENCE_NODES: usize = 256;
-const MAX_EQUIVALENCE_BYTES: usize = 64 * 1024;
-const MAX_EQUIVALENCE_TOTAL_INPUT_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const MAX_EQUIVALENCE_BYTES: usize = 64 * 1024;
+pub(super) const MAX_EQUIVALENCE_TOTAL_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_EQUIVALENCE_TOTAL_NODES: usize = 64 * 1024;
 const MAX_EQUIVALENCE_TOTAL_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CANONICAL_RENDER_NODES: usize = 8 * 1024;
@@ -58,6 +58,13 @@ struct AuthoredAssumePlan {
     surface: String,
     canonical: String,
     input_bytes: usize,
+    bridge: AuthoredAssumeBridge,
+}
+
+#[derive(Clone, Copy)]
+enum AuthoredAssumeBridge {
+    Equivalence,
+    LinearArithmeticImplication,
 }
 
 #[derive(Default)]
@@ -73,8 +80,86 @@ struct AuthoredAssumePlanner {
     planned: HashMap<TermId, AuthoredAssumePlan>,
     unsupported: HashSet<TermId>,
     bridged_ids: HashSet<ProofId>,
+    /// Terms with override-bearing `Assume` rows but no consumed row. This is
+    /// term-keyed only after the duplicate census has excluded every term for
+    /// which even one sibling `Assume` id is consumed.
+    assume_only_terms: HashSet<TermId>,
     inspected_terms: usize,
     accounting: AuthoredAssumeAccounting,
+}
+
+/// Borrowed admission and exact work charge for cloning the override ledger.
+///
+/// These are the authored-assume channel's existing published entry, token and
+/// aggregate-input limits. Reusing them here keeps the copy envelope identical
+/// to the planner that consumes the map. Work charges one unit for each entry
+/// in the borrowed scan, one for each entry copied into the owned map, and one
+/// per owned rendering byte copied. The caller spends and checks this charge
+/// before allocating that map.
+pub(super) fn wire_term_override_clone_work_from_lengths(
+    entry_count: usize,
+    rendering_lengths: impl IntoIterator<Item = usize>,
+) -> Result<u64, AlethePrintError> {
+    if entry_count > MAX_AUTHORED_ASSUME_BRIDGES {
+        return Err(invalid_authored_assume_plan(
+            ProofId(0),
+            "surface override entry count exceeds the authored assume bound",
+        ));
+    }
+    let mut total_bytes = 0usize;
+    let mut observed_entries = 0usize;
+    for length in rendering_lengths {
+        observed_entries = observed_entries.checked_add(1).ok_or_else(|| {
+            invalid_authored_assume_plan(ProofId(0), "surface override entry count overflowed")
+        })?;
+        if observed_entries > entry_count {
+            return Err(invalid_authored_assume_plan(
+                ProofId(0),
+                "surface override ledger changed during borrowed preflight",
+            ));
+        }
+        if length > MAX_EQUIVALENCE_BYTES {
+            return Err(invalid_authored_assume_plan(
+                ProofId(0),
+                "one surface override exceeds the authored assume input-size bound",
+            ));
+        }
+        total_bytes = total_bytes.checked_add(length).ok_or_else(|| {
+            invalid_authored_assume_plan(
+                ProofId(0),
+                "surface override aggregate input size overflowed",
+            )
+        })?;
+        if total_bytes > MAX_EQUIVALENCE_TOTAL_INPUT_BYTES {
+            return Err(invalid_authored_assume_plan(
+                ProofId(0),
+                "surface overrides exceed the authored assume aggregate input-size bound",
+            ));
+        }
+    }
+    if observed_entries != entry_count {
+        return Err(invalid_authored_assume_plan(
+            ProofId(0),
+            "surface override ledger changed during borrowed preflight",
+        ));
+    }
+    let work = entry_count
+        .checked_mul(2)
+        .and_then(|entries| entries.checked_add(total_bytes))
+        .and_then(|work| u64::try_from(work).ok())
+        .ok_or_else(|| {
+            invalid_authored_assume_plan(ProofId(0), "surface override clone work overflowed")
+        })?;
+    Ok(work)
+}
+
+fn wire_term_override_clone_work(
+    overrides: Option<&HashMap<TermId, String>>,
+) -> Result<u64, AlethePrintError> {
+    let Some(overrides) = overrides else {
+        return Ok(0);
+    };
+    wire_term_override_clone_work_from_lengths(overrides.len(), overrides.values().map(String::len))
 }
 
 fn consumed_authored_assume_ids(proof: &Proof) -> Result<Vec<bool>, AlethePrintError> {
@@ -122,6 +207,33 @@ fn consumed_authored_assume_ids(proof: &Proof) -> Result<Vec<bool>, AlethePrintE
 }
 
 impl AlethePrinter<'_> {
+    /// Initialize the downstream wire-rule view only after its complete source
+    /// map is admitted and its scan/copy work fits the caller's emission budget.
+    /// No owned override string is duplicated on a declining path.
+    pub(super) fn initialize_wire_term_overrides(&self) -> Result<(), AlethePrintError> {
+        if self.wire_term_overrides_initialized.get() {
+            return Ok(());
+        }
+        let clone_work = wire_term_override_clone_work(self.term_overrides)?;
+        self.charge(clone_work);
+        if self.work_budget_exhausted() {
+            return Err(self.work_budget_error(0));
+        }
+        // Do not use `HashMap::clone`: hashbrown preserves the source table's
+        // bucket count, so a tiny but heavily over-reserved caller map could
+        // duplicate an allocation far beyond the admitted entry/byte bounds.
+        // Entry-wise collection sizes the owned table from the admitted len.
+        let cloned = self.term_overrides.map(|overrides| {
+            overrides
+                .iter()
+                .map(|(term, rendering)| (*term, rendering.clone()))
+                .collect()
+        });
+        *self.wire_term_overrides.borrow_mut() = cloned;
+        self.wire_term_overrides_initialized.set(true);
+        Ok(())
+    }
+
     /// Materialize exactly the bridge `format_step` would emit for one proof
     /// id. The planner uses the returned byte length and node count, so id
     /// length, premise lists, and duplicate rows are accounted byte-for-byte
@@ -132,7 +244,19 @@ impl AlethePrinter<'_> {
         term: TermId,
         surface: &str,
         canonical: &str,
+        bridge: AuthoredAssumeBridge,
     ) -> (Option<String>, usize) {
+        if matches!(bridge, AuthoredAssumeBridge::LinearArithmeticImplication) {
+            if !crate::printed_la_generic_unit_implication_is_supported(surface, canonical) {
+                return (None, 1);
+            }
+            let output = format!(
+                "(assume {id}.a {surface})\n\
+                 (step {id}.n (cl (not {surface}) {canonical}) :rule la_generic :args (1 1))\n\
+                 (step {id} (cl {canonical}) :rule resolution :premises ({id}.n {id}.a))"
+            );
+            return (Some(output), 1);
+        }
         let mut equality_steps = Vec::new();
         let mut nodes = 0;
         let equality_id = format!("{id}.n");
@@ -171,8 +295,13 @@ impl AlethePrinter<'_> {
     ) -> Result<bool, AlethePrintError> {
         account_authored_assume_planning_input(id, plan.input_bytes, accounting)?;
 
-        let (rendered, nodes) =
-            self.render_authored_assume_bridge(id, term, &plan.surface, &plan.canonical);
+        let (rendered, nodes) = self.render_authored_assume_bridge(
+            id,
+            term,
+            &plan.surface,
+            &plan.canonical,
+            plan.bridge,
+        );
         let Some(planning_nodes) = accounting.total_nodes.checked_add(nodes) else {
             return Err(invalid_authored_assume_plan(
                 id,
@@ -268,10 +397,30 @@ impl AlethePrinter<'_> {
             account_authored_assume_planning_input(id, input_bytes, &mut planner.accounting)?;
             return Ok(None);
         }
+        let mut probe_steps = Vec::new();
+        let mut probe_nodes = 0;
+        let bridge = if self.build_authored_surface_equivalence(
+            "probe",
+            surface,
+            term,
+            EquivalenceLeafSchema::AuthoredAssume,
+            EquivalenceDirection::SurfaceToCanonical,
+            0,
+            &mut probe_nodes,
+            &mut probe_steps,
+        ) {
+            AuthoredAssumeBridge::Equivalence
+        } else if crate::printed_la_generic_unit_implication_is_supported(surface, &canonical) {
+            AuthoredAssumeBridge::LinearArithmeticImplication
+        } else {
+            account_authored_assume_planning_input(id, input_bytes, &mut planner.accounting)?;
+            return Ok(None);
+        };
         let plan = AuthoredAssumePlan {
             surface: surface.to_string(),
             canonical,
             input_bytes,
+            bridge,
         };
         if !self.plan_authored_assume_use(id, term, &plan, &mut planner.accounting)? {
             return Ok(None);
@@ -345,11 +494,19 @@ impl AlethePrinter<'_> {
         let mut canonical_renderings = self.let_bridge_renderings.borrow_mut();
         let mut surfaces = self.authored_assume_surfaces.borrow_mut();
         let mut bridged = self.authored_assume_bridged.borrow_mut();
+        let mut assume_only = self.assume_only_override_terms.borrow_mut();
+        let mut linear_arithmetic_bridges = self.linear_arithmetic_assume_bridges.borrow_mut();
         if planner.planned.keys().any(|term| {
             canonical_renderings.contains_key(term)
                 || surfaces.contains_key(term)
                 || self.folded_assume_surfaces.borrow().contains_key(term)
+        }) || planner.assume_only_terms.iter().any(|term| {
+            planner.planned.contains_key(term)
+                || canonical_renderings.contains_key(term)
+                || surfaces.contains_key(term)
+                || self.folded_assume_surfaces.borrow().contains_key(term)
         }) || !bridged.is_empty()
+            || !assume_only.is_empty()
         {
             return Err(invalid_authored_assume_plan(
                 ProofId(0),
@@ -357,22 +514,45 @@ impl AlethePrinter<'_> {
             ));
         }
         for (term, plan) in planner.planned {
+            if let Some(overrides) = self.wire_term_overrides.borrow_mut().as_mut() {
+                overrides.remove(&term);
+            }
+            if matches!(
+                plan.bridge,
+                AuthoredAssumeBridge::LinearArithmeticImplication
+            ) {
+                linear_arithmetic_bridges.insert(term);
+            }
             canonical_renderings.insert(term, plan.canonical);
             surfaces.insert(term, plan.surface);
         }
+        if let Some(overrides) = self.wire_term_overrides.borrow_mut().as_mut() {
+            for term in &planner.assume_only_terms {
+                overrides.remove(term);
+            }
+        }
+        *assume_only = planner.assume_only_terms;
         *bridged = planner.bridged_ids;
         Ok(())
     }
 
-    /// Atomically move supported source spellings into the assume-only channel.
+    /// Atomically confine source spellings to the assumptions that need them.
     ///
-    /// Every admitted equivalence is independently expressible through
-    /// `comp_simplify`, binary numeric-multiplication `aci_simp`, and `cong`.
-    /// Anything else is left to the existing fail-closed surface validators.
+    /// Every admitted source-to-canonical step is independently expressible
+    /// through `comp_simplify`, binary numeric-multiplication `aci_simp`, and
+    /// `cong`, or through the exact two-row arithmetic implication checked by
+    /// [`crate::printed_la_generic_unit_implication_is_supported`]. Anything
+    /// else is left to the existing fail-closed surface validators when a
+    /// consumed assumption makes a bridge necessary. If every override-bearing
+    /// `Assume` id for a term is unused, no bridge is owed: the source spelling
+    /// is emitted only at those leaves and the canonical term is rendered at
+    /// every downstream occurrence. A single consumed duplicate keeps the
+    /// whole term out of this bridge-free channel.
     pub(super) fn plan_equivalent_authored_assumes(
         &self,
         proof: &Proof,
     ) -> Result<(), AlethePrintError> {
+        self.initialize_wire_term_overrides()?;
         let Some(overrides) = self.term_overrides else {
             return Ok(());
         };
@@ -381,18 +561,29 @@ impl AlethePrinter<'_> {
         }
         let consumed = consumed_authored_assume_ids(proof)?;
         let mut planner = AuthoredAssumePlanner::default();
+        let mut consumed_override_terms = HashSet::default();
         for (index, step) in proof.steps.iter().enumerate() {
             let ProofStep::Assume(term) = step else {
                 continue;
             };
-            if !consumed[index] {
-                continue;
-            }
             let Some(surface) = overrides.get(term) else {
                 continue;
             };
-            self.plan_one_authored_assume_id(ProofId(index as u32), *term, surface, &mut planner)?;
+            if consumed[index] {
+                consumed_override_terms.insert(*term);
+                self.plan_one_authored_assume_id(
+                    ProofId(index as u32),
+                    *term,
+                    surface,
+                    &mut planner,
+                )?;
+            } else {
+                planner.assume_only_terms.insert(*term);
+            }
         }
+        planner
+            .assume_only_terms
+            .retain(|term| !consumed_override_terms.contains(term));
         self.commit_authored_assume_plan(proof.steps.len(), planner)
     }
 
@@ -401,6 +592,18 @@ impl AlethePrinter<'_> {
         id: ProofId,
         term: TermId,
     ) -> Result<Option<String>, AlethePrintError> {
+        if self.assume_only_override_terms.borrow().contains(&term) {
+            let Some(surface) = self
+                .term_overrides
+                .and_then(|overrides| overrides.get(&term))
+            else {
+                return Err(AlethePrintError::InvalidSurfaceStep {
+                    id,
+                    reason: "assume-only override lost its authored rendering".to_string(),
+                });
+            };
+            return Ok(Some(format!("(assume {id} {surface})")));
+        }
         let Some(surface) = self.authored_assume_surfaces.borrow().get(&term).cloned() else {
             return Ok(None);
         };
@@ -413,7 +616,17 @@ impl AlethePrinter<'_> {
                 reason: "authored assume bridge lost its canonical rendering".to_string(),
             });
         };
-        let (output, _) = self.render_authored_assume_bridge(id, term, &surface, &canonical);
+        let bridge = if self
+            .linear_arithmetic_assume_bridges
+            .borrow()
+            .contains(&term)
+        {
+            AuthoredAssumeBridge::LinearArithmeticImplication
+        } else {
+            AuthoredAssumeBridge::Equivalence
+        };
+        let (output, _) =
+            self.render_authored_assume_bridge(id, term, &surface, &canonical, bridge);
         let Some(output) = output else {
             return Err(AlethePrintError::InvalidSurfaceStep {
                 id,

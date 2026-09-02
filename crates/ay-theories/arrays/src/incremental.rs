@@ -438,6 +438,120 @@ impl ArraySolver<'_> {
             !target_data.parent_selects.is_empty() && !target_data.parent_stores.is_empty();
     }
 
+    /// Apply one logged equality merge and append its inverse to the undo
+    /// trail. Keeping this operation centralized is important when structural
+    /// term growth forces the complete merge log to be replayed against a new
+    /// `array_vars` base.
+    pub(crate) fn apply_array_var_merge(&mut self, target: TermId, source: TermId) {
+        let target_existed = self.array_vars.contains_key(&target);
+        let (stores_len, selects_len, parent_stores_len, prev_prop_upward) = self
+            .array_vars
+            .get(&target)
+            .map(|data| {
+                (
+                    data.stores_as_result.len() as u32,
+                    data.parent_selects.len() as u32,
+                    data.parent_stores.len() as u32,
+                    data.prop_upward,
+                )
+            })
+            .unwrap_or((0, 0, 0, false));
+        self.array_var_merge_undo.push(ArrayVarMergeUndo {
+            target,
+            target_existed,
+            stores_len,
+            selects_len,
+            parent_stores_len,
+            prev_prop_upward,
+        });
+        Self::merge_array_var_data(&mut self.array_vars, target, source);
+    }
+
+    /// Reconstruct the pop-invariant structural base of `array_vars` in term
+    /// registration order. `var_layer_terms` is already the scoped, ordered
+    /// index of terms that can contribute to this derived map.
+    fn structural_array_vars(&self) -> HashMap<TermId, ArrayVarData> {
+        let mut array_vars: HashMap<TermId, ArrayVarData> = HashMap::default();
+        for &term_id in &self.var_layer_terms {
+            let TermData::App(sym, args) = self.terms.get(term_id) else {
+                continue;
+            };
+            match sym.name() {
+                "select" if args.len() == 2 => {
+                    array_vars
+                        .entry(args[0])
+                        .or_default()
+                        .parent_selects
+                        .push(term_id);
+                }
+                "store" if args.len() == 3 => {
+                    let base_data = array_vars.entry(args[0]).or_default();
+                    base_data.parent_stores.push(term_id);
+                    let result_data = array_vars.entry(term_id).or_default();
+                    result_data.stores_as_result.push(term_id);
+                }
+                "lambda-array" if args.len() == 2 => {
+                    array_vars.entry(term_id).or_default();
+                }
+                name if (name.starts_with("as-array[")
+                    && name.ends_with(']')
+                    && args.is_empty())
+                    || (name.starts_with("map[") && name.ends_with(']') && !args.is_empty()) =>
+                {
+                    array_vars.entry(term_id).or_default();
+                }
+                _ => {}
+            }
+        }
+        for data in array_vars.values_mut() {
+            data.prop_upward = !data.parent_selects.is_empty() && !data.parent_stores.is_empty();
+        }
+        array_vars
+    }
+
+    /// Rebase all active equality-derived array data after structural term
+    /// growth. A merge records a snapshot of its source, so a later select or
+    /// store cannot be incorporated by appending to the old merged map. Replay
+    /// from the complete structural base also regenerates undo lengths, which
+    /// prevents a later `pop()` from truncating newly registered base data.
+    fn replay_array_var_merges_after_growth(&mut self) {
+        self.array_vars = self.structural_array_vars();
+        self.array_var_merge_undo.clear();
+
+        let merge_log = self.array_var_merge_log.clone();
+        for (target, source) in merge_log {
+            // Re-derive the notification work before applying this edge, just
+            // as `notify_equality()` did originally. Existing queues and exact
+            // ROW2 fingerprints deduplicate old work; pairs involving the new
+            // structural terms are added here for the first time.
+            self.queue_array_equality_events(target, source);
+            self.apply_array_var_merge(target, source);
+        }
+        debug_assert_eq!(
+            self.array_var_merge_undo.len(),
+            self.array_var_merge_log.len(),
+            "arrays: merge log and undo trail must remain parallel after structural growth"
+        );
+    }
+
+    /// Whether a newly registered term can change `array_vars` or any event
+    /// cross-product derived from an already-notified array equality.
+    fn term_affects_array_merge_replay(&self, term_id: TermId) -> bool {
+        let TermData::App(sym, args) = self.terms.get(term_id) else {
+            return false;
+        };
+        match sym.name() {
+            "select" if args.len() == 2 => true,
+            "store" if args.len() == 3 => true,
+            "const-array" if args.len() == 1 => true,
+            "lambda-array" if args.len() == 2 => true,
+            "default" if args.len() == 1 => true,
+            name if name.starts_with("as-array[") && name.ends_with(']') && args.is_empty() => true,
+            name if name.starts_with("map[") && name.ends_with(']') && !args.is_empty() => true,
+            _ => false,
+        }
+    }
+
     /// Register a term into the caches.
     ///
     /// When `insert_structural` is true (the normal incremental-growth path),
@@ -681,7 +795,71 @@ impl ArraySolver<'_> {
             data.parent_stores.sort_unstable_by_key(|term| term.0);
         }
 
-        expected == actual
+        if expected == actual {
+            return true;
+        }
+
+        // Bounded mismatch report for the debug invariant. Keep the assert
+        // fail-closed, but identify which derived class and vector diverged so
+        // incremental-growth regressions are diagnosable without a debugger.
+        let mut keys: Vec<TermId> = expected.keys().chain(actual.keys()).copied().collect();
+        keys.sort_unstable_by_key(|term| term.0);
+        keys.dedup();
+        let differing: Vec<TermId> = keys
+            .into_iter()
+            .filter(|term| expected.get(term) != actual.get(term))
+            .collect();
+        eprintln!(
+            "arrays: array_vars mismatch: expected_keys={} actual_keys={} differing_keys={} merges={} populated={}/{} dirty={} var_layer_dirty={}",
+            expected.len(),
+            actual.len(),
+            differing.len(),
+            self.array_var_merge_log.len(),
+            self.populated_terms,
+            self.terms.len(),
+            self.dirty,
+            self.var_layer_dirty,
+        );
+        for term in differing.iter().take(32) {
+            let expected_data = expected.get(term);
+            let actual_data = actual.get(term);
+            let expected_stores = expected_data.map_or(&[][..], |data| {
+                &data.stores_as_result[..data.stores_as_result.len().min(16)]
+            });
+            let actual_stores = actual_data.map_or(&[][..], |data| {
+                &data.stores_as_result[..data.stores_as_result.len().min(16)]
+            });
+            let expected_selects = expected_data.map_or(&[][..], |data| {
+                &data.parent_selects[..data.parent_selects.len().min(16)]
+            });
+            let actual_selects = actual_data.map_or(&[][..], |data| {
+                &data.parent_selects[..data.parent_selects.len().min(16)]
+            });
+            let expected_parents = expected_data.map_or(&[][..], |data| {
+                &data.parent_stores[..data.parent_stores.len().min(16)]
+            });
+            let actual_parents = actual_data.map_or(&[][..], |data| {
+                &data.parent_stores[..data.parent_stores.len().min(16)]
+            });
+            eprintln!(
+                "arrays: key={term} expected lens=({},{},{}) prefix=({expected_stores:?},{expected_selects:?},{expected_parents:?}) prop={} actual lens=({},{},{}) prefix=({actual_stores:?},{actual_selects:?},{actual_parents:?}) prop={}",
+                expected_data.map_or(0, |data| data.stores_as_result.len()),
+                expected_data.map_or(0, |data| data.parent_selects.len()),
+                expected_data.map_or(0, |data| data.parent_stores.len()),
+                expected_data.is_some_and(|data| data.prop_upward),
+                actual_data.map_or(0, |data| data.stores_as_result.len()),
+                actual_data.map_or(0, |data| data.parent_selects.len()),
+                actual_data.map_or(0, |data| data.parent_stores.len()),
+                actual_data.is_some_and(|data| data.prop_upward),
+            );
+        }
+        if differing.len() > 32 {
+            eprintln!(
+                "arrays: {} additional array_vars mismatches suppressed",
+                differing.len() - 32
+            );
+        }
+        false
     }
 
     #[cfg(not(debug_assertions))]
@@ -922,10 +1100,13 @@ impl ArraySolver<'_> {
         }
 
         let registered_new_terms = self.populated_terms < self.terms.len();
+        let mut array_merge_replay_needed = false;
         if registered_new_terms {
             for idx in self.populated_terms..self.terms.len() {
                 let term_id = TermId(idx as u32);
                 if self.term_in_scope(term_id) {
+                    array_merge_replay_needed |= !self.array_var_merge_log.is_empty()
+                        && self.term_affects_array_merge_replay(term_id);
                     self.register_term(term_id);
                 }
             }
@@ -941,6 +1122,9 @@ impl ArraySolver<'_> {
         if self.var_layer_dirty {
             self.replay_var_layer();
             self.var_layer_dirty = false;
+        }
+        if array_merge_replay_needed {
+            self.replay_array_var_merges_after_growth();
         }
 
         // Debug reference oracle (mandatory M1 discipline, cfg(debug_assertions)

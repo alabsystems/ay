@@ -154,6 +154,35 @@ fn test_euf_chain_congruence_plus_comparison_splits_certified() {
     );
 }
 
+/// MODEL_CHECKER_CONSUMER's minimal strict-replay reproducer: the negation of a polynomial
+/// ring identity must be closed by a checked `poly_simp` lemma rather than a
+/// premiseless Generic/trust leaf.
+#[test]
+#[timeout(10_000)]
+fn test_ring_identity_exports_checked_poly_simp() {
+    let input = r#"
+        (set-logic QF_NIA)
+        (set-option :produce-proofs true)
+        (set-option :check-proofs-strict true)
+        (declare-const i Int)
+        (assert (not (= (* (+ i 1) (+ i 1)) (+ (* i i) (+ (* 2 i) 1)))))
+        (check-sat)
+        (get-proof)
+    "#;
+
+    let (_exec, proof_text, quality) = run_unsat_proof(input);
+
+    assert!(
+        proof_text.contains(":rule poly_simp"),
+        "ring identity must use Alethe's checked polynomial rule:\n{proof_text}"
+    );
+    assert!(
+        !proof_text.contains(":rule hole") && !proof_text.contains(":rule trust"),
+        "ring identity proof must contain no unproved step:\n{proof_text}"
+    );
+    assert_eq!(quality.trust_count, 0, "trust_count must be 0: {quality:?}");
+}
+
 /// The ReLU-disjunction family (#relu-trust-glue), 1-ReLU smoke shape:
 /// `y = relu(x)` encoded as an `(or (and ..) (and ..))` case split over
 /// linear atoms, `x ∈ [1, 2]`, query `y < 1/2`. The eager pipeline refutes

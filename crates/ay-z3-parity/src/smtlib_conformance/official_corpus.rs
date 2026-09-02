@@ -21,7 +21,7 @@ use std::io::Read;
 use std::process::Stdio;
 
 pub(super) const INVENTORY_VALIDATOR_ID: &str = "builtin.official-corpus-inventory.v1";
-pub(super) const VALIDATOR_ID: &str = "builtin.official-corpus-z3-5.0.0.v1";
+pub(super) const VALIDATOR_ID: &str = "builtin.official-corpus-z3-5.1.0.v1";
 
 const DIMENSION_ID: &str = "coverage.corpus";
 const REQUIREMENT_ID: &str = "coverage.corpus.closed-query-manifest";
@@ -1597,7 +1597,7 @@ fn execute_semantic(
         .ok_or("official corpus requires subject.ay_executable")?;
     let z3_sha256 = &contract.profile.z3_overlay.reference_executable.sha256;
     let staged_ay = stage_authenticated_executable(ay_source, &subject.sha256, "AY executable")?;
-    let staged_z3 = stage_authenticated_executable(z3_source, z3_sha256, "Z3 5.0.0 executable")?;
+    let staged_z3 = stage_authenticated_executable(z3_source, z3_sha256, "Z3 5.1.0 executable")?;
     let repo_root = locate_repo_root()?;
     let resources = PlannedResources::plan(
         &repo_root,
@@ -1658,7 +1658,7 @@ fn execute_semantic(
         z3_sha256: z3_sha256.clone(),
         resource_envelope,
         ay_mode: "solve --quiet --competition --strict-proofs --self-check --memory <planned-MiB> <file>; rss-watchdog".to_string(),
-        z3_mode: "z3-5.0.0 -smt2 <file>; rss-watchdog".to_string(),
+        z3_mode: "z3-5.1.0 -smt2 <file>; rss-watchdog".to_string(),
         counts,
         files,
     };
@@ -1904,7 +1904,7 @@ fn validate_run_results(
         || results.resource_envelope != contract.resource_envelope.as_deref().unwrap_or_default()
         || results.ay_mode
             != "solve --quiet --competition --strict-proofs --self-check --memory <planned-MiB> <file>; rss-watchdog"
-        || results.z3_mode != "z3-5.0.0 -smt2 <file>; rss-watchdog"
+        || results.z3_mode != "z3-5.1.0 -smt2 <file>; rss-watchdog"
     {
         return Err("official corpus result campaign/profile/mode binding drift".to_string());
     }

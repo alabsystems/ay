@@ -486,6 +486,20 @@ fn test_parse_wide_decimal_bv_literal_issue_7040() {
         .parse_expr()
         .expect("(_ bv<u128::MAX> 128) should parse");
     assert_eq!(expr, ChcExpr::BitVec(u128::MAX, 128));
+
+    // A small numerical value with a wide declared width still uses the exact
+    // wide representation, so every >128-bit literal has one canonical shape.
+    parser.input = "(_ bv1 129)".to_string();
+    parser.pos = 0;
+    let expr = parser.parse_expr().expect("(_ bv1 129) should parse");
+    match &expr {
+        ChcExpr::Op(ChcOp::BvConcat, args) => {
+            assert_eq!(args.len(), 2);
+            assert_eq!(args[0].as_ref(), &ChcExpr::BitVec(0, 1));
+            assert_eq!(args[1].as_ref(), &ChcExpr::BitVec(1, 128));
+        }
+        _ => panic!("expected canonical BvConcat for (_ bv1 129), got {expr:?}"),
+    }
 }
 
 /// Test #5122: hex/binary BV literals in compound expressions.
@@ -649,4 +663,56 @@ fn test_parse_bvsrem_i_unknown_width_errors_6536() {
         result.is_err(),
         "bvsrem_i with non-BV operands should return parse error"
     );
+}
+
+#[test]
+fn safe_division_uses_the_sort_of_a_wide_literal_tree() {
+    let mut parser = ChcParser::new();
+    let high_bit = (num_bigint::BigUint::from(1_u8) << 128_usize).to_str_radix(10);
+    parser.input = format!("(bvsdiv_i (_ bv{high_bit} 129) (_ bv1 129))");
+    parser.pos = 0;
+    let expr = parser
+        .parse_expr()
+        .expect("wide literal safe division should parse");
+    assert_eq!(expr.sort(), ChcSort::BitVec(129));
+}
+
+#[test]
+fn raw_bv_literals_and_indexed_results_obey_the_shared_width_cap() {
+    let mut parser = ChcParser::new();
+    parser.input = format!("#b{}", "0".repeat(crate::MAX_BITVECTOR_WIDTH as usize + 1));
+    parser.pos = 0;
+    assert!(parser.parse_expr().is_err());
+
+    parser
+        .variables
+        .insert("x".to_string(), ChcSort::BitVec(crate::MAX_BITVECTOR_WIDTH));
+    parser.variables.insert("y".to_string(), ChcSort::BitVec(1));
+    parser.input = "((_ zero_extend 1) x)".to_string();
+    parser.pos = 0;
+    assert!(parser.parse_expr().is_err());
+
+    parser.input = "((_ repeat 0) x)".to_string();
+    parser.pos = 0;
+    assert!(parser.parse_expr().is_err());
+    parser.input = "((_ int2bv 0) 1)".to_string();
+    parser.pos = 0;
+    assert!(parser.parse_expr().is_err());
+
+    parser.input = "(concat x y)".to_string();
+    parser.pos = 0;
+    assert!(parser.parse_expr().is_err());
+
+    parser.input = "(concat #b1 #b0 #b1)".to_string();
+    parser.pos = 0;
+    let concat = parser
+        .parse_expr()
+        .expect("the parser's variadic concat extension folds to binary AST nodes");
+    assert_eq!(concat.sort(), ChcSort::BitVec(3));
+    assert!(matches!(
+        concat,
+        ChcExpr::Op(ChcOp::BvConcat, ref args)
+            if args.len() == 2
+                && matches!(args[0].as_ref(), ChcExpr::Op(ChcOp::BvConcat, inner) if inner.len() == 2)
+    ));
 }

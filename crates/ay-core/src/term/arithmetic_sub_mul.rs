@@ -18,12 +18,12 @@ impl TermStore {
     /// This normalization enables coefficient collection across subtraction operations.
     #[allow(clippy::needless_pass_by_value)]
     pub fn mk_sub(&mut self, args: Vec<TermId>) -> TermId {
-        if args.is_empty() {
+        let Some((&first, rest)) = args.split_first() else {
             return self.mk_int(BigInt::zero());
-        }
-        if args.len() == 1 {
+        };
+        if rest.is_empty() {
             // Unary minus
-            return self.mk_neg(args[0]);
+            return self.mk_neg(first);
         }
 
         debug_assert!(
@@ -32,16 +32,16 @@ impl TermStore {
             "BUG: mk_sub expects Int or Real args"
         );
         debug_assert!(
-            args.windows(2).all(|w| self.sort(w[0]) == self.sort(w[1])),
+            args.iter()
+                .zip(args.iter().skip(1))
+                .all(|(&a, &b)| self.sort(a) == self.sort(b)),
             "BUG: mk_sub expects same sort args"
         );
 
-        let sort = self.sort(args[0]).clone();
+        let sort = self.sort(first).clone();
 
         // For binary subtraction: constant folding
-        if args.len() == 2 {
-            let (a, b) = (args[0], args[1]);
-
+        if let &[a, b] = args.as_slice() {
             // Integer constant folding
             if let (Some(n1), Some(n2)) = (self.get_int(a), self.get_int(b)) {
                 return self.mk_int(n1.clone() - n2.clone());
@@ -94,9 +94,8 @@ impl TermStore {
 
         // N-ary subtraction: (- a b c) -> (+ a (- b) (- c))
         // Negate all arguments except the first
-        let first = args[0];
         let mut add_args = vec![first];
-        for &arg in &args[1..] {
+        for &arg in rest {
             add_args.push(self.mk_neg(arg));
         }
         self.mk_add(add_args)
@@ -121,7 +120,9 @@ impl TermStore {
             "BUG: mk_mul expects Int or Real args"
         );
         debug_assert!(
-            args.windows(2).all(|w| self.sort(w[0]) == self.sort(w[1])),
+            args.iter()
+                .zip(args.iter().skip(1))
+                .all(|(&a, &b)| self.sort(a) == self.sort(b)),
             "BUG: mk_mul expects same sort args"
         );
 

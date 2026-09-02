@@ -83,6 +83,13 @@ pub(super) struct InliningBackTranslator {
     /// self-validate an expanded derivation against it. `None` when the
     /// ground-back-translation feature is off.
     pub(super) input_problem: Option<std::sync::Arc<ChcProblem>>,
+    /// Predicate declarations absent from every clause in the inliner's INPUT
+    /// problem. Compaction drops these declarations, but they have no defining
+    /// clause for `inlined_defs` to reconstruct. Since they are unconstrained
+    /// at this boundary, canonical `false` is an exact completion; earlier
+    /// back-translators may refine/overwrite it before mandatory validation on
+    /// the original problem.
+    pub(super) absent_input_predicates: Vec<crate::Predicate>,
 }
 
 impl InliningBackTranslator {
@@ -2170,7 +2177,9 @@ impl InliningBackTranslator {
             ChcExpr::Var(v) => env.get(&v.name).cloned(),
             ChcExpr::Int(i) => Some(SmtValue::Int(*i)),
             ChcExpr::Bool(b) => Some(SmtValue::Bool(*b)),
-            ChcExpr::BitVec(v, w) => Some(SmtValue::BitVec(*v, *w)),
+            ChcExpr::BitVec(v, w) => Some(SmtValue::bitvec_from_u128(*v, *w)),
+            // Wide literals are represented as a ground concat tree.
+            ChcExpr::Op(ChcOp::BvConcat, _) => crate::expr::evaluate_expr(expr, env),
             _ => None,
         }
     }
@@ -2179,10 +2188,18 @@ impl InliningBackTranslator {
     fn value_to_expr(value: &SmtValue, sort: &ChcSort) -> Option<ChcExpr> {
         match (sort, value) {
             (ChcSort::Int, SmtValue::Int(i)) => Some(ChcExpr::int(*i)),
+            (ChcSort::Int, SmtValue::BigInt(i)) => Some(ChcExpr::from_bigint(i.as_ref().clone())),
             (ChcSort::Bool, SmtValue::Bool(b)) => Some(ChcExpr::Bool(*b)),
             (ChcSort::Bool, SmtValue::Int(i)) => Some(ChcExpr::Bool(*i != 0)),
-            (ChcSort::BitVec(w), SmtValue::BitVec(v, vw)) if w == vw => {
-                Some(ChcExpr::BitVec(*v, *w))
+            (
+                ChcSort::BitVec(expected_width),
+                value @ (SmtValue::BitVec(_, actual_width) | SmtValue::BigBitVec(_, actual_width)),
+            ) if expected_width == actual_width => value.bitvec_to_chc_expr(),
+            (ChcSort::BitVec(width), SmtValue::Int(value)) => {
+                SmtValue::bitvec_from_bigint((*value).into(), *width).bitvec_to_chc_expr()
+            }
+            (ChcSort::BitVec(width), SmtValue::BigInt(value)) => {
+                SmtValue::bitvec_from_bigint(value.as_ref().clone(), *width).bitvec_to_chc_expr()
             }
             _ => None,
         }
@@ -2228,7 +2245,24 @@ impl BackTranslator for InliningBackTranslator {
             witness = Self::remap_witness(witness, &self.new_to_old);
         }
 
-        // Step 2: Synthesize interpretations for inlined predicates.
+        // Step 2: Restore declarations that were already absent from the
+        // inliner's input clause graph. Do this AFTER compacted-ID remapping:
+        // an absent old ID can be reused by a surviving compacted predicate,
+        // and inserting first would overwrite that engine interpretation.
+        for pred in &self.absent_input_predicates {
+            let vars = pred
+                .arg_sorts
+                .iter()
+                .enumerate()
+                .map(|(i, sort)| ChcVar::new(crate::canonical_var_name(pred.id, i), sort.clone()))
+                .collect();
+            witness.set(
+                pred.id,
+                PredicateInterpretation::new(vars, ChcExpr::Bool(false)),
+            );
+        }
+
+        // Step 3: Synthesize interpretations for inlined predicates.
         // inlined_defs uses original PredicateIds, so after remapping the
         // engine witness, all IDs are in the original space.
         let profile = accept_profile_enabled();

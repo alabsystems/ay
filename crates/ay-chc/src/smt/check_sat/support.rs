@@ -54,6 +54,7 @@ pub(super) fn build_theory_solvers<'a>(
     needs_euf: bool,
     start: ay_core::time::Instant,
     timeout: Option<std::time::Duration>,
+    global_deadline: Option<ay_core::time::Instant>,
     lia_state: &mut LiaReusableState,
 ) -> (
     LiaSolver<'a>,
@@ -70,10 +71,18 @@ pub(super) fn build_theory_solvers<'a>(
     }
     if let Some(timeout) = timeout {
         lia.set_timeout_callback(move || start.elapsed() >= timeout);
-        // Inc-10: also install the hard wall-clock deadline (#8749) so
-        // BigInt-heavy sub-loops that poll the deadline rather than the
-        // cascade-boundary callback (IntSat probe) honor the per-check budget.
-        lia.set_deadline(start + timeout);
+    }
+    // Install the earliest absolute boundary as well as the legacy relative
+    // callback. Exact-arithmetic subroutines poll this deadline internally;
+    // without propagating the solve-wide boundary, one such call could keep a
+    // cancelled portfolio worker inside synchronous reaping indefinitely.
+    let per_check_deadline = timeout.map(|timeout| start + timeout);
+    if let Some(deadline) = match (per_check_deadline, global_deadline) {
+        (Some(per_check), Some(global)) => Some(per_check.min(global)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    } {
+        lia.set_deadline(deadline);
     }
     let needs_cut_replay = lia_state.restore_into(&mut lia);
 

@@ -46,7 +46,7 @@ tools can adopt AY one workflow at a time; new tools can embed its native
 Rust APIs directly.
 
 > **Status:** AY 0.x is under active development. Its tested Z3-compatible
-> subset is useful today, but the exact Z3 5.0.0 full-replacement gate is still
+> subset is useful today, but the exact Z3 5.1.0 full-replacement gate is still
 > red. The gate authenticates all 807 required exports and the byte-exact
 > 11-header/805-declaration C surface; current runtime evidence executes
 > 217/805 declarations and has 0/805 exhaustive per-API semantic contracts.
@@ -60,8 +60,8 @@ Rust APIs directly.
 
 ## Quick start
 
-Build from source. `rust-toolchain.toml` pins the compiler, so `rustup`
-fetches the right stock stable toolchain for you:
+Build from source. The published snapshot's `rust-toolchain.toml` pins stock
+stable Rust, so `rustup` fetches the right toolchain for you:
 
 ```bash
 git clone https://github.com/alabsystems/ay.git
@@ -70,11 +70,19 @@ cargo build --release --locked -p ay --features cli --bin ay
 export PATH="$PWD/target/release:$PATH"
 ```
 
-> AY builds with plain stable Rust. The ALab
-> [Trust](https://github.com/alabsystems/trust) compiler — a
-> verification-oriented Rust toolchain, now published — machine-checks selected
-> kernels today through an explicit fail-closed lane; its public check builds
-> on a stock nightly, and its INSTALL.md documents the self-hosted fork lane.
+> AY builds with plain stable Rust, and that stays the supported path for
+> consumers: publication repins the exported toolchain to stock stable, so
+> nothing here requires a verifying compiler. ALab's own development tree is
+> different — since 2026-08-30 its default compiler is the ALab
+> [Trust](https://github.com/alabsystems/trust) toolchain, a
+> verification-oriented Rust toolchain, now published, with verification ON:
+> AY's contracts are written in Trust's native clause grammar in ordinary
+> `src/`, first-party code is verified in an advisory (report-everything,
+> fail-nothing) policy that is ratcheting toward fail-closed, and the strict
+> fail-closed policy still refuses the one crate measured end to end — a gap
+> that is recorded rather than claimed away. Trust also machine-checks selected
+> kernels through an explicit fail-closed lane; its public check builds on a
+> stock nightly, and its INSTALL.md documents the self-hosted fork lane.
 
 Solve a small integer problem from stdin:
 
@@ -381,7 +389,7 @@ contributions, not claims that the techniques began here.
   and crashes — measuring a named surface instead of turning one passing
   corpus into a universal claim. See
   [`ay-z3-parity`](crates/ay-z3-parity/src/main.rs). Its `smtlib-conformance`
-  gate pins SMT-LIB 2.7 and the exact Z3 5.0.0 overlay, then fails closed on
+  gate pins SMT-LIB 2.7 and the exact Z3 5.1.0 overlay, then fails closed on
   any unowned requirement, incomplete inventory, skip, unknown, or unvalidated
   SAT model / UNSAT proof. All 18 validators across its twelve dimensions are
   executable and fail closed — which closes the validator-implementation work,
@@ -447,7 +455,7 @@ Every cell was verified by running both solvers on concrete instances against
 | SMT-LIB 2.6, incremental, models, unsat cores | ✓ | ✓ |
 | OMT (`minimize`/`maximize`) and MaxSMT (`assert-soft`) | ✓ incl. joint use | ◐ each alone; the joint combination returns `unknown` rather than a half-optimized answer |
 | CHC / fixedpoint (HORN) | ✓ | ✓ plus an inductive-invariant certificate and replay obligations |
-| Z3 tactic surface (`apply`, `check-sat-using`) | ✓ native engine | ◐ all 118 Z3 5.0.0 tactic + 42 probe names accepted with z3-style errors; `apply` runs real transforms, `check-sat-using` validates then solves with AY's engine |
+| Z3 tactic surface (`apply`, `check-sat-using`) | ✓ native engine | ◐ all 118 Z3 5.1.0 tactic + 42 probe names accepted with z3-style errors; `apply` runs real transforms, `check-sat-using` validates then solves with AY's engine |
 | `unsat` proofs | ◐ own format, no independent checker | ✓ Alethe + DRAT/LRAT, replayed by Carcara / drat-trim |
 | PB **certified** optimality | ✗ solves OPB, emits no certificate | ✓ VeriPB proof incl. `BOUNDS optimum optimum`, accepted by the pinned checker |
 | DIMACS SAT | ✓ | ✓ (+ DRAT/LRAT/VeriPB proofs) |
@@ -481,7 +489,7 @@ Every number AY states about itself is reproducible from the shipped tree
 (each command is tested; `ay bench` needs a `--features bench` build):
 
 ```bash
-ay --features                    # 55 SMT logics, 4 proof formats, 12 proof theories, provenance
+ay --features                    # 57 accepted SMT logics (some conditional), 4 proof formats, 12 proof theories
 ay z3-audit --scope cli-subset --inventory-only --summary-json audit.json
 ay verifier-audit --consumer all --json surfaces.json  # 13 surfaces: 11 READY, 2 tracked gaps
 ay diagnose --reference z3 examples/quickstart_unsat.smt2

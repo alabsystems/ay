@@ -11,7 +11,31 @@ use super::Executor;
 use crate::features::StaticFeatures;
 use crate::logic_detection::{declared_logic_routes_as_all, LogicCategory};
 
+mod ufbvlia;
+
 impl Executor {
+    pub(in crate::executor) fn declares_named_bv_lia_combination(&self) -> bool {
+        matches!(self.ctx.logic(), Some("QF_UFBVLIA") | Some("QF_AUFBVLIA"))
+    }
+
+    /// Whether the public authored window exceeds the first certified slice
+    /// of the named UF/BV/LIA combination logics.
+    ///
+    /// W7a covers satisfiability only, so optimization and soft constraints
+    /// decline even when their individual term sorts would otherwise fit.
+    pub(in crate::executor) fn named_bv_lia_authored_slice_declined(
+        &self,
+        roots: &[TermId],
+    ) -> bool {
+        if !self.declares_named_bv_lia_combination() {
+            return false;
+        }
+        if !self.ctx.objectives().is_empty() || !self.ctx.soft_constraints().is_empty() {
+            return true;
+        }
+        !roots.is_empty() && self.detect_logic_category(roots).0 == LogicCategory::Other
+    }
+
     pub(in crate::executor) fn detect_logic_category(
         &self,
         assertions: &[TermId],
@@ -31,11 +55,15 @@ impl Executor {
                 logic_name,
                 Some("QF_MSLIA") | Some("QF_MULTISETLIA") | Some("QF_MULTISET") | Some("QF_MS")
             )
+            && !matches!(logic_name, Some("QF_UFBVLIA") | Some("QF_AUFBVLIA"))
         {
             let features = StaticFeatures::collect(&self.ctx.terms, assertions);
             return (LogicCategory::QfMslia, features);
         }
-        if self.ctx.uses_set() && !matches!(logic_name, Some("QF_SET") | Some("QF_SETLIA")) {
+        if self.ctx.uses_set()
+            && !matches!(logic_name, Some("QF_SET") | Some("QF_SETLIA"))
+            && !matches!(logic_name, Some("QF_UFBVLIA") | Some("QF_AUFBVLIA"))
+        {
             let features = StaticFeatures::collect(&self.ctx.terms, assertions);
             return (LogicCategory::QfSetlia, features);
         }
@@ -331,6 +359,32 @@ impl Executor {
             } else {
                 LogicCategory::QfSeq
             };
+        }
+
+        // W7a: admit only the first, array-free scalar slice of the two named
+        // UF/BV/LIA upper bounds. This override intentionally runs LAST, after
+        // every generic declared-logic narrowing rule above: a rejected
+        // Real/nonlinear/DT footprint must not be narrowed out of `Other` by a later
+        // pure-arithmetic or pure-Boolean shortcut. Only the live assertion
+        // footprint selects the route: declarations are an upper bound and
+        // unused broad declarations must not fabricate
+        // a mixed-theory query. The component audit below is likewise
+        // rooted in this exact live window.
+        // Actual array content under `QF_AUFBVLIA` remains fail-closed; its
+        // array-free live subset shares this same closed validator.
+        if self.declares_named_bv_lia_combination() {
+            let component_roots =
+                ufbvlia::flatten_positive_top_level_conjunctions(&self.ctx.terms, assertions);
+            let symbol_components = self
+                .partition_symbol_disjoint(&component_roots)
+                .map(|(components, _)| components);
+            category = ufbvlia::validated_route(
+                &assertion_features,
+                &self.ctx.terms,
+                symbol_components.as_deref(),
+                assertion_has_datatypes,
+            )
+            .unwrap_or(LogicCategory::Other);
         }
 
         (category, features)

@@ -143,15 +143,12 @@ fn test_parse_forall_expr() {
     assert!(matches!(expr, ChcExpr::Op(ChcOp::Ge, _)));
 }
 
-/// Quantifier stripping is polarity-dependent. A `forall` in a rule BODY is
-/// hoisted into the flat clause scope, which turns `forall i. (B(i) -> H)`
-/// into `(exists i. B(i)) -> H` -- a WEAKENED antecedent that can fabricate a
-/// counterexample. It must be recorded so the verdict can be downgraded.
-///
-/// Regression for the wrong-answer witness: on this shape ay used to answer
-/// `sat` where z3 4.16.0 answers `unsat`.
+/// The MODEL_CHECKER_CONSUMER singleton array initializer has an exact quantifier-free form
+/// by array extensionality. It must not take the general body-forall
+/// over-approximation (which used to make AY answer `sat` where Z3 answered
+/// `unsat`).
 #[test]
-fn body_position_forall_is_flagged_as_overapproximation() {
+fn body_position_singleton_forall_is_eliminated_exactly() {
     let input = r#"
         (set-logic HORN)
         (declare-var a (Array (_ BitVec 64) (_ BitVec 64)))
@@ -164,9 +161,283 @@ fn body_position_forall_is_flagged_as_overapproximation() {
     "#;
     let problem = ChcParser::parse(input).expect("body-forall must still parse");
     assert!(
-        problem.has_stripped_body_forall(),
-        "a body-position forall must be flagged as an over-approximation"
+        !problem.has_stripped_body_forall(),
+        "the exact singleton array equivalence must not arm the downgrade"
     );
+    let constraint = problem.clauses()[0]
+        .body
+        .constraint
+        .as_ref()
+        .expect("the initializer rule has an array equality constraint");
+    let ChcExpr::Op(ChcOp::Eq, arguments) = constraint else {
+        panic!("expected rewritten array equality, got {constraint:?}");
+    };
+    assert!(
+        arguments
+            .iter()
+            .any(|argument| matches!(argument.as_ref(), ChcExpr::ConstArray(_, _))),
+        "forall-select initializer must become equality with a const array"
+    );
+}
+
+#[test]
+fn negative_singleton_forall_accepts_reversed_equality_and_capture_rename() {
+    let mut parser = ChcParser::new();
+    parser.polarity = -1;
+    parser.variables.insert(
+        "a".to_string(),
+        ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int)),
+    );
+    // Force the quantifier binder through the parser's capture-renaming path.
+    parser.variables.insert("i".to_string(), ChcSort::Int);
+    parser.clause_binder_names.insert("i".to_string());
+    parser.input = "(forall ((i Int)) (= 7 (select a i)))".to_string();
+
+    let rewritten = parser
+        .parse_expr()
+        .expect("exact reversed form should parse");
+    assert!(!parser.problem.has_stripped_body_forall());
+    let ChcExpr::Op(ChcOp::Eq, arguments) = &rewritten else {
+        panic!("expected array equality after exact elimination");
+    };
+    assert!(matches!(
+        arguments[1].as_ref(),
+        ChcExpr::ConstArray(ChcSort::Int, value)
+            if matches!(value.as_ref(), ChcExpr::Int(7))
+    ));
+}
+
+#[test]
+fn singleton_forall_elimination_is_negative_polarity_only() {
+    for polarity in [0, 1] {
+        let mut parser = ChcParser::new();
+        parser.polarity = polarity;
+        parser.variables.insert(
+            "a".to_string(),
+            ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int)),
+        );
+        parser.input = "(forall ((i Int)) (= (select a i) 7))".to_string();
+
+        let body = parser.parse_expr().expect("forall should parse");
+        let ChcExpr::Op(ChcOp::Eq, arguments) = &body else {
+            panic!("expected the original equality");
+        };
+        assert!(matches!(
+            arguments[0].as_ref(),
+            ChcExpr::Op(ChcOp::Select, _)
+        ));
+        assert!(
+            polarity > 0 || parser.problem.has_stripped_body_forall(),
+            "mixed polarity must retain the conservative downgrade"
+        );
+        assert!(
+            polarity <= 0 || !parser.problem.has_stripped_body_forall(),
+            "positive forall stripping is already exact and must not be flagged"
+        );
+    }
+}
+
+#[test]
+fn negative_singleton_forall_near_misses_remain_fail_closed() {
+    let cases = [
+        // The value depends on the binder.
+        "(forall ((i Int)) (= (select a i) i))",
+        // The select index is not exactly the binder.
+        "(forall ((i Int)) (= (select a (+ i 0)) 7))",
+        // The selected array expression depends on the binder.
+        "(forall ((i Int)) (= (select (store a i 7) i) 7))",
+        // The exact equivalence is intentionally singleton-binder only.
+        "(forall ((i Int) (j Int)) (= (select a i) 7))",
+    ];
+
+    for input in cases {
+        let mut parser = ChcParser::new();
+        parser.polarity = -1;
+        parser.variables.insert(
+            "a".to_string(),
+            ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int)),
+        );
+        parser.input = input.to_string();
+
+        let body = parser.parse_expr().expect("near miss should still parse");
+        assert!(
+            parser.problem.has_stripped_body_forall(),
+            "near miss must preserve the Unsafe-to-Unknown downgrade: {input}"
+        );
+        let ChcExpr::Op(ChcOp::Eq, arguments) = &body else {
+            panic!("near miss must retain its equality body: {input}");
+        };
+        assert!(
+            arguments
+                .iter()
+                .all(|argument| !matches!(argument.as_ref(), ChcExpr::ConstArray(_, _))),
+            "near miss must not synthesize a const array: {input}"
+        );
+    }
+}
+
+#[test]
+fn singleton_forall_elimination_checks_key_and_value_sorts_exactly() {
+    let binder = ChcVar::new("i", ChcSort::Int);
+    let index = ChcExpr::var(binder.clone());
+    let wrong_key_array = ChcExpr::var(ChcVar::new(
+        "wrong-key",
+        ChcSort::Array(Box::new(ChcSort::Bool), Box::new(ChcSort::Int)),
+    ));
+    let wrong_key_body = ChcExpr::eq(
+        ChcExpr::select(wrong_key_array, index.clone()),
+        ChcExpr::Int(7),
+    );
+    assert!(
+        ChcParser::eliminate_singleton_forall_const_array(
+            &wrong_key_body,
+            &binder.name,
+            &binder.sort,
+        )
+        .is_none(),
+        "a binder whose sort differs from the array key cannot be eliminated"
+    );
+
+    let int_array = ChcExpr::var(ChcVar::new(
+        "wrong-value",
+        ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int)),
+    ));
+    let wrong_value_body = ChcExpr::eq(ChcExpr::select(int_array, index), ChcExpr::Bool(true));
+    assert!(
+        ChcParser::eliminate_singleton_forall_const_array(
+            &wrong_value_body,
+            &binder.name,
+            &binder.sort,
+        )
+        .is_none(),
+        "a value whose sort differs from the array element cannot be eliminated"
+    );
+}
+
+#[test]
+fn singleton_forall_binder_scan_charges_flat_fanout_before_scheduling() {
+    fn const_array_with_flat_value(child_count: usize) -> ChcExpr {
+        ChcExpr::ConstArray(
+            ChcSort::Int,
+            std::sync::Arc::new(ChcExpr::Op(
+                ChcOp::And,
+                (0..child_count)
+                    .map(|_| std::sync::Arc::new(ChcExpr::Bool(true)))
+                    .collect(),
+            )),
+        )
+    }
+
+    let binder = ChcVar::new("i", ChcSort::Int);
+    let limit = super::super::expr::MAX_SINGLETON_FORALL_INSPECTION_NODES;
+    assert!(ChcParser::expr_is_binder_free(
+        &const_array_with_flat_value(limit - 2),
+        &binder.name,
+    ));
+    assert!(
+        !ChcParser::expr_is_binder_free(&const_array_with_flat_value(limit - 1), &binder.name,),
+        "cap+1 must fail before extending the work stack with flat children"
+    );
+}
+
+#[test]
+fn singleton_forall_sort_depth_and_node_caps_are_exact() {
+    fn nested_key_sort(array_depth: usize) -> ChcSort {
+        let mut sort = ChcSort::Int;
+        for _ in 0..array_depth {
+            sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(sort));
+        }
+        sort
+    }
+
+    fn candidate(key_sort: ChcSort) -> (ChcVar, ChcExpr) {
+        let binder = ChcVar::new("i", key_sort.clone());
+        let array = ChcExpr::var(ChcVar::new(
+            "a",
+            ChcSort::Array(Box::new(key_sort), Box::new(ChcSort::Int)),
+        ));
+        let body = ChcExpr::eq(
+            ChcExpr::select(array, ChcExpr::var(binder.clone())),
+            ChcExpr::Int(7),
+        );
+        (binder, body)
+    }
+
+    // At depth 63, the binder sort contributes 127 nodes and the outer
+    // array sort contributes 129: exactly the shared 256-node cap, with the
+    // deepest child at the exact depth-64 boundary.
+    let (at_binder, at_body) = candidate(nested_key_sort(63));
+    assert!(ChcParser::eliminate_singleton_forall_const_array(
+        &at_body,
+        &at_binder.name,
+        &at_binder.sort,
+    )
+    .is_some());
+
+    let (over_binder, over_body) = candidate(nested_key_sort(64));
+    assert!(ChcParser::eliminate_singleton_forall_const_array(
+        &over_body,
+        &over_binder.name,
+        &over_binder.sort,
+    )
+    .is_none());
+}
+
+#[test]
+fn singleton_forall_sort_name_byte_cap_is_exact() {
+    fn candidate(sort_name_bytes: usize) -> (ChcVar, ChcExpr) {
+        let key_sort = ChcSort::Uninterpreted("K".repeat(sort_name_bytes));
+        let binder = ChcVar::new("i", key_sort.clone());
+        let array = ChcExpr::var(ChcVar::new(
+            "a",
+            ChcSort::Array(Box::new(key_sort), Box::new(ChcSort::Int)),
+        ));
+        let body = ChcExpr::eq(
+            ChcExpr::select(array, ChcExpr::var(binder.clone())),
+            ChcExpr::Int(7),
+        );
+        (binder, body)
+    }
+
+    // The key-sort name is visited once through the binder and once through
+    // the array sort, so half the byte cap is the exact admitted boundary.
+    let at_name_bytes = super::super::expr::MAX_SINGLETON_FORALL_SORT_NAME_BYTES / 2;
+    let (at_binder, at_body) = candidate(at_name_bytes);
+    assert!(ChcParser::eliminate_singleton_forall_const_array(
+        &at_body,
+        &at_binder.name,
+        &at_binder.sort,
+    )
+    .is_some());
+
+    let (over_binder, over_body) = candidate(at_name_bytes + 1);
+    assert!(ChcParser::eliminate_singleton_forall_const_array(
+        &over_body,
+        &over_binder.name,
+        &over_binder.sort,
+    )
+    .is_none());
+}
+
+#[test]
+fn singleton_forall_binder_name_copy_cap_is_exact() {
+    fn parse_with_binder_name(name: &str) -> ChcProblem {
+        ChcParser::parse(&format!(
+            "(set-logic HORN)\n\
+             (declare-var a (Array Int Int))\n\
+             (declare-fun P () Bool)\n\
+             (assert (=> (forall (({name} Int)) (= (select a {name}) 7)) P))\n\
+             (assert (=> P false))\n\
+             (check-sat)"
+        ))
+        .expect("bounded-name singleton forall should parse")
+    }
+
+    let at_name = "i".repeat(super::super::expr::MAX_SINGLETON_FORALL_BINDER_NAME_BYTES);
+    assert!(!parse_with_binder_name(&at_name).has_stripped_body_forall());
+
+    let over_name = "i".repeat(super::super::expr::MAX_SINGLETON_FORALL_BINDER_NAME_BYTES + 1);
+    assert!(parse_with_binder_name(&over_name).has_stripped_body_forall());
 }
 
 /// A `forall` at POSITIVE polarity is the legitimate implicit-universal

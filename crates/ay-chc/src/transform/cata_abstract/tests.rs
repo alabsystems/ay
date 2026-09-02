@@ -68,6 +68,74 @@ fn obligation_scripts_declare_unreserved_cata_symbols() {
 }
 
 #[test]
+fn obligation_scripts_reconstruct_ordinary_scalar_uf_declarations() {
+    let mut problem = ChcProblem::new();
+    let predicate = problem.declare_predicate("P", vec![list_sort(), ChcSort::Int]);
+    let list = lst_var("list");
+    let value = ChcVar::new("value", ChcSort::Int);
+    let application = ChcExpr::FuncApp(
+        "f".to_string(),
+        ChcSort::Int,
+        vec![ChcExpr::var(value.clone()).into()],
+    );
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(application, ChcExpr::var(value.clone()))),
+        ClauseHead::Predicate(predicate, vec![ChcExpr::var(list), ChcExpr::var(value)]),
+    ));
+
+    let abstraction = CataAbstraction::build(&problem, &[CataKind::Size])
+        .expect("ordinary scalar UFs do not make cata obligations inapplicable");
+    let script = &abstraction.obligations[0].script;
+    assert!(
+        script.contains("(declare-fun f (Int) Int)"),
+        "cata obligation must declare every preserved ordinary UF: {script}"
+    );
+}
+
+#[test]
+fn source_uf_named_like_cata_gets_distinct_generated_symbol() {
+    let mut problem = ChcProblem::new();
+    let predicate = problem.declare_predicate("P", vec![list_sort()]);
+    let list = lst_var("list");
+    let source_name = CataKind::Size.uf_name("Lst");
+    let source_application = ChcExpr::FuncApp(
+        source_name.clone(),
+        ChcSort::Int,
+        vec![ChcExpr::var(list.clone()).into()],
+    );
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(source_application, ChcExpr::int(0))),
+        ClauseHead::Predicate(predicate, vec![ChcExpr::var(list)]),
+    ));
+
+    let abstraction = CataAbstraction::build(&problem, &[CataKind::Size])
+        .expect("source UF collision must be resolved with a fresh cata name");
+    let generated_name = abstraction.symbols.name(&CataKind::Size, "Lst");
+    assert_ne!(generated_name, source_name);
+
+    let script = &abstraction.obligations[0].script;
+    assert!(
+        script.contains(&format!(
+            "(declare-fun {} (Lst) Int)",
+            quote_symbol(&source_name)
+        )),
+        "source UF declaration must be preserved: {script}"
+    );
+    assert!(
+        script.contains(&format!(
+            "(declare-fun {} (Lst) Int)",
+            quote_symbol(&generated_name)
+        )),
+        "generated cata must have its own declaration: {script}"
+    );
+    assert!(abstraction.symbols.parse(&source_name).is_none());
+    assert_eq!(
+        abstraction.symbols.parse(&generated_name),
+        Some((CataKind::Size, "Lst"))
+    );
+}
+
+#[test]
 fn obligations_discharge_on_supported_clauses() {
     let problem = equal_shape_problem();
     let pool = vec![CataKind::Size, CataKind::RootDisc];

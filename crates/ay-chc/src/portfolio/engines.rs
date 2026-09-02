@@ -25,7 +25,8 @@ use crate::{ChcProblem, ChcVar};
 use ay_sat::TlaTraceable;
 use std::time::Duration;
 
-use super::{EngineConfig, EngineResult};
+use super::types::EngineResult;
+use super::EngineConfig;
 
 /// Replay-confirm a SingleLoop-encoded engine's Unsafe on the engine-input
 /// problem (inc-9, gate g3).

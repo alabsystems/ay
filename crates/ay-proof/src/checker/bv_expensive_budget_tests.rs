@@ -4,7 +4,7 @@
 
 //! Whole-proof resource regressions for expensive BV semantic checkers.
 
-use ay_core::{Proof, Sort, Symbol, TermId, TermStore, TheoryLemmaKind};
+use ay_core::{AletheRule, Proof, ProofStep, Sort, Symbol, TermId, TermStore, TheoryLemmaKind};
 use num_bigint::BigInt;
 
 use super::*;
@@ -16,6 +16,43 @@ fn assert_expensive_cap(error: ProofCheckError) {
             if step.0 as usize == MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF
                 && reason.contains("whole-proof cap")
     ));
+}
+
+fn closed_wide_evaluate_step(terms: &mut TermStore) -> ProofStep {
+    let zero64 = terms.mk_bitvec(BigInt::from(0_u8), 64);
+    let extended = terms.mk_app(
+        Symbol::indexed("zero_extend", vec![64]),
+        [zero64],
+        Sort::bitvec(128),
+    );
+    let eight = terms.mk_bitvec(BigInt::from(8_u8), 128);
+    let product = terms.mk_app(Symbol::named("bvmul"), [extended, eight], Sort::bitvec(128));
+    let high = terms.mk_app(
+        Symbol::indexed("extract", vec![127, 64]),
+        [product],
+        Sort::bitvec(64),
+    );
+    let equality = terms.mk_app(Symbol::named("="), [high, zero64], Sort::Bool);
+    ProofStep::Step {
+        rule: AletheRule::Evaluate,
+        clause: vec![equality],
+        premises: Vec::new(),
+        args: Vec::new(),
+    }
+}
+
+fn legacy_concat_evaluate_step(terms: &mut TermStore) -> ProofStep {
+    let high = terms.mk_bitvec(BigInt::from(1_u8), 8);
+    let low = terms.mk_bitvec(BigInt::from(2_u8), 8);
+    let concat = terms.mk_app(Symbol::named("concat"), [high, low], Sort::bitvec(16));
+    let expected = terms.mk_bitvec(BigInt::from(0x0102_u16), 16);
+    let equality = terms.mk_app(Symbol::named("="), [concat, expected], Sort::Bool);
+    ProofStep::Step {
+        rule: AletheRule::Evaluate,
+        clause: vec![equality],
+        premises: Vec::new(),
+        args: Vec::new(),
+    }
 }
 
 #[test]
@@ -82,6 +119,44 @@ fn ground_bv_constants_use_bounded_evaluation_without_expensive_precharge() {
 }
 
 #[test]
+fn closed_wide_evaluate_shares_the_expensive_cap_but_legacy_concat_does_not() {
+    let mut terms = TermStore::new();
+    let closed = closed_wide_evaluate_step(&mut terms);
+    let mut proof = Proof::new();
+    for _ in 0..MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF {
+        proof.add_step(closed.clone());
+    }
+    let charge = validate_expensive_bv_budget(&proof, &terms)
+        .expect("the exact closed-BV structural boundary must remain admitted");
+    assert_eq!(
+        charge.work,
+        usize::try_from(closed_bv_evaluate::MAX_CLOSED_BV_EVALUATE_WORK_PER_LEMMA)
+            .expect("published work fits usize")
+            * MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF
+    );
+    assert_eq!(
+        charge.bytes,
+        closed_bv_evaluate::MAX_CLOSED_BV_EVALUATE_BYTES_PER_LEMMA
+            * MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF
+    );
+
+    proof.add_step(closed);
+    let error = validate_expensive_bv_budget(&proof, &terms)
+        .expect_err("the ninth closed-BV evaluation must exceed the shared cap");
+    assert_expensive_cap(error);
+
+    let legacy = legacy_concat_evaluate_step(&mut terms);
+    let mut legacy_proof = Proof::new();
+    for _ in 0..=MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF {
+        legacy_proof.add_step(legacy.clone());
+    }
+    let legacy_charge = validate_expensive_bv_budget(&legacy_proof, &terms)
+        .expect("legacy <=64-bit concat evaluation is outside the expensive census");
+    assert_eq!(legacy_charge.work, 0);
+    assert_eq!(legacy_charge.bytes, 0);
+}
+
+#[test]
 fn symbolic_wide_and_unsupported_ground_bv_stay_expensive_and_fail_closed() {
     let mut terms = TermStore::new();
     let symbolic = terms.mk_var("symbolic_width_8", Sort::bitvec(8));
@@ -125,8 +200,16 @@ fn published_single_lemma_reserve_covers_each_expensive_kind() {
     const {
         assert!(MAX_EXPENSIVE_BV_WORK_PER_LEMMA >= MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA);
         assert!(MAX_EXPENSIVE_BV_WORK_PER_LEMMA >= MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA);
+        assert!(
+            MAX_EXPENSIVE_BV_WORK_PER_LEMMA
+                >= closed_bv_evaluate::MAX_CLOSED_BV_EVALUATE_WORK_PER_LEMMA
+        );
         assert!(MAX_EXPENSIVE_BV_BYTES_PER_LEMMA >= MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA);
         assert!(MAX_EXPENSIVE_BV_BYTES_PER_LEMMA >= MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA);
+        assert!(
+            MAX_EXPENSIVE_BV_BYTES_PER_LEMMA
+                >= closed_bv_evaluate::MAX_CLOSED_BV_EVALUATE_BYTES_PER_LEMMA
+        );
     }
 }
 

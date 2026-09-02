@@ -517,7 +517,7 @@ impl PcSplitBackTranslator {
     fn pc_value_as_smt(value: &ChcExpr) -> Option<SmtValue> {
         match value {
             ChcExpr::Int(i) => Some(SmtValue::Int(*i)),
-            ChcExpr::BitVec(v, w) => Some(SmtValue::BitVec(*v, *w)),
+            ChcExpr::BitVec(v, w) => Some(SmtValue::bitvec_from_u128(*v, *w)),
             ChcExpr::Bool(b) => Some(SmtValue::Bool(*b)),
             _ => None,
         }

@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
-use num_bigint::BigInt;
+use num_bigint::{BigInt, BigUint};
 use num_rational::BigRational;
 
 /// Regression test for #6266: parse_smt_value_str returns None on parse failure
@@ -43,6 +43,19 @@ fn test_parse_smt_value_str_valid_int() {
 }
 
 #[test]
+fn test_parse_smt_value_str_preserves_beyond_i128_ints() {
+    let positive: BigInt = (BigInt::from(1_u8) << 128_usize) + 7_u8;
+    assert_eq!(
+        parse_smt_value_str(&positive.to_string(), &Sort::Int),
+        Some(SmtValue::int_from_bigint(positive.clone()))
+    );
+    assert_eq!(
+        parse_smt_value_str(&format!("(- {positive})"), &Sort::Int),
+        Some(SmtValue::int_from_bigint(-positive))
+    );
+}
+
+#[test]
 fn test_parse_smt_value_str_valid_bool() {
     assert_eq!(
         parse_smt_value_str("true", &Sort::Bool),
@@ -72,24 +85,21 @@ fn test_parse_smt_value_str_valid_bv() {
 }
 
 #[test]
-fn test_parse_smt_value_str_wide_bv_truncation_7040() {
+fn test_parse_smt_value_str_wide_bv_is_exact() {
     // 192-bit hex literal: 48 hex digits > 32 (128-bit limit).
-    // Should truncate to low 128 bits.
     let bv192 = Sort::BitVec(ay_core::BitVecSort { width: 192 });
     let hex_192 = "#x000000000000000100000000000000020000000000000003";
     let result = parse_smt_value_str(hex_192, &bv192);
-    // Low 128 bits = 0x00000000000000020000000000000003
-    assert_eq!(
-        result,
-        Some(SmtValue::BitVec(0x00000000000000020000000000000003, 192))
-    );
+    let expected =
+        BigUint::parse_bytes(b"000000000000000100000000000000020000000000000003", 16).unwrap();
+    assert_eq!(result, Some(SmtValue::bitvec_from_biguint(expected, 192)));
 
     // 256-bit binary literal: 256 chars > 128 limit.
     let bv256 = Sort::BitVec(ay_core::BitVecSort { width: 256 });
     let bin_256 = &format!("#b{}", "1".repeat(256));
     let result = parse_smt_value_str(bin_256, &bv256);
-    // Low 128 bits = all ones = u128::MAX
-    assert_eq!(result, Some(SmtValue::BitVec(u128::MAX, 256)));
+    let expected = (BigUint::from(1u8) << 256) - BigUint::from(1u8);
+    assert_eq!(result, Some(SmtValue::bitvec_from_biguint(expected, 256)));
 }
 
 #[test]

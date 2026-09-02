@@ -48,7 +48,7 @@ fn ground_linear_identity_lowers_to_argument_free_evaluate() {
 }
 
 #[test]
-fn symbolic_linear_identity_promotes_to_checked_la_generic() {
+fn symbolic_linear_identity_promotes_to_checked_poly_simp() {
     let mut terms = TermStore::new();
     let x = terms.mk_var("x", Sort::Int);
     let zero = terms.mk_int(BigInt::from(0));
@@ -60,11 +60,9 @@ fn symbolic_linear_identity_promotes_to_checked_la_generic() {
         .format_step(&step, ProofId(8))
         .expect("symbolic identity must render");
 
-    assert!(
-        rendered.contains(":rule la_generic :args (1)"),
-        "{rendered}"
-    );
+    assert!(rendered.contains(":rule poly_simp"), "{rendered}");
     assert!(!rendered.contains(":rule evaluate"), "{rendered}");
+    assert!(!rendered.contains(":rule la_generic"), "{rendered}");
     assert!(!rendered.contains(":rule lia_generic"), "{rendered}");
 }
 

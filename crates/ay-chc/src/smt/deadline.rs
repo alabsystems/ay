@@ -68,12 +68,10 @@ impl Drop for ScopedSmtDeadline {
 /// for anything whose result feeds back into the enclosing engine's search: the
 /// enclosing budget is what bounds that search.
 ///
-/// It is WRONG for ground back-translation. That computation runs inside the
-/// BMC probe's own deadline (`bmc/mod.rs` `BmcSolver::solve`), by which point
-/// the probe has consumed nearly all of it, so every witness solve issued there
-/// receives only the few-millisecond remainder no matter what it asks for —
-/// which reads at the call site exactly like a theory failure. (It was misread
-/// as one: see the note in `ground_derivation/complete.rs`.)
+/// Ground back-translation can sit inside a narrower engine slice while its
+/// authoritative caller still has acceptance budget. Its witness solve may
+/// replace that inner deadline, but only with an absolute boundary already
+/// clamped to the caller's remaining route budget.
 ///
 /// # Soundness
 ///
@@ -82,11 +80,9 @@ impl Drop for ScopedSmtDeadline {
 /// candidate ground environment handed to
 /// [`crate::ground_derivation::validate_ground_derivation`], which re-evaluates
 /// every ORIGINAL clause against it and remains the sole acceptance anchor.
-/// Overrunning a wall-clock budget here can therefore only cost time; it can
-/// never admit a wrong answer. The previous deadline is restored on drop, so
-/// the enclosing engine's budget accounting resumes unchanged, and the
-/// enclosing engine's `cancel_after` token is untouched so a true global
-/// timeout still preempts.
+/// The previous deadline is restored on drop. The supplied replacement must
+/// never exceed the authoritative caller deadline, and the landing checks
+/// deadline/cancellation again before publishing its validated candidate.
 ///
 /// Use ONLY for that purpose, and always with a hard cap.
 pub(crate) struct ScopedSmtDeadlineOverride {
@@ -94,11 +90,13 @@ pub(crate) struct ScopedSmtDeadlineOverride {
 }
 
 impl ScopedSmtDeadlineOverride {
-    /// Replace the thread deadline with `budget` from now, ignoring (but
-    /// restoring) any enclosing deadline.
-    pub(crate) fn install(budget: Duration) -> Self {
+    /// Replace the thread deadline with the exact absolute boundary, ignoring
+    /// (but restoring) any enclosing deadline. Callers must derive `deadline`
+    /// from their own already-bounded route so this override never widens the
+    /// authoritative solve window.
+    pub(crate) fn install_until(deadline: Instant) -> Self {
         let prev = THREAD_SMT_DEADLINE.with(Cell::get);
-        THREAD_SMT_DEADLINE.with(|cell| cell.set(Some(Instant::now() + budget)));
+        THREAD_SMT_DEADLINE.with(|cell| cell.set(Some(deadline)));
         Self { prev }
     }
 }
@@ -115,6 +113,12 @@ pub(crate) fn smt_deadline_remaining() -> Option<Duration> {
     THREAD_SMT_DEADLINE
         .with(Cell::get)
         .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+}
+
+/// Return the exact route-scoped SMT deadline for child solver adapters.
+/// Callers must still perform a landing check before publishing a verdict.
+pub(crate) fn current_smt_deadline() -> Option<Instant> {
+    THREAD_SMT_DEADLINE.with(Cell::get)
 }
 
 /// True if a thread-local SMT deadline is installed and has passed.

@@ -17,6 +17,9 @@ use ay_core::{Constant, Sort, TermData, TermId, TermStore};
 use num_bigint::BigInt;
 
 fn sat_literal_value(bit_lit: i32, sat_model: &[bool], bv_var_offset: i32) -> Option<bool> {
+    if bit_lit == 0 {
+        return None;
+    }
     let offset = u32::try_from(bv_var_offset).ok()?;
     let sat_index = bit_lit.unsigned_abs().checked_add(offset)?.checked_sub(1)? as usize;
     let assigned = *sat_model.get(sat_index)?;
@@ -27,6 +30,7 @@ impl SmtContext {
     /// Build a term-values map from the current model for array model extraction.
     /// Maps TermId → String value, combining LIA model, SAT Bool assignments, and BV values.
     /// This is the "EUF model" substitute that ArraySolver::extract_model needs.
+    /// Returns `None` rather than completing a malformed or incomplete SAT assignment.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_term_values_map(
         terms: &TermStore,
@@ -35,7 +39,7 @@ impl SmtContext {
         term_to_var: &std::collections::BTreeMap<TermId, u32>,
         bv_term_to_bits: &HbHashMap<TermId, Vec<i32>>,
         bv_var_offset: i32,
-    ) -> HbHashMap<TermId, String> {
+    ) -> Option<HbHashMap<TermId, String>> {
         let mut term_values: HbHashMap<TermId, String> = HbHashMap::default();
 
         // Array extraction asks for the values of store indices/values and
@@ -80,12 +84,9 @@ impl SmtContext {
             if !matches!(terms.sort(tid), Sort::Bool) {
                 continue;
             }
-            let Some(sat_index) = cnf_var.checked_sub(1).map(|index| index as usize) else {
-                continue;
-            };
-            if let Some(&value) = sat_model.get(sat_index) {
-                term_values.insert(tid, if value { "true" } else { "false" }.to_string());
-            }
+            let sat_index = cnf_var.checked_sub(1)? as usize;
+            let value = *sat_model.get(sat_index)?;
+            term_values.insert(tid, if value { "true" } else { "false" }.to_string());
         }
 
         // Likewise, BV selects and store subterms live in the bit-blast map but
@@ -94,34 +95,43 @@ impl SmtContext {
         // very cell value array validation is meant to replay.
         for (&tid, bits) in bv_term_to_bits {
             let Sort::BitVec(bvs) = terms.sort(tid) else {
-                continue;
+                return None;
             };
+            if bvs.width == 0
+                || bvs.width > crate::MAX_BITVECTOR_WIDTH
+                || bits.len() != usize::try_from(bvs.width).ok()?
+            {
+                return None;
+            }
             let mut value = BigInt::from(0u8);
             for (index, &bit_lit) in bits.iter().enumerate() {
-                if sat_literal_value(bit_lit, sat_model, bv_var_offset) == Some(true) {
+                if sat_literal_value(bit_lit, sat_model, bv_var_offset)? {
                     value += BigInt::from(1u8) << index;
                 }
             }
             term_values.insert(tid, ay_dpll::format_bitvec(&value, bvs.width));
         }
 
-        term_values
+        Some(term_values)
     }
 
     /// Convert an ArrayInterpretation from the array solver into an SmtValue.
+    /// Returns `None` when any concrete default, index, or element cannot be
+    /// parsed exactly for its declared sort.
     pub(super) fn array_interp_to_smt_value(
         interp: &ay_arrays::ArrayInterpretation,
         element_sort: &Sort,
         index_sort: &Sort,
-    ) -> SmtValue {
-        let default_val = interp
-            .default
-            .as_ref()
-            .and_then(|d| value_parse::parse_smt_value_str(d, element_sort))
-            .unwrap_or_else(|| value_parse::default_smt_value(element_sort));
+    ) -> Option<SmtValue> {
+        // `default: None` is not proof that the array is unconstrained. It can
+        // also represent an array-valued application whose else value could
+        // not be derived. Inventing zero there may violate array equality, so
+        // incomplete interpretations must remain indeterminate.
+        let default = interp.default.as_ref()?;
+        let default_val = value_parse::parse_smt_value_str(default, element_sort)?;
 
         if interp.stores.is_empty() {
-            SmtValue::ConstArray(Box::new(default_val))
+            Some(SmtValue::ConstArray(Box::new(default_val)))
         } else {
             let entries: Vec<(SmtValue, SmtValue)> = interp
                 .stores
@@ -132,17 +142,16 @@ impl SmtContext {
                 // the array solver's denotation.
                 .rev()
                 .map(|(k, v)| {
-                    let key = value_parse::parse_smt_value_str(k, index_sort)
-                        .unwrap_or_else(|| value_parse::default_smt_value(index_sort));
-                    let val = value_parse::parse_smt_value_str(v, element_sort)
-                        .unwrap_or_else(|| value_parse::default_smt_value(element_sort));
-                    (key, val)
+                    Some((
+                        value_parse::parse_smt_value_str(k, index_sort)?,
+                        value_parse::parse_smt_value_str(v, element_sort)?,
+                    ))
                 })
-                .collect();
-            SmtValue::ArrayMap {
+                .collect::<Option<_>>()?;
+            Some(SmtValue::ArrayMap {
                 default: Box::new(default_val),
                 entries,
-            }
+            })
         }
     }
 }

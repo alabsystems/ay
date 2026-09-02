@@ -188,6 +188,11 @@ impl PdrSolver {
             .as_ref()
             .is_some_and(crate::cancellation::CancellationToken::is_cancelled)
             || self
+                .config
+                .external_cancellation_token
+                .as_ref()
+                .is_some_and(crate::cancellation::CancellationToken::is_cancelled)
+            || self
                 .solve_deadline
                 .is_some_and(|d| ay_core::time::Instant::now() >= d)
             || self.reachability.reach_facts_saturated

@@ -1,9 +1,9 @@
 // Copyright 2026 Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Closed, source-authenticated inventory of the Z3 5.0.0 CLI overlay.
+//! Closed, source-authenticated inventory of the Z3 5.1.0 CLI overlay.
 //!
-//! The full source tree is retained as bounded metadata, not as 2,761 copied
+//! The full source tree is retained as bounded metadata, not as 2,756 copied
 //! blobs.  Only the UTF-8 files that define the shell, SMT2 command registry,
 //! and registry-generation mechanisms are retained verbatim.  Live registries
 //! are read from the exact profile-pinned executable under the repository OOM
@@ -16,40 +16,40 @@ pub(super) const VALIDATOR_ID: &str = "builtin.z3-source-inventory.v1";
 pub(super) const REFERENCE_VALIDATOR_ID: &str = "builtin.z3-reference-inventory.v1";
 
 const SNAPSHOT_SCHEMA: &str = "ay-z3-source-metadata-snapshot/v1";
-const SNAPSHOT_ID: &str = "z3-5.0.0-source-tree";
-const SNAPSHOT_SELECTION: &str = "all 2,761 tracked files as path/git-blob/size metadata, the 43 UTF-8 C-API/shell/SMT2/registry/operator source blobs, and the pinned whole-tree registration-keyword scan over src and scripts";
+const SNAPSHOT_ID: &str = "z3-5.1.0-source-tree";
+const SNAPSHOT_SELECTION: &str = "all 2,756 tracked files as path/git-blob/size metadata, the 43 UTF-8 C-API/shell/SMT2/registry/operator source blobs, and the pinned whole-tree registration-keyword scan over src and scripts";
 const SNAPSHOT_DIGEST_KIND: &str = "sorted-path-git-blob-size-manifest/v1";
 const MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
-const EXPECTED_TREE_FILES: usize = 2_761;
+const EXPECTED_TREE_FILES: usize = 2_756;
 const EXPECTED_TREE_SHA256: &str =
-    "1abb6b6f933a1ff92c3207729330372c6df46ad62c7c4d20d01c60262573c65a";
-pub(super) const EXPECTED_OBSERVABLE_ITEMS: usize = 1_508;
+    "df491d15649b581936f8422fbd704b0694831c160c01d1d339164c8a1441939b";
+pub(super) const EXPECTED_OBSERVABLE_ITEMS: usize = 1_518;
 pub(super) const EXPECTED_OBSERVABLE_SHA256: &str =
-    "200e2b25b213fa4d55133f1e12b2875570d58b208f08d5dcd513ad7a044520c7";
+    "8a8d7ad916bca1530c39f7507adce5b4e7e279852d3c2de7c8802c9e85cace77";
 const EXPECTED_PROCESS_CASES: usize = 8;
 const REGISTRATION_SCAN_PATTERN: &str = r"tactic|probe|simplif|install_cmd|register_cmd|cmd_context|REG_PARAMS|gparams|parameter|IN_[A-Z_]+|is_option|strcmp\([^[:cntrl:]]*-|extension";
-const EXPECTED_REGISTRATION_SCAN_LINES: usize = 12_641;
+const EXPECTED_REGISTRATION_SCAN_LINES: usize = 12_681;
 const EXPECTED_REGISTRATION_SCAN_SHA256: &str =
-    "da812923426612df6d685649b8c912cfa148c435e9e98529f03eb18c529b1ee6";
+    "761e4140c263159e0e79589fa9f63ae0b19992a10b9eab1cfbfcd481cdb20bdb";
 const EXPECTED_REGISTRATION_CLASSIFICATION_SHA256: &str =
-    "f570ad0c083f3e295453252a7ffa9db0e04184318c5e6624e1ccab10189cadaf";
+    "4f31f4e821b78256a856d20e8f9209fe90d7dd287646dd6580c077c5f89815ed";
 const EXPECTED_REGISTRATION_CLASSIFICATION_COUNTS: [(&str, usize); 16] = [
     ("nonobservable.build-metadata", 296),
-    ("nonobservable.comment-or-documentation", 1_866),
-    ("nonobservable.foreign-api-binding-or-implementation", 2_314),
+    ("nonobservable.comment-or-documentation", 1_880),
+    ("nonobservable.foreign-api-binding-or-implementation", 2_331),
     ("nonobservable.generator-or-maintenance-tool", 212),
     (
         "nonobservable.internal-declaration-or-schema-plumbing",
-        1_913,
+        1_911,
     ),
     ("nonobservable.internal-implementation-reference", 5_573),
-    ("nonobservable.internal-test-only", 145),
+    ("nonobservable.internal-test-only", 155),
     ("observable.cli-option-dispatch", 4),
     ("observable.command-registry-anchor", 30),
     ("observable.filename-extension-dispatch", 2),
     ("observable.input-mode-dispatch", 31),
     ("observable.parameter-module-registry-anchor", 2),
-    ("observable.parameter-schema-anchor", 68),
+    ("observable.parameter-schema-anchor", 69),
     ("observable.probe-registration", 42),
     ("observable.simplifier-registration", 29),
     ("observable.tactic-registration", 114),
@@ -125,14 +125,14 @@ const CATEGORY_COUNTS: [(&str, usize); 17] = [
     ("cli-option", 33),
     ("declaration-builtin", 323),
     ("filename-extension", 16),
-    ("global-parameter", 24),
+    ("global-parameter", 25),
     ("input-mode", 9),
     ("logic-recognizer-literal", 24),
     ("logic-strategy-alias", 33),
-    ("module-parameter", 654),
-    ("parameter-module", 21),
+    ("module-parameter", 663),
+    ("parameter-module", 22),
     ("probe", 42),
-    ("simplifier", 37),
+    ("simplifier", 36),
     ("smt-command", 94),
     ("smt-info-key", 11),
     ("smt-option-key", 20),
@@ -277,7 +277,7 @@ impl LiveCapture {
             id: format!("live.{}", self.id),
             input_sha256,
             expected: format!(
-                "authenticated Z3 5.0.0 invocation {:?} exits 0 with complete UTF-8 stdout and empty stderr",
+                "authenticated Z3 5.1.0 invocation {:?} exits 0 with complete UTF-8 stdout and empty stderr",
                 self.invocation
             ),
             observed: format!(
@@ -452,7 +452,7 @@ pub(super) fn run_reference(args: &[String]) -> Result<i32, String> {
         receipt_sha
     );
     println!(
-        "attach to overlay.z3-5.0.0 inventory: {{\"path\":\"{output_relative}\",\"sha256\":\"{receipt_sha}\"}}"
+        "attach to overlay.z3-5.1.0 inventory: {{\"path\":\"{output_relative}\",\"sha256\":\"{receipt_sha}\"}}"
     );
     if !report.complete {
         println!(
@@ -534,7 +534,7 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
         profile_id: PROFILE_ID.to_string(),
         profile_sha256: canonical_profile_sha256()?,
         dimension_id: dimension.id.clone(),
-        requirement_ids: vec!["overlay.z3-5.0.0.source-inventory".to_string()],
+        requirement_ids: vec!["overlay.z3-5.1.0.source-inventory".to_string()],
         inventory_sha256: dimension.inventory.sha256.clone(),
         validator: ValidatorIdentity {
             id: VALIDATOR_ID.to_string(),
@@ -561,7 +561,7 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
     atomic_write_new(&receipt_path, &bytes)?;
     let receipt_sha = sha256_bytes(&bytes);
     println!(
-        "z3-source-inventory={} source-files={} commands=94 tactics=118 probes=42 simplifiers=37 parameters=678 observable-items={} receipt={} sha256={}",
+        "z3-source-inventory={} source-files={} commands=94 tactics=118 probes=42 simplifiers=36 parameters=688 observable-items={} receipt={} sha256={}",
         if receipt.result == ValidatorResult::Pass { "PASS" } else { "FAIL" },
         EXPECTED_TREE_FILES,
         EXPECTED_OBSERVABLE_ITEMS,
@@ -569,7 +569,7 @@ pub(super) fn run(args: &[String]) -> Result<i32, String> {
         receipt_sha
     );
     println!(
-        "attach to overlay.z3-5.0.0.source-inventory: {{\"path\":\"{output_relative}\",\"sha256\":\"{receipt_sha}\"}}"
+        "attach to overlay.z3-5.1.0.source-inventory: {{\"path\":\"{output_relative}\",\"sha256\":\"{receipt_sha}\"}}"
     );
     if !report.complete {
         println!(
@@ -585,8 +585,8 @@ pub(super) fn validate_and_replay(
     context: EvidenceContext<'_>,
 ) -> Result<(), String> {
     if receipt.validator.kind != ValidatorKind::Z3Differential
-        || context.dimension.id != "overlay.z3-5.0.0"
-        || receipt.requirement_ids != ["overlay.z3-5.0.0.source-inventory".to_string()]
+        || context.dimension.id != "overlay.z3-5.1.0"
+        || receipt.requirement_ids != ["overlay.z3-5.1.0.source-inventory".to_string()]
         || !receipt.exhaustive
         || receipt.subject.ay_executable_sha256.is_some()
         || receipt.subject.ay_shared_library_sha256.is_some()
@@ -651,7 +651,7 @@ pub(super) fn validate_reference_and_replay(
         .map(|requirement| requirement.id.clone())
         .collect::<Vec<_>>();
     if receipt.validator.kind != ValidatorKind::ReferenceExtractor
-        || context.dimension.id != "overlay.z3-5.0.0"
+        || context.dimension.id != "overlay.z3-5.1.0"
         || receipt.requirement_ids != expected_ids
         || !receipt.exhaustive
         || receipt.subject.ay_executable_sha256.is_some()
@@ -698,7 +698,7 @@ fn overlay_dimension(contract: &Contract) -> Result<&Dimension, String> {
     contract
         .dimensions
         .iter()
-        .find(|dimension| dimension.id == "overlay.z3-5.0.0")
+        .find(|dimension| dimension.id == "overlay.z3-5.1.0")
         .ok_or("closed Z3 overlay dimension is missing".to_string())
 }
 
@@ -1233,7 +1233,7 @@ fn execute(
     let staged_z3 = stage_authenticated_executable(
         &source_z3,
         &target.reference_executable.sha256,
-        "Z3 5.0.0 executable",
+        "Z3 5.1.0 executable",
     )?;
     let repo_root = locate_repo_root()?;
     let resources = PlannedResources::plan(
@@ -1336,7 +1336,7 @@ fn run_capture(
             args.iter().copied(),
             input,
             timeout,
-            &format!("Z3 5.0.0 source inventory: {id}"),
+            &format!("Z3 5.1.0 source inventory: {id}"),
         )
         .map_err(|error| error.to_string())?;
     let stdout_utf8 = String::from_utf8(output.stdout);
@@ -2236,9 +2236,9 @@ fn reference_inventory_cases(snapshot: &Z3SourceSnapshot) -> Result<Vec<Validato
     ];
     let behavior_digest = selected_manifest(&behavior_paths)?;
     let version = source_text(snapshot, "scripts/VERSION.txt")?.trim();
-    if version != "5.0.0.0" {
+    if version != "5.1.0.0" {
         return Err(format!(
-            "pinned Z3 VERSION.txt is {version:?}, expected \"5.0.0.0\""
+            "pinned Z3 VERSION.txt is {version:?}, expected \"5.1.0.0\""
         ));
     }
     let identity_digest = selected_manifest(&["scripts/VERSION.txt", "src/util/z3_version.h.in"])?;
@@ -2253,7 +2253,7 @@ fn reference_inventory_cases(snapshot: &Z3SourceSnapshot) -> Result<Vec<Validato
 
     let mut rows = vec![
         pass(
-            "overlay.z3-5.0.0.behavioral-transcripts",
+            "overlay.z3-5.1.0.behavioral-transcripts",
             behavior_digest.clone(),
             "pinned shell, parser, command, tactic, simplifier, and parameter source owners define the behavioral transcript row",
             format!(
@@ -2262,16 +2262,16 @@ fn reference_inventory_cases(snapshot: &Z3SourceSnapshot) -> Result<Vec<Validato
             ),
         ),
         pass(
-            "overlay.z3-5.0.0.c-abi",
+            "overlay.z3-5.1.0.c-abi",
             abi_source_digest.clone(),
-            "the exact pinned Z3 5.0.0 z3_api.h and z3_macros.h source objects own the C ABI row",
+            "the exact pinned Z3 5.1.0 z3_api.h and z3_macros.h source objects own the C ABI row",
             format!(
                 "path={:?};git-blob={};size={};api-source-manifest-sha256={abi_source_digest}",
                 abi.path, abi.git_blob, abi.size,
             ),
         ),
         pass(
-            "overlay.z3-5.0.0.source-inventory",
+            "overlay.z3-5.1.0.source-inventory",
             source_digest.clone(),
             "the complete source-tree manifest and retained registry-owner blobs define the observable overlay inventory row",
             format!(
@@ -2282,9 +2282,9 @@ fn reference_inventory_cases(snapshot: &Z3SourceSnapshot) -> Result<Vec<Validato
             ),
         ),
         pass(
-            "overlay.z3-5.0.0.target-identity",
+            "overlay.z3-5.1.0.target-identity",
             identity_digest.clone(),
-            "the pinned VERSION.txt and generated version-header template define the Z3 5.0.0 target-identity row",
+            "the pinned VERSION.txt and generated version-header template define the Z3 5.1.0 target-identity row",
             format!(
                 "version={version};selected-source-manifest-sha256={identity_digest}"
             ),
@@ -2304,7 +2304,7 @@ fn source_cases(snapshot: &Z3SourceSnapshot) -> Result<Vec<ValidatorCase>, Strin
                 &sha256_bytes(entry.path.as_bytes())[..12]
             ),
             input_sha256: sha256_bytes(manifest.as_bytes()),
-            expected: "exact tracked path, Git blob object, and byte-size row in the pinned 2,761-file source manifest".to_string(),
+            expected: "exact tracked path, Git blob object, and byte-size row in the pinned 2,756-file source manifest".to_string(),
             observed: format!(
                 "path={:?};git-blob={};size={}",
                 entry.path, entry.git_blob, entry.size
@@ -2371,7 +2371,7 @@ fn observable_cases(items: &[ObservableItem]) -> Vec<ValidatorCase> {
                     &sha256_bytes(item.name.as_bytes())[..12]
                 ),
                 input_sha256: sha256_bytes(canonical.as_bytes()),
-                expected: "exact sorted observable Z3 5.0.0 source/live-registry inventory item"
+                expected: "exact sorted observable Z3 5.1.0 source/live-registry inventory item"
                     .to_string(),
                 observed: format!(
                     "category={:?};name={:?};detail={:?}",

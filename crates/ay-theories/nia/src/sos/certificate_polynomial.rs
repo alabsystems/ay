@@ -31,6 +31,7 @@ pub(crate) fn orient(c: &MultiConstraint) -> Option<(MultiPoly, OrientedKind)> {
 fn derive_oriented(
     origin: CertOrigin,
     constraints: &[MultiConstraint],
+    budget: &mut SosPolynomialBudget,
 ) -> Result<(MultiPoly, OrientedKind), SosError> {
     match origin {
         CertOrigin::Constraint(i) => {
@@ -42,7 +43,11 @@ fn derive_oriented(
             let cj = constraints.get(j).ok_or(SosError::BadConstraintIndex)?;
             let (gi, ki) = orient(ci).ok_or(SosError::NotOrientable)?;
             let (gj, kj) = orient(cj).ok_or(SosError::NotOrientable)?;
-            if !ki.is_inequality() || !kj.is_inequality() {
+            if !ki.is_inequality()
+                || !kj.is_inequality()
+                || poly_degree(&gi) > 1
+                || poly_degree(&gj) > 1
+            {
                 return Err(SosError::NotOrientable);
             }
             let kind = if ki.is_strict() && kj.is_strict() {
@@ -50,7 +55,8 @@ fn derive_oriented(
             } else {
                 OrientedKind::Ge
             };
-            Ok((gi.mul(&gj), kind))
+            let product = checked_poly_mul(&gi, &gj, budget).ok_or(SosError::ResourceLimit)?;
+            Ok((product, kind))
         }
     }
 }
@@ -65,19 +71,30 @@ fn mono_product(a: &[TermId], b: &[TermId]) -> Vec<TermId> {
 }
 
 /// Scale every coefficient of a polynomial by a rational.
-fn scale(p: &MultiPoly, k: &BigRational) -> MultiPoly {
+fn scale(
+    p: &MultiPoly,
+    k: &BigRational,
+    budget: &mut SosPolynomialBudget,
+) -> Result<MultiPoly, SosError> {
     if k.is_zero() {
-        return MultiPoly::zero();
+        return Ok(MultiPoly::zero());
     }
     let mut out = MultiPoly::zero();
     for (m, c) in &p.terms {
-        out.add_term(m.clone(), c * k);
+        let term = MultiPoly {
+            terms: vec![(m.clone(), c * k)],
+        };
+        out = checked_poly_add(&out, &term, budget).ok_or(SosError::ResourceLimit)?;
     }
-    out
+    Ok(out)
 }
 
 /// Expand `σ0 = basisᵀ Q basis` into a [`MultiPoly`].
-fn sigma0_poly(basis: &[Vec<TermId>], gram: &[Vec<BigRational>]) -> MultiPoly {
+fn sigma0_poly(
+    basis: &[Vec<TermId>],
+    gram: &[Vec<BigRational>],
+    budget: &mut SosPolynomialBudget,
+) -> Result<MultiPoly, SosError> {
     let mut out = MultiPoly::zero();
     for (a, ba) in basis.iter().enumerate() {
         for (b, bb) in basis.iter().enumerate() {
@@ -85,8 +102,11 @@ fn sigma0_poly(basis: &[Vec<TermId>], gram: &[Vec<BigRational>]) -> MultiPoly {
             if q.is_zero() {
                 continue;
             }
-            out.add_term(mono_product(ba, bb), q.clone());
+            let term = MultiPoly {
+                terms: vec![(mono_product(ba, bb), q.clone())],
+            };
+            out = checked_poly_add(&out, &term, budget).ok_or(SosError::ResourceLimit)?;
         }
     }
-    out
+    Ok(out)
 }

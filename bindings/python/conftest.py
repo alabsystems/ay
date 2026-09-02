@@ -19,10 +19,10 @@ except ImportError as error:
         "declared dev dependencies with `pip install -e 'bindings/python[dev]'`"
     ) from error
 
-EXPECTED_Z3_API_VERSION = "5.0.0"
+EXPECTED_Z3_API_VERSION = "5.1.0"
 if reference_z3.get_version_string() != EXPECTED_Z3_API_VERSION:
     raise pytest.UsageError(
-        "the ayz3 test suite requires z3-solver==5.0.0.0 "
+        "the ayz3 test suite requires z3-solver==5.1.0.0 "
         f"(API {EXPECTED_Z3_API_VERSION}), found API "
         f"{reference_z3.get_version_string()}"
     )

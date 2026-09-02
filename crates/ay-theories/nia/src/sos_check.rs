@@ -28,12 +28,13 @@
 //!   `verify` re-check ([`crate::sos::SosCertificate::verify`]) inside
 //!   [`crate::sos::search`]; a tampered certificate is rejected there.
 
-use ay_core::term::{Constant, Symbol, TermData, TermId};
-use ay_core::{TheoryLit, TheoryResult};
-use num_rational::BigRational;
-use num_traits::{One, Signed, Zero};
+mod translation;
 
-use crate::sos::{MultiConstraint, MultiPoly, Rel};
+use ay_core::term::TermId;
+use ay_core::{TheoryLit, TheoryResult};
+
+use self::translation::is_nonlinear;
+use crate::sos::MultiConstraint;
 use crate::NiaSolver;
 
 /// Cap on the number of distinct variables the pre-phase considers. Mirrors
@@ -41,19 +42,12 @@ use crate::NiaSolver;
 /// the variable count, so above this the search declines rather than stall.
 const MAX_SOS_VARS: usize = 8;
 
-/// Classification of a single asserted atom for the SOS fragment.
-enum NiaMultiAtom {
-    /// A genuine `poly REL 0` constraint.
-    Constraint(MultiConstraint),
-    /// The atom is a constant `true` (vacuous — dropped from the system).
-    ConstTrue,
-    /// The atom is a constant `false` — the asserted conjunction is UNSAT.
-    ConstFalse,
-}
-
 /// Outcome of translating the whole asserted literal set into the polynomial
 /// fragment used by the SOS search.
 enum SosFragment {
+    /// A deterministic translation resource bound was exhausted. The entire
+    /// SOS attempt declines; a prefix is never mistaken for a complete pass.
+    Exhausted,
     /// Some asserted atom is syntactically false, so the conjunction is UNSAT
     /// outright (no polynomial certificate needed).
     ConstFalse,
@@ -73,6 +67,7 @@ impl NiaSolver<'_> {
     /// false; `None` otherwise. It NEVER returns `Sat`.
     pub(crate) fn try_sos_positivstellensatz_unsat(&mut self) -> Option<TheoryResult> {
         match self.build_sos_fragment() {
+            SosFragment::Exhausted => None,
             SosFragment::ConstFalse => {
                 // A syntactically-false asserted atom makes the whole conjunction
                 // unsatisfiable. This is a genuine UNSAT (no SOS certificate is
@@ -112,6 +107,7 @@ impl NiaSolver<'_> {
     /// ([`crate::sos::SosCertificate::verify`]).
     pub(crate) fn try_build_unsat_sos_certificate(&self) -> Option<crate::sos::SosCertificate> {
         match self.build_sos_fragment() {
+            SosFragment::Exhausted => None,
             // A degenerate constant-false UNSAT has no polynomial refutation to
             // certify; leave the existing (non-SOS) UNSAT reason as-is.
             SosFragment::ConstFalse => None,
@@ -130,35 +126,6 @@ impl NiaSolver<'_> {
         }
     }
 
-    /// Translate every asserted literal into the SOS polynomial fragment.
-    ///
-    /// Out-of-fragment atoms (unrecognized comparisons, `/`, `mod`, …) are
-    /// SKIPPED: dropping a constraint only weakens the system, so any refutation
-    /// of the retained subset still refutes the full conjunction. This is sound
-    /// *for UNSAT only* and is never used to justify SAT.
-    fn build_sos_fragment(&self) -> SosFragment {
-        let mut constraints: Vec<MultiConstraint> = Vec::new();
-        for &(atom, value) in &self.asserted {
-            match self.atom_to_multi(atom, value) {
-                Some(NiaMultiAtom::ConstFalse) => return SosFragment::ConstFalse,
-                Some(NiaMultiAtom::ConstTrue) => {}
-                Some(NiaMultiAtom::Constraint(c)) => constraints.push(c),
-                // Out-of-fragment atom: SKIP (sound-for-UNSAT weakening).
-                None => {}
-            }
-        }
-        let mut vars: Vec<TermId> = Vec::new();
-        for c in &constraints {
-            for v in c.poly.variables() {
-                if !vars.contains(&v) {
-                    vars.push(v);
-                }
-            }
-        }
-        vars.sort_unstable_by_key(|t| t.0);
-        SosFragment::System { constraints, vars }
-    }
-
     /// All asserted literals as a `TheoryResult::Unsat` conflict clause. The full
     /// asserted set is a sound (if not necessarily minimal) UNSAT core for a
     /// refutation that may weaken the system by skipping atoms.
@@ -168,140 +135,18 @@ impl NiaSolver<'_> {
             .map(|&(term, value)| TheoryLit { term, value })
             .collect()
     }
-
-    /// Classify an asserted atom into a multivariate `poly REL 0` form, a
-    /// constant truth value, or `None` if it is not a recognized arithmetic
-    /// comparison / uses an unsupported operator.
-    fn atom_to_multi(&self, atom: TermId, value: bool) -> Option<NiaMultiAtom> {
-        let (rel0, lhs, rhs) = self.comparison_parts(atom)?;
-        let rel = if value { rel0 } else { negate_rel(rel0) };
-        let lhs_poly = self.term_to_multipoly(lhs)?;
-        let rhs_poly = self.term_to_multipoly(rhs)?;
-        let poly = lhs_poly.sub(&rhs_poly);
-        if poly.variables().is_empty() {
-            // Pure constant constraint.
-            let sign = if poly.is_zero() {
-                0
-            } else {
-                // Single constant term.
-                rational_sign(&poly.terms[0].1)
-            };
-            if rel.holds_for_sign(sign) {
-                Some(NiaMultiAtom::ConstTrue)
-            } else {
-                Some(NiaMultiAtom::ConstFalse)
-            }
-        } else {
-            Some(NiaMultiAtom::Constraint(MultiConstraint { poly, rel }))
-        }
-    }
-
-    /// Extract `(rel, lhs, rhs)` from a binary comparison atom, or `None` if the
-    /// atom is not a recognized arithmetic comparison.
-    fn comparison_parts(&self, atom: TermId) -> Option<(Rel, TermId, TermId)> {
-        match self.terms.get(atom) {
-            TermData::App(Symbol::Named(name), args) if args.len() == 2 => {
-                let rel = match name.as_str() {
-                    "<" => Rel::Lt,
-                    "<=" => Rel::Le,
-                    "=" => Rel::Eq,
-                    ">=" => Rel::Ge,
-                    ">" => Rel::Gt,
-                    "distinct" | "!=" => Rel::Ne,
-                    _ => return None,
-                };
-                Some((rel, args[0], args[1]))
-            }
-            _ => None,
-        }
-    }
-
-    /// Convert an arithmetic term to a multivariate polynomial, or `None` for
-    /// unsupported operators (`/`, `div`, `mod`, `abs`, transcendental, …).
-    ///
-    /// Mirrors `NraSolver::term_to_multipoly`. Variables are treated as real
-    /// unknowns; since ℤ ⊂ ℝ, a real refutation over these polynomials is a valid
-    /// integer refutation. `None` here causes the enclosing atom to be skipped
-    /// (sound-for-UNSAT weakening).
-    fn term_to_multipoly(&self, term: TermId) -> Option<MultiPoly> {
-        match self.terms.get(term) {
-            TermData::Const(Constant::Int(n)) => {
-                Some(MultiPoly::constant(BigRational::from_integer(n.clone())))
-            }
-            TermData::Const(Constant::Rational(r)) => Some(MultiPoly::constant(r.0.clone())),
-            TermData::Var(_, _) => Some(MultiPoly::var(term)),
-            TermData::App(Symbol::Named(name), args) => match name.as_str() {
-                "+" if !args.is_empty() => {
-                    let mut acc = MultiPoly::zero();
-                    for &a in args {
-                        acc = acc.add(&self.term_to_multipoly(a)?);
-                    }
-                    Some(acc)
-                }
-                "-" if args.len() == 1 => Some(self.term_to_multipoly(args[0])?.neg()),
-                "-" if args.len() >= 2 => {
-                    let mut acc = self.term_to_multipoly(args[0])?;
-                    for &a in &args[1..] {
-                        acc = acc.sub(&self.term_to_multipoly(a)?);
-                    }
-                    Some(acc)
-                }
-                "*" if !args.is_empty() => {
-                    let mut acc = MultiPoly::constant(BigRational::one());
-                    for &a in args {
-                        acc = acc.mul(&self.term_to_multipoly(a)?);
-                    }
-                    Some(acc)
-                }
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-}
-
-/// True iff the constraint's polynomial contains a NONLINEAR monomial — a term
-/// whose sorted variable multiset has total degree ≥ 2. `MultiPoly` encodes a
-/// monomial as the sorted `Vec<TermId>` of its variable factors *with
-/// multiplicity*, so `mono.len()` IS the total degree: `[]` is the constant term
-/// (degree 0), `[x]` is linear (degree 1), and `[x, x]` (a squared variable) or
-/// `[x, y]` (a cross-term) are nonlinear (degree ≥ 2). The SOS/Positivstellensatz
-/// search only adds decision power when at least one constraint is nonlinear;
-/// linear/univariate systems are already decided completely by LIA and the
-/// univariate-integer decider, so running the search on them is pure latency.
-fn is_nonlinear(c: &MultiConstraint) -> bool {
-    c.poly.terms.iter().any(|(mono, _)| mono.len() >= 2)
-}
-
-/// Negate a comparison relation (used when an atom is asserted false).
-fn negate_rel(rel: Rel) -> Rel {
-    match rel {
-        Rel::Lt => Rel::Ge,
-        Rel::Le => Rel::Gt,
-        Rel::Eq => Rel::Ne,
-        Rel::Ge => Rel::Lt,
-        Rel::Gt => Rel::Le,
-        Rel::Ne => Rel::Eq,
-    }
-}
-
-/// Sign of a rational: -1, 0, or +1.
-fn rational_sign(r: &BigRational) -> i32 {
-    if r.is_zero() {
-        0
-    } else if r.is_positive() {
-        1
-    } else {
-        -1
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::sos::budget::{
+        MAX_SOS_ASSERTED_LITERALS, MAX_SOS_COEFFICIENT_BITS, MAX_SOS_TERM_DEPTH,
+    };
     use crate::NiaSolver;
-    use ay_core::term::TermStore;
+    use ay_core::term::{Symbol, TermStore};
     use ay_core::{Sort, TheoryResult, TheorySolver};
     use num_bigint::BigInt;
+    use num_rational::BigRational;
 
     /// Mandatory test 1: `(x − y)² < 0` over integers is UNSAT via a certificate.
     #[test]
@@ -447,5 +292,148 @@ mod tests {
             solver.took_sos_unsat_certificate(),
             "the end-to-end UNSAT must carry an SOS certificate"
         );
+    }
+
+    #[test]
+    fn asserted_literal_limit_declines_without_storing_a_prefix_certificate() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let y = terms.mk_var("y", Sort::Int);
+        let difference = terms.mk_sub(vec![x, y]);
+        let square = terms.mk_mul(vec![difference, difference]);
+        let zero = terms.mk_int(BigInt::from(0));
+        let contradiction = terms.mk_lt(square, zero);
+
+        let mut solver = NiaSolver::new(&terms);
+        solver.asserted = vec![(contradiction, true); MAX_SOS_ASSERTED_LITERALS + 1];
+        assert!(solver.try_sos_positivstellensatz_unsat().is_none());
+        assert!(!solver.took_sos_unsat_certificate());
+    }
+
+    #[test]
+    fn deep_term_exhaustion_declines_the_whole_attempt() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let y = terms.mk_var("y", Sort::Int);
+        let difference = terms.mk_sub(vec![x, y]);
+        let square = terms.mk_mul(vec![difference, difference]);
+        let zero = terms.mk_int(BigInt::from(0));
+        let contradiction = terms.mk_lt(square, zero);
+
+        let mut deep = x;
+        for _ in 0..=MAX_SOS_TERM_DEPTH {
+            deep = terms.mk_app(Symbol::named("+"), [deep], Sort::Int);
+        }
+        let over_limit = terms.mk_ge(deep, zero);
+
+        let mut solver = NiaSolver::new(&terms);
+        solver.asserted = vec![(contradiction, true), (over_limit, true)];
+        assert!(solver.try_sos_positivstellensatz_unsat().is_none());
+        assert!(!solver.took_sos_unsat_certificate());
+    }
+
+    #[test]
+    fn coefficient_exhaustion_declines_the_whole_attempt() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let y = terms.mk_var("y", Sort::Int);
+        let difference = terms.mk_sub(vec![x, y]);
+        let square = terms.mk_mul(vec![difference, difference]);
+        let zero = terms.mk_int(BigInt::from(0));
+        let contradiction = terms.mk_lt(square, zero);
+        let huge = terms.mk_int(BigInt::from(1u8) << MAX_SOS_COEFFICIENT_BITS as usize);
+        let over_limit = terms.mk_ge(x, huge);
+
+        let mut solver = NiaSolver::new(&terms);
+        solver.asserted = vec![(contradiction, true), (over_limit, true)];
+        assert!(solver.try_sos_positivstellensatz_unsat().is_none());
+        assert!(!solver.took_sos_unsat_certificate());
+    }
+
+    #[test]
+    fn rational_coefficient_exhaustion_declines_before_translation_clone() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Real);
+        let y = terms.mk_var("y", Sort::Real);
+        let difference = terms.mk_sub(vec![x, y]);
+        let square = terms.mk_mul(vec![difference, difference]);
+        let zero = terms.mk_rational(BigRational::from_integer(BigInt::from(0)));
+        let contradiction = terms.mk_lt(square, zero);
+        let huge = terms.mk_rational(BigRational::new(
+            BigInt::from(1u8) << MAX_SOS_COEFFICIENT_BITS as usize,
+            BigInt::from(3u8),
+        ));
+        let over_limit = terms.mk_ge(x, huge);
+
+        let mut solver = NiaSolver::new(&terms);
+        solver.asserted = vec![(contradiction, true), (over_limit, true)];
+        assert!(solver.try_sos_positivstellensatz_unsat().is_none());
+        assert!(!solver.took_sos_unsat_certificate());
+    }
+
+    #[test]
+    fn variable_limit_declines_without_a_prefix_certificate() {
+        let mut terms = TermStore::new();
+        let variables: Vec<_> = (0..=super::MAX_SOS_VARS)
+            .map(|index| terms.mk_var(format!("x{index}"), Sort::Int))
+            .collect();
+        let difference = terms.mk_sub(vec![variables[0], variables[1]]);
+        let square = terms.mk_mul(vec![difference, difference]);
+        let zero = terms.mk_int(BigInt::from(0));
+        let contradiction = terms.mk_lt(square, zero);
+        let mut assertions = vec![(contradiction, true)];
+        assertions.extend(
+            variables
+                .iter()
+                .map(|&variable| (terms.mk_ge(variable, zero), true)),
+        );
+
+        let mut solver = NiaSolver::new(&terms);
+        solver.asserted = assertions;
+        assert!(solver.try_sos_positivstellensatz_unsat().is_none());
+        assert!(!solver.took_sos_unsat_certificate());
+    }
+
+    #[test]
+    fn unsupported_conjunct_keeps_retained_verified_contradiction() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let y = terms.mk_var("y", Sort::Int);
+        let difference = terms.mk_sub(vec![x, y]);
+        let square = terms.mk_mul(vec![difference, difference]);
+        let zero = terms.mk_int(BigInt::from(0));
+        let contradiction = terms.mk_lt(square, zero);
+        let opaque = terms.mk_app(Symbol::named("opaque"), [x], Sort::Int);
+        let unsupported = terms.mk_ge(opaque, zero);
+
+        let mut solver = NiaSolver::new(&terms);
+        solver.asserted = vec![(unsupported, true), (contradiction, true)];
+        assert!(matches!(
+            solver.try_sos_positivstellensatz_unsat(),
+            Some(TheoryResult::Unsat(_))
+        ));
+        let certificate = solver
+            .last_unsat_certificate
+            .as_ref()
+            .expect("retained nonlinear contradiction must carry a certificate");
+        let super::SosFragment::System { constraints, .. } = solver.build_sos_fragment() else {
+            panic!("unsupported conjunct must be a sound weakening");
+        };
+        assert_eq!(constraints.len(), 1);
+        assert!(certificate.verify(&constraints).is_ok());
+    }
+
+    #[test]
+    fn unsupported_only_fragment_cannot_mint_a_certificate() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let zero = terms.mk_int(BigInt::from(0));
+        let opaque = terms.mk_app(Symbol::named("opaque"), [x], Sort::Int);
+        let atom = terms.mk_ge(opaque, zero);
+
+        let mut solver = NiaSolver::new(&terms);
+        solver.asserted = vec![(atom, true)];
+        assert!(solver.try_sos_positivstellensatz_unsat().is_none());
+        assert!(!solver.took_sos_unsat_certificate());
     }
 }

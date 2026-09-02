@@ -21,6 +21,82 @@ mod scalarization;
 #[cfg(test)]
 mod tests;
 
+/// Stable identity for one independently solvable safety query.
+///
+/// A query can be introduced through a nullary marker such as
+/// `error_p7 => error`, `error => false`.  In that case `query_clause_index`
+/// identifies the original `error => false` clause and
+/// `defining_clause_index` identifies the selected marker definition.  For a
+/// direct false-head query, `defining_clause_index` is `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChcQueryObligationId {
+    query_clause_index: usize,
+    defining_clause_index: Option<usize>,
+    label: String,
+    content_sha256: String,
+}
+
+impl ChcQueryObligationId {
+    /// Index of the false-head clause in the original problem.
+    pub fn query_clause_index(&self) -> usize {
+        self.query_clause_index
+    }
+
+    /// Index of the nullary marker's defining clause, when the query was
+    /// unfolded through one.
+    pub fn defining_clause_index(&self) -> Option<usize> {
+        self.defining_clause_index
+    }
+
+    /// Stable human-readable label for diagnostics and result correlation.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// SHA-256 of the obligation's deterministic normalized CHC input.
+    ///
+    /// Unlike the source-clause indices, this binds the identity to the exact
+    /// independently solvable problem content and remains stable across
+    /// repeated construction of the same slice.
+    pub fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+}
+
+/// One exact, independently solvable slice of a multi-query CHC problem.
+///
+/// The contained problem retains only definitions in the selected query's
+/// backwards dependency cone.  Its verdict is therefore equivalent to the
+/// corresponding query in the source problem, while unrelated difficult
+/// properties cannot consume its solve budget.
+#[derive(Debug, Clone)]
+pub struct ChcQueryObligation {
+    id: ChcQueryObligationId,
+    problem: ChcProblem,
+}
+
+impl ChcQueryObligation {
+    /// Stable identity of this query slice.
+    pub fn id(&self) -> &ChcQueryObligationId {
+        &self.id
+    }
+
+    /// Independently solvable problem for this query.
+    pub fn problem(&self) -> &ChcProblem {
+        &self.problem
+    }
+
+    /// Consume the slice and return its independently solvable problem.
+    pub fn into_problem(self) -> ChcProblem {
+        self.problem
+    }
+
+    /// Consume the slice and return both its identity and problem.
+    pub fn into_parts(self) -> (ChcQueryObligationId, ChcProblem) {
+        (self.id, self.problem)
+    }
+}
+
 /// A constant array index, either an integer or a bitvector.
 ///
 /// Used during scalarization to represent the set of constant indices at which

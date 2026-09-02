@@ -36,13 +36,21 @@ impl TermStore {
 
         // Modular cancellation: x + (y - x) = y and (y - x) + x = y.
         if let TermData::App(Symbol::Named(name), sub_args) = self.get(b) {
-            if name == "bvsub" && sub_args.len() == 2 && sub_args[1] == a {
-                return sub_args[0];
+            if name == "bvsub" {
+                if let &[minuend, subtrahend] = sub_args.as_slice() {
+                    if subtrahend == a {
+                        return minuend;
+                    }
+                }
             }
         }
         if let TermData::App(Symbol::Named(name), sub_args) = self.get(a) {
-            if name == "bvsub" && sub_args.len() == 2 && sub_args[1] == b {
-                return sub_args[0];
+            if name == "bvsub" {
+                if let &[minuend, subtrahend] = sub_args.as_slice() {
+                    if subtrahend == b {
+                        return minuend;
+                    }
+                }
             }
         }
 

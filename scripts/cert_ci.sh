@@ -32,6 +32,9 @@ set -eu
 
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$REPO/scripts/lib/veripb_verdict.sh"
+# The ONE cache-key authority, shared with scripts/ci/pb_certified_gate.sh and
+# pinned byte-for-byte by the Rust resolvers' cross-language tests.
+. "$REPO/scripts/lib/veripb_build_id.sh"
 
 # The checker PIN is the single source of truth for WHICH VeriPB a certified
 # claim is made against; scripts/ci/pb_certified_gate.sh reads the same file.
@@ -39,7 +42,7 @@ PIN_FILE="$REPO/ci/veripb.pin"
 [ -r "$PIN_FILE" ] || { echo "ERROR: missing checker pin: $PIN_FILE" >&2; exit 2; }
 . "$PIN_FILE"
 for _required in VERIPB_REPO VERIPB_COMMIT VERIPB_PATCH VERIPB_PATCH_SHA256 \
-                 VERIPB_PATCH2 VERIPB_PATCH2_SHA256 VERIPB_SOUNDNESS_DIR; do
+                 VERIPB_SOUNDNESS_DIR; do
     eval "_value=\${$_required:-}"
     [ -n "$_value" ] || { echo "ERROR: $PIN_FILE does not set $_required" >&2; exit 2; }
 done
@@ -67,7 +70,8 @@ if [ -z "$VERIPB" ]; then
 fi
 if [ -z "$VERIPB" ]; then
     # Build the PINNED checker: the pinned commit with the reviewed patch
-    # applied, in a directory keyed by both. This used to `git clone --depth 1`
+    # applied, in a directory keyed by commit, patch and compiler. This used
+    # to `git clone --depth 1`
     # the upstream default branch and build whatever it got — an UNPINNED,
     # UNPATCHED checker, which is precisely the binary the pin exists to
     # exclude. That build passes the self-test battery below and still answers
@@ -82,31 +86,42 @@ if [ -z "$VERIPB" ]; then
         echo "       file: ${actual_patch_sha:-<unreadable>}" >&2
         exit 2
     fi
-    actual_patch2_sha=$(sha256_file "$REPO/$VERIPB_PATCH2" 2>/dev/null || true)
-    if [ "$actual_patch2_sha" != "$VERIPB_PATCH2_SHA256" ]; then
-        echo "ERROR: $VERIPB_PATCH2 does not match VERIPB_PATCH2_SHA256 in $PIN_FILE" >&2
-        echo "       pin:  $VERIPB_PATCH2_SHA256" >&2
-        echo "       file: ${actual_patch2_sha:-<unreadable>}" >&2
-        exit 2
-    fi
-    # Both patch hashes are in the key: a changed or added patch must rebuild.
-    BUILD_ID="${VERIPB_COMMIT}-$(printf '%s' "$VERIPB_PATCH_SHA256" | cut -c1-12)"
-    BUILD_ID="${BUILD_ID}-$(printf '%s' "$VERIPB_PATCH2_SHA256" | cut -c1-12)"
+    # The key covers the commit, the patch, AND the compiler (one authority:
+    # scripts/lib/veripb_build_id.sh, shared with pb_certified_gate.sh — this
+    # script previously computed an unkeyed <commit>-<patch12> id, so the same
+    # pinned checker lived at a different path depending on which entry point
+    # built it). The compiler is resolved by the lib ($RUSTC, rustc on PATH,
+    # then the compiler_consumer sysroot) and passed to cargo explicitly so the compiler
+    # named in the key is the one that actually builds.
+    AY_VERIPB_RUSTC=$(veripb_rustc_path) || exit 2
+    BUILD_ID=$(veripb_build_id "$VERIPB_COMMIT" "$VERIPB_PATCH_SHA256") || exit 2
     BUILD_DIR="$CACHE/$BUILD_ID"
     VERIPB="$BUILD_DIR/target/release/veripb"
     if [ ! -x "$VERIPB" ]; then
-        echo "== building pinned checker ($VERIPB_COMMIT + $(basename "$VERIPB_PATCH") + $(basename "$VERIPB_PATCH2")) into $BUILD_DIR"
-        mkdir -p "$CACHE"
-        [ -d "$BUILD_DIR" ] || git clone --quiet "$VERIPB_REPO" "$BUILD_DIR"
-        git -C "$BUILD_DIR" checkout --quiet "$VERIPB_COMMIT"
-        got=$(git -C "$BUILD_DIR" rev-parse HEAD)
-        [ "$got" = "$VERIPB_COMMIT" ] || {
-            echo "ERROR: checkout landed on $got, pin says $VERIPB_COMMIT" >&2
-            exit 2
-        }
-        git -C "$BUILD_DIR" apply "$REPO/$VERIPB_PATCH"
-        git -C "$BUILD_DIR" apply "$REPO/$VERIPB_PATCH2"
-        (cd "$BUILD_DIR" && cargo build --release --quiet)
+        # A build from before the compiler joined the key (2026-08-30) is
+        # still the pinned source, and this script only RUNS the binary —
+        # it never compiles inside the cache directory, so the mixed-rlib
+        # E0514 hazard that put the compiler in the key cannot bite here.
+        # Reuse it out loud; the version cross-check, self-test battery and
+        # 22 soundness fixtures below re-prove its behaviour either way.
+        legacy_veripb="$CACHE/$(veripb_legacy_build_id "$VERIPB_COMMIT" "$VERIPB_PATCH_SHA256")/target/release/veripb"
+        if [ -x "$legacy_veripb" ]; then
+            echo "== reusing legacy unkeyed pinned build $legacy_veripb"
+            echo "   (built before the compiler joined the cache key; behaviour re-proved below)"
+            VERIPB="$legacy_veripb"
+        else
+            echo "== building pinned checker ($VERIPB_COMMIT + $(basename "$VERIPB_PATCH")) into $BUILD_DIR"
+            mkdir -p "$CACHE"
+            [ -d "$BUILD_DIR" ] || git clone --quiet "$VERIPB_REPO" "$BUILD_DIR"
+            git -C "$BUILD_DIR" checkout --quiet "$VERIPB_COMMIT"
+            got=$(git -C "$BUILD_DIR" rev-parse HEAD)
+            [ "$got" = "$VERIPB_COMMIT" ] || {
+                echo "ERROR: checkout landed on $got, pin says $VERIPB_COMMIT" >&2
+                exit 2
+            }
+            git -C "$BUILD_DIR" apply "$REPO/$VERIPB_PATCH"
+            (cd "$BUILD_DIR" && RUSTC="$AY_VERIPB_RUSTC" cargo build --release --quiet)
+        fi
     fi
 fi
 echo "checker: $("$VERIPB" --version 2>&1 | head -1 || echo "$VERIPB")"

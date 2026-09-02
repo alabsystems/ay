@@ -143,34 +143,56 @@ impl PdrSolver {
                         ChcExpr::int(*val),
                     ));
                 }
+                (ChcSort::Int, Some(SmtValue::BigInt(val))) => {
+                    conjuncts.push(ChcExpr::eq(
+                        ChcExpr::var((*var).clone()),
+                        ChcExpr::from_bigint(val.as_ref().clone()),
+                    ));
+                }
                 (ChcSort::Bool, Some(SmtValue::Bool(true))) => {
                     conjuncts.push(ChcExpr::var((*var).clone()));
                 }
                 (ChcSort::Bool, Some(SmtValue::Bool(false))) => {
                     conjuncts.push(ChcExpr::not(ChcExpr::var((*var).clone())));
                 }
-                (ChcSort::BitVec(_), Some(SmtValue::BitVec(val, width))) => {
+                (
+                    ChcSort::BitVec(expected_width),
+                    Some(
+                        value @ (SmtValue::BitVec(_, actual_width)
+                        | SmtValue::BigBitVec(_, actual_width)),
+                    ),
+                ) if expected_width == actual_width => {
                     conjuncts.push(ChcExpr::eq(
                         ChcExpr::var((*var).clone()),
-                        ChcExpr::BitVec(*val, *width),
+                        value.bitvec_to_chc_expr()?,
                     ));
                 }
-                (ChcSort::Datatype { .. }, Some(SmtValue::Datatype(ctor, fields))) => {
+                (
+                    ChcSort::Datatype { constructors, .. },
+                    Some(SmtValue::Datatype(ctor, fields)),
+                ) => {
+                    let constructor = constructors
+                        .iter()
+                        .find(|candidate| candidate.name == *ctor)?;
+                    if constructor.selectors.len() != fields.len() {
+                        return None;
+                    }
                     let field_exprs: Vec<std::sync::Arc<ChcExpr>> = fields
                         .iter()
                         .enumerate()
                         .map(|(i, f)| {
-                            std::sync::Arc::new(Self::smt_value_to_blocking_expr_for_field(
-                                &var.sort, ctor, i, f,
-                            ))
+                            Self::smt_value_to_blocking_expr_for_field(&var.sort, ctor, i, f)
+                                .map(std::sync::Arc::new)
                         })
-                        .collect();
+                        .collect::<Option<_>>()?;
                     let ctor_app = ChcExpr::FuncApp(ctor.clone(), var.sort.clone(), field_exprs);
                     conjuncts.push(ChcExpr::eq(ChcExpr::var((*var).clone()), ctor_app));
                 }
                 // Nullary DT constructor stored as Opaque string.
                 (ChcSort::Datatype { constructors, .. }, Some(SmtValue::Opaque(name)))
-                    if constructors.iter().any(|c| c.name == *name) =>
+                    if constructors
+                        .iter()
+                        .any(|c| c.name == *name && c.selectors.is_empty()) =>
                 {
                     let ctor_app = ChcExpr::FuncApp(name.clone(), var.sort.clone(), vec![]);
                     conjuncts.push(ChcExpr::eq(ChcExpr::var((*var).clone()), ctor_app));
@@ -211,57 +233,73 @@ impl PdrSolver {
         ctor: &str,
         field_index: usize,
         val: &SmtValue,
-    ) -> ChcExpr {
-        let expected_sort = Self::datatype_field_sort(parent_sort, ctor, field_index);
-        Self::smt_value_to_blocking_expr(val, expected_sort.as_ref())
+    ) -> Option<ChcExpr> {
+        let expected_sort = Self::datatype_field_sort(parent_sort, ctor, field_index)?;
+        Self::smt_value_to_blocking_expr(val, Some(&expected_sort))
     }
 
     /// Convert an SmtValue to a ChcExpr for point-blocking formulas.
     pub(super) fn smt_value_to_blocking_expr(
         val: &SmtValue,
         expected_sort: Option<&ChcSort>,
-    ) -> ChcExpr {
-        match (val, expected_sort) {
-            (SmtValue::Bool(b), _) => ChcExpr::Bool(*b),
-            (SmtValue::Int(n), _) => ChcExpr::Int(*n),
-            (SmtValue::BitVec(v, w), _) => ChcExpr::BitVec(*v, *w),
-            (SmtValue::Real(r), _) => {
+    ) -> Option<ChcExpr> {
+        Some(match (val, expected_sort) {
+            (SmtValue::Bool(b), Some(ChcSort::Bool) | None) => ChcExpr::Bool(*b),
+            (SmtValue::Int(n), Some(ChcSort::Int) | None) => ChcExpr::Int(*n),
+            (SmtValue::BigInt(n), Some(ChcSort::Int) | None) => {
+                ChcExpr::from_bigint(n.as_ref().clone())
+            }
+            (
+                value @ (SmtValue::BitVec(_, width) | SmtValue::BigBitVec(_, width)),
+                Some(ChcSort::BitVec(expected_width)),
+            ) if width == expected_width => value.bitvec_to_chc_expr()?,
+            (value @ (SmtValue::BitVec(..) | SmtValue::BigBitVec(..)), None) => {
+                value.bitvec_to_chc_expr()?
+            }
+            (SmtValue::Real(r), Some(ChcSort::Real) | None) => {
                 use num_traits::ToPrimitive;
-                let n = r.numer().to_i64().unwrap_or(0);
-                let d = r.denom().to_i64().unwrap_or(1);
+                let n = r.numer().to_i64()?;
+                let d = r.denom().to_i64()?;
                 ChcExpr::Real(n, d)
             }
             (SmtValue::Datatype(ctor, fields), Some(sort @ ChcSort::Datatype { .. })) => {
+                let ChcSort::Datatype { constructors, .. } = sort else {
+                    return None;
+                };
+                let constructor = constructors
+                    .iter()
+                    .find(|candidate| candidate.name == *ctor)?;
+                if constructor.selectors.len() != fields.len() {
+                    return None;
+                }
                 let field_exprs: Vec<std::sync::Arc<ChcExpr>> = fields
                     .iter()
                     .enumerate()
                     .map(|(i, f)| {
-                        std::sync::Arc::new(Self::smt_value_to_blocking_expr_for_field(
-                            sort, ctor, i, f,
-                        ))
+                        Self::smt_value_to_blocking_expr_for_field(sort, ctor, i, f)
+                            .map(std::sync::Arc::new)
                     })
-                    .collect();
+                    .collect::<Option<_>>()?;
                 ChcExpr::FuncApp(ctor.clone(), sort.clone(), field_exprs)
             }
-            (SmtValue::Datatype(ctor, fields), _) => {
+            (SmtValue::Datatype(ctor, fields), None) => {
                 let field_exprs: Vec<std::sync::Arc<ChcExpr>> = fields
                     .iter()
-                    .map(|f| std::sync::Arc::new(Self::smt_value_to_blocking_expr(f, None)))
-                    .collect();
+                    .map(|f| Self::smt_value_to_blocking_expr(f, None).map(std::sync::Arc::new))
+                    .collect::<Option<_>>()?;
                 ChcExpr::FuncApp(
                     ctor.clone(),
                     ChcSort::Uninterpreted(ctor.clone()),
                     field_exprs,
                 )
             }
-            // Opaque, Array: fallback to Int(0)
             (SmtValue::Opaque(name), Some(sort @ ChcSort::Datatype { constructors, .. }))
                 if constructors.iter().any(|ctor| ctor.name == *name) =>
             {
                 ChcExpr::FuncApp(name.clone(), sort.clone(), vec![])
             }
-            _ => ChcExpr::Int(0),
-        }
+            _ => return None,
+        })
     }
 
     /// Convert a FuncApp (constructor application) to SmtValue::Datatype.
@@ -271,14 +309,9 @@ impl PdrSolver {
     ) -> Option<SmtValue> {
         let fields: Vec<SmtValue> = args
             .iter()
-            .filter_map(|a| Self::expr_to_smt_value(a))
-            .collect();
-        if fields.len() == args.len() {
-            Some(SmtValue::Datatype(ctor.to_string(), fields))
-        } else {
-            // If we can't convert all fields, use Opaque as fallback.
-            Some(SmtValue::Opaque(ctor.to_string()))
-        }
+            .map(|a| Self::expr_to_smt_value(a))
+            .collect::<Option<_>>()?;
+        Some(SmtValue::Datatype(ctor.to_string(), fields))
     }
 
     /// Convert a ChcExpr to SmtValue (inverse of smt_value_to_blocking_expr).
@@ -286,7 +319,7 @@ impl PdrSolver {
         match expr {
             ChcExpr::Bool(b) => Some(SmtValue::Bool(*b)),
             ChcExpr::Int(n) => Some(SmtValue::Int(*n)),
-            ChcExpr::BitVec(v, w) => Some(SmtValue::BitVec(*v, *w)),
+            ChcExpr::BitVec(v, w) => Some(SmtValue::bitvec_from_u128(*v, *w)),
             ChcExpr::FuncApp(ctor, _, args) => Self::funcapp_to_smt_value(ctor, args),
             _ => None,
         }

@@ -533,11 +533,12 @@ impl Solver {
                  raw_checker_failures={checker_failures:?}, \
                  proof_complete={}, proof_trust={trust_fallbacks:?}, \
                  checked_steps={checked_steps:?}, total_steps={total_steps:?}, \
-                 skipped_holes={skipped_holes:?})",
+                 skipped_holes={skipped_holes:?}, proof_decline={:?})",
                 details.verification.unsat_proof_available,
                 details.verification.unsat_proof_checker_failures,
                 details.verification.unsat_proof_strictly_verified,
                 stats.proof_complete,
+                details.verification.unsat_proof_decline.map(|m| m.tag()),
             ),
         })
     }

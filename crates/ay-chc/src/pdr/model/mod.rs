@@ -6,6 +6,9 @@
 
 use std::sync::Arc;
 
+use crate::smt::executor_adapter::{
+    collect_uninterpreted_function_declarations_for_exprs, emit_declare_uninterpreted_function,
+};
 use crate::{ChcError, ChcExpr, ChcOp, ChcProblem, ChcResult, ChcSort, ChcVar};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 use ay_core::quote_symbol;
@@ -399,7 +402,7 @@ impl InvariantModel {
                     &name,
                     clause,
                     &violation,
-                );
+                )?;
                 Ok(ChcReplayObligation {
                     name,
                     kind,
@@ -487,7 +490,7 @@ impl InvariantModel {
         name: &str,
         clause: &crate::HornClause,
         violation: &ChcExpr,
-    ) -> String {
+    ) -> ChcResult<String> {
         use std::fmt::Write;
 
         let mut out = String::new();
@@ -496,22 +499,51 @@ impl InvariantModel {
         let _ = writeln!(out, "; clause: {clause_index}");
         let _ = writeln!(out, "(set-logic ALL)");
         out.push('\n');
-        out.push_str(&self.to_smtlib(problem));
-
-        let mut vars = clause.vars();
-        vars.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.sort.cmp(&b.sort)));
-        for var in vars {
-            let _ = writeln!(
-                out,
-                "(declare-const {} {})",
-                quote_symbol(&var.name),
-                var.sort
-            );
+        let is_constant_false = matches!(violation, ChcExpr::Bool(false));
+        // A constant-false violation is already the complete replay query.
+        // Omitting unused model definitions keeps this canonical case out of
+        // nullary macro expansion.  It also gives the proof renderer an empty
+        // declaration namespace for the private guard emitted below.
+        if !is_constant_false {
+            let declarations = collect_uninterpreted_function_declarations_for_exprs(
+                std::iter::once(violation)
+                    .chain(self.interpretations.values().map(|interp| &interp.formula)),
+            )?;
+            for declaration in &declarations {
+                out.push_str(&emit_declare_uninterpreted_function(declaration));
+            }
+            out.push_str(&self.to_smtlib(problem));
         }
-        let _ = writeln!(out, "(assert {})", Self::expr_to_smtlib(violation));
+
+        if is_constant_false {
+            // A literal `(assert false)` is decided before AY's proof producer
+            // creates an authored `Assume`, so the strict bundle correctly
+            // refuses to claim exact-query authority for it.  This fresh
+            // propositional contradiction is equisatisfiable with `false`,
+            // while both hard assertions remain explicit proof assumptions.
+            // Nothing else is declared in this branch, making the private
+            // guard collision-free.  The consumer still authenticates the
+            // checked proof's nonempty Assume inventory against these exact
+            // authored assertions.
+            let _ = writeln!(out, "(declare-const chc_replay_false_guard Bool)");
+            let _ = writeln!(out, "(assert chc_replay_false_guard)");
+            let _ = writeln!(out, "(assert (not chc_replay_false_guard))");
+        } else {
+            let mut vars = clause.vars();
+            vars.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.sort.cmp(&b.sort)));
+            for var in vars {
+                let _ = writeln!(
+                    out,
+                    "(declare-const {} {})",
+                    quote_symbol(&var.name),
+                    var.sort
+                );
+            }
+            let _ = writeln!(out, "(assert {})", Self::expr_to_smtlib(violation));
+        }
         let _ = writeln!(out, "(check-sat)");
         let _ = writeln!(out, "(exit)");
-        out
+        Ok(out)
     }
 
     /// Export the model to Spacer-compatible format

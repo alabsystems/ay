@@ -132,6 +132,7 @@ impl Executor {
         probe.set_decision_limit(self.decision_limit());
         probe.set_ground_budget_enabled(self.ground_budget_enabled());
         probe.set_memory_limit(self.memory_limit());
+        probe.set_term_memory_limit(self.term_memory_limit());
         let tight = ay_core::time::Instant::now()
             + std::time::Duration::from_millis(OPTIMIZATION_AUTHORITY_PROBE_BUDGET_MS);
         let deadline = match self.solve_deadline.get() {

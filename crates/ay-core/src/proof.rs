@@ -20,10 +20,7 @@ pub use fp::FpOp;
 ///
 /// Different theory conflict types map to different Alethe proof rules.
 /// This enum specifies which rule to use when exporting the proof.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
-)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[non_exhaustive]
 pub enum TheoryLemmaKind {
     /// EUF transitivity chain `(cl (not (= a b)) ... (= a z))`; Alethe: `eq_transitive`.
@@ -1021,6 +1018,7 @@ pub enum TheoryLemmaKind {
     /// fallback.
     GroundEqualitySubstitution,
 }
+mod theory_lemma_kind_serde;
 
 // Textual inclusion preserves the public proof-step item paths.
 include!("proof/proof_steps.rs");

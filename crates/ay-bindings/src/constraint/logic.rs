@@ -50,6 +50,9 @@ pub const QF_ABV: &str = "QF_ABV";
 /// Quantifier-free arrays with uninterpreted functions and bitvectors.
 pub const QF_AUFBV: &str = "QF_AUFBV";
 
+/// Quantifier-free arrays, uninterpreted functions, bitvectors, and linear integer arithmetic.
+pub const QF_AUFBVLIA: &str = "QF_AUFBVLIA";
+
 /// Quantifier-free IEEE 754 floating-point arithmetic.
 pub const QF_FP: &str = "QF_FP";
 
@@ -77,6 +80,12 @@ pub const QF_AX: &str = "QF_AX";
 /// Quantifier-free algebraic datatypes.
 pub const QF_DT: &str = "QF_DT";
 
+/// Quantifier-free arrays and linear integer arithmetic.
+pub const QF_ALIA: &str = "QF_ALIA";
+
+/// Quantifier-free uninterpreted functions and algebraic datatypes.
+pub const QF_UFDT: &str = "QF_UFDT";
+
 /// Quantifier-free strings + non-linear integer arithmetic.
 pub const QF_SNIA: &str = "QF_SNIA";
 
@@ -88,6 +97,9 @@ pub const QF_NIRA: &str = "QF_NIRA";
 
 /// Quantifier-free uninterpreted functions with bitvectors.
 pub const QF_UFBV: &str = "QF_UFBV";
+
+/// Quantifier-free uninterpreted functions, bitvectors, and linear integer arithmetic.
+pub const QF_UFBVLIA: &str = "QF_UFBVLIA";
 
 /// Quantifier-free uninterpreted functions with non-linear integer arithmetic.
 pub const QF_UFNIA: &str = "QF_UFNIA";
@@ -155,6 +167,15 @@ pub const LIRA: &str = "LIRA";
 
 /// Arrays with uninterpreted functions and mixed integer/real arithmetic (with quantifiers).
 pub const AUFLIRA: &str = "AUFLIRA";
+
+/// Uninterpreted functions and algebraic datatypes with quantifiers.
+pub const UFDT: &str = "UFDT";
+
+/// Uninterpreted functions, algebraic datatypes, and linear integer arithmetic with quantifiers.
+pub const UFDTLIA: &str = "UFDTLIA";
+
+/// Uninterpreted functions, algebraic datatypes, and non-linear integer arithmetic with quantifiers.
+pub const UFDTNIA: &str = "UFDTNIA";
 
 // =========================================================================
 // Special logics

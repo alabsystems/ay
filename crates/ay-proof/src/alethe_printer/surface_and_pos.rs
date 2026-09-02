@@ -188,6 +188,28 @@ impl AlethePrinter<'_> {
             if self.work_budget_exhausted() {
                 return Err(self.work_budget_error(id.0));
             }
+            // (3) Arithmetic elaboration can normalize one authored operand
+            // while leaving the surrounding source conjunction in its exact
+            // problem spelling. Project that exact operand first, then use
+            // the same narrowly checked printed `la_generic` implication as
+            // the authored-assume bridge to derive the canonical conjunct.
+            // The recognizer replays the literal pair and exact `(1 1)`
+            // certificate against the printed strings; a merely similar or
+            // non-implying operand is therefore still rejected below.
+            if let Some((surface_index, surface_operand)) =
+                surface_operands.iter().enumerate().find(|(_, operand)| {
+                    crate::printed_la_generic_unit_implication_is_supported(
+                        operand,
+                        selected_surface,
+                    )
+                })
+            {
+                return Ok(Some(format!(
+                    "(step {id}.a (cl {expected_gate} {surface_operand}) :rule and_pos :args ({surface_index}))\n\
+                     (step {id}.n (cl (not {surface_operand}) {selected_surface}) :rule la_generic :args (1 1))\n\
+                     (step {id} (cl {expected_gate} {selected_surface}) :rule resolution :premises ({id}.a {id}.n))"
+                )));
+            }
             return Err(invalid_and_pos(
                 id,
                 "and_pos indexed conjunct is absent from its effective source",

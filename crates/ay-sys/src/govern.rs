@@ -171,7 +171,148 @@ const MIN_AS_HEADROOM_MB: u64 = 65_536;
 /// Denominator for the default budget. Deliberately a small fraction of RAM:
 /// one solver must never be able to approach the machine, and several of them
 /// must still leave the OS its headroom.
+///
+/// UNCHANGED ON PURPOSE. This is a GLOBAL default whose justification above is
+/// multi-tenancy — several solvers at once must still leave the OS headroom —
+/// so raising it to rescue one workload trades a machine-wide guard for a
+/// per-workload win. The PB proof path, which is the workload that hits the
+/// ceiling, gets [`CLI_BUDGET_FLAG`] instead: an explicit per-invocation
+/// budget, scoped to `pb`, that leaves every other caller on this divisor.
 const DEFAULT_BUDGET_DIVISOR: usize = 16;
+
+/// Command-line spelling of the per-invocation footprint budget, in MiB.
+///
+/// # Why this is read from `argv` and not from a parsed struct
+///
+/// [`arm`] runs as the FIRST statement of `main`, before any argument parser
+/// exists, and it re-execs — so a value the parser produced later could not
+/// reach it. `argv` is the one carrier that is available that early AND
+/// survives `execve`, which is what makes the same value visible to
+/// [`budget_mb`] again in the re-exec'd image (and in the second re-exec the
+/// `pb` subcommand performs for its worker stacks) without any process state.
+///
+/// # Why it is a CLI flag and not an environment variable
+///
+/// The two `GOVERN_*` variables below are pre-existing and stay honoured, but
+/// new knobs on this repository are command-line flags; environment flags are
+/// rejected as cruft. This one is also the reason the global divisor above
+/// does not move.
+///
+/// # Scope
+///
+/// Honoured only when the first argument is `pb`. A memory budget typed for a
+/// PB solve must not silently re-govern an SMT or CHC run in the same shell,
+/// and the argument parser only accepts the flag on `pb solve` anyway — this
+/// keeps the two surfaces from disagreeing.
+pub const CLI_BUDGET_FLAG: &str = "--memory-mb";
+
+/// The `pb`-scoped `--memory-mb <MB>` value, if the caller passed a usable one.
+///
+/// Accepts both `--memory-mb 6000` and `--memory-mb=6000`. A malformed or
+/// zero value is IGNORED rather than treated as "unbounded": this function
+/// decides a kernel-held safety limit, and the failure mode of believing a
+/// typo would be an ungoverned solver.
+fn cli_budget_mb() -> Option<u64> {
+    cli_budget_mb_from(std::env::args_os().skip(1).map(|arg| {
+        arg.to_str()
+            .map(str::to_owned)
+            // A non-UTF-8 argument is not this flag and must not end the scan;
+            // it is simply skipped.
+            .unwrap_or_default()
+    }))
+}
+
+/// Pure core of [`cli_budget_mb`], split out so the scan is testable without a
+/// real process image. `args` is everything AFTER the executable name.
+fn cli_budget_mb_from<I: Iterator<Item = String>>(mut args: I) -> Option<u64> {
+    // Scoped to the PB frontend; see `CLI_BUDGET_FLAG`.
+    if args.next()? != "pb" {
+        return None;
+    }
+    while let Some(arg) = args.next() {
+        let raw = if arg == CLI_BUDGET_FLAG {
+            args.next()?
+        } else if let Some(inline) = arg
+            .strip_prefix(CLI_BUDGET_FLAG)
+            .and_then(|tail| tail.strip_prefix('='))
+        {
+            inline.to_owned()
+        } else {
+            continue;
+        };
+        return raw.trim().parse::<u64>().ok().filter(|mb| *mb > 0);
+    }
+    None
+}
+
+#[cfg(test)]
+mod cli_budget_tests {
+    use super::cli_budget_mb_from;
+
+    fn scan(args: &[&str]) -> Option<u64> {
+        cli_budget_mb_from(args.iter().map(|a| (*a).to_string()))
+    }
+
+    #[test]
+    fn reads_both_spellings_under_pb() {
+        assert_eq!(
+            scan(&["pb", "solve", "--memory-mb", "6000", "f.opb"]),
+            Some(6000)
+        );
+        assert_eq!(
+            scan(&["pb", "solve", "--memory-mb=6000", "f.opb"]),
+            Some(6000)
+        );
+    }
+
+    /// The scope is the whole point of the flag existing instead of a raised
+    /// global: a budget typed for a PB solve must not re-govern anything else.
+    #[test]
+    fn ignored_outside_the_pb_frontend() {
+        assert_eq!(scan(&["solve", "--memory-mb", "6000", "f.smt2"]), None);
+        assert_eq!(scan(&["check", "--memory-mb=6000"]), None);
+        assert_eq!(scan(&[]), None);
+    }
+
+    /// FAIL CLOSED. Every rejected spelling must fall back to the DEFAULT
+    /// budget, never to "no bound" — the whole module exists because an
+    /// ungoverned solver panics this machine. `None` here means "use the
+    /// divisor", which is exactly that fallback.
+    #[test]
+    fn malformed_values_fall_back_to_the_default_never_to_unbounded() {
+        for bad in [
+            "0",                    // an explicit zero is not a budget
+            "-1",                   // negative
+            "6000MB",               // unit suffix
+            "6e3",                  // exponent
+            "",                     // empty
+            "  ",                   // whitespace only
+            "18446744073709551616", // u64::MAX + 1
+        ] {
+            assert_eq!(
+                scan(&["pb", "solve", "--memory-mb", bad, "f.opb"]),
+                None,
+                "{bad:?} must be refused, not honoured"
+            );
+        }
+        // A dangling flag at the end of the line has no value to read.
+        assert_eq!(scan(&["pb", "solve", "--memory-mb"]), None);
+    }
+
+    /// A prefix collision must not be mistaken for the flag.
+    #[test]
+    fn near_miss_spellings_are_not_the_flag() {
+        assert_eq!(scan(&["pb", "solve", "--memory-mbytes", "6000"]), None);
+        assert_eq!(scan(&["pb", "solve", "--memory-mb-extra=6000"]), None);
+    }
+
+    /// Whitespace around an otherwise valid value is tolerated, because shells
+    /// and harnesses quote inconsistently.
+    #[test]
+    fn surrounding_whitespace_is_tolerated() {
+        assert_eq!(scan(&["pb", "solve", "--memory-mb", " 6000 "]), Some(6000));
+    }
+}
 
 #[cfg(target_os = "macos")]
 const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
@@ -183,9 +324,22 @@ const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
 /// refusing to run strictly beats maybe-panicking.
 pub const EXIT_UNGOVERNED: i32 = 126;
 
-/// Resolved budget in MiB, honoring the environment overrides.
+/// Resolved budget in MiB, honoring the `pb`-scoped command-line budget first,
+/// then the environment overrides, then the default divisor.
+///
+/// THE FLAG OUTRANKS THE ENVIRONMENT because it is the more explicit statement:
+/// a variable is inherited from whatever shell or harness happened to export it,
+/// while the flag was typed for THIS invocation. Both are still bounded by the
+/// same kernel mechanisms; neither can produce an ungoverned process.
+///
+/// Re-derived on every call rather than cached, so it returns the same answer in
+/// the original image and in each re-exec'd one — `argv` and the environment are
+/// the two things that survive `execve`, and this reads only those.
 #[must_use]
 pub fn budget_mb() -> u64 {
+    if let Some(mb) = cli_budget_mb() {
+        return mb;
+    }
     for key in [BUDGET_ENV, SHARED_BUDGET_ENV] {
         if let Ok(raw) = std::env::var(key) {
             if let Ok(mb) = raw.trim().parse::<u64>() {

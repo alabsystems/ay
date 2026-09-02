@@ -35,6 +35,7 @@ mod test_model_parse_fp_dt;
 mod test_model_value_display_seq;
 mod test_native_replay;
 mod test_native_replay_identity_scope;
+mod test_native_replay_qf_ufbvlia;
 mod test_proof_access;
 mod test_proof_artifact;
 mod test_query_dump;

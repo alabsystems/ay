@@ -4,9 +4,10 @@
 
 //! Type definitions for the SMT backend.
 
-use crate::ChcExpr;
+use crate::{ChcExpr, ChcOp};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 use ay_core::{FarkasAnnotation, TermId};
+use num_bigint::{BigInt, BigUint, Sign};
 use num_rational::BigRational;
 
 /// Result of model verification against a CHC expression.
@@ -228,8 +229,15 @@ pub enum SmtValue {
     BigInt(std::sync::Arc<num_bigint::BigInt>),
     /// Real (rational) value
     Real(BigRational),
-    /// Bitvector value (value, width)
+    /// Bitvector value (value, width), with a `u128` fast path.
     BitVec(u128, u32),
+    /// Exact bitvector value whose declared width exceeds 128 bits.
+    ///
+    /// Values enter this representation through [`SmtValue::try_bitvec_from_biguint`],
+    /// which masks them to `width` bits. Keeping this separate from [`SmtValue::BitVec`]
+    /// leaves the common <=128-bit evaluator path allocation-free while model
+    /// extraction and validation retain every high bit of wide witnesses.
+    BigBitVec(std::sync::Arc<BigUint>, u32),
     /// Opaque symbolic model value that could not be concretized.
     ///
     /// This preserves solver-generated placeholders such as `@arr33` and
@@ -253,6 +261,37 @@ pub enum SmtValue {
 }
 
 impl SmtValue {
+    fn validate_public_bitvec_width(width: u32) -> crate::ChcResult<()> {
+        if width == 0 || width > crate::MAX_BITVECTOR_WIDTH {
+            return Err(crate::ChcError::InvalidBitVectorWidth {
+                width,
+                max: crate::MAX_BITVECTOR_WIDTH,
+            });
+        }
+        Ok(())
+    }
+
+    /// Build an exact bit-vector model value after validating its width.
+    ///
+    /// The value is reduced modulo `2^width`. This checked public entry point
+    /// prevents typed clients from bypassing the parser's resource bound.
+    pub fn try_bitvec_from_biguint(value: BigUint, width: u32) -> crate::ChcResult<Self> {
+        Self::validate_public_bitvec_width(width)?;
+        Ok(Self::bitvec_from_biguint(value, width))
+    }
+
+    /// Build a checked bit-vector model value from a `u128` payload.
+    pub fn try_bitvec_from_u128(value: u128, width: u32) -> crate::ChcResult<Self> {
+        Self::validate_public_bitvec_width(width)?;
+        Ok(Self::bitvec_from_u128(value, width))
+    }
+
+    /// Build a checked bit-vector model value with signed modulo semantics.
+    pub fn try_bitvec_from_bigint(value: BigInt, width: u32) -> crate::ChcResult<Self> {
+        Self::validate_public_bitvec_width(width)?;
+        Ok(Self::bitvec_from_bigint(value, width))
+    }
+
     /// Build an integer model value from a `BigInt`, canonicalizing.
     ///
     /// This is the ONLY permitted constructor for [`SmtValue::BigInt`]
@@ -266,6 +305,163 @@ impl SmtValue {
             Some(small) => Self::Int(small),
             None => Self::BigInt(std::sync::Arc::new(n)),
         }
+    }
+
+    /// Build a bitvector model value from an exact unsigned integer.
+    ///
+    /// The value is reduced modulo `2^width`. Widths through 128 use the
+    /// allocation-free [`SmtValue::BitVec`] representation; wider values use
+    /// [`SmtValue::BigBitVec`] even when their numeric value happens to be small.
+    pub(crate) fn bitvec_from_biguint(value: BigUint, width: u32) -> Self {
+        use num_traits::{One, ToPrimitive, Zero};
+
+        let masked = if width == 0 {
+            BigUint::zero()
+        } else if value.bits() <= u64::from(width) {
+            // Avoid allocating a `width`-bit mask for already-normalized
+            // values.  This matters for ordinary defaults such as `(_ bv0 N)`
+            // when N itself is very large.
+            value
+        } else {
+            value & ((BigUint::one() << width) - BigUint::one())
+        };
+        if width <= 128 {
+            // Masking to at most 128 bits makes this conversion infallible.
+            let Some(small) = masked.to_u128() else {
+                unreachable!("a value masked to 128 bits must fit u128");
+            };
+            Self::BitVec(small, width)
+        } else {
+            Self::BigBitVec(std::sync::Arc::new(masked), width)
+        }
+    }
+
+    /// Build a bitvector model value from a `u128`, canonicalizing its width.
+    ///
+    /// This is the allocation-free constructor for the common <=128-bit path.
+    /// A `u128` is already in range for every wider sort, so widths above 128
+    /// only allocate the exact backing integer and never need a mask.
+    pub(crate) fn bitvec_from_u128(value: u128, width: u32) -> Self {
+        if width <= 128 {
+            let masked = match width {
+                0 => 0,
+                128 => value,
+                _ => value & ((1u128 << width) - 1),
+            };
+            Self::BitVec(masked, width)
+        } else {
+            Self::BigBitVec(std::sync::Arc::new(BigUint::from(value)), width)
+        }
+    }
+
+    /// Build a bitvector model value from a signed integer using SMT-LIB's
+    /// modulo-`2^width` `int_to_bv` semantics.
+    pub(crate) fn bitvec_from_bigint(value: BigInt, width: u32) -> Self {
+        use num_traits::{One, Signed};
+
+        if width == 0 {
+            return Self::bitvec_from_u128(0, 0);
+        }
+        if !value.is_negative() {
+            let Some(unsigned) = value.to_biguint() else {
+                unreachable!("a non-negative BigInt must convert to BigUint");
+            };
+            return Self::bitvec_from_biguint(unsigned, width);
+        }
+
+        let modulus = BigInt::from_biguint(Sign::Plus, BigUint::one() << width);
+        let mut reduced = value % &modulus;
+        if reduced.is_negative() {
+            reduced += modulus;
+        }
+        let Some(unsigned) = reduced.to_biguint() else {
+            unreachable!("a reduced bitvector residue must be non-negative");
+        };
+        Self::bitvec_from_biguint(unsigned, width)
+    }
+
+    /// Return an exact unsigned bitvector value and its declared width.
+    ///
+    /// Direct legacy `BitVec` construction is normalized here as well, so an
+    /// over-wide `u128` payload at a narrow width cannot leak non-bitvector bits
+    /// into exact evaluator operations. Returns `None` for a non-BV value or a
+    /// width outside `1..=`[`crate::MAX_BITVECTOR_WIDTH`], including malformed
+    /// enum variants constructed directly by downstream code.
+    pub fn bitvec_to_biguint(&self) -> Option<(BigUint, u32)> {
+        match self {
+            Self::BitVec(value, width) => {
+                if *width == 0 || *width > crate::MAX_BITVECTOR_WIDTH {
+                    return None;
+                }
+                let normalized = Self::bitvec_from_u128(*value, *width);
+                match normalized {
+                    Self::BitVec(value, width) => Some((BigUint::from(value), width)),
+                    Self::BigBitVec(value, width) => Some((value.as_ref().clone(), width)),
+                    _ => unreachable!("bitvec constructor returned a non-bitvector value"),
+                }
+            }
+            Self::BigBitVec(value, width) => {
+                // Check the public resource bound before normalization. A
+                // directly-constructed non-canonical enum variant may carry
+                // `u32::MAX`; building its modulo mask first would itself be
+                // an attacker-controlled allocation.
+                if *width == 0 || *width > crate::MAX_BITVECTOR_WIDTH {
+                    return None;
+                }
+                let normalized = Self::bitvec_from_biguint(value.as_ref().clone(), *width);
+                match normalized {
+                    Self::BitVec(value, width) => Some((BigUint::from(value), width)),
+                    Self::BigBitVec(value, width) => Some((value.as_ref().clone(), width)),
+                    _ => unreachable!("bitvec constructor returned a non-bitvector value"),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Convert a concrete bitvector model value into an exact CHC literal.
+    ///
+    /// Wide literals are represented as a high-to-low `concat` tree of
+    /// allocation-free, at-most-128-bit [`ChcExpr::BitVec`] leaves, matching
+    /// the parser's representation for wide SMT-LIB literals.
+    /// Returns `None` for a non-bit-vector value or a declared width outside
+    /// `1..=`[`crate::MAX_BITVECTOR_WIDTH`]. The latter check keeps public
+    /// replay/rendering code fail-closed even if it receives a directly-built,
+    /// non-canonical [`SmtValue`] variant.
+    pub fn bitvec_to_chc_expr(&self) -> Option<ChcExpr> {
+        use num_traits::{One, ToPrimitive};
+
+        let (mut value, width) = self.bitvec_to_biguint()?;
+        if width == 0 || width > crate::MAX_BITVECTOR_WIDTH {
+            return None;
+        }
+        if width <= 128 {
+            return value.to_u128().map(|value| ChcExpr::BitVec(value, width));
+        }
+
+        let mut chunks = Vec::new();
+        let mut bits_left = width;
+        while bits_left != 0 {
+            let chunk_width = bits_left.min(128);
+            let mask = (BigUint::one() << chunk_width) - BigUint::one();
+            let chunk = (&value & mask).to_u128()?;
+            chunks.push((chunk, chunk_width));
+            value >>= chunk_width;
+            bits_left -= chunk_width;
+        }
+
+        let (low, low_width) = *chunks.first()?;
+        let mut result = ChcExpr::BitVec(low, low_width);
+        for &(chunk, chunk_width) in chunks.iter().skip(1) {
+            result = ChcExpr::Op(
+                ChcOp::BvConcat,
+                vec![
+                    std::sync::Arc::new(ChcExpr::BitVec(chunk, chunk_width)),
+                    std::sync::Arc::new(result),
+                ],
+            );
+        }
+        Some(result)
     }
 }
 

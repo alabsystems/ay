@@ -19,6 +19,7 @@ use std::fmt::Write as _;
 /// a fragment is not one.
 #[derive(Clone, Copy)]
 struct ZeroTestGate {
+    operator: &'static str,
     connective: &'static str,
     blast_rule: &'static str,
     simplify_rule: &'static str,
@@ -50,7 +51,9 @@ struct ZeroTestText {
     v: String,
     z: String,
     one: String,
+    zero: String,
     pure_eq: String,
+    eqz_reversed: bool,
 }
 
 impl AlethePrinter<'_> {
@@ -154,19 +157,30 @@ impl AlethePrinter<'_> {
         let TermData::App(Symbol::Named(eq), args) = self.terms.get(eqz) else {
             return None;
         };
-        let [z, zero] = args.as_slice() else {
+        let [first, second] = args.as_slice() else {
             return None;
         };
         if eq != "=" {
             return None;
         }
-        let (z, zero) = (*z, *zero);
-        let TermData::Const(Constant::BitVec { value, width: zw }) = self.terms.get(zero) else {
+        let is_zero = |term| {
+            matches!(
+                self.terms.get(term),
+                TermData::Const(Constant::BitVec { value, width: zw })
+                    if *zw == width && *value == 0u32.into()
+            )
+        };
+        // Equality is interned canonically by TermId, so the zero constant can
+        // occupy either operand even when the authored source wrote `(= z 0)`.
+        // Recover the semantic roles first; the rendered orientation is
+        // checked separately and bridged with `eq_symmetric` when necessary.
+        let (z, zero) = if is_zero(*second) {
+            (*first, *second)
+        } else if is_zero(*first) {
+            (*second, *first)
+        } else {
             return None;
         };
-        if *zw != width || *value != 0u32.into() {
-            return None;
-        }
 
         let gate = if z == v {
             None
@@ -175,12 +189,13 @@ impl AlethePrinter<'_> {
             // operator match: it already pairs `bvand`/`bvor` with the exact
             // Carcara rules used below, and it is the table the wire-rule
             // coverage gate reads.
-            let (_, blast_rule, connective, simplify_rule, operand) =
+            let (operator, blast_rule, connective, simplify_rule, operand) =
                 Self::decode_idempotent_bv_gate(self.terms, z)?;
             if operand != v {
                 return None;
             }
             Some(ZeroTestGate {
+                operator,
                 connective,
                 blast_rule,
                 simplify_rule,
@@ -197,25 +212,74 @@ impl AlethePrinter<'_> {
     }
 
     fn zero_test_text(&self, shape: ZeroTestShape) -> Option<ZeroTestText> {
+        let v = self.format_term(shape.pair.v);
+        let z = self.format_term(shape.pair.z);
+        let one = self.format_term(shape.pair.one);
+        let zero = self.format_term(shape.pair.zero);
+        let (one_value, one_width) = super::parse_printed_bitvec_literal(&one)?;
+        let (zero_value, zero_width) = super::parse_printed_bitvec_literal(&zero)?;
+        if one_width != shape.pair.width
+            || one_value != 1_u8.into()
+            || zero_width != shape.pair.width
+            || zero_value != 0_u8.into()
+        {
+            return None;
+        }
+        if let Some(gate) = shape.pair.gate {
+            let [first, second] =
+                <[String; 2]>::try_from(super::split_application(&z, gate.operator)?).ok()?;
+            if first != v || second != v {
+                return None;
+            }
+        } else if z != v {
+            return None;
+        }
         let ult = self.format_term(shape.ult);
         let eqz = self.format_term(shape.eqz);
+        if !super::surface_literal::equal_modulo_bitvec_literal_spelling(
+            &ult,
+            &format!("(bvult {v} {one})"),
+        ) {
+            return None;
+        }
+        let direct_eqz = format!("(= {z} {zero})");
+        let reversed_eqz = format!("(= {zero} {z})");
+        let eqz_reversed =
+            if super::surface_literal::equal_modulo_bitvec_literal_spelling(&eqz, &direct_eqz) {
+                false
+            } else if super::surface_literal::equal_modulo_bitvec_literal_spelling(
+                &eqz,
+                &reversed_eqz,
+            ) {
+                true
+            } else {
+                return None;
+            };
         let oriented_equality = if shape.reversed {
             format!("(= {eqz} {ult})")
         } else {
             format!("(= {ult} {eqz})")
         };
-        if self.format_term(shape.equality) != oriented_equality {
+        // A source row may retain SMT-LIB's indexed numeral spelling while
+        // its interned constant children print canonically as `#b...`.
+        // Those spellings parse to the same bit-vector term; the bounded
+        // positional comparison still rejects every changed operator,
+        // operand, value, or width.
+        if !super::surface_literal::equal_modulo_bitvec_literal_spelling(
+            &self.format_term(shape.equality),
+            &oriented_equality,
+        ) {
             return None;
         }
-        let v = self.format_term(shape.pair.v);
-        let z = self.format_term(shape.pair.z);
-        let zero = self.format_term(shape.pair.zero);
+        let pure_eq = format!("(= {v} {zero})");
         Some(ZeroTestText {
             ult,
             eqz,
             oriented_equality,
-            one: self.format_term(shape.pair.one),
-            pure_eq: format!("(= {v} {zero})"),
+            one,
+            zero,
+            pure_eq,
+            eqz_reversed,
             v,
             z,
         })
@@ -264,7 +328,7 @@ impl AlethePrinter<'_> {
              (step {id}.pe (cl (= {ep} {b})) :rule pbblast_bveq)",
             v = text.v,
             one = text.one,
-            zero = self.format_term(shape.pair.zero),
+            zero = text.zero,
             ult = text.ult,
             pure_eq = text.pure_eq,
         );
@@ -287,7 +351,7 @@ impl AlethePrinter<'_> {
             .map(|i| format!("{id}.b{i}"))
             .collect::<Vec<_>>()
             .join(" ");
-        let core_id = if shape.pair.gate.is_none() && !shape.reversed {
+        let core_id = if shape.pair.gate.is_none() && !shape.reversed && !text.eqz_reversed {
             id.to_string()
         } else {
             format!("{id}.a")
@@ -325,60 +389,98 @@ impl AlethePrinter<'_> {
         text: &ZeroTestText,
         out: &mut String,
     ) -> String {
-        let Some(ZeroTestGate {
+        let direct_eqz = format!("(= {} {})", text.z, text.zero);
+        let mut eqz_bridge = None;
+        if let Some(ZeroTestGate {
+            operator: _,
             connective: conn,
             blast_rule,
             simplify_rule,
         }) = shape.pair.gate
-        else {
-            return format!("{id}.a");
-        };
-        let width = shape.pair.width;
-        let bit = |i: u32| format!("((_ @bit_of {i}) {})", text.v);
-        let gated = (0..width)
-            .map(|i| format!("({conn} {b} {b})", b = bit(i)))
-            .collect::<Vec<_>>();
-        let bits = (0..width).map(bit).collect::<Vec<_>>();
-        let bb_gated = format!("(@bbterm {})", gated.join(" "));
-        let bb_bits = format!("(@bbterm {})", bits.join(" "));
-        let _ = write!(
-            out,
-            "\n(step {id}.gb (cl (= {z} {bb_gated})) :rule {blast_rule})\n\
-             (step {id}.gv (cl (= {v} {bb_bits})) :rule bitblast_var)",
-            z = text.z,
-            v = text.v,
-        );
-        for i in 0..width {
-            let bi = bit(i);
+        {
+            let width = shape.pair.width;
+            let bit = |i: u32| format!("((_ @bit_of {i}) {})", text.v);
+            let gated = (0..width)
+                .map(|i| format!("({conn} {b} {b})", b = bit(i)))
+                .collect::<Vec<_>>();
+            let bits = (0..width).map(bit).collect::<Vec<_>>();
+            let bb_gated = format!("(@bbterm {})", gated.join(" "));
+            let bb_bits = format!("(@bbterm {})", bits.join(" "));
             let _ = write!(
                 out,
-                "\n(step {id}.j{i} (cl (= ({conn} {bi} {bi}) {bi})) :rule {simplify_rule})"
+                "\n(step {id}.gb (cl (= {z} {bb_gated})) :rule {blast_rule})\n\
+                 (step {id}.gv (cl (= {v} {bb_bits})) :rule bitblast_var)",
+                z = text.z,
+                v = text.v,
             );
+            for i in 0..width {
+                let bi = bit(i);
+                let _ = write!(
+                    out,
+                    "\n(step {id}.j{i} (cl (= ({conn} {bi} {bi}) {bi})) :rule {simplify_rule})"
+                );
+            }
+            let jres = (0..width)
+                .map(|i| format!("{id}.j{i}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = write!(
+                out,
+                "\n(step {id}.gc (cl (= {bb_gated} {bb_bits})) :rule cong :premises ({jres}))\n\
+                 (step {id}.gl (cl (= {z} {bb_bits})) :rule trans :premises ({id}.gb {id}.gc))\n\
+                 (step {id}.gr (cl (= {bb_bits} {v})) :rule symm :premises ({id}.gv))\n\
+                 (step {id}.gf (cl (= {z} {v})) :rule trans :premises ({id}.gl {id}.gr))\n\
+                 (step {id}.gi (cl (= {v} {z})) :rule symm :premises ({id}.gf))\n\
+                 (step {id}.ge (cl (= {pure_eq} {direct_eqz})) :rule cong :premises ({id}.gi))",
+                z = text.z,
+                v = text.v,
+                pure_eq = text.pure_eq,
+            );
+            eqz_bridge = Some(format!("{id}.ge"));
         }
-        let jres = (0..width)
-            .map(|i| format!("{id}.j{i}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let fwd_id = if shape.reversed {
+
+        if text.eqz_reversed {
+            let _ = write!(
+                out,
+                "\n(step {id}.es (cl (= {direct_eqz} {eqz})) :rule eq_symmetric)",
+                eqz = text.eqz,
+            );
+            if let Some(prior) = eqz_bridge.as_deref() {
+                let _ = write!(
+                    out,
+                    "\n(step {id}.et (cl (= {pure_eq} {eqz})) :rule trans :premises ({prior} {id}.es))",
+                    pure_eq = text.pure_eq,
+                    eqz = text.eqz,
+                );
+                eqz_bridge = Some(format!("{id}.et"));
+            } else {
+                // Without a gate `z` is `v`, so `direct_eqz` is exactly the
+                // `pure_eq` endpoint produced by the pseudo-Boolean core.
+                eqz_bridge = Some(format!("{id}.es"));
+            }
+        }
+
+        let Some(eqz_bridge) = eqz_bridge else {
+            // No gate and no inner equality reversal: the core already ends
+            // at the target endpoint. It used `.a` only when the OUTER
+            // equality is reversed and the caller must append one `symm`.
+            return if shape.reversed {
+                format!("{id}.a")
+            } else {
+                id.to_string()
+            };
+        };
+        let forward_id = if shape.reversed {
             format!("{id}.fwd")
         } else {
             id.to_string()
         };
         let _ = write!(
             out,
-            "\n(step {id}.gc (cl (= {bb_gated} {bb_bits})) :rule cong :premises ({jres}))\n\
-             (step {id}.gl (cl (= {z} {bb_bits})) :rule trans :premises ({id}.gb {id}.gc))\n\
-             (step {id}.gr (cl (= {bb_bits} {v})) :rule symm :premises ({id}.gv))\n\
-             (step {id}.gf (cl (= {z} {v})) :rule trans :premises ({id}.gl {id}.gr))\n\
-             (step {id}.gi (cl (= {v} {z})) :rule symm :premises ({id}.gf))\n\
-             (step {id}.ge (cl (= {pure_eq} {eqz})) :rule cong :premises ({id}.gi))\n\
-             (step {fwd_id} (cl (= {ult} {eqz})) :rule trans :premises ({id}.a {id}.ge))",
-            z = text.z,
-            v = text.v,
-            pure_eq = text.pure_eq,
-            eqz = text.eqz,
+            "\n(step {forward_id} (cl (= {ult} {eqz})) :rule trans :premises ({id}.a {eqz_bridge}))",
             ult = text.ult,
+            eqz = text.eqz,
         );
-        format!("{id}.fwd")
+        forward_id
     }
 }

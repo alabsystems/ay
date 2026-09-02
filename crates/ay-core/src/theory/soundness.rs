@@ -25,17 +25,12 @@ pub fn assert_conflict_soundness(
         // Batched-lemma check() converts conflicts to NeedLemmas (#6546).
         // Extract literals from the first lemma clause for soundness check.
         TheoryResult::NeedLemmas(lemmas) => {
-            assert!(
-                !lemmas.is_empty(),
-                "NeedLemmas must have at least one lemma"
-            );
             // Lemma clause literals are the negation of the conflict reasons.
             // Return the first lemma's clause as the "conflict" for verification.
-            return lemmas
-                .into_iter()
-                .next()
-                .expect("invariant: non-empty checked above")
-                .clause;
+            let Some(first) = lemmas.into_iter().next() else {
+                panic!("NeedLemmas must have at least one lemma");
+            };
+            return first.clause;
         }
         // Test helper: this function is only called from tests; panic
         // is the expected behavior for unexpected TheoryResult variants.

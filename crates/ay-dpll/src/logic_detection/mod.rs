@@ -10,7 +10,6 @@
 mod parse;
 mod transforms;
 
-#[cfg(test)]
 pub(crate) use parse::FAIL_CLOSED_COMBINED;
 pub(crate) use parse::{declared_logic_routes_as_all, is_z3_recognized_logic};
 
@@ -64,7 +63,8 @@ pub(crate) enum LogicCategory {
     QfUfbv,
     /// QF_AUFBV: Quantifier-free arrays + uninterpreted functions + bitvectors
     QfAufbv,
-    /// BV + integer arithmetic (bv2nat/int2bv cross-theory). Not yet supported (#5503).
+    /// Conservative BV + integer arithmetic bridge: conversions or admitted
+    /// UF-free Boolean coupling. Decides only independently checked results.
     QfBvLia,
     /// BV + integer arithmetic without conversion functions (#5356).
     /// BV and Int coexist but don't interact — route to AUFLIA (BV as UF).

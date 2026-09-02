@@ -176,9 +176,25 @@ const DEVEX_RESET: f64 = 1e6;
 /// instead of grinding indefinitely. Bounds work, never soundness.
 const SIMPLEX_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Advisory simplex stop controls. Production uses a wall deadline plus the
-/// hard cap; regressions can omit the clock and use a fixed iteration count so
-/// scheduler delay cannot change whether a fixture converges.
+/// Advisory simplex stop controls. The SEARCH path uses a wall deadline plus
+/// the hard cap; the CERTIFICATE path and regressions omit the clock and use a
+/// fixed iteration count so scheduler delay cannot change whether a fixture
+/// converges.
+///
+/// WHY THE CERTIFICATE PATH MUST NOT CARRY A CLOCK. Every floor rung's budget in
+/// this repository is a deterministic WORK COUNT rather than a clock, for one
+/// published reason: the emitted certificate bytes must not depend on machine
+/// load (`lp_dual_floor::MAX_DUAL_SOLVE_POLLS`, `certified_bb::MAX_NODES`,
+/// `odd_cycle_cover::packing::Limits` all say so). That guarantee was
+/// nevertheless FALSE, because both certificate emitters reach this simplex
+/// through `lp_bound::lp_dual_raw_diagnosed`, which asked for
+/// [`SimplexLimits::wall`]. Measured on 2026-08-31, one frozen binary, one
+/// input set, two identical `-P 4` batches over 46 instances: 10 of the 46
+/// returned different node/leaf/poll counts, and TWO flipped outcome —
+/// `addm4.r` `exhausted(no-branch-variable)` at 15 nodes against `certified`
+/// (249,950 B) at 73, and `fir04_trarea_ac` `exhausted(node-lp-declined)` at 2
+/// nodes against `certified` (67,016 B) at 3. A conversion that appears or
+/// disappears with the box's load is not a measurement.
 #[derive(Clone, Copy)]
 struct SimplexLimits {
     deadline: Option<std::time::Instant>,
@@ -193,7 +209,6 @@ impl SimplexLimits {
         }
     }
 
-    #[cfg(test)]
     const fn iterations(iterations_per_phase: usize) -> Self {
         Self {
             deadline: None,
@@ -1018,10 +1033,12 @@ pub(crate) fn approx_dual_for_box_lp(
     approx_dual_for_box_lp_with_limits(n, c, rows, SimplexLimits::wall(budget), should_stop)
 }
 
-/// Deterministic counterpart of [`approx_dual_for_box_lp`] for mandatory
-/// regressions. Each simplex phase gets at most `iterations_per_phase` loop
-/// iterations; no wall clock is consulted.
-#[cfg(test)]
+/// Deterministic counterpart of [`approx_dual_for_box_lp`]: the CERTIFICATE
+/// path's entry point, and the one mandatory regressions use. Each simplex
+/// phase gets at most `iterations_per_phase` loop iterations; no wall clock is
+/// consulted, so the dual point — and therefore the emitted certificate bytes —
+/// is a function of the model alone. See [`SimplexLimits`] for the measurement
+/// that made this the production form for certificates.
 pub(crate) fn approx_dual_for_box_lp_with_iteration_budget(
     n: usize,
     c: Vec<f64>,

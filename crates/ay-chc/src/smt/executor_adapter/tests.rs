@@ -213,6 +213,25 @@ fn test_detect_logic_default_int_only() {
 }
 
 #[test]
+fn test_detect_logic_real_only_uses_real_uf_logic() {
+    let r = ChcExpr::var(ChcVar::new("r", ChcSort::Real));
+    let f_r = ChcExpr::FuncApp("f".to_string(), ChcSort::Real, vec![r.clone().into()]);
+    let expr = ChcExpr::eq(f_r, r);
+    assert_eq!(detect_logic(&expr.vars(), &expr), "QF_UFLRA");
+}
+
+#[test]
+fn test_detect_logic_mixed_int_real_uses_supported_combined_logic() {
+    let x = ChcExpr::var(ChcVar::new("x", ChcSort::Int));
+    let r = ChcExpr::var(ChcVar::new("r", ChcSort::Real));
+    let expr = ChcExpr::and(
+        ChcExpr::eq(x, ChcExpr::Int(0)),
+        ChcExpr::eq(r, ChcExpr::Real(0, 1)),
+    );
+    assert_eq!(detect_logic(&expr.vars(), &expr), "QF_AUFLIRA");
+}
+
+#[test]
 fn test_detect_logic_linear_int_product_stays_lia() {
     let x = ChcVar::new("x", ChcSort::Int);
     let vars = vec![x.clone()];
@@ -233,6 +252,19 @@ fn test_detect_logic_nonlinear_int_product_uses_nia_9004() {
         ChcExpr::int(0),
     );
     assert_eq!(detect_logic(&vars, &expr), "QF_NIA");
+}
+
+#[test]
+fn test_detect_logic_nonlinear_scalar_ufs_keep_uf_family() {
+    let x = ChcExpr::var(ChcVar::new("x", ChcSort::Int));
+    let f_x = ChcExpr::FuncApp("f".to_string(), ChcSort::Int, vec![x.clone().into()]);
+    let int_expr = ChcExpr::eq(f_x, ChcExpr::mul(x.clone(), x));
+    assert_eq!(detect_logic(&int_expr.vars(), &int_expr), "QF_UFNIA");
+
+    let r = ChcExpr::var(ChcVar::new("r", ChcSort::Real));
+    let g_r = ChcExpr::FuncApp("g".to_string(), ChcSort::Real, vec![r.clone().into()]);
+    let real_expr = ChcExpr::eq(g_r, ChcExpr::mul(r.clone(), r));
+    assert_eq!(detect_logic(&real_expr.vars(), &real_expr), "QF_UFNRA");
 }
 
 #[test]
@@ -459,22 +491,29 @@ fn test_term_body_to_smt_value_hex_bv() {
 }
 
 #[test]
-fn test_term_body_to_smt_value_wide_hex_bv_truncation_7040() {
-    // 192-bit hex (48 hex digits): truncates to low 128 bits
+fn test_term_body_to_smt_value_wide_hex_bv_is_exact_7040() {
+    // 192-bit hex (three distinct 64-bit limbs): every high bit is preserved.
     let term = ay_frontend::Term::Const(ay_frontend::Constant::Hexadecimal(
         "000000000000000100000000000000020000000000000003".to_string(),
     ));
+    let expected = (num_bigint::BigUint::from(1u8) << 128)
+        | (num_bigint::BigUint::from(2u8) << 64)
+        | num_bigint::BigUint::from(3u8);
     assert_eq!(
         tv(&term),
-        Some(SmtValue::BitVec(0x00000000000000020000000000000003, 192))
+        Some(SmtValue::bitvec_from_biguint(expected, 192))
     );
 }
 
 #[test]
-fn test_term_body_to_smt_value_wide_bin_bv_truncation_7040() {
-    // 192-bit binary: truncates to low 128 bits (all ones)
+fn test_term_body_to_smt_value_wide_bin_bv_is_exact_7040() {
+    // 192-bit binary: all 192 one-bits survive model parsing.
     let term = ay_frontend::Term::Const(ay_frontend::Constant::Binary("1".repeat(192)));
-    assert_eq!(tv(&term), Some(SmtValue::BitVec(u128::MAX, 192)));
+    let expected = (num_bigint::BigUint::from(1u8) << 192) - num_bigint::BigUint::from(1u8);
+    assert_eq!(
+        tv(&term),
+        Some(SmtValue::bitvec_from_biguint(expected, 192))
+    );
 }
 
 #[test]
@@ -1078,6 +1117,273 @@ fn test_parse_model_simple_pipe_quoted_name_no_spaces() {
 // ========================================================================
 
 #[test]
+fn test_executor_uf_declarations_are_typed_and_signature_checked() {
+    let x = ChcExpr::var(ChcVar::new("x", ChcSort::Int));
+    let g_x = ChcExpr::FuncApp("g".to_string(), ChcSort::Int, vec![x.into()]);
+    let f_x = ChcExpr::FuncApp("f".to_string(), ChcSort::Int, vec![g_x.clone().into()]);
+    let repeated_f_x = ChcExpr::FuncApp("f".to_string(), ChcSort::Int, vec![g_x.into()]);
+    let expr = ChcExpr::eq(f_x, repeated_f_x);
+
+    let declarations = collect_uninterpreted_function_declarations(&expr)
+        .expect("nested consistent UF signatures should be collected");
+    assert_eq!(declarations.len(), 2);
+    let f = declarations
+        .iter()
+        .find(|declaration| declaration.name == "f")
+        .expect("outer f declaration");
+    let g = declarations
+        .iter()
+        .find(|declaration| declaration.name == "g")
+        .expect("nested g declaration");
+    assert_eq!(
+        emit_declare_uninterpreted_function(f),
+        "(declare-fun f (Int) Int)\n"
+    );
+    assert_eq!(
+        emit_declare_uninterpreted_function(g),
+        "(declare-fun g (Int) Int)\n"
+    );
+
+    let conflicting = ChcExpr::and(
+        expr,
+        ChcExpr::eq(
+            ChcExpr::FuncApp(
+                "f".to_string(),
+                ChcSort::Int,
+                vec![ChcExpr::Bool(true).into()],
+            ),
+            ChcExpr::Int(0),
+        ),
+    );
+    assert!(
+        collect_uninterpreted_function_declarations(&conflicting).is_err(),
+        "one UF name with two signatures must fail closed"
+    );
+}
+
+#[test]
+fn test_uf_collector_excludes_nested_datatype_symbols() {
+    let inner = ChcSort::Datatype {
+        name: "InnerUfAudit".to_string(),
+        constructors: Arc::new(vec![ChcDtConstructor {
+            name: "mk-inner-uf-audit".to_string(),
+            selectors: vec![ChcDtSelector {
+                name: "payload-uf-audit".to_string(),
+                sort: ChcSort::Int,
+            }],
+        }]),
+    };
+    let wrapper = ChcSort::Datatype {
+        name: "WrapperUfAudit".to_string(),
+        constructors: Arc::new(vec![ChcDtConstructor {
+            name: "mk-wrapper-uf-audit".to_string(),
+            selectors: vec![ChcDtSelector {
+                name: "inner-uf-audit".to_string(),
+                sort: inner.clone(),
+            }],
+        }]),
+    };
+    let w = ChcExpr::var(ChcVar::new("w", wrapper));
+    let projected_inner = ChcExpr::FuncApp("inner-uf-audit".to_string(), inner, vec![w.into()]);
+    let payload = ChcExpr::FuncApp(
+        "payload-uf-audit".to_string(),
+        ChcSort::Int,
+        vec![projected_inner.into()],
+    );
+    let ordinary = ChcExpr::FuncApp(
+        "ordinary-uf-audit".to_string(),
+        ChcSort::Int,
+        vec![payload.into()],
+    );
+
+    let declarations = collect_uninterpreted_function_declarations(&ordinary)
+        .expect("nested datatype metadata should classify its functions");
+    assert_eq!(declarations.len(), 1);
+    assert_eq!(declarations[0].name, "ordinary-uf-audit");
+    let applications = collect_uninterpreted_function_applications(&ordinary)
+        .expect("ordinary application collection uses the same classification");
+    assert_eq!(applications, vec![ordinary]);
+}
+
+#[test]
+fn test_check_sat_via_executor_declares_scalar_uf_for_unsat_congruence() {
+    let array = ChcExpr::var(ChcVar::new(
+        "A",
+        ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int)),
+    ));
+    let x = ChcExpr::var(ChcVar::new("x", ChcSort::Int));
+    let y = ChcExpr::var(ChcVar::new("y", ChcSort::Int));
+    let f_x = ChcExpr::FuncApp("f".to_string(), ChcSort::Int, vec![x.clone().into()]);
+    let f_y = ChcExpr::FuncApp("f".to_string(), ChcSort::Int, vec![y.clone().into()]);
+    let expr = ChcExpr::and_all([
+        ChcExpr::eq(ChcExpr::select(array, ChcExpr::Int(0)), ChcExpr::Int(7)),
+        ChcExpr::eq(x, y),
+        ChcExpr::not(ChcExpr::eq(f_x, f_y)),
+    ]);
+
+    let result = SmtContext::new().check_sat_via_executor(
+        &expr,
+        &FxHashMap::default(),
+        std::time::Duration::from_secs(5),
+    );
+    assert!(
+        result.is_unsat(),
+        "executor must parse the UF declaration and enforce congruence: got {result:?}"
+    );
+}
+
+#[test]
+fn test_mixed_array_uf_sat_without_function_interpretation_stays_unknown() {
+    let array = ChcExpr::var(ChcVar::new(
+        "A",
+        ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int)),
+    ));
+    let x = ChcExpr::var(ChcVar::new("x", ChcSort::Int));
+    let f_x = ChcExpr::FuncApp("f".to_string(), ChcSort::Int, vec![x.into()]);
+    let expr = ChcExpr::and(
+        ChcExpr::eq(ChcExpr::select(array, ChcExpr::Int(0)), ChcExpr::Int(7)),
+        ChcExpr::eq(f_x, ChcExpr::Int(9)),
+    );
+    let mut model = FxHashMap::default();
+    model.insert(
+        "A".to_string(),
+        SmtValue::ConstArray(Box::new(SmtValue::Int(7))),
+    );
+    model.insert("x".to_string(), SmtValue::Int(0));
+
+    assert!(
+        accept_reparsed_sat_model(&[&expr], model, "executor mixed Array+UF boundary test")
+            .is_none(),
+        "mixed-theory SAT must remain Unknown until generic UF interpretations are parsed and evaluated"
+    );
+}
+
+#[test]
+fn test_mixed_array_uf_sat_extracts_exact_application_values() {
+    let array = ChcExpr::var(ChcVar::new(
+        "A_uf_sat",
+        ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int)),
+    ));
+    let x = ChcExpr::var(ChcVar::new("x_uf_sat", ChcSort::Int));
+    let f_x = ChcExpr::FuncApp("f_uf_sat".to_string(), ChcSort::Int, vec![x.clone().into()]);
+    let expr = ChcExpr::and_all([
+        ChcExpr::eq(x, ChcExpr::Int(3)),
+        ChcExpr::eq(ChcExpr::select(array, ChcExpr::Int(0)), ChcExpr::Int(7)),
+        ChcExpr::eq(f_x, ChcExpr::Int(9)),
+    ]);
+
+    let result = SmtContext::new().check_sat_via_executor(
+        &expr,
+        &FxHashMap::default(),
+        std::time::Duration::from_secs(5),
+    );
+    let SmtResult::Sat(model) = result else {
+        panic!("mixed Array+UF witness should be strictly checkable: {result:?}");
+    };
+    assert_eq!(
+        crate::expr::evaluate::evaluate_expr(&expr, &model),
+        Some(SmtValue::Bool(true)),
+        "the original expression, including f(x), must evaluate under the returned model"
+    );
+}
+
+#[test]
+fn test_scalar_bv_uf_sat_extracts_exact_application_value() {
+    let x = ChcExpr::var(ChcVar::new("x_bv_uf_sat", ChcSort::BitVec(8)));
+    let f_x = ChcExpr::FuncApp(
+        "f_bv_uf_sat".to_string(),
+        ChcSort::BitVec(16),
+        vec![x.clone().into()],
+    );
+    let expr = ChcExpr::and(
+        ChcExpr::eq(x, ChcExpr::BitVec(3, 8)),
+        ChcExpr::eq(f_x, ChcExpr::BitVec(0x1234, 16)),
+    );
+
+    let result = SmtContext::new().check_sat_via_executor(
+        &expr,
+        &FxHashMap::default(),
+        std::time::Duration::from_secs(5),
+    );
+    let SmtResult::Sat(model) = result else {
+        panic!("BV UF witness should be strictly checkable: {result:?}");
+    };
+    assert_eq!(
+        crate::expr::evaluate::evaluate_expr(&expr, &model),
+        Some(SmtValue::Bool(true))
+    );
+}
+
+#[test]
+fn test_scalar_real_uf_sat_extracts_exact_application_value() {
+    let x = ChcExpr::var(ChcVar::new("x_real_uf_sat", ChcSort::Real));
+    let f_x = ChcExpr::FuncApp(
+        "f_real_uf_sat".to_string(),
+        ChcSort::Real,
+        vec![x.clone().into()],
+    );
+    let expr = ChcExpr::and(
+        ChcExpr::eq(x, ChcExpr::Real(3, 2)),
+        ChcExpr::eq(f_x, ChcExpr::Real(5, 2)),
+    );
+
+    let result = SmtContext::new().check_sat_via_executor(
+        &expr,
+        &FxHashMap::default(),
+        std::time::Duration::from_secs(5),
+    );
+    let SmtResult::Sat(model) = result else {
+        panic!("Real UF witness should be strictly checkable: {result:?}");
+    };
+    assert_eq!(
+        crate::expr::evaluate::evaluate_expr(&expr, &model),
+        Some(SmtValue::Bool(true))
+    );
+}
+
+#[test]
+fn test_typed_bool_uf_has_congruence_and_exact_sat_model() {
+    let x = ChcExpr::var(ChcVar::new("x_bool_uf", ChcSort::Int));
+    let y = ChcExpr::var(ChcVar::new("y_bool_uf", ChcSort::Int));
+    let f_x = ChcExpr::FuncApp(
+        "f_bool_uf".to_string(),
+        ChcSort::Bool,
+        vec![x.clone().into()],
+    );
+    let f_y = ChcExpr::FuncApp(
+        "f_bool_uf".to_string(),
+        ChcSort::Bool,
+        vec![y.clone().into()],
+    );
+    let contradiction =
+        ChcExpr::and_all([ChcExpr::eq(x.clone(), y), f_x.clone(), ChcExpr::not(f_y)]);
+    let context = SmtContext::new();
+    let unsat = context.check_sat_via_executor(
+        &contradiction,
+        &FxHashMap::default(),
+        std::time::Duration::from_secs(5),
+    );
+    assert!(
+        unsat.is_unsat(),
+        "typed Bool-returning FuncApp must obey UF congruence: {unsat:?}"
+    );
+
+    let sat_expr = ChcExpr::and(ChcExpr::eq(x, ChcExpr::Int(3)), f_x);
+    let sat = context.check_sat_via_executor(
+        &sat_expr,
+        &FxHashMap::default(),
+        std::time::Duration::from_secs(5),
+    );
+    let SmtResult::Sat(model) = sat else {
+        panic!("typed Bool UF witness should be strictly checkable: {sat:?}");
+    };
+    assert_eq!(
+        crate::expr::evaluate::evaluate_expr(&sat_expr, &model),
+        Some(SmtValue::Bool(true))
+    );
+}
+
+#[test]
 fn test_check_sat_via_executor_sat_simple() {
     // (x > 0) with x:Int — trivially SAT.
     let x = ChcVar::new("x", ChcSort::Int);
@@ -1382,6 +1688,81 @@ fn test_check_sat_conjunction_via_executor_unsat() {
 }
 
 #[test]
+fn conjunction_executor_inherits_deadlines_and_term_store_limit() {
+    use super::super::incremental::IncrementalCheckResult;
+
+    let x = ChcVar::new("bounded_conjunction_x", ChcSort::Int);
+    let gt = ChcExpr::Op(
+        crate::ChcOp::Gt,
+        vec![ChcExpr::var(x.clone()).into(), ChcExpr::Int(10).into()],
+    );
+    let lt = ChcExpr::Op(
+        crate::ChcOp::Lt,
+        vec![ChcExpr::var(x).into(), ChcExpr::Int(5).into()],
+    );
+    let expressions = [gt, lt];
+    let propagated = FxHashMap::default();
+    let timeout = std::time::Duration::from_secs(5);
+
+    assert!(matches!(
+        check_sat_conjunction_via_executor_with_resource_limits(
+            &expressions,
+            &propagated,
+            timeout,
+            None,
+            Some(usize::MAX),
+        ),
+        IncrementalCheckResult::Unsat
+    ));
+    assert!(matches!(
+        check_sat_conjunction_via_executor_with_resource_limits(
+            &expressions,
+            &propagated,
+            timeout,
+            Some(Instant::now()),
+            Some(usize::MAX),
+        ),
+        IncrementalCheckResult::Unknown
+    ));
+    {
+        let _deadline = crate::smt::ScopedSolveDeadline::new(Some(Instant::now()));
+        assert!(matches!(
+            check_sat_conjunction_via_executor_with_resource_limits(
+                &expressions,
+                &propagated,
+                timeout,
+                None,
+                Some(usize::MAX),
+            ),
+            IncrementalCheckResult::Unknown
+        ));
+    }
+    {
+        let _deadline = crate::smt::ScopedSmtDeadline::install(std::time::Duration::ZERO);
+        assert!(matches!(
+            check_sat_conjunction_via_executor_with_resource_limits(
+                &expressions,
+                &propagated,
+                timeout,
+                None,
+                Some(usize::MAX),
+            ),
+            IncrementalCheckResult::Unknown
+        ));
+    }
+    assert!(matches!(
+        check_sat_conjunction_via_executor_with_resource_limits(
+            &expressions,
+            &propagated,
+            timeout,
+            None,
+            Some(1),
+        ),
+        IncrementalCheckResult::Unknown
+    ));
+}
+
+#[test]
 fn test_check_sat_conjunction_via_executor_empty_returns_unknown() {
     use super::super::incremental::IncrementalCheckResult;
     // No expressions with variables -> Unknown.
@@ -1550,6 +1931,544 @@ fn test_emit_declare_datatype_roundtrip_nested_array_sort() {
         }
         other => panic!("expected DeclareDatatype, got {other:?}"),
     }
+}
+
+#[test]
+fn test_emit_declare_datatypes_nested_dependency_is_simultaneous_and_deterministic() {
+    let inner_constructors = Arc::new(vec![ChcDtConstructor {
+        name: "mk-inner".to_string(),
+        selectors: vec![ChcDtSelector {
+            name: "inner-value".to_string(),
+            sort: ChcSort::Int,
+        }],
+    }]);
+    let inner_sort = ChcSort::Datatype {
+        name: "Inner".to_string(),
+        constructors: Arc::clone(&inner_constructors),
+    };
+    let outer_constructors = Arc::new(vec![ChcDtConstructor {
+        name: "mk-outer".to_string(),
+        selectors: vec![ChcDtSelector {
+            name: "outer-inner".to_string(),
+            sort: inner_sort.clone(),
+        }],
+    }]);
+    let outer_sort = ChcSort::Datatype {
+        name: "Outer".to_string(),
+        constructors: Arc::clone(&outer_constructors),
+    };
+
+    let forward_vars = [
+        ChcVar::new("outer", outer_sort.clone()),
+        ChcVar::new("inner", inner_sort.clone()),
+    ];
+    let reverse_vars = [
+        ChcVar::new("inner", inner_sort),
+        ChcVar::new("outer", outer_sort),
+    ];
+    let forward = collect_dt_declarations(&forward_vars).unwrap();
+    let reverse = collect_dt_declarations(&reverse_vars).unwrap();
+    let forward_text = emit_declare_datatypes(&forward).unwrap();
+    let reverse_text = emit_declare_datatypes(&reverse).unwrap();
+
+    assert_eq!(forward_text, reverse_text);
+    assert_eq!(
+        forward_text,
+        "(declare-datatypes ((Inner 0) (Outer 0)) (((mk-inner (inner-value Int))) ((mk-outer (outer-inner Inner)))))\n"
+    );
+    assert_eq!(ay_frontend::parse(&forward_text).unwrap().len(), 1);
+}
+
+#[test]
+fn test_emit_declare_datatypes_roundtrip_mutual_forward_references() {
+    let a_constructors = vec![ChcDtConstructor {
+        name: "mk-a".to_string(),
+        selectors: vec![ChcDtSelector {
+            name: "a-b".to_string(),
+            sort: ChcSort::Uninterpreted("B".to_string()),
+        }],
+    }];
+    let b_constructors = vec![ChcDtConstructor {
+        name: "mk-b".to_string(),
+        selectors: vec![ChcDtSelector {
+            name: "b-a".to_string(),
+            sort: ChcSort::Uninterpreted("A".to_string()),
+        }],
+    }];
+    let emitted = emit_declare_datatypes(&[
+        ("B", b_constructors.as_slice()),
+        ("A", a_constructors.as_slice()),
+    ])
+    .unwrap();
+
+    assert_eq!(
+        emitted,
+        "(declare-datatypes ((A 0) (B 0)) (((mk-a (a-b B))) ((mk-b (b-a A)))))\n"
+    );
+    assert_eq!(ay_frontend::parse(&emitted).unwrap().len(), 1);
+}
+
+#[test]
+fn test_collect_dt_declarations_accepts_finite_mutual_resolution_snapshots() {
+    let unresolved_a = Arc::new(vec![ChcDtConstructor {
+        name: "mk-a".to_string(),
+        selectors: vec![ChcDtSelector {
+            name: "a-b".to_string(),
+            sort: ChcSort::Uninterpreted("B".to_string()),
+        }],
+    }]);
+    let resolved_b = Arc::new(vec![ChcDtConstructor {
+        name: "mk-b".to_string(),
+        selectors: vec![ChcDtSelector {
+            name: "b-a".to_string(),
+            sort: ChcSort::Datatype {
+                name: "A".to_string(),
+                constructors: Arc::clone(&unresolved_a),
+            },
+        }],
+    }]);
+    let resolved_a = Arc::new(vec![ChcDtConstructor {
+        name: "mk-a".to_string(),
+        selectors: vec![ChcDtSelector {
+            name: "a-b".to_string(),
+            sort: ChcSort::Datatype {
+                name: "B".to_string(),
+                constructors: resolved_b,
+            },
+        }],
+    }]);
+    let vars = [ChcVar::new(
+        "a",
+        ChcSort::Datatype {
+            name: "A".to_string(),
+            constructors: resolved_a,
+        },
+    )];
+    let declarations = collect_dt_declarations(&vars).unwrap();
+
+    assert_eq!(declarations.len(), 2);
+    assert_eq!(declarations[0].0, "A");
+    assert_eq!(declarations[1].0, "B");
+    assert!(emit_declare_datatypes(&declarations).is_ok());
+}
+
+#[test]
+fn test_collect_dt_declarations_rejects_conflict_hidden_in_repeated_outer_sort() {
+    fn nested_outer(inner_constructor: &str) -> ChcSort {
+        let inner = ChcSort::Datatype {
+            name: "InnerConflict".to_string(),
+            constructors: Arc::new(vec![ChcDtConstructor {
+                name: inner_constructor.to_string(),
+                selectors: Vec::new(),
+            }]),
+        };
+        ChcSort::Datatype {
+            name: "OuterConflict".to_string(),
+            constructors: Arc::new(vec![ChcDtConstructor {
+                name: "mk-outer-conflict".to_string(),
+                selectors: vec![ChcDtSelector {
+                    name: "outer-conflict-inner".to_string(),
+                    sort: inner,
+                }],
+            }]),
+        }
+    }
+
+    let vars = [
+        ChcVar::new("left", nested_outer("mk-inner-left")),
+        ChcVar::new("right", nested_outer("mk-inner-right")),
+    ];
+    let result = collect_dt_declarations(&vars);
+    assert!(matches!(
+        result,
+        Err(
+            super::logic_detection::DatatypeDeclarationError::ConflictingDefinition(name)
+        ) if name == "InnerConflict"
+    ));
+}
+
+#[test]
+fn test_collect_dt_declarations_expr_fanout_cap_is_charged_before_push() {
+    fn flat_expr(child_count: usize) -> ChcExpr {
+        ChcExpr::Op(
+            crate::ChcOp::And,
+            (0..child_count)
+                .map(|_| Arc::new(ChcExpr::Bool(true)))
+                .collect(),
+        )
+    }
+
+    let limit = super::logic_detection::MAX_DT_EXPR_NODES;
+    assert!(collect_dt_declarations_for_expr(&[], &flat_expr(limit - 1)).is_ok());
+    assert!(matches!(
+        collect_dt_declarations_for_expr(&[], &flat_expr(limit)),
+        Err(
+            super::logic_detection::DatatypeDeclarationError::ResourceLimit(
+                "datatype expression nodes"
+            )
+        )
+    ));
+}
+
+#[test]
+fn test_emit_declare_datatypes_definition_cap_is_exact() {
+    let names: Vec<_> = (0..=super::logic_detection::MAX_DT_DECLARATIONS)
+        .map(|index| format!("D{index:03}"))
+        .collect();
+    let constructors: Vec<_> = (0..=super::logic_detection::MAX_DT_DECLARATIONS)
+        .map(|index| {
+            vec![ChcDtConstructor {
+                name: format!("mk-D{index:03}"),
+                selectors: Vec::new(),
+            }]
+        })
+        .collect();
+    let declarations: Vec<_> = names
+        .iter()
+        .zip(&constructors)
+        .map(|(name, constructors)| (name.as_str(), constructors.as_slice()))
+        .collect();
+
+    assert!(
+        emit_declare_datatypes(&declarations[..super::logic_detection::MAX_DT_DECLARATIONS])
+            .is_ok()
+    );
+    assert!(matches!(
+        emit_declare_datatypes(&declarations),
+        Err(
+            super::logic_detection::DatatypeDeclarationError::ResourceLimit("datatype definitions")
+        )
+    ));
+}
+
+#[test]
+fn test_collect_dt_declarations_constructor_cap_is_exact() {
+    fn datatype_with_constructors(count: usize) -> ChcSort {
+        ChcSort::Datatype {
+            name: "Wide".to_string(),
+            constructors: Arc::new(
+                (0..count)
+                    .map(|index| ChcDtConstructor {
+                        name: format!("wide-{index}"),
+                        selectors: Vec::new(),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    assert!(collect_dt_declarations(&[ChcVar::new(
+        "at-cap",
+        datatype_with_constructors(super::logic_detection::MAX_DT_CONSTRUCTORS),
+    )])
+    .is_ok());
+    assert!(matches!(
+        collect_dt_declarations(&[ChcVar::new(
+            "over-cap",
+            datatype_with_constructors(super::logic_detection::MAX_DT_CONSTRUCTORS + 1),
+        )]),
+        Err(
+            super::logic_detection::DatatypeDeclarationError::ResourceLimit(
+                "datatype constructors"
+            )
+        )
+    ));
+}
+
+#[test]
+fn test_executor_problem_expr_node_cap_is_aggregate_and_exact() {
+    fn flat_expr(child_count: usize) -> ChcExpr {
+        ChcExpr::Op(
+            crate::ChcOp::And,
+            (0..child_count)
+                .map(|_| Arc::new(ChcExpr::Bool(true)))
+                .collect(),
+        )
+    }
+
+    let limit = super::logic_detection::MAX_DT_EXPR_NODES;
+    let left_children = (limit - 2) / 2;
+    let right_children = limit - 2 - left_children;
+    let left = flat_expr(left_children);
+    let exact_right = flat_expr(right_children);
+    collect_uninterpreted_function_declarations_for_exprs([&left, &exact_right])
+        .expect("two roots totaling exactly the executor node cap must be admitted");
+
+    let over_right = flat_expr(right_children + 1);
+    let error = collect_uninterpreted_function_declarations_for_exprs([&left, &over_right])
+        .expect_err("separate roots must not reset the aggregate expression-node cap");
+    assert!(error.to_string().contains("expression nodes"));
+}
+
+#[test]
+fn test_executor_problem_name_byte_cap_is_aggregate_and_exact() {
+    let limit = super::logic_detection::MAX_EXECUTOR_SURFACE_NAME_BYTES;
+    let left_len = limit / 2;
+    let right_len = limit - left_len;
+    let left = ChcExpr::var(ChcVar::new("l".repeat(left_len), ChcSort::Int));
+    let exact_right = ChcExpr::var(ChcVar::new("r".repeat(right_len), ChcSort::Int));
+    collect_uninterpreted_function_declarations_for_exprs([&left, &exact_right])
+        .expect("two roots totaling exactly the executor name-byte cap must be admitted");
+
+    let over_right = ChcExpr::var(ChcVar::new("r".repeat(right_len + 1), ChcSort::Int));
+    let error = collect_uninterpreted_function_declarations_for_exprs([&left, &over_right])
+        .expect_err("separate roots must not reset the aggregate name-byte cap");
+    assert!(error.to_string().contains("surface name bytes"));
+}
+
+#[test]
+fn test_executor_problem_uf_declaration_cap_is_aggregate_and_exact() {
+    let mut problem = crate::ChcProblem::new();
+    for index in 0..super::logic_detection::MAX_EXECUTOR_UF_DECLARATIONS {
+        problem.add_clause(crate::HornClause::new(
+            crate::ClauseBody::constraint(ChcExpr::FuncApp(
+                format!("uf-{index}"),
+                ChcSort::Bool,
+                Vec::new(),
+            )),
+            crate::ClauseHead::False,
+        ));
+    }
+    let declarations = collect_uninterpreted_function_declarations_for_problem(&problem)
+        .expect("the exact whole-problem UF declaration boundary must be admitted");
+    assert_eq!(
+        declarations.len(),
+        super::logic_detection::MAX_EXECUTOR_UF_DECLARATIONS
+    );
+
+    problem.add_clause(crate::HornClause::new(
+        crate::ClauseBody::constraint(ChcExpr::FuncApp(
+            "uf-over-cap".to_string(),
+            ChcSort::Bool,
+            Vec::new(),
+        )),
+        crate::ClauseHead::False,
+    ));
+    let error = collect_uninterpreted_function_declarations_for_problem(&problem)
+        .expect_err("one UF in another clause must not bypass the whole-problem cap");
+    assert!(error.to_string().contains("UF declarations"));
+}
+
+#[test]
+fn test_executor_uf_application_occurrence_cap_is_aggregate_and_exact() {
+    let application = ChcExpr::FuncApp("f".to_string(), ChcSort::Bool, Vec::new());
+    let exact: Vec<ChcExpr> = (0..super::logic_detection::MAX_EXECUTOR_UF_APPLICATIONS)
+        .map(|_| application.clone())
+        .collect();
+    let applications = collect_uninterpreted_function_applications_for_exprs(exact.iter())
+        .expect("the exact aggregate UF application boundary must be admitted");
+    assert_eq!(applications, vec![application.clone()]);
+
+    let over = exact
+        .iter()
+        .chain(std::iter::once(&application))
+        .collect::<Vec<_>>();
+    let error = collect_uninterpreted_function_applications_for_exprs(over)
+        .expect_err("one repeated UF occurrence in another root must exceed the aggregate cap");
+    assert!(error.to_string().contains("UF application occurrences"));
+}
+
+fn nested_scalar_uf_chain(depth: usize) -> ChcExpr {
+    let mut expression = ChcExpr::var(ChcVar::new("uf_chain_leaf", ChcSort::Int));
+    for index in 0..depth {
+        expression = ChcExpr::FuncApp(
+            format!("f{index}"),
+            ChcSort::Int,
+            vec![Arc::new(expression)],
+        );
+    }
+    expression
+}
+
+fn unary_uf_chain_alias_work(depth: usize) -> usize {
+    // Prefix i contains i UF applications plus the leaf variable.
+    depth * (depth + 3) / 2
+}
+
+#[test]
+fn test_emit_uf_aliases_nested_chain_byte_and_work_boundaries_are_exact() {
+    let depth = 6;
+    let chain = nested_scalar_uf_chain(depth);
+    let mut next_alias = 0;
+    let aliases = build_uf_application_aliases([&chain], &mut next_alias).unwrap();
+    assert_eq!(aliases.len(), depth);
+    let exact_work = unary_uf_chain_alias_work(depth);
+
+    let unbounded = emit_uf_application_aliases_with_limits(
+        &aliases,
+        None,
+        UfApplicationAliasEmissionLimits {
+            emitted_bytes: usize::MAX,
+            serializer_work: usize::MAX,
+        },
+    )
+    .unwrap();
+    let exact_bytes = unbounded.len();
+    let legacy = aliases
+        .iter()
+        .map(|alias| {
+            let quoted_alias = quote_symbol(&alias.alias);
+            format!(
+                "(declare-const {} {})\n(assert (= {} {}))\n",
+                quoted_alias,
+                sort_to_smtlib(&alias.application.sort()),
+                quoted_alias,
+                InvariantModel::expr_to_smtlib(&alias.application),
+            )
+        })
+        .collect::<String>();
+    assert_eq!(
+        unbounded, legacy,
+        "the bounded iterative writer must preserve the established alias wire format"
+    );
+
+    let exact = emit_uf_application_aliases_with_limits(
+        &aliases,
+        None,
+        UfApplicationAliasEmissionLimits {
+            emitted_bytes: exact_bytes,
+            serializer_work: exact_work,
+        },
+    )
+    .expect("the exact aggregate byte/work boundary must be admitted");
+    assert_eq!(exact, unbounded);
+
+    assert!(matches!(
+        emit_uf_application_aliases_with_limits(
+            &aliases,
+            None,
+            UfApplicationAliasEmissionLimits {
+                emitted_bytes: exact_bytes - 1,
+                serializer_work: exact_work,
+            },
+        ),
+        Err(UfApplicationAliasEmissionError::ResourceLimit(
+            "emitted bytes"
+        ))
+    ));
+    assert!(matches!(
+        emit_uf_application_aliases_with_limits(
+            &aliases,
+            None,
+            UfApplicationAliasEmissionLimits {
+                emitted_bytes: exact_bytes,
+                serializer_work: exact_work - 1,
+            },
+        ),
+        Err(UfApplicationAliasEmissionError::ResourceLimit(
+            "serializer work"
+        ))
+    ));
+}
+
+#[test]
+fn test_emit_uf_aliases_nested_chain_production_work_cap_is_exact() {
+    let work_limit = super::logic_detection::MAX_EXECUTOR_UF_ALIAS_EMIT_WORK;
+    let mut depth = 0usize;
+    while unary_uf_chain_alias_work(depth + 1) <= work_limit {
+        depth += 1;
+    }
+    let chain = nested_scalar_uf_chain(depth);
+    let mut next_alias = 0;
+    let mut aliases = build_uf_application_aliases([&chain], &mut next_alias).unwrap();
+    let base_work = unary_uf_chain_alias_work(depth);
+    assert!(base_work <= work_limit);
+    assert!(unary_uf_chain_alias_work(depth + 1) > work_limit);
+
+    // Nullary applications cost exactly one serializer visit, so fill the
+    // triangular-chain gap and exercise the literal production boundary.
+    for index in 0..(work_limit - base_work) {
+        aliases.push(UfApplicationAlias {
+            alias: format!("manual_alias_{index}"),
+            application: ChcExpr::FuncApp(format!("manual_uf_{index}"), ChcSort::Int, Vec::new()),
+        });
+    }
+    emit_uf_application_aliases(&aliases, None)
+        .expect("exact production serializer-work boundary must be admitted");
+
+    aliases.push(UfApplicationAlias {
+        alias: "manual_alias_over_cap".to_string(),
+        application: ChcExpr::FuncApp("manual_uf_over_cap".to_string(), ChcSort::Int, Vec::new()),
+    });
+    assert!(matches!(
+        emit_uf_application_aliases(&aliases, None),
+        Err(UfApplicationAliasEmissionError::ResourceLimit(
+            "serializer work"
+        ))
+    ));
+}
+
+#[test]
+fn test_emit_uf_aliases_observes_explicit_deadline_before_serialization() {
+    let aliases = [UfApplicationAlias {
+        alias: "deadline_alias".to_string(),
+        application: ChcExpr::FuncApp("deadline_uf".to_string(), ChcSort::Int, Vec::new()),
+    }];
+    assert_eq!(
+        emit_uf_application_aliases(&aliases, Some(ay_core::time::Instant::now())),
+        Err(UfApplicationAliasEmissionError::DeadlineExpired)
+    );
+}
+
+#[test]
+fn test_emit_uf_aliases_accounts_const_array_sort_work_exactly() {
+    let array = ChcExpr::ConstArray(ChcSort::Int, Arc::new(ChcExpr::Int(7)));
+    let selected = ChcExpr::Op(
+        crate::ChcOp::Select,
+        vec![Arc::new(array), Arc::new(ChcExpr::Int(0))],
+    );
+    let aliases = [UfApplicationAlias {
+        alias: "const_array_alias".to_string(),
+        application: ChcExpr::FuncApp(
+            "const_array_uf".to_string(),
+            ChcSort::Int,
+            vec![Arc::new(selected)],
+        ),
+    }];
+    let limits = UfApplicationAliasEmissionLimits {
+        emitted_bytes: usize::MAX,
+        serializer_work: 8,
+    };
+    emit_uf_application_aliases_with_limits(&aliases, None, limits)
+        .expect("exact expression plus hidden const-array sort work must be admitted");
+
+    assert!(matches!(
+        emit_uf_application_aliases_with_limits(
+            &aliases,
+            None,
+            UfApplicationAliasEmissionLimits {
+                serializer_work: 7,
+                ..limits
+            },
+        ),
+        Err(UfApplicationAliasEmissionError::ResourceLimit(
+            "serializer work"
+        ))
+    ));
+}
+
+#[test]
+fn test_executor_declines_oversized_mod_surface_before_axiomatization() {
+    let x = ChcExpr::var(ChcVar::new("x", ChcSort::Int));
+    let one_mod = ChcExpr::Op(
+        crate::ChcOp::Mod,
+        vec![Arc::new(x), Arc::new(ChcExpr::Int(3))],
+    );
+    let oversized = ChcExpr::Op(
+        crate::ChcOp::And,
+        (0..super::logic_detection::MAX_DT_EXPR_NODES)
+            .map(|_| Arc::new(one_mod.clone()))
+            .collect(),
+    );
+    let result = SmtContext::new().check_sat_via_executor(
+        &oversized,
+        &FxHashMap::default(),
+        std::time::Duration::from_secs(1),
+    );
+    assert!(
+        matches!(result, SmtResult::Unknown),
+        "oversized mod/div input must fail closed at the iterative pre-gate"
+    );
 }
 
 // ========================================================================
@@ -1866,6 +2785,112 @@ fn split_leading_set_logic_falls_back_and_leaves_unrecognized_input_alone() {
     }
 }
 mod strict_unsat;
+
+#[test]
+fn bounded_smtlib_adapter_reaches_executor_under_live_resources() {
+    let script = "(set-logic QF_LIA)\n\
+                  (declare-const x Int)\n\
+                  (assert (> x 5))\n\
+                  (assert (< x 3))\n\
+                  (check-sat)\n";
+    let verdict = smtlib_first_verdict_via_executor_until(
+        script,
+        Instant::now() + std::time::Duration::from_secs(5),
+        Some(usize::MAX),
+    );
+    assert_eq!(
+        verdict.as_deref(),
+        Some("unsat"),
+        "the bounded adapter must reach ay-dpll, not stop at an SmtContext preflight"
+    );
+}
+
+#[test]
+fn bounded_smtlib_adapter_fails_closed_on_stale_or_exhausted_term_resources() {
+    let script = "(set-logic QF_LIA)\n(assert false)\n(check-sat)\n";
+    assert_eq!(
+        smtlib_first_verdict_via_executor_until(script, Instant::now(), Some(usize::MAX)),
+        None,
+        "an already-expired absolute deadline must not launch a solver"
+    );
+    assert_eq!(
+        smtlib_first_verdict_via_executor_until(
+            script,
+            Instant::now() + std::time::Duration::from_secs(5),
+            Some(1),
+        ),
+        None,
+        "a one-byte term-store ceiling must reach ay-dpll and block publication"
+    );
+}
+
+#[test]
+fn bounded_smtlib_adapter_rejects_timeout_overrides() {
+    let script = "(set-logic QF_LIA)\n\
+                  (set-option :timeout 0)\n\
+                  (assert false)\n\
+                  (check-sat)\n";
+    assert_eq!(
+        smtlib_first_verdict_via_executor_until(
+            script,
+            Instant::now() + std::time::Duration::from_secs(5),
+            Some(usize::MAX),
+        ),
+        None,
+        "the script must not replace its caller-installed absolute deadline"
+    );
+}
+
+#[test]
+fn smt_context_executor_adapter_forwards_its_term_memory_budget() {
+    let x = ChcExpr::var(ChcVar::new("x", ChcSort::Int));
+    let contradiction = ChcExpr::and(
+        ChcExpr::gt(x.clone(), ChcExpr::Int(5)),
+        ChcExpr::lt(x, ChcExpr::Int(3)),
+    );
+    let propagated_model = FxHashMap::default();
+
+    let mut live = SmtContext::new();
+    live.set_term_memory_budget(Some(usize::MAX));
+    assert!(matches!(
+        live.check_sat_via_executor(
+            &contradiction,
+            &propagated_model,
+            std::time::Duration::from_secs(5),
+        ),
+        SmtResult::Unsat
+    ));
+
+    let mut exhausted = SmtContext::new();
+    exhausted.set_term_memory_budget(Some(1));
+    assert!(matches!(
+        exhausted.check_sat_via_executor(
+            &contradiction,
+            &propagated_model,
+            std::time::Duration::from_secs(5),
+        ),
+        SmtResult::Unknown
+    ));
+}
+
+#[test]
+fn smt_context_executor_adapter_honors_expired_ambient_solve_deadline() {
+    let _deadline = crate::smt::ScopedSolveDeadline::new(Some(Instant::now()));
+    let x = ChcExpr::var(ChcVar::new("ambient_deadline_x", ChcSort::Int));
+    let contradiction = ChcExpr::and(
+        ChcExpr::gt(x.clone(), ChcExpr::Int(5)),
+        ChcExpr::lt(x, ChcExpr::Int(3)),
+    );
+
+    assert!(matches!(
+        SmtContext::new().check_sat_via_executor(
+            &contradiction,
+            &FxHashMap::default(),
+            std::time::Duration::from_secs(5),
+        ),
+        SmtResult::Unknown
+    ));
+}
 
 /// #cert-accounting item 3/6: the declared query role reaches ay-dpll and is
 /// attributed there, and declaring it changes no verdict.

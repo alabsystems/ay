@@ -24,9 +24,10 @@ impl TermStore {
     /// into OR/NOT/=> to avoid creating extra variables inside clauses.
     pub fn decompose_arithmetic_eq(&mut self, term: TermId) -> TermId {
         match self.get(term).clone() {
-            TermData::App(Symbol::Named(ref name), ref args) if name == "=" && args.len() == 2 => {
-                let lhs = args[0];
-                let rhs = args[1];
+            TermData::App(Symbol::Named(ref name), ref args) if name == "=" => {
+                let &[lhs, rhs] = args.as_slice() else {
+                    return term;
+                };
                 let lhs_sort = self.sort(lhs).clone();
                 if matches!(lhs_sort, Sort::Real | Sort::Int) {
                     // (= e1 e2) -> (and (<= e1 e2) (>= e1 e2))
@@ -68,11 +69,10 @@ impl TermStore {
     pub fn decompose_disequality(&mut self, term: TermId) -> TermId {
         match self.get(term).clone() {
             // (distinct e1 e2) where both are arithmetic
-            TermData::App(Symbol::Named(ref name), ref args)
-                if name == "distinct" && args.len() == 2 =>
-            {
-                let lhs = args[0];
-                let rhs = args[1];
+            TermData::App(Symbol::Named(ref name), ref args) if name == "distinct" => {
+                let &[lhs, rhs] = args.as_slice() else {
+                    return term;
+                };
                 let lhs_sort = self.sort(lhs).clone();
                 if matches!(lhs_sort, Sort::Real | Sort::Int) {
                     let lt = self.mk_app(Symbol::Named("<".into()), vec![lhs, rhs], Sort::Bool);
@@ -84,11 +84,10 @@ impl TermStore {
             }
             // (not (= e1 e2)) where both are arithmetic
             TermData::Not(inner) => match self.get(inner).clone() {
-                TermData::App(Symbol::Named(ref name), ref eq_args)
-                    if name == "=" && eq_args.len() == 2 =>
-                {
-                    let lhs = eq_args[0];
-                    let rhs = eq_args[1];
+                TermData::App(Symbol::Named(ref name), ref eq_args) if name == "=" => {
+                    let &[lhs, rhs] = eq_args.as_slice() else {
+                        return term;
+                    };
                     let lhs_sort = self.sort(lhs).clone();
                     if matches!(lhs_sort, Sort::Real | Sort::Int) {
                         let lt = self.mk_app(Symbol::Named("<".into()), vec![lhs, rhs], Sort::Bool);

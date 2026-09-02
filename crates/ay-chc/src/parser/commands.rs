@@ -15,6 +15,17 @@ use crate::{ChcError, ChcExpr, ChcResult, ChcSort, ChcVar, ClauseBody, ClauseHea
 use ay_core::kani_compat::DetHashSet as FxHashSet;
 use std::sync::Arc;
 
+/// Function-position symbols parsed as theory operators rather than declarations.
+pub(super) const BUILTIN_TERM_SYMBOLS: &[&str] = &[
+    "*", "+", "-", "/", "<", "<=", "=", "=>", ">", ">=", "_", "and", "as", "bv2int", "bv2nat",
+    "bvadd", "bvand", "bvashr", "bvcomp", "bvlshr", "bvmul", "bvnand", "bvneg", "bvnor", "bvnot",
+    "bvor", "bvsdiv", "bvsdiv_i", "bvsge", "bvsgt", "bvshl", "bvsle", "bvslt", "bvsmod",
+    "bvsmod_i", "bvsrem", "bvsrem_i", "bvsub", "bvudiv", "bvudiv_i", "bvuge", "bvugt", "bvule",
+    "bvult", "bvurem", "bvurem_i", "bvxnor", "bvxor", "concat", "const", "distinct", "div",
+    "exists", "false", "forall", "implies", "is_int", "ite", "let", "mod", "not", "or", "select",
+    "store", "to_int", "to_real", "true",
+];
+
 impl ChcParser {
     /// Parse a single command
     pub(super) fn parse_command(&mut self) -> ChcResult<()> {
@@ -113,7 +124,65 @@ impl ChcParser {
         Ok(())
     }
 
-    /// Parse a declare-rel or declare-fun command
+    /// Reject a declaration that would make a term symbol ambiguous.
+    ///
+    /// Predicates, ordinary functions, datatype functions, and file-scoped
+    /// variables all share the parser's term-symbol lookup.  Accepting the same
+    /// surface name in two of those tables would make parse order choose the
+    /// meaning, rather than the SMT-LIB declaration.
+    fn ensure_fresh_term_symbol(&self, name: &str, new_kind: &str) -> ChcResult<()> {
+        if BUILTIN_TERM_SYMBOLS.contains(&name) {
+            return Err(ChcError::Parse(format!(
+                "Cannot declare {new_kind} '{name}': symbol is already defined by the active logic"
+            )));
+        }
+
+        let existing_kind = if self.predicates.contains_key(name) {
+            Some("predicate")
+        } else if self.functions.contains_key(name) {
+            Some("function")
+        } else if self.declared_var_names.contains(name) {
+            Some("variable")
+        } else {
+            None
+        };
+
+        if let Some(existing_kind) = existing_kind {
+            return Err(ChcError::Parse(format!(
+                "Cannot declare {new_kind} '{name}': symbol is already declared as a {existing_kind}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Register a datatype constructor, selector, or tester.
+    ///
+    /// Datatype functions may overload one another, but never an ordinary UF,
+    /// predicate, or file-scoped variable.
+    fn register_datatype_function(
+        &mut self,
+        name: String,
+        ret_sort: ChcSort,
+        arg_sorts: Vec<ChcSort>,
+    ) -> ChcResult<()> {
+        if BUILTIN_TERM_SYMBOLS.contains(&name.as_str()) {
+            return Err(ChcError::Parse(format!(
+                "Cannot declare datatype function '{name}': symbol is already defined by the active logic"
+            )));
+        }
+        if self.uninterpreted_functions.contains(&name)
+            || self.predicates.contains_key(&name)
+            || self.declared_var_names.contains(&name)
+        {
+            return Err(ChcError::Parse(format!(
+                "Cannot declare datatype function '{name}': symbol is already declared"
+            )));
+        }
+        self.register_function(name, ret_sort, arg_sorts);
+        Ok(())
+    }
+
+    /// Parse a declare-rel or declare-fun command.
     fn parse_declare_predicate(&mut self, cmd: &str) -> ChcResult<()> {
         self.skip_whitespace_and_comments();
         let name = self.parse_symbol()?;
@@ -131,17 +200,41 @@ impl ChcParser {
         }
         self.expect_char(')')?;
 
-        // For declare-fun, also parse return sort
-        if cmd == "declare-fun" {
+        // `declare-rel` and Bool-returning `declare-fun` introduce CHC
+        // predicates.  Every other `declare-fun` is an ordinary UF retained in
+        // `ChcExpr::FuncApp`; the SMT core supplies congruence semantics.
+        let return_sort = if cmd == "declare-fun" {
             self.skip_whitespace_and_comments();
-            let ret_sort = self.parse_sort()?;
-            if ret_sort != ChcSort::Bool {
-                // Non-Bool functions are not supported - fail with error (fixes #352)
+            self.parse_sort()?
+        } else {
+            ChcSort::Bool
+        };
+
+        self.ensure_fresh_term_symbol(
+            &name,
+            if return_sort == ChcSort::Bool {
+                "predicate"
+            } else {
+                "function"
+            },
+        )?;
+
+        if return_sort != ChcSort::Bool {
+            let scalar = |sort: &ChcSort| {
+                matches!(
+                    sort,
+                    ChcSort::Bool | ChcSort::Int | ChcSort::Real | ChcSort::BitVec(_)
+                )
+            };
+            if !scalar(&return_sort) || !sorts.iter().all(|sort| scalar(sort)) {
                 return Err(ChcError::Parse(format!(
-                    "Non-predicate function declaration: '{name}' with return sort {ret_sort:?}. \
-                     Only Bool-returning functions (predicates) are supported in ay-chc."
+                    "Unsupported non-scalar uninterpreted function declaration '{name}': \
+                     scalar arguments and return sort are required"
                 )));
             }
+            self.uninterpreted_functions.insert(name.clone());
+            self.register_function(name, return_sort, sorts);
+            return Ok(());
         }
 
         // Register predicate
@@ -157,6 +250,8 @@ impl ChcParser {
         let name = self.parse_symbol()?;
         self.skip_whitespace_and_comments();
         let sort = self.parse_sort()?;
+
+        self.ensure_fresh_term_symbol(&name, "variable")?;
 
         // Track separately from `variables` so a quantifier binder can tell a
         // file-scoped declare-var apart from another binder. Both kinds capture;
@@ -277,20 +372,28 @@ impl ChcParser {
             let mut selector_sorts: Vec<ChcSort> = Vec::new();
             for (sel_name, sel_sort) in selectors {
                 let resolved_sort = self.resolve_sort_refs(sel_sort);
-                self.register_function(
+                self.register_datatype_function(
                     sel_name.clone(),
                     resolved_sort.clone(),
                     vec![datatype_sort.clone()],
-                );
+                )?;
                 selector_sorts.push(resolved_sort);
             }
 
             // Register constructor: (field_sorts) -> datatype
-            self.register_function(ctor_name.clone(), datatype_sort.clone(), selector_sorts);
+            self.register_datatype_function(
+                ctor_name.clone(),
+                datatype_sort.clone(),
+                selector_sorts,
+            )?;
 
             // Register tester: datatype -> Bool
             let tester_name = format!("is-{ctor_name}");
-            self.register_function(tester_name, ChcSort::Bool, vec![datatype_sort.clone()]);
+            self.register_datatype_function(
+                tester_name,
+                ChcSort::Bool,
+                vec![datatype_sort.clone()],
+            )?;
         }
         Ok(())
     }
@@ -456,16 +559,24 @@ impl ChcParser {
                 let mut selector_sorts: Vec<ChcSort> = Vec::new();
                 for (sel_name, sel_sort) in selectors {
                     let resolved_sort = self.resolve_sort_refs(sel_sort);
-                    self.register_function(
+                    self.register_datatype_function(
                         sel_name.clone(),
                         resolved_sort.clone(),
                         vec![datatype_sort.clone()],
-                    );
+                    )?;
                     selector_sorts.push(resolved_sort);
                 }
-                self.register_function(ctor_name.clone(), datatype_sort.clone(), selector_sorts);
+                self.register_datatype_function(
+                    ctor_name.clone(),
+                    datatype_sort.clone(),
+                    selector_sorts,
+                )?;
                 let tester_name = format!("is-{ctor_name}");
-                self.register_function(tester_name, ChcSort::Bool, vec![datatype_sort.clone()]);
+                self.register_datatype_function(
+                    tester_name,
+                    ChcSort::Bool,
+                    vec![datatype_sort.clone()],
+                )?;
             }
         }
         Ok(())

@@ -35,6 +35,7 @@ pub(in crate::pdr) fn value_expr_from_model(
             ChcExpr::Var(v) => match model.get(&v.name) {
                 Some(SmtValue::Int(n)) => Some(*n),
                 Some(SmtValue::BitVec(n, _w)) => i128::try_from(*n).ok(),
+                Some(SmtValue::BigBitVec(n, _w)) => num_traits::ToPrimitive::to_i128(n.as_ref()),
                 _ => None,
             },
             ChcExpr::Op(op, args) => match op {
@@ -149,6 +150,7 @@ pub(in crate::pdr) fn value_expr_from_model(
                     | SmtValue::BigInt(_)
                     | SmtValue::Real(_)
                     | SmtValue::BitVec(_, _)
+                    | SmtValue::BigBitVec(_, _)
                     | SmtValue::Opaque(_)
                     | SmtValue::ConstArray(_)
                     | SmtValue::ArrayMap { .. }

@@ -15,7 +15,8 @@ use crate::engine_result::ValidationEvidence;
 use crate::kind::{KindConfig, KindResult, KindSolver};
 use crate::pdr::counterexample::{DerivationWitness, DerivationWitnessEntry};
 use crate::pdr::{Counterexample, CounterexampleStep, InvariantModel, PdrConfig, PdrSolver};
-use crate::portfolio::{PortfolioResult, PortfolioSolver, PreprocessSummary};
+use crate::portfolio::types::{BudgetPolicy, EngineType};
+use crate::portfolio::{PortfolioConfig, PortfolioResult, PortfolioSolver, PreprocessSummary};
 use crate::smt::{SmtResult, SmtValue};
 use crate::{
     ChcExpr, ChcOp, ChcProblem, ChcSort, ChcVar, ClauseBody, ClauseHead, PredicateId,
@@ -26,13 +27,23 @@ use ay_core::time::Instant;
 use ay_sat::TlaTraceable;
 use std::time::Duration;
 
-use crate::adaptive::{AdaptivePortfolio, ADAPTIVE_SOLVER_STACK_SIZE};
+use crate::adaptive::{
+    deterministic_array_forwarded_surface_caps, AdaptivePortfolio, StagedProbeBudgetProfile,
+    ADAPTIVE_SOLVER_STACK_SIZE,
+};
+use crate::adaptive_route_admission::admit_problem_clone_fanout;
 
 /// #8287 / FIX #2c: expanded-Bool state size above which bit-blasting lanes
 /// are intractable (state-space explosion; BvToBool has no cancellation check
 /// inside the transform). Shared by Lane A's skip and the MultiPredComplex
 /// stage-0.15 bit-blasted refutation probes.
 pub(crate) const BVTOBOOL_EXPANDED_SKIP_THRESHOLD: usize = 400;
+
+// Exact maximum number of new full `ChcProblem` clones allocated during
+// pre-spawn preparation for each production BV race. These are structural
+// fanouts, not user-tunable limits.
+const BV_DUAL_LANE_PROBLEM_CLONE_FANOUT: usize = 5;
+const BV_ARRAY_PROBLEM_CLONE_FANOUT: usize = 2;
 
 /// Maximum per-predicate expanded Boolean state size under BvToBool.
 ///
@@ -386,6 +397,18 @@ fn sample_reachable_states(
     problem: &ChcProblem,
     budget: Duration,
 ) -> FxHashMap<PredicateId, Vec<Vec<i128>>> {
+    // This legacy sampler stores every value in `i128` and constructs masks
+    // with native shifts.  Keep the guard here (rather than relying on a
+    // particular caller) so a future lane cannot accidentally truncate a
+    // BigBitVec or shift by 128+.
+    if problem.predicates().iter().any(|predicate| {
+        predicate
+            .arg_sorts
+            .iter()
+            .any(|sort| matches!(sort, ChcSort::BitVec(width) if *width == 0 || *width >= 128))
+    }) {
+        return FxHashMap::default();
+    }
     const MAX_PER_PRED: usize = 8;
     const ROUNDS: usize = 8;
     let deadline = Instant::now() + budget;
@@ -2627,6 +2650,17 @@ fn sample_states_i2(
     problem: &ChcProblem,
     budget: Duration,
 ) -> FxHashMap<PredicateId, Vec<Vec<i128>>> {
+    // Both I2 and the reve lane call this sampler.  It is intentionally a
+    // narrow, i128-backed candidate source, so reject wide predicates at the
+    // boundary instead of depending on every caller to remember the guard.
+    if problem.predicates().iter().any(|predicate| {
+        predicate
+            .arg_sorts
+            .iter()
+            .any(|sort| matches!(sort, ChcSort::BitVec(width) if *width == 0 || *width >= 128))
+    }) {
+        return FxHashMap::default();
+    }
     use std::sync::Arc;
     const MAX_PER_PRED: usize = 24;
     const ROUNDS: usize = 16;
@@ -2866,6 +2900,16 @@ fn try_data_driven_houdini(problem: &ChcProblem, budget: Duration) -> Option<Inv
         || problem.has_real_sorts()
         || problem.has_datatype_sorts()
         || problem.clauses().len() > 80
+        // This candidate-mining lane deliberately stores samples in i128 and
+        // constructs masks with `1u128 << width`. Wide values are handled by
+        // the exact SMT/PDR lanes; admitting them here would both drop
+        // BigBitVec samples and panic at width >= 128. Candidate lanes may
+        // decline a problem, but must never truncate a witness.
+        || problem.predicates().iter().any(|predicate| {
+            predicate.arg_sorts.iter().any(
+                |sort| matches!(sort, ChcSort::BitVec(width) if *width == 0 || *width >= 128),
+            )
+        })
     {
         return None;
     }
@@ -3737,6 +3781,14 @@ fn try_reve_accumulator_invariant(
         || problem.has_real_sorts()
         || problem.has_datatype_sorts()
         || problem.clauses().len() > 80
+        // REVE shares the i128-backed sampler and candidate representation
+        // with I2. Wide BVs are served by exact SMT/PDR lanes; this optional
+        // synthesis lane must decline rather than truncate BigBitVec samples.
+        || problem.predicates().iter().any(|predicate| {
+            predicate.arg_sorts.iter().any(
+                |sort| matches!(sort, ChcSort::BitVec(width) if *width == 0 || *width >= 128),
+            )
+        })
     {
         return None;
     }
@@ -4523,19 +4575,124 @@ fn bv_reve_equivalence_model_is_certified(problem: &ChcProblem) -> bool {
     true
 }
 
-fn join_finished_lanes_until_deadline<I>(handles: I, join_deadline: Instant)
+fn bv_lane_route_deadline(
+    started_at: Instant,
+    budget: Duration,
+    enclosing: Option<Instant>,
+) -> Instant {
+    let requested = started_at + budget;
+    enclosing.map_or(requested, |deadline| requested.min(deadline))
+}
+
+fn bv_lane_boundary_open(deadline: Instant, cancellation: &crate::CancellationToken) -> bool {
+    !cancellation.is_cancelled() && Instant::now() < deadline
+}
+
+fn bv_lane_remaining(
+    deadline: Instant,
+    cancellation: &crate::CancellationToken,
+) -> Option<Duration> {
+    if !bv_lane_boundary_open(deadline, cancellation) {
+        return None;
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+/// Clone one lane input only while the authoritative route boundary is open.
+///
+/// `ChcProblem::clone` itself is synchronous. The route first admits its exact
+/// aggregate fanout under the existing cooperative surface caps, which bounds
+/// this uninterruptible interval; this check on both sides then prevents a
+/// cancelled or expired copy from reaching a worker.
+fn clone_bv_problem_at_boundary(
+    problem: &ChcProblem,
+    deadline: Instant,
+    cancellation: &crate::CancellationToken,
+) -> Option<ChcProblem> {
+    if !bv_lane_boundary_open(deadline, cancellation) {
+        return None;
+    }
+    let clone = problem.clone();
+    bv_lane_boundary_open(deadline, cancellation).then_some(clone)
+}
+
+fn clamp_bv_lane_portfolio_config(
+    mut config: PortfolioConfig,
+    deadline: Instant,
+    cancellation: &crate::CancellationToken,
+) -> Option<PortfolioConfig> {
+    let remaining = bv_lane_remaining(deadline, cancellation)?;
+    config.external_cancellation = Some(cancellation.clone());
+    if config.parallel {
+        config.parallel_timeout = Some(
+            config
+                .parallel_timeout
+                .map_or(remaining, |configured| configured.min(remaining)),
+        );
+    } else {
+        config.timeout = Some(
+            config
+                .timeout
+                .map_or(remaining, |configured| configured.min(remaining)),
+        );
+    }
+    Some(config)
+}
+
+fn clamp_bv_lane_staged_probe_config(
+    config: PortfolioConfig,
+    deadline: Instant,
+    cancellation: &crate::CancellationToken,
+    profile: StagedProbeBudgetProfile,
+    caller_budgets: &[(EngineType, BudgetPolicy)],
+) -> Option<PortfolioConfig> {
+    let mut config = clamp_bv_lane_portfolio_config(config, deadline, cancellation)?;
+    AdaptivePortfolio::reconcile_staged_probe_budget_defaults(
+        &mut config,
+        profile,
+        caller_budgets,
+        None,
+    );
+    Some(config)
+}
+
+fn run_bv_lane_with_deadline<T>(deadline: Instant, run: impl FnOnce() -> T) -> T {
+    // Worker threads do not inherit either thread-local deadline. Install both
+    // absolute scopes so every nested SMT context and solver construction sees
+    // the same authoritative route boundary.
+    let _solve_deadline = crate::smt::ScopedSolveDeadline::new(Some(deadline));
+    let _smt_deadline = crate::smt::ScopedSmtDeadline::install_until(deadline);
+    run()
+}
+
+fn reject_late_bv_lane_result(
+    result: PortfolioResult,
+    deadline: Instant,
+    cancellation: &crate::CancellationToken,
+) -> PortfolioResult {
+    if matches!(
+        &result,
+        PortfolioResult::Safe(_) | PortfolioResult::Unsafe(_)
+    ) && !bv_lane_boundary_open(deadline, cancellation)
+    {
+        PortfolioResult::Unknown
+    } else {
+        result
+    }
+}
+
+fn join_bv_lanes<I>(handles: I)
 where
     I: IntoIterator<Item = std::thread::JoinHandle<()>>,
 {
     for handle in handles {
-        while !handle.is_finished() && Instant::now() < join_deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if handle.is_finished() {
-            let _ = handle.join();
-        } else {
-            drop(handle);
-        }
+        // Rust cannot safely kill a thread. Every BV lane receives linked
+        // cooperative cancellation and the absolute deadline, then is always
+        // synchronously reaped. This may wait for a currently executing
+        // transform stage to reach its next cancellation boundary, but no
+        // solver worker can outlive this route invocation.
+        let _ = handle.join();
     }
 }
 
@@ -6326,13 +6483,47 @@ impl AdaptivePortfolio {
     /// BV CHC and verifies any Unsafe witness against that same source problem
     /// before letting it win the race.
     ///
-    /// All lanes run in separate threads with the full budget. First definitive
-    /// result (Safe/Unsafe) wins.
+    /// All lanes run in separate threads under one inherited absolute deadline
+    /// and linked cancellation tree. The first on-time definitive result
+    /// (Safe/Unsafe) wins; all losing workers are cancelled and reaped.
     pub(super) fn solve_bv_dual_lane(&self, budget: Duration) -> PortfolioResult {
         use std::sync::mpsc;
 
-        let problem = self.problem.clone();
+        // Resolve the route boundary before any preprocessing or worker spawn.
+        // Worker threads do not inherit the caller's thread-local deadline,
+        // and recomputing `now + budget` in each lane would silently grant a
+        // fresh wall-clock allowance after construction time.
+        let route_started = Instant::now();
+        let route_deadline =
+            bv_lane_route_deadline(route_started, budget, self.enclosing_subsolve_deadline());
+        let route_cancellation = self.cancellation_token.child();
+        let Some(budget) = bv_lane_remaining(route_deadline, &route_cancellation) else {
+            return PortfolioResult::Unknown;
+        };
+        let _route_timeout = route_cancellation.cancel_after(budget);
         let verbose = self.config.verbose;
+        if let Err(failure) = admit_problem_clone_fanout(
+            &self.problem,
+            deterministic_array_forwarded_surface_caps(),
+            BV_DUAL_LANE_PROBLEM_CLONE_FANOUT,
+            &route_cancellation,
+            route_deadline,
+        ) {
+            if verbose {
+                safe_eprintln!(
+                    "Adaptive: BV multi-lane source-clone admission rejected: {:?}",
+                    failure
+                );
+            }
+            route_cancellation.cancel();
+            return PortfolioResult::Unknown;
+        }
+        let Some(problem) =
+            clone_bv_problem_at_boundary(&self.problem, route_deadline, &route_cancellation)
+        else {
+            route_cancellation.cancel();
+            return PortfolioResult::Unknown;
+        };
 
         // Lane A: BvToBool → Boolean portfolio (existing path)
         //
@@ -6379,20 +6570,41 @@ impl AdaptivePortfolio {
         let problem_a = if skip_lane_a {
             None
         } else {
-            Some(problem.clone())
+            let Some(problem_a) =
+                clone_bv_problem_at_boundary(&problem, route_deadline, &route_cancellation)
+            else {
+                route_cancellation.cancel();
+                return PortfolioResult::Unknown;
+            };
+            Some(problem_a)
         };
-        let bool_config = self.boolean_simple_loop_portfolio_config(lane_a_budget, &bv_bit_groups);
+        let mut bool_config =
+            self.boolean_simple_loop_portfolio_config(lane_a_budget, &bv_bit_groups);
+        self.prepare_portfolio_config(&mut bool_config, StagedProbeBudgetProfile::CallerOnly);
 
         // Lane B: BvToInt-only → LIA portfolio (exact integer encoding)
-        let problem_b = problem.clone();
+        let Some(problem_b) =
+            clone_bv_problem_at_boundary(&problem, route_deadline, &route_cancellation)
+        else {
+            route_cancellation.cancel();
+            return PortfolioResult::Unknown;
+        };
         let mut int_config = self.simple_loop_portfolio_config(budget);
         int_config.enable_preprocessing = false; // We preprocess manually via build_int_only
+        self.prepare_portfolio_config(&mut int_config, StagedProbeBudgetProfile::BmcOnly);
 
         // Lane C: BV-native → PDR + BMC on original BV problem (#5877 Wave 3)
         // No BV transforms — PDR operates on BV-sorted predicates directly,
         // delegating BV satisfiability to the SMT solver's BV theory.
-        let problem_c = problem.clone();
-        let bv_native_config = self.bv_native_portfolio_config(budget);
+        let Some(problem_c) =
+            clone_bv_problem_at_boundary(&problem, route_deadline, &route_cancellation)
+        else {
+            route_cancellation.cancel();
+            return PortfolioResult::Unknown;
+        };
+        let mut bv_native_config = self.bv_native_portfolio_config(budget);
+        self.prepare_portfolio_config(&mut bv_native_config, StagedProbeBudgetProfile::CallerOnly);
+        let caller_engine_budgets_b = self.config.engine_budgets.clone();
 
         // Lane E: original-problem BMC for constructive Unsafe discovery.
         //
@@ -6402,7 +6614,12 @@ impl AdaptivePortfolio {
         // verifies any candidate against the original BV CHC before publishing
         // it to the race. If validation is inconclusive, the lane fails closed
         // to Unknown so it cannot hide another lane's Safe result.
-        let problem_e = problem.clone();
+        let Some(problem_e) =
+            clone_bv_problem_at_boundary(&problem, route_deadline, &route_cancellation)
+        else {
+            route_cancellation.cancel();
+            return PortfolioResult::Unknown;
+        };
 
         // Lane D: Relaxed BvToInt + KIND + validation (#4198).
         // Maps BV arithmetic to unbounded integers (no mod/div wrapping).
@@ -6416,12 +6633,25 @@ impl AdaptivePortfolio {
         let skip_lane_d = !has_bv64;
         let problem_d = if has_bv64 { Some(problem) } else { None };
 
+        // Classification/configuration between clone sites is synchronous too.
+        // No worker is spawned unless every prepared input still belongs to
+        // this route's one authoritative boundary.
+        if !bv_lane_boundary_open(route_deadline, &route_cancellation) {
+            route_cancellation.cancel();
+            return PortfolioResult::Unknown;
+        }
+
         let (tx, rx) = mpsc::channel();
         let tx_a = tx.clone();
         let tx_b = tx.clone();
         let tx_c = tx.clone();
         let tx_e = tx.clone();
         let tx_d = tx;
+        let cancel_a = route_cancellation.child();
+        let cancel_b = route_cancellation.child();
+        let cancel_c = route_cancellation.child();
+        let cancel_d = route_cancellation.child();
+        let cancel_e = route_cancellation.child();
 
         // Spawn Lane A: BvToBool + Boolean portfolio (skip if expanded state too large)
         let handle_a = if let Some(problem_a) = problem_a {
@@ -6429,9 +6659,36 @@ impl AdaptivePortfolio {
                 .name("bv-bool-lane".to_string())
                 .stack_size(ADAPTIVE_SOLVER_STACK_SIZE)
                 .spawn(move || {
-                    let summary = PreprocessSummary::build(problem_a, verbose);
-                    let result = PortfolioSolver::from_summary(summary, bool_config).solve();
-                    let _ = tx_a.send(("BvToBool", result));
+                    run_bv_lane_with_deadline(route_deadline, || {
+                        let publish = |result| {
+                            let result =
+                                reject_late_bv_lane_result(result, route_deadline, &cancel_a);
+                            let _ = tx_a.send(("BvToBool", result));
+                        };
+                        let Some(summary) = PreprocessSummary::build_with_limits(
+                            problem_a,
+                            verbose,
+                            Some(route_deadline),
+                            &cancel_a,
+                        ) else {
+                            publish(PortfolioResult::Unknown);
+                            return;
+                        };
+                        let Some(bool_config) =
+                            clamp_bv_lane_portfolio_config(bool_config, route_deadline, &cancel_a)
+                        else {
+                            publish(PortfolioResult::Unknown);
+                            return;
+                        };
+                        publish(
+                            PortfolioSolver::from_summary_with_solve_limits(
+                                summary,
+                                bool_config,
+                                Some(route_deadline),
+                            )
+                            .solve(),
+                        );
+                    });
                 })
         } else {
             // Lane A skipped — send Unknown immediately so the recv loop counts it
@@ -6454,203 +6711,295 @@ impl AdaptivePortfolio {
             .name("bv-int-lane".to_string())
             .stack_size(ADAPTIVE_SOLVER_STACK_SIZE)
             .spawn(move || {
-                let lane_start = Instant::now();
-
-                // Phase 1: Relaxed BvToInt + KIND (fast path for BV64, #4198)
-                //
-                // Budget scales with the lane budget instead of a hard 5 s cap:
-                // at competition budgets the old cap starved KIND's proof
-                // VALIDATION slice (fresh cross-check + k-to-1 strengthening +
-                // init/query verify), discarding genuine induction proofs it
-                // had already found (measured: vmt-chc simple_if finds forward
-                // induction at k=3 and dropped it). 5 s stays the floor so
-                // short probes behave exactly as before (#chc25-lever-1).
-                let relaxed_budget = budget
-                    .min((budget / 4).max(Duration::from_secs(5)))
-                    .min(Duration::from_mins(1));
-                let relaxed_query_timeout = (relaxed_budget / 8)
-                    .max(Duration::from_secs(2))
-                    .min(Duration::from_secs(15));
-                let relaxed_summary =
-                    PreprocessSummary::build_int_relaxed(problem_b.clone(), verbose);
-                let kind_config_relaxed = KindConfig::with_engine_config(
-                    5,
-                    relaxed_query_timeout,
-                    relaxed_budget,
-                    verbose,
-                    None,
-                );
-                if verbose {
-                    safe_eprintln!(
-                        "Adaptive: BV Lane B Phase 1 — relaxed BvToInt + KIND ({} preds, {} clauses)",
-                        relaxed_summary.transformed_problem.predicates().len(),
-                        relaxed_summary.transformed_problem.clauses().len(),
-                    );
-                }
-                let mut kind_solver_relaxed =
-                    KindSolver::new(relaxed_summary.transformed_problem.clone(), kind_config_relaxed);
-                kind_solver_relaxed.maybe_enable_tla_trace_from_env();
-                let relaxed_result = kind_solver_relaxed.solve();
-
-                if verbose {
-                    safe_eprintln!(
-                        "Adaptive: BV Lane B Phase 1 relaxed KIND: {} ({:?})",
-                        match &relaxed_result {
-                            KindResult::Safe(_) => "Safe",
-                            KindResult::Unsafe(_) => "Unsafe",
-                            KindResult::Unknown => "Unknown",
-                            KindResult::NotApplicable => "NotApplicable",
-                        },
-                        lane_start.elapsed()
-                    );
-                }
-
-                if let KindResult::Safe(model) = relaxed_result {
-                    let translated = relaxed_summary.back_translator.translate_validity(model);
-                    // #8630: Wire solve_timeout so verification PdrSolvers bail
-                    // cooperatively instead of hanging indefinitely.
-                    let config = PdrConfig {
-                        verbose,
-                        solve_timeout: Some(Duration::from_secs(30)),
-                        ..PdrConfig::default()
+                run_bv_lane_with_deadline(route_deadline, || {
+                    let lane_start = Instant::now();
+                    let publish = |lane_name, result| {
+                        let result = reject_late_bv_lane_result(
+                            result,
+                            route_deadline,
+                            &cancel_b,
+                        );
+                        let _ = tx_b.send((lane_name, result));
                     };
-                    let mut verifier =
-                        PdrSolver::new(relaxed_summary.original_problem.clone(), config);
-                    // Validation slice scales with the lane budget: a found
-                    // proof must never be discarded because its soundness
-                    // check was starved (#chc25-lever-1b). 3 s stays the floor.
-                    let validation_slice = (budget / 8)
-                        .max(Duration::from_secs(3))
-                        .min(Duration::from_secs(30));
-                    if verifier.verify_model_per_rule(&translated, validation_slice) {
-                        if verbose {
-                            safe_eprintln!(
-                                "Adaptive: BV Lane B Phase 1 — relaxed invariant VALIDATED ({:?})",
-                                lane_start.elapsed()
-                            );
-                        }
-                        let _ = tx_b.send(("BvToInt-relaxed", PortfolioResult::Safe(translated)));
+
+                    // Phase 1: Relaxed BvToInt + KIND (fast path for BV64,
+                    // #4198). Every relative phase slice is capped by the one
+                    // absolute route boundary after preprocessing time.
+                    if !bv_lane_boundary_open(route_deadline, &cancel_b) {
+                        publish("BvToInt", PortfolioResult::Unknown);
                         return;
                     }
-                    if verbose {
-                        safe_eprintln!(
-                            "Adaptive: BV Lane B Phase 1 — relaxed invariant failed BV validation"
-                        );
-                    }
-                }
-
-                let elapsed = lane_start.elapsed();
-                if elapsed >= budget {
-                    let _ = tx_b.send(("BvToInt", PortfolioResult::Unknown));
-                    return;
-                }
-
-                // Phase 2: Exact BvToInt + KIND
-                //
-                // Same budget scaling as Phase 1 (#chc25-lever-1): the old hard
-                // 2 s cap left exact KIND no room to validate a found proof at
-                // competition budgets. 2 s stays the floor; max_k rises with
-                // budget (exact BvToInt formulas are heavier, keep k modest).
-                let summary = PreprocessSummary::build_int_only(problem_b, verbose);
-                let remaining = budget.saturating_sub(elapsed);
-                let kind_budget = remaining
-                    .min((budget / 6).max(Duration::from_secs(2)))
-                    .min(Duration::from_secs(45));
-                let exact_max_k = if kind_budget >= Duration::from_secs(10) { 5 } else { 3 };
-                let kind_config = KindConfig::with_engine_config(
-                    exact_max_k,
-                    (kind_budget / 8)
-                        .max(Duration::from_secs(1))
-                        .min(Duration::from_secs(10)),
-                    kind_budget,
-                    verbose,
-                    None,
-                );
-                if verbose {
-                    safe_eprintln!(
-                        "Adaptive: BV Lane B Phase 2 — exact BvToInt + KIND ({} preds, {} clauses, has_bv={})",
-                        summary.transformed_problem.predicates().len(),
-                        summary.transformed_problem.clauses().len(),
-                        summary.transformed_problem.has_bv_sorts(),
-                    );
-                }
-                let mut kind_solver =
-                    KindSolver::new(summary.transformed_problem.clone(), kind_config);
-                kind_solver.maybe_enable_tla_trace_from_env();
-                let kind_result = kind_solver.solve();
-
-                if verbose {
-                    safe_eprintln!(
-                        "Adaptive: BV Lane B Phase 2 exact KIND: {}",
-                        match &kind_result {
-                            KindResult::Safe(_) => "Safe".to_string(),
-                            KindResult::Unsafe(_) => "Unsafe".to_string(),
-                            KindResult::Unknown => "Unknown".to_string(),
-                            KindResult::NotApplicable => "NotApplicable".to_string(),
-                        }
-                    );
-                }
-
-                if let KindResult::Safe(model) = kind_result {
-                    let translated = summary.back_translator.translate_validity(model);
-                    // #8630: Wire solve_timeout so verification PdrSolvers bail
-                    // cooperatively instead of hanging indefinitely.
-                    let config = PdrConfig {
-                        verbose,
-                        solve_timeout: Some(Duration::from_secs(30)),
-                        ..PdrConfig::default()
+                    let Some(relaxed_summary) =
+                        PreprocessSummary::build_int_relaxed_with_limits(
+                            problem_b.clone(),
+                            verbose,
+                            Some(route_deadline),
+                            &cancel_b,
+                        )
+                    else {
+                        publish("BvToInt", PortfolioResult::Unknown);
+                        return;
                     };
-                    let mut verifier = PdrSolver::new(summary.original_problem.clone(), config);
-                    // Scaled validation slice, same rationale as Phase 1
-                    // (#chc25-lever-1b); 2 s stays the floor.
-                    let validation_slice = (budget / 8)
+                    let Some(remaining) = bv_lane_remaining(route_deadline, &cancel_b) else {
+                        publish("BvToInt", PortfolioResult::Unknown);
+                        return;
+                    };
+                    let relaxed_budget = budget
+                        .min((budget / 4).max(Duration::from_secs(5)))
+                        .min(Duration::from_mins(1))
+                        .min(remaining);
+                    if relaxed_budget.is_zero() {
+                        publish("BvToInt", PortfolioResult::Unknown);
+                        return;
+                    }
+                    let relaxed_query_timeout = (relaxed_budget / 8)
                         .max(Duration::from_secs(2))
-                        .min(Duration::from_secs(30));
-                    if verifier.verify_model_per_rule(&translated, validation_slice) {
-                        let _ = tx_b.send(("BvToInt", PortfolioResult::Safe(translated)));
-                        return;
-                    }
+                        .min(Duration::from_secs(15))
+                        .min(relaxed_budget);
+                    let kind_config_relaxed = KindConfig::with_engine_config(
+                        5,
+                        relaxed_query_timeout,
+                        relaxed_budget,
+                        verbose,
+                        Some(cancel_b.child()),
+                    );
                     if verbose {
                         safe_eprintln!(
-                            "Adaptive: BV Lane B Phase 2 — exact invariant failed validation"
+                            "Adaptive: BV Lane B Phase 1 — relaxed BvToInt + KIND ({} preds, {} clauses, {:.1}s remaining)",
+                            relaxed_summary.transformed_problem.predicates().len(),
+                            relaxed_summary.transformed_problem.clauses().len(),
+                            remaining.as_secs_f64(),
                         );
                     }
-                }
+                    let mut kind_solver_relaxed = KindSolver::new(
+                        relaxed_summary.transformed_problem.clone(),
+                        kind_config_relaxed,
+                    );
+                    kind_solver_relaxed.maybe_enable_tla_trace_from_env();
+                    let relaxed_result = kind_solver_relaxed.solve();
 
-                // Phase 3: Full portfolio on exact BvToInt problem.
-                // Check if the exact BvToInt had any bitwise UF fallbacks that
-                // could be refined via full bit-decomposition (#8289 CEGAR).
-                let had_bitwise_uf = summary.had_bitwise_uf_fallback();
-                let original_problem = summary.original_problem.clone();
-                let result = PortfolioSolver::from_summary(summary, int_config.clone()).solve();
+                    if verbose {
+                        safe_eprintln!(
+                            "Adaptive: BV Lane B Phase 1 relaxed KIND: {} ({:?})",
+                            match &relaxed_result {
+                                KindResult::Safe(_) => "Safe",
+                                KindResult::Unsafe(_) => "Unsafe",
+                                KindResult::Unknown => "Unknown",
+                                KindResult::NotApplicable => "NotApplicable",
+                            },
+                            lane_start.elapsed()
+                        );
+                    }
 
-                // #8289 CEGAR: If Phase 3 returned Unknown and there were
-                // bitwise UF fallbacks, retry with full bit-decomposition
-                // (decompose_limit=64) for improved precision.
-                if matches!(&result, PortfolioResult::Unknown) && had_bitwise_uf {
-                    let remaining = budget.saturating_sub(lane_start.elapsed());
-                    if remaining > Duration::from_millis(500) {
+                    if let KindResult::Safe(model) = relaxed_result {
+                        if !bv_lane_boundary_open(route_deadline, &cancel_b) {
+                            publish("BvToInt-relaxed", PortfolioResult::Unknown);
+                            return;
+                        }
+                        let translated = relaxed_summary.back_translator.translate_validity(model);
+                        let Some(remaining) = bv_lane_remaining(route_deadline, &cancel_b) else {
+                            publish("BvToInt-relaxed", PortfolioResult::Unknown);
+                            return;
+                        };
+                        let validation_slice = (budget / 8)
+                            .max(Duration::from_secs(3))
+                            .min(Duration::from_secs(30))
+                            .min(remaining);
+                        let config = PdrConfig {
+                            verbose,
+                            solve_timeout: Some(validation_slice),
+                            cancellation_token: Some(cancel_b.child()),
+                            ..PdrConfig::default()
+                        };
+                        let mut verifier =
+                            PdrSolver::new(relaxed_summary.original_problem.clone(), config);
+                        if verifier.verify_model_per_rule(&translated, validation_slice) {
+                            if verbose {
+                                safe_eprintln!(
+                                    "Adaptive: BV Lane B Phase 1 — relaxed invariant VALIDATED ({:?})",
+                                    lane_start.elapsed()
+                                );
+                            }
+                            publish(
+                                "BvToInt-relaxed",
+                                PortfolioResult::Safe(translated),
+                            );
+                            return;
+                        }
+                        if !bv_lane_boundary_open(route_deadline, &cancel_b) {
+                            publish("BvToInt-relaxed", PortfolioResult::Unknown);
+                            return;
+                        }
                         if verbose {
                             safe_eprintln!(
-                                "Adaptive: BV Lane B Phase 3 CEGAR — retrying with full bit-decomposition ({:.1}s remaining)",
-                                remaining.as_secs_f64()
+                                "Adaptive: BV Lane B Phase 1 — relaxed invariant failed BV validation"
                             );
                         }
-                        let refined_summary =
-                            PreprocessSummary::build_int_with_decompose_limit(
-                                original_problem,
-                                verbose,
-                                64,
-                            );
-                        let mut refined_config = int_config;
-                        refined_config.timeout = Some(remaining);
-                        let refined_result =
-                            PortfolioSolver::from_summary(refined_summary, refined_config).solve();
-                        let _ = tx_b.send(("BvToInt-refined", refined_result));
+                    }
+
+                    // Phase 2: Exact BvToInt + KIND.
+                    let Some(summary) = PreprocessSummary::build_int_only_with_limits(
+                        problem_b,
+                        verbose,
+                        Some(route_deadline),
+                        &cancel_b,
+                    ) else {
+                        publish("BvToInt", PortfolioResult::Unknown);
+                        return;
+                    };
+                    let Some(remaining) = bv_lane_remaining(route_deadline, &cancel_b) else {
+                        publish("BvToInt", PortfolioResult::Unknown);
+                        return;
+                    };
+                    let kind_budget = remaining
+                        .min((budget / 6).max(Duration::from_secs(2)))
+                        .min(Duration::from_secs(45));
+                    if kind_budget.is_zero() {
+                        publish("BvToInt", PortfolioResult::Unknown);
                         return;
                     }
-                }
-                let _ = tx_b.send(("BvToInt", result));
+                    let exact_max_k = if kind_budget >= Duration::from_secs(10) {
+                        5
+                    } else {
+                        3
+                    };
+                    let kind_config = KindConfig::with_engine_config(
+                        exact_max_k,
+                        (kind_budget / 8)
+                            .max(Duration::from_secs(1))
+                            .min(Duration::from_secs(10))
+                            .min(kind_budget),
+                        kind_budget,
+                        verbose,
+                        Some(cancel_b.child()),
+                    );
+                    if verbose {
+                        safe_eprintln!(
+                            "Adaptive: BV Lane B Phase 2 — exact BvToInt + KIND ({} preds, {} clauses, has_bv={})",
+                            summary.transformed_problem.predicates().len(),
+                            summary.transformed_problem.clauses().len(),
+                            summary.transformed_problem.has_bv_sorts(),
+                        );
+                    }
+                    let mut kind_solver =
+                        KindSolver::new(summary.transformed_problem.clone(), kind_config);
+                    kind_solver.maybe_enable_tla_trace_from_env();
+                    let kind_result = kind_solver.solve();
+
+                    if verbose {
+                        safe_eprintln!(
+                            "Adaptive: BV Lane B Phase 2 exact KIND: {}",
+                            match &kind_result {
+                                KindResult::Safe(_) => "Safe",
+                                KindResult::Unsafe(_) => "Unsafe",
+                                KindResult::Unknown => "Unknown",
+                                KindResult::NotApplicable => "NotApplicable",
+                            }
+                        );
+                    }
+
+                    if let KindResult::Safe(model) = kind_result {
+                        if !bv_lane_boundary_open(route_deadline, &cancel_b) {
+                            publish("BvToInt", PortfolioResult::Unknown);
+                            return;
+                        }
+                        let translated = summary.back_translator.translate_validity(model);
+                        let Some(remaining) = bv_lane_remaining(route_deadline, &cancel_b) else {
+                            publish("BvToInt", PortfolioResult::Unknown);
+                            return;
+                        };
+                        let validation_slice = (budget / 8)
+                            .max(Duration::from_secs(2))
+                            .min(Duration::from_secs(30))
+                            .min(remaining);
+                        let config = PdrConfig {
+                            verbose,
+                            solve_timeout: Some(validation_slice),
+                            cancellation_token: Some(cancel_b.child()),
+                            ..PdrConfig::default()
+                        };
+                        let mut verifier =
+                            PdrSolver::new(summary.original_problem.clone(), config);
+                        if verifier.verify_model_per_rule(&translated, validation_slice) {
+                            publish("BvToInt", PortfolioResult::Safe(translated));
+                            return;
+                        }
+                        if !bv_lane_boundary_open(route_deadline, &cancel_b) {
+                            publish("BvToInt", PortfolioResult::Unknown);
+                            return;
+                        }
+                        if verbose {
+                            safe_eprintln!(
+                                "Adaptive: BV Lane B Phase 2 — exact invariant failed validation"
+                            );
+                        }
+                    }
+
+                    // Phase 3: Full portfolio on exact BvToInt problem.
+                    let had_bitwise_uf = summary.had_bitwise_uf_fallback();
+                    let original_problem = summary.original_problem.clone();
+                    let Some(exact_config) = clamp_bv_lane_staged_probe_config(
+                        int_config.clone(),
+                        route_deadline,
+                        &cancel_b,
+                        StagedProbeBudgetProfile::BmcOnly,
+                        &caller_engine_budgets_b,
+                    ) else {
+                        publish("BvToInt", PortfolioResult::Unknown);
+                        return;
+                    };
+                    let result = PortfolioSolver::from_summary_with_solve_limits(
+                        summary,
+                        exact_config,
+                        Some(route_deadline),
+                    )
+                    .solve();
+
+                    // #8289 CEGAR: If Phase 3 returned Unknown and there were
+                    // bitwise UF fallbacks, retry with full bit-decomposition.
+                    if matches!(&result, PortfolioResult::Unknown) && had_bitwise_uf {
+                        if let Some(remaining) = bv_lane_remaining(route_deadline, &cancel_b) {
+                            if remaining > Duration::from_millis(500) {
+                                if verbose {
+                                    safe_eprintln!(
+                                        "Adaptive: BV Lane B Phase 3 CEGAR — retrying with full bit-decomposition ({:.1}s remaining)",
+                                        remaining.as_secs_f64()
+                                    );
+                                }
+                                let Some(refined_summary) = PreprocessSummary::build_int_with_decompose_limit_with_limits(
+                                    original_problem,
+                                    verbose,
+                                    64,
+                                    Some(route_deadline),
+                                    &cancel_b,
+                                ) else {
+                                    publish("BvToInt-refined", PortfolioResult::Unknown);
+                                    return;
+                                };
+                                let Some(refined_config) = clamp_bv_lane_staged_probe_config(
+                                    int_config,
+                                    route_deadline,
+                                    &cancel_b,
+                                    StagedProbeBudgetProfile::BmcOnly,
+                                    &caller_engine_budgets_b,
+                                ) else {
+                                    publish("BvToInt-refined", PortfolioResult::Unknown);
+                                    return;
+                                };
+                                let refined_result =
+                                    PortfolioSolver::from_summary_with_solve_limits(
+                                        refined_summary,
+                                        refined_config,
+                                        Some(route_deadline),
+                                    )
+                                    .solve();
+                                publish("BvToInt-refined", refined_result);
+                                return;
+                            }
+                        }
+                    }
+                    publish("BvToInt", result);
+                });
             });
 
         // Spawn Lane C: BV-native PDR + BMC (no BV transforms)
@@ -6658,161 +7007,180 @@ impl AdaptivePortfolio {
             .name("bv-native-lane".to_string())
             .stack_size(ADAPTIVE_SOLVER_STACK_SIZE)
             .spawn(move || {
-                if verbose {
-                    safe_eprintln!("Adaptive: BV-native lane (Lane C) thread started");
-                }
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _t_preproc = Instant::now();
-                    let summary = PreprocessSummary::build_bv_native(problem_c, verbose);
+                run_bv_lane_with_deadline(route_deadline, || {
                     if verbose {
-                        safe_eprintln!(
-                            "Adaptive: BV-native preprocessing took {:?}",
-                            _t_preproc.elapsed()
-                        );
+                        safe_eprintln!("Adaptive: BV-native lane (Lane C) thread started");
                     }
-                    PortfolioSolver::from_summary(summary, bv_native_config).solve()
-                }));
-                let result = match result {
-                    Ok(r) => r,
-                    Err(payload) => {
-                        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                            s.to_string()
-                        } else if let Some(s) = payload.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "unknown panic".to_string()
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _t_preproc = Instant::now();
+                        let Some(summary) = PreprocessSummary::build_bv_native_with_limits(
+                            problem_c,
+                            verbose,
+                            Some(route_deadline),
+                            &cancel_c,
+                        ) else {
+                            return PortfolioResult::Unknown;
                         };
-                        safe_eprintln!("Adaptive: BV-native lane (Lane C) panicked: {}", msg);
-                        PortfolioResult::Unknown
-                    }
-                };
-                let _ = tx_c.send(("BvNative", result));
+                        if verbose {
+                            safe_eprintln!(
+                                "Adaptive: BV-native preprocessing took {:?}",
+                                _t_preproc.elapsed()
+                            );
+                        }
+                        let Some(bv_native_config) = clamp_bv_lane_portfolio_config(
+                            bv_native_config,
+                            route_deadline,
+                            &cancel_c,
+                        ) else {
+                            return PortfolioResult::Unknown;
+                        };
+                        PortfolioSolver::from_summary_with_solve_limits(
+                            summary,
+                            bv_native_config,
+                            Some(route_deadline),
+                        )
+                        .solve()
+                    }));
+                    let result = match result {
+                        Ok(r) => r,
+                        Err(payload) => {
+                            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else if let Some(s) = payload.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            safe_eprintln!("Adaptive: BV-native lane (Lane C) panicked: {}", msg);
+                            PortfolioResult::Unknown
+                        }
+                    };
+                    let result = reject_late_bv_lane_result(result, route_deadline, &cancel_c);
+                    let _ = tx_c.send(("BvNative", result));
+                });
             });
 
         let handle_e = std::thread::Builder::new()
             .name("bv-original-bmc-lane".to_string())
             .stack_size(ADAPTIVE_SOLVER_STACK_SIZE)
             .spawn(move || {
-                let lane_start = Instant::now();
-                if verbose {
-                    safe_eprintln!("Adaptive: BV original BMC lane (Lane E) thread started");
-                }
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let bmc_plan = original_bv_bmc_lane_plan(&problem_e, budget);
+                run_bv_lane_with_deadline(route_deadline, || {
                     if verbose {
-                        safe_eprintln!(
-                            "Adaptive: BV original BMC lane plan: mode={}, max_depth={}, budget={:.1}s, per_depth={:.3}s",
-                            bmc_plan.mode.label(),
-                            bmc_plan.max_depth,
-                            bmc_plan.time_budget.as_secs_f64(),
-                            bmc_plan.per_depth_timeout.as_secs_f64(),
-                        );
+                        safe_eprintln!("Adaptive: BV original BMC lane (Lane E) thread started");
                     }
-                    let bmc = crate::bmc::BmcSolver::new(
-                        problem_e.clone(),
-                        BmcConfig {
-                            base: ChcEngineConfig {
-                                verbose,
-                                ..ChcEngineConfig::default()
-                            },
-                            max_depth: bmc_plan.max_depth,
-                            per_depth_timeout: Some(bmc_plan.per_depth_timeout),
-                            time_budget: Some(bmc_plan.time_budget),
-                            enable_k_induction: false,
-                            enable_adaptive_stepping: false,
-                            acyclic_safe: false,
-                            prefer_exact_acyclic_first: false,
-                            proof_cross_check: false,
-                            ts_probe_clamp: None,
-            sweep_past_spurious_sat: true,
-                        },
-                    );
-                    match bmc.solve() {
-                        crate::engine_result::ChcEngineResult::Unsafe(cex) => {
-                            let validation_budget = budget
-                                .saturating_sub(lane_start.elapsed())
-                                .min(Duration::from_secs(3));
-                            if validation_budget.is_zero() {
-                                if verbose {
-                                    safe_eprintln!(
-                                        "Adaptive: BV original BMC lane found counterexample but had no validation budget"
-                                    );
-                                }
-                                return PortfolioResult::Unknown;
-                            }
-                            // BMC witnesses are keyed to `problem_e`'s clause
-                            // indices and predicate ids (BMC's own replay in
-                            // `verified_unsafe_from_witness` validates with
-                            // `preserve_original_clauses: true` against the same
-                            // problem). Keep the clause vector intact here too,
-                            // or nullary-fail expansion re-keys the clause space
-                            // and the fail-closed witness replay demotes valid
-                            // counterexamples to Unknown.
-                            let mut verifier = PdrSolver::new(
-                                problem_e,
-                                PdrConfig {
-                                    verbose,
-                                    solve_timeout: Some(validation_budget),
-                                    disable_array_scalarization: true,
-                                    preserve_original_clauses: true,
-                                    ..PdrConfig::default()
-                                },
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let Some(remaining) = bv_lane_remaining(route_deadline, &cancel_e) else {
+                            return PortfolioResult::Unknown;
+                        };
+                        let bmc_plan = original_bv_bmc_lane_plan(&problem_e, remaining);
+                        if verbose {
+                            safe_eprintln!(
+                                "Adaptive: BV original BMC lane plan: mode={}, max_depth={}, budget={:.1}s, per_depth={:.3}s",
+                                bmc_plan.mode.label(),
+                                bmc_plan.max_depth,
+                                bmc_plan.time_budget.as_secs_f64(),
+                                bmc_plan.per_depth_timeout.as_secs_f64(),
                             );
-                            verifier.set_validation_deadline(validation_budget);
-                            match verifier.verify_counterexample(&cex) {
-                                crate::CexVerificationResult::Valid => {
-                                    if verbose {
-                                        safe_eprintln!(
-                                            "Adaptive: BV original BMC lane source-validated counterexample (steps={}, validation_budget={:.1}s)",
-                                            cex.steps.len(),
-                                            validation_budget.as_secs_f64(),
-                                        );
+                        }
+                        let bmc = crate::bmc::BmcSolver::new(
+                            problem_e.clone(),
+                            BmcConfig {
+                                base: ChcEngineConfig {
+                                    verbose,
+                                    cancellation_token: Some(cancel_e.child()),
+                                },
+                                max_depth: bmc_plan.max_depth,
+                                per_depth_timeout: Some(bmc_plan.per_depth_timeout),
+                                time_budget: Some(bmc_plan.time_budget),
+                                enable_k_induction: false,
+                                enable_adaptive_stepping: false,
+                                acyclic_safe: false,
+                                prefer_exact_acyclic_first: false,
+                                proof_cross_check: false,
+                                ts_probe_clamp: None,
+                                sweep_past_spurious_sat: true,
+                            },
+                        );
+                        match bmc.solve() {
+                            crate::engine_result::ChcEngineResult::Unsafe(cex) => {
+                                let Some(validation_budget) =
+                                    bv_lane_remaining(route_deadline, &cancel_e)
+                                else {
+                                    return PortfolioResult::Unknown;
+                                };
+                                let validation_budget =
+                                    validation_budget.min(Duration::from_secs(3));
+                                // BMC witnesses are keyed to `problem_e`'s
+                                // original clause indices and predicate ids.
+                                let mut verifier = PdrSolver::new(
+                                    problem_e,
+                                    PdrConfig {
+                                        verbose,
+                                        solve_timeout: Some(validation_budget),
+                                        cancellation_token: Some(cancel_e.child()),
+                                        disable_array_scalarization: true,
+                                        preserve_original_clauses: true,
+                                        ..PdrConfig::default()
+                                    },
+                                );
+                                verifier.set_validation_deadline(validation_budget);
+                                match verifier.verify_counterexample(&cex) {
+                                    crate::CexVerificationResult::Valid => {
+                                        if verbose {
+                                            safe_eprintln!(
+                                                "Adaptive: BV original BMC lane source-validated counterexample (steps={}, validation_budget={:.1}s)",
+                                                cex.steps.len(),
+                                                validation_budget.as_secs_f64(),
+                                            );
+                                        }
+                                        PortfolioResult::Unsafe(cex)
                                     }
-                                    PortfolioResult::Unsafe(cex)
-                                }
-                                crate::CexVerificationResult::Spurious => {
-                                    if verbose {
-                                        safe_eprintln!(
-                                            "Adaptive: BV original BMC lane rejected spurious counterexample"
-                                        );
+                                    crate::CexVerificationResult::Spurious => {
+                                        if verbose {
+                                            safe_eprintln!(
+                                                "Adaptive: BV original BMC lane rejected spurious counterexample"
+                                            );
+                                        }
+                                        PortfolioResult::Unknown
                                     }
-                                    PortfolioResult::Unknown
-                                }
-                                crate::CexVerificationResult::Unknown => {
-                                    if verbose {
-                                        safe_eprintln!(
-                                            "Adaptive: BV original BMC lane rejected counterexample with inconclusive source validation"
-                                        );
+                                    crate::CexVerificationResult::Unknown => {
+                                        if verbose {
+                                            safe_eprintln!(
+                                                "Adaptive: BV original BMC lane rejected counterexample with inconclusive source validation"
+                                            );
+                                        }
+                                        PortfolioResult::Unknown
                                     }
-                                    PortfolioResult::Unknown
                                 }
+                            }
+                            crate::engine_result::ChcEngineResult::Safe(_)
+                            | crate::engine_result::ChcEngineResult::Unknown
+                            | crate::engine_result::ChcEngineResult::NotApplicable => {
+                                PortfolioResult::Unknown
                             }
                         }
-                        crate::engine_result::ChcEngineResult::Safe(_)
-                        | crate::engine_result::ChcEngineResult::Unknown
-                        | crate::engine_result::ChcEngineResult::NotApplicable => {
+                    }));
+                    let result = match result {
+                        Ok(result) => result,
+                        Err(payload) => {
+                            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else if let Some(s) = payload.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            safe_eprintln!(
+                                "Adaptive: BV original BMC lane (Lane E) panicked: {}",
+                                msg
+                            );
                             PortfolioResult::Unknown
                         }
-                    }
-                }));
-                let result = match result {
-                    Ok(result) => result,
-                    Err(payload) => {
-                        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                            s.to_string()
-                        } else if let Some(s) = payload.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "unknown panic".to_string()
-                        };
-                        safe_eprintln!(
-                            "Adaptive: BV original BMC lane (Lane E) panicked: {}",
-                            msg
-                        );
-                        PortfolioResult::Unknown
-                    }
-                };
-                let _ = tx_e.send(("BvOriginalBmc", result));
+                    };
+                    let result =
+                        reject_late_bv_lane_result(result, route_deadline, &cancel_e);
+                    let _ = tx_e.send(("BvOriginalBmc", result));
+                });
             });
 
         // Spawn Lane D: Relaxed BvToInt + KIND (dedicated BV64 lane, #4198)
@@ -6823,69 +7191,103 @@ impl AdaptivePortfolio {
                 .name("bv-relaxed-lane".to_string())
                 .stack_size(ADAPTIVE_SOLVER_STACK_SIZE)
                 .spawn(move || {
-                    let lane_start = Instant::now();
-                    let relaxed_budget = budget.min(Duration::from_secs(15));
-                    let summary = PreprocessSummary::build_int_relaxed(problem_d, verbose);
-                    if verbose {
-                        safe_eprintln!(
-                            "Adaptive: BV Lane D — relaxed BvToInt + KIND ({} preds, {} clauses)",
-                            summary.transformed_problem.predicates().len(),
-                            summary.transformed_problem.clauses().len(),
-                        );
-                    }
-                    let kind_config = KindConfig::with_engine_config(
-                        10,
-                        Duration::from_secs(3),
-                        relaxed_budget,
-                        verbose,
-                        None,
-                    );
-                    let mut kind_solver =
-                        KindSolver::new(summary.transformed_problem.clone(), kind_config);
-                    kind_solver.maybe_enable_tla_trace_from_env();
-                    let kind_result = kind_solver.solve();
-
-                    if verbose {
-                        safe_eprintln!(
-                            "Adaptive: BV Lane D relaxed KIND: {} ({:?})",
-                            match &kind_result {
-                                KindResult::Safe(_) => "Safe",
-                                KindResult::Unsafe(_) => "Unsafe",
-                                KindResult::Unknown => "Unknown",
-                                KindResult::NotApplicable => "NotApplicable",
-                            },
-                            lane_start.elapsed()
-                        );
-                    }
-
-                    if let KindResult::Safe(model) = kind_result {
-                        let translated = summary.back_translator.translate_validity(model);
-                        // #8630: Wire solve_timeout so verification PdrSolvers bail
-                        // cooperatively instead of hanging indefinitely.
-                        let config = PdrConfig {
-                            verbose,
-                            solve_timeout: Some(Duration::from_secs(30)),
-                            ..PdrConfig::default()
+                    run_bv_lane_with_deadline(route_deadline, || {
+                        let lane_start = Instant::now();
+                        let publish = |result| {
+                            let result = reject_late_bv_lane_result(
+                                result,
+                                route_deadline,
+                                &cancel_d,
+                            );
+                            let _ = tx_d.send(("BvRelaxed", result));
                         };
-                        let mut verifier = PdrSolver::new(summary.original_problem.clone(), config);
-                        if verifier.verify_model_per_rule(&translated, Duration::from_secs(5)) {
-                            if verbose {
-                                safe_eprintln!(
-                                    "Adaptive: BV Lane D — relaxed invariant VALIDATED ({:?})",
-                                    lane_start.elapsed()
-                                );
-                            }
-                            let _ = tx_d.send(("BvRelaxed", PortfolioResult::Safe(translated)));
+                        let Some(summary) =
+                            PreprocessSummary::build_int_relaxed_with_limits(
+                                problem_d,
+                                verbose,
+                                Some(route_deadline),
+                                &cancel_d,
+                            )
+                        else {
+                            publish(PortfolioResult::Unknown);
                             return;
-                        }
+                        };
+                        let Some(remaining) = bv_lane_remaining(route_deadline, &cancel_d) else {
+                            publish(PortfolioResult::Unknown);
+                            return;
+                        };
+                        let relaxed_budget = remaining.min(Duration::from_secs(15));
+                        let kind_config = KindConfig::with_engine_config(
+                            10,
+                            Duration::from_secs(3).min(relaxed_budget),
+                            relaxed_budget,
+                            verbose,
+                            Some(cancel_d.child()),
+                        );
                         if verbose {
                             safe_eprintln!(
-                                "Adaptive: BV Lane D — relaxed invariant failed BV validation"
+                                "Adaptive: BV Lane D — relaxed BvToInt + KIND ({} preds, {} clauses)",
+                                summary.transformed_problem.predicates().len(),
+                                summary.transformed_problem.clauses().len(),
                             );
                         }
-                    }
+                        let mut kind_solver =
+                            KindSolver::new(summary.transformed_problem.clone(), kind_config);
+                        kind_solver.maybe_enable_tla_trace_from_env();
+                        let kind_result = kind_solver.solve();
 
-                    let _ = tx_d.send(("BvRelaxed", PortfolioResult::Unknown));
+                        if verbose {
+                            safe_eprintln!(
+                                "Adaptive: BV Lane D relaxed KIND: {} ({:?})",
+                                match &kind_result {
+                                    KindResult::Safe(_) => "Safe",
+                                    KindResult::Unsafe(_) => "Unsafe",
+                                    KindResult::Unknown => "Unknown",
+                                    KindResult::NotApplicable => "NotApplicable",
+                                },
+                                lane_start.elapsed()
+                            );
+                        }
+
+                        if let KindResult::Safe(model) = kind_result {
+                            if !bv_lane_boundary_open(route_deadline, &cancel_d) {
+                                publish(PortfolioResult::Unknown);
+                                return;
+                            }
+                            let translated = summary.back_translator.translate_validity(model);
+                            let Some(remaining) = bv_lane_remaining(route_deadline, &cancel_d)
+                            else {
+                                publish(PortfolioResult::Unknown);
+                                return;
+                            };
+                            let validation_budget = remaining.min(Duration::from_secs(5));
+                            let config = PdrConfig {
+                                verbose,
+                                solve_timeout: Some(validation_budget),
+                                cancellation_token: Some(cancel_d.child()),
+                                ..PdrConfig::default()
+                            };
+                            let mut verifier =
+                                PdrSolver::new(summary.original_problem.clone(), config);
+                            if verifier.verify_model_per_rule(&translated, validation_budget) {
+                                if verbose {
+                                    safe_eprintln!(
+                                        "Adaptive: BV Lane D — relaxed invariant VALIDATED ({:?})",
+                                        lane_start.elapsed()
+                                    );
+                                }
+                                publish(PortfolioResult::Safe(translated));
+                                return;
+                            }
+                            if verbose {
+                                safe_eprintln!(
+                                    "Adaptive: BV Lane D — relaxed invariant failed BV validation"
+                                );
+                            }
+                        }
+
+                        publish(PortfolioResult::Unknown);
+                    });
                 })
         } else {
             let _ = tx_d.send(("BvRelaxed", PortfolioResult::Unknown));
@@ -6927,25 +7329,27 @@ impl AdaptivePortfolio {
             );
         }
         if spawned == 0 {
+            route_cancellation.cancel();
             return PortfolioResult::Unknown;
         }
 
         // Collect results: first definitive answer wins
-        let deadline = Instant::now() + budget;
         let mut best = PortfolioResult::Unknown;
         let mut received = 0u32;
         let expected = expected_messages as u32;
 
         while received < expected {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            let Some(remaining) = bv_lane_remaining(route_deadline, &route_cancellation) else {
                 break;
-            }
+            };
             match rx.recv_timeout(remaining) {
                 Ok((lane_name, result)) => {
                     received += 1;
                     match &result {
                         PortfolioResult::Safe(_) | PortfolioResult::Unsafe(_) => {
+                            if !bv_lane_boundary_open(route_deadline, &route_cancellation) {
+                                break;
+                            }
                             if verbose {
                                 safe_eprintln!(
                                     "Adaptive: BV multi-lane — {} lane produced definitive result",
@@ -6970,19 +7374,25 @@ impl AdaptivePortfolio {
             }
         }
 
-        // Join remaining threads to reclaim their 128 MiB stacks + solver state.
-        // Each lane's portfolio has its own `parallel_timeout` budget enforcement,
-        // so they should finish within ~budget. Use a short grace period after
-        // the deadline to avoid blocking indefinitely on a stuck thread.
-        let join_deadline = Instant::now() + Duration::from_secs(2);
-        join_finished_lanes_until_deadline(
+        // Stop every losing lane, then synchronously reap all workers. A lane
+        // currently inside one transform stage may take until its next
+        // cooperative boundary, but it is never detached from this solve.
+        route_cancellation.cancel();
+        join_bv_lanes(
             [handle_a, handle_b, handle_c, handle_d, handle_e]
                 .into_iter()
                 .flatten(),
-            join_deadline,
         );
 
-        best
+        // Recheck after all joins. A candidate received before the deadline
+        // cannot be published after the authoritative caller boundary closes.
+        if matches!(&best, PortfolioResult::Safe(_) | PortfolioResult::Unsafe(_))
+            && self.budget_exhausted(Some(route_deadline))
+        {
+            PortfolioResult::Unknown
+        } else {
+            best
+        }
     }
 
     /// Race BV-native Lane C against the array-safe portfolio for BV+array
@@ -6999,83 +7409,188 @@ impl AdaptivePortfolio {
     /// `PreprocessSummary::build_bv_native`, letting PDR operate on the array
     /// natively and emit ROW ITE expansions during inductiveness checks.
     ///
-    /// Both lanes run with the full budget; first definitive result wins.
+    /// Both lanes share the full inherited route budget; the first on-time
+    /// definitive result wins, and both workers are cancelled and reaped
+    /// before this route returns.
     pub(super) fn solve_bv_array_portfolio(&self, budget: Duration) -> PortfolioResult {
         use std::sync::mpsc;
 
+        // Resolve the route boundary before configuration, preprocessing, or
+        // worker spawn. Neither thread-local deadline is inherited by worker
+        // threads, so every lane must receive this same absolute instant.
+        let route_started = Instant::now();
+        let route_deadline =
+            bv_lane_route_deadline(route_started, budget, self.enclosing_subsolve_deadline());
+        let route_cancellation = self.cancellation_token.child();
+        let Some(budget) = bv_lane_remaining(route_deadline, &route_cancellation) else {
+            return PortfolioResult::Unknown;
+        };
+        let _route_timeout = route_cancellation.cancel_after(budget);
+
         let verbose = self.config.verbose;
+        if let Err(failure) = admit_problem_clone_fanout(
+            &self.problem,
+            deterministic_array_forwarded_surface_caps(),
+            BV_ARRAY_PROBLEM_CLONE_FANOUT,
+            &route_cancellation,
+            route_deadline,
+        ) {
+            if verbose {
+                safe_eprintln!(
+                    "Adaptive: BV+array source-clone admission rejected: {:?}",
+                    failure
+                );
+            }
+            route_cancellation.cancel();
+            return PortfolioResult::Unknown;
+        }
 
         // Lane N (BV-native): preserves BV sorts and Array(BV, BV). ROW expansion
         // works correctly because selects over symbolic BV indices survive
         // preprocessing.
-        let problem_native = self.problem.clone();
-        let native_config = self.bv_native_portfolio_config(budget);
+        let Some(problem_native) =
+            clone_bv_problem_at_boundary(&self.problem, route_deadline, &route_cancellation)
+        else {
+            route_cancellation.cancel();
+            return PortfolioResult::Unknown;
+        };
+        let mut native_config = self.bv_native_portfolio_config(budget);
+        self.prepare_portfolio_config(&mut native_config, StagedProbeBudgetProfile::CallerOnly);
 
         // Lane S (array-safe): the original portfolio that worked for LIA-indexed
         // arrays. Keeping it in parallel means pure-LIA-indexed or mixed problems
         // still have the original fast path.
-        let problem_safe = self.problem.clone();
-        let safe_config = self.simple_loop_array_portfolio_config(budget);
+        let Some(problem_safe) =
+            clone_bv_problem_at_boundary(&self.problem, route_deadline, &route_cancellation)
+        else {
+            route_cancellation.cancel();
+            return PortfolioResult::Unknown;
+        };
+        let mut safe_config = self.simple_loop_array_portfolio_config(budget);
+        self.prepare_portfolio_config(&mut safe_config, StagedProbeBudgetProfile::BmcOnly);
+        let caller_engine_budgets_s = self.config.engine_budgets.clone();
+
+        if !bv_lane_boundary_open(route_deadline, &route_cancellation) {
+            route_cancellation.cancel();
+            return PortfolioResult::Unknown;
+        }
 
         let (tx, rx) = mpsc::channel();
         let tx_n = tx.clone();
         let tx_s = tx;
+        let cancel_n = route_cancellation.child();
+        let cancel_s = route_cancellation.child();
 
         let handle_n = std::thread::Builder::new()
             .name("bv-array-native-lane".to_string())
             .stack_size(ADAPTIVE_SOLVER_STACK_SIZE)
             .spawn(move || {
-                if verbose {
-                    safe_eprintln!("Adaptive: BV+array Lane N (BV-native) thread started");
-                }
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let summary = PreprocessSummary::build_bv_native(problem_native, verbose);
-                    PortfolioSolver::from_summary(summary, native_config).solve()
-                }));
-                let result = match result {
-                    Ok(r) => r,
-                    Err(payload) => {
-                        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                            s.to_string()
-                        } else if let Some(s) = payload.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "unknown panic".to_string()
-                        };
-                        safe_eprintln!("Adaptive: BV+array Lane N (BV-native) panicked: {}", msg);
-                        PortfolioResult::Unknown
+                run_bv_lane_with_deadline(route_deadline, || {
+                    if verbose {
+                        safe_eprintln!("Adaptive: BV+array Lane N (BV-native) thread started");
                     }
-                };
-                let _ = tx_n.send(("BvArrayNative", result));
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let Some(summary) = PreprocessSummary::build_bv_native_with_limits(
+                            problem_native,
+                            verbose,
+                            Some(route_deadline),
+                            &cancel_n,
+                        ) else {
+                            return PortfolioResult::Unknown;
+                        };
+                        let Some(native_config) = clamp_bv_lane_portfolio_config(
+                            native_config,
+                            route_deadline,
+                            &cancel_n,
+                        ) else {
+                            return PortfolioResult::Unknown;
+                        };
+                        PortfolioSolver::from_summary_with_solve_limits(
+                            summary,
+                            native_config,
+                            Some(route_deadline),
+                        )
+                        .solve()
+                    }));
+                    let result = match result {
+                        Ok(r) => r,
+                        Err(payload) => {
+                            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else if let Some(s) = payload.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            safe_eprintln!(
+                                "Adaptive: BV+array Lane N (BV-native) panicked: {}",
+                                msg
+                            );
+                            PortfolioResult::Unknown
+                        }
+                    };
+                    let result = reject_late_bv_lane_result(result, route_deadline, &cancel_n);
+                    let _ = tx_n.send(("BvArrayNative", result));
+                });
             });
 
         let handle_s = std::thread::Builder::new()
             .name("bv-array-safe-lane".to_string())
             .stack_size(ADAPTIVE_SOLVER_STACK_SIZE)
             .spawn(move || {
-                if verbose {
-                    safe_eprintln!("Adaptive: BV+array Lane S (array-safe) thread started");
-                }
-                // safe_config.enable_preprocessing is true — PortfolioSolver::new
-                // will run BvToBool + BvToInt preprocessing internally.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    PortfolioSolver::new(problem_safe, safe_config).solve()
-                }));
-                let result = match result {
-                    Ok(r) => r,
-                    Err(payload) => {
-                        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                            s.to_string()
-                        } else if let Some(s) = payload.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "unknown panic".to_string()
-                        };
-                        safe_eprintln!("Adaptive: BV+array Lane S (array-safe) panicked: {}", msg);
-                        PortfolioResult::Unknown
+                run_bv_lane_with_deadline(route_deadline, || {
+                    if verbose {
+                        safe_eprintln!("Adaptive: BV+array Lane S (array-safe) thread started");
                     }
-                };
-                let _ = tx_s.send(("BvArraySafe", result));
+                    // The bounded constructor keeps the existing standard
+                    // preprocessing pipeline while checking this route's
+                    // cancellation/deadline between every transform stage.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let Some(safe_config) = clamp_bv_lane_staged_probe_config(
+                            safe_config,
+                            route_deadline,
+                            &cancel_s,
+                            StagedProbeBudgetProfile::BmcOnly,
+                            &caller_engine_budgets_s,
+                        ) else {
+                            return PortfolioResult::Unknown;
+                        };
+                        let mut solver = PortfolioSolver::new_with_solve_limits(
+                            problem_safe,
+                            safe_config,
+                            Some(route_deadline),
+                        );
+                        AdaptivePortfolio::reconcile_staged_probe_budget_defaults(
+                            solver.config_mut_for_budget_reconciliation(),
+                            StagedProbeBudgetProfile::BmcOnly,
+                            &caller_engine_budgets_s,
+                            Some(
+                                route_deadline
+                                    .saturating_duration_since(ay_core::time::Instant::now()),
+                            ),
+                        );
+                        solver.solve()
+                    }));
+                    let result = match result {
+                        Ok(r) => r,
+                        Err(payload) => {
+                            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else if let Some(s) = payload.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            safe_eprintln!(
+                                "Adaptive: BV+array Lane S (array-safe) panicked: {}",
+                                msg
+                            );
+                            PortfolioResult::Unknown
+                        }
+                    };
+                    let result = reject_late_bv_lane_result(result, route_deadline, &cancel_s);
+                    let _ = tx_s.send(("BvArraySafe", result));
+                });
             });
 
         let spawned = [&handle_n, &handle_s].iter().filter(|h| h.is_ok()).count();
@@ -7088,23 +7603,25 @@ impl AdaptivePortfolio {
             );
         }
         if spawned == 0 {
+            route_cancellation.cancel();
             return PortfolioResult::Unknown;
         }
 
-        let deadline = Instant::now() + budget;
         let mut best = PortfolioResult::Unknown;
         let mut received = 0usize;
 
         while received < spawned {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            let Some(remaining) = bv_lane_remaining(route_deadline, &route_cancellation) else {
                 break;
-            }
+            };
             match rx.recv_timeout(remaining) {
                 Ok((lane_name, result)) => {
                     received += 1;
                     match &result {
                         PortfolioResult::Safe(_) | PortfolioResult::Unsafe(_) => {
+                            if !bv_lane_boundary_open(route_deadline, &route_cancellation) {
+                                break;
+                            }
                             if verbose {
                                 safe_eprintln!(
                                     "Adaptive: BV+array — {} lane produced definitive result",
@@ -7129,13 +7646,21 @@ impl AdaptivePortfolio {
             }
         }
 
-        let join_deadline = Instant::now() + Duration::from_secs(2);
-        join_finished_lanes_until_deadline(
-            [handle_n, handle_s].into_iter().flatten(),
-            join_deadline,
-        );
+        // Stop the loser and reap both workers synchronously. Rust cannot kill
+        // a thread safely, so a bounded join window would only detach it and
+        // violate the route lifetime boundary.
+        route_cancellation.cancel();
+        join_bv_lanes([handle_n, handle_s].into_iter().flatten());
 
-        best
+        // A candidate accepted before cancellation still cannot cross an
+        // enclosing deadline while the losing worker is being reaped.
+        if matches!(&best, PortfolioResult::Safe(_) | PortfolioResult::Unsafe(_))
+            && self.budget_exhausted(Some(route_deadline))
+        {
+            PortfolioResult::Unknown
+        } else {
+            best
+        }
     }
 }
 
@@ -7143,6 +7668,190 @@ impl AdaptivePortfolio {
 mod tests {
     use super::*;
     use crate::ab_switches::{ChcAbSwitches, TestOverride};
+
+    #[test]
+    fn bv_dual_lane_deadline_never_extends_enclosing_boundary() {
+        let started = Instant::now();
+        let enclosing = started + Duration::from_millis(10);
+        assert_eq!(
+            bv_lane_route_deadline(started, Duration::from_secs(30), Some(enclosing)),
+            enclosing
+        );
+        assert_eq!(
+            bv_lane_route_deadline(started, Duration::from_millis(1), Some(enclosing)),
+            started + Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn bv_problem_clone_obeys_route_boundary() {
+        let problem = ChcProblem::new();
+        let open = crate::CancellationToken::new();
+        assert!(clone_bv_problem_at_boundary(
+            &problem,
+            Instant::now() + Duration::from_secs(1),
+            &open,
+        )
+        .is_some());
+
+        let cancelled = crate::CancellationToken::new();
+        cancelled.cancel();
+        assert!(clone_bv_problem_at_boundary(
+            &problem,
+            Instant::now() + Duration::from_secs(1),
+            &cancelled,
+        )
+        .is_none());
+        assert!(clone_bv_problem_at_boundary(
+            &problem,
+            Instant::now(),
+            &crate::CancellationToken::new(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn bv_dual_lane_inherits_expired_ambient_deadline() {
+        let problem = parse_problem(
+            r#"
+(set-logic HORN)
+(declare-fun Inv ((_ BitVec 8)) Bool)
+(assert (Inv #x00))
+(assert (forall ((x (_ BitVec 8)))
+    (=> (Inv x) (Inv (bvadd x #x01)))))
+(assert (forall ((x (_ BitVec 8)))
+    (=> (and (Inv x) (= x #x02)) false)))
+(check-sat)
+"#,
+        );
+        let solver = AdaptivePortfolio::new(
+            problem,
+            crate::AdaptiveConfig::with_budget(Duration::from_secs(30), false),
+        );
+        let _ambient = crate::smt::ScopedSolveDeadline::new(Some(Instant::now()));
+
+        assert!(matches!(
+            solver.solve_bv_dual_lane(Duration::from_secs(30)),
+            PortfolioResult::Unknown
+        ));
+    }
+
+    #[test]
+    fn bv_array_portfolio_inherits_expired_ambient_deadline() {
+        let problem = parse_problem(
+            r#"
+(set-logic HORN)
+(declare-fun Inv ((_ BitVec 8)) Bool)
+(assert (Inv #x00))
+(assert (forall ((x (_ BitVec 8)))
+    (=> (Inv x) (Inv (bvadd x #x01)))))
+(assert (forall ((x (_ BitVec 8)))
+    (=> (and (Inv x) (= x #x02)) false)))
+(check-sat)
+"#,
+        );
+        let solver = AdaptivePortfolio::new(
+            problem,
+            crate::AdaptiveConfig::with_budget(Duration::from_secs(30), false),
+        );
+        let _ambient = crate::smt::ScopedSolveDeadline::new(Some(Instant::now()));
+
+        assert!(matches!(
+            solver.solve_bv_array_portfolio(Duration::from_secs(30)),
+            PortfolioResult::Unknown
+        ));
+    }
+
+    #[test]
+    fn bv_dual_lane_rejects_decisive_results_after_boundary_closes() {
+        let cancellation = crate::CancellationToken::new();
+        let late = reject_late_bv_lane_result(
+            PortfolioResult::Safe(InvariantModel::new()),
+            Instant::now(),
+            &cancellation,
+        );
+        assert!(matches!(late, PortfolioResult::Unknown));
+
+        let cancelled = crate::CancellationToken::new();
+        cancelled.cancel();
+        let cancelled_result = reject_late_bv_lane_result(
+            PortfolioResult::Safe(InvariantModel::new()),
+            Instant::now() + Duration::from_secs(1),
+            &cancelled,
+        );
+        assert!(matches!(cancelled_result, PortfolioResult::Unknown));
+    }
+
+    #[test]
+    fn bv_dual_lane_worker_installs_absolute_solve_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let observed = std::thread::spawn(move || {
+            run_bv_lane_with_deadline(deadline, crate::smt::current_thread_solve_deadline)
+        })
+        .join()
+        .expect("deadline observer worker should not panic");
+        assert_eq!(observed, Some(deadline));
+    }
+
+    #[test]
+    fn bv_dual_lane_cancellation_is_linked_and_workers_are_reaped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let route = crate::CancellationToken::new();
+        let worker_cancellation = route.child();
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = finished.clone();
+        let handle = std::thread::spawn(move || {
+            while !worker_cancellation.is_cancelled() {
+                std::thread::yield_now();
+            }
+            worker_finished.store(true, Ordering::Release);
+        });
+
+        route.cancel();
+        join_bv_lanes([handle]);
+        assert!(finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn bv_dual_lane_nested_portfolio_uses_remaining_wall_and_route_cancel() {
+        let route = crate::CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut initial = PortfolioConfig::test_default();
+        initial.parallel_timeout = Some(Duration::from_secs(120));
+        AdaptivePortfolio::reconcile_staged_probe_budget_defaults(
+            &mut initial,
+            StagedProbeBudgetProfile::BmcAndKind,
+            &[],
+            None,
+        );
+        assert_eq!(
+            initial.budget_policy(EngineType::Bmc),
+            BudgetPolicy::Fixed(Duration::from_secs(2))
+        );
+        let config = clamp_bv_lane_staged_probe_config(
+            initial,
+            deadline,
+            &route,
+            StagedProbeBudgetProfile::BmcAndKind,
+            &[],
+        )
+        .expect("open route should admit a nested portfolio");
+        assert!(config
+            .parallel_timeout
+            .is_some_and(|timeout| { !timeout.is_zero() && timeout <= Duration::from_secs(1) }));
+        assert_eq!(config.budget_policy(EngineType::Bmc), BudgetPolicy::Default);
+        assert_eq!(
+            config.budget_policy(EngineType::Kind),
+            BudgetPolicy::Default
+        );
+        route.cancel();
+        assert!(config
+            .external_cancellation
+            .as_ref()
+            .is_some_and(crate::CancellationToken::is_cancelled));
+    }
 
     fn parse_problem(smt: &str) -> ChcProblem {
         crate::parser::ChcParser::parse(smt).expect("test CHC should parse")
@@ -7912,6 +8621,20 @@ mod tests {
         assert!(
             super::try_data_driven_houdini(&problem, std::time::Duration::from_secs(10)).is_none(),
             "must not certify an unsafe problem as Safe"
+        );
+    }
+
+    #[test]
+    fn data_driven_houdini_declines_wide_bitvectors_without_sampling() {
+        let input = "(set-logic HORN)\n\
+             (declare-fun P ((_ BitVec 129)) Bool)\n\
+             (assert (P (_ bv1 129)))\n\
+             (assert (forall ((x (_ BitVec 129))) (=> (P x) false)))\n\
+             (check-sat)\n";
+        let problem = parse_problem(input);
+        assert!(
+            super::try_data_driven_houdini(&problem, std::time::Duration::from_secs(1)).is_none(),
+            "the i128 affine sampler must fail closed before handling BV129 values"
         );
     }
 

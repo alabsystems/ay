@@ -64,7 +64,7 @@ impl Executor {
         false
     }
 
-    /// Check whether live assertions contain active datatype operations.
+    /// Check whether live assertions contain datatype carriers or operations.
     pub(in crate::executor) fn assertions_contain_datatype_terms(&self) -> bool {
         self.terms_contain_datatype_terms(&self.ctx.assertions)
     }
@@ -76,6 +76,19 @@ impl Executor {
             if !visited.insert(term) {
                 continue;
             }
+            let sort = self.ctx.terms.sort(term);
+            if sort.is_datatype()
+                || matches!(
+                    sort,
+                    ay_core::Sort::Uninterpreted(name)
+                        if self
+                            .ctx
+                            .datatype_iter()
+                            .any(|(datatype, _)| datatype == name.as_str())
+                )
+            {
+                return true;
+            }
             match self.ctx.terms.get(term) {
                 TermData::App(sym, args) => {
                     if self.is_datatype_symbol_name(sym.name()) {
@@ -83,7 +96,7 @@ impl Executor {
                     }
                     stack.extend(args.iter().copied());
                 }
-                TermData::Var(name, _) if self.ctx.is_constructor(name).is_some() => return true,
+                TermData::Var(name, _) if self.is_datatype_symbol_name(name) => return true,
                 TermData::Let(bindings, body) => {
                     stack.extend(bindings.iter().map(|(_, binding)| *binding));
                     stack.push(*body);
@@ -101,7 +114,8 @@ impl Executor {
     }
 
     fn is_datatype_symbol_name(&self, name: &str) -> bool {
-        if self.ctx.is_constructor(name).is_some()
+        if self.ctx.is_live_datatype_member_identity(name)
+            || self.ctx.is_constructor(name).is_some()
             || name
                 .strip_prefix("is-")
                 .is_some_and(|ctor| self.ctx.is_constructor(ctor).is_some())

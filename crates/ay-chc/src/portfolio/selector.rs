@@ -94,13 +94,16 @@ impl EngineSelector {
     /// This is the main entry point. Returns an ordered list of engines
     /// with the predicted best engine first.
     pub(crate) fn select(features: &ChcFeatureVector) -> EngineSelection {
-        // Level 1: Theory dispatch -- BV and array problems need specialized handling
-        if features.has_bv_args || features.theory == TheoryProfile::PureBv {
-            return Self::select_bv(features);
-        }
-
+        // Level 1: Theory dispatch -- BV and array problems need specialized handling.
+        // Arrays take precedence because BvArrays needs the array-capable roster;
+        // treating a BV-indexed array as scalar BV strands LAWI behind engines
+        // whose transition encodings assume scalar state (W4-2C).
         if features.base.uses_arrays {
             return Self::select_arrays(features);
+        }
+
+        if features.has_bv_args || features.theory == TheoryProfile::PureBv {
+            return Self::select_bv(features);
         }
 
         if features.theory == TheoryProfile::Real {
@@ -1329,3 +1332,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "selector_bv_array_tests.rs"]
+mod bv_array_tests;

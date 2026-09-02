@@ -75,7 +75,10 @@ pub use alethe_parser::{
     AletheDocumentReport, AletheSelfCheckWriter, Pos as AlethePos, ProblemScope,
 };
 pub use alethe_printer::{
-    split_alethe_application_bounded, AlethePrintError, AletheSurfaceParseError,
+    carcara_proof_surface_is_supported, certified_let_assume_bridge_is_supported,
+    checked_bv_bitblast_lowering_supported, effective_wire_term_overrides_for_proof,
+    split_alethe_application_bounded, trans_step_surface_is_supported, AlethePrintError,
+    AletheSurfaceParseError,
 };
 pub use array_row_axiom::{mint_row1_axiom, plan_row1_axiom_instances};
 pub use array_store_overwrite::{mint_store_overwrite_axiom, plan_store_overwrite_instances};
@@ -100,7 +103,9 @@ pub use checker::assumed_is_authored_bool_ite_consequence;
 pub use checker::clause_mentions_floating_point;
 pub use checker::clause_mentions_string_or_regex;
 pub use checker::recognize_arith_clause_tautology;
+pub use checker::recognize_arith_eq_implies_bound;
 pub use checker::recognize_arith_eq_triangle;
+pub use checker::recognize_arith_poly_simp;
 pub use checker::recognize_array_guarded_row_expansion;
 pub use checker::recognize_datatype_acyclic_direct;
 pub use checker::recognize_euf_congruent;
@@ -193,7 +198,14 @@ pub use scope::problem_scope_symbol_names;
 pub use terminal_trust::{
     terminal_trust_report, terminal_trust_report_with_provenance, TerminalTrustReport,
 };
-pub use wire_rule::{lia_divisibility_lowering_supported, promoted_wire_rule};
+pub use wire_rule::{
+    arith_eq_implies_bound_lowering_supported, arith_eq_triangle_lowering_supported,
+    arith_poly_simp_lowering_supported, evaluate_step_lowering_supported,
+    exact_clause_surface_preserved, int_bounds_tautology_lowering_supported,
+    la_generic_farkas_lowering_supported, lia_divisibility_lowering_supported, promoted_wire_rule,
+    theory_lemma_poly_simp_lowering_supported, ArithPolySimpPromotionBudget,
+    MAX_ARITH_POLY_SIMP_PROMOTIONS_PER_PROOF,
+};
 
 use alethe_printer::AlethePrinter;
 use variables::{
@@ -311,7 +323,12 @@ pub fn try_export_alethe(proof: &Proof, terms: &TermStore) -> Result<String, Ale
         if printer.is_skolem_witness_name(name) {
             continue;
         }
-        let _ = writeln!(output, "(declare-fun {} () {})", quote_symbol(name), sort);
+        let _ = writeln!(
+            output,
+            "(declare-fun {} () {})",
+            quote_symbol(name),
+            alethe_printer::format_sort_alethe(sort)
+        );
     }
 
     for (idx, step) in proof.steps.iter().enumerate() {

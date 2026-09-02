@@ -679,6 +679,9 @@ impl KindSolver {
                             SmtValue::Int(n) => i64::try_from(*n).ok(),
                             SmtValue::Bool(b) => Some(if *b { 1 } else { 0 }),
                             SmtValue::BitVec(val, _) => i64::try_from(*val).ok(),
+                            SmtValue::BigBitVec(val, _) => {
+                                num_traits::ToPrimitive::to_i64(val.as_ref())
+                            }
                             _ => None,
                         };
                         val.map(|v| (k.clone(), v))

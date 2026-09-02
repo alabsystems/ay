@@ -696,8 +696,8 @@ fn z3_500_parameter_and_markdown_discovery_is_byte_exact() {
     let listing = Command::new(z3).arg("-p").output().expect("spawn z3 -p");
     let listing = String::from_utf8(listing.stdout).expect("Z3 -p is UTF-8");
     let (modules, parameters) = parameter_inventory_from_listing(&listing);
-    assert_eq!(modules.len(), 21);
-    assert_eq!(parameters.len(), 678);
+    assert_eq!(modules.len(), 22);
+    assert_eq!(parameters.len(), 688);
 
     for module in modules.iter().map(String::as_str).chain(["global"]) {
         for prefix in ["-pm:", "-pmmd:"] {
@@ -4993,7 +4993,7 @@ fn z3_mode_get_info_version_is_consistent_z3_version() {
     // smt_get_info_version_keeps_ay_provenance_with_z3_record_shape).
     let output = run_ay_stdin_with_args(&["--z3-mode"], "(get-info :version)\n", true);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout, "(:version \"5.0.0\")\n", "got: {stdout}");
+    assert_eq!(stdout, "(:version \"5.1.0\")\n", "got: {stdout}");
 }
 
 #[test]

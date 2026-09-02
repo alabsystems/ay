@@ -243,6 +243,10 @@ fn build_verification_summary(executor: &Executor, result: &SolveResult) -> Veri
     VerificationSummary {
         sat_model_validated: executor.was_model_validated(),
         unsat_proof_available: result.is_unsat() && executor.last_proof().is_some(),
+        unsat_proof_decline: result
+            .is_unsat()
+            .then(|| executor.last_proof_decline())
+            .flatten(),
         // `run_cross_check` has already crossed `execute_authored`, whose text
         // boundary consumes the exact one-shot certificate and records its
         // sealed class. A bare surviving UNSAT proves admission, but does not

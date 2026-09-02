@@ -13,6 +13,10 @@ use crate::TheoryLit;
 use num_rational::BigRational;
 use num_traits::{One, Zero};
 
+/// Capacity-hint clamp for per-monomial scratch vectors: monomial factor
+/// counts are small in practice, and larger ones just grow past the hint.
+const MAX_PREALLOC_MONOMIAL_FACTORS: usize = 64;
+
 /// A tracked monomial representing a nonlinear product.
 ///
 /// The exact invariant is `value(aux_var) == coeff * product(value(vars))`.
@@ -82,7 +86,7 @@ impl Monomial {
 
     /// Check if this is a square (x*x).
     pub fn is_square(&self) -> bool {
-        self.degree == 2 && self.vars[0] == self.vars[1]
+        self.degree == 2 && matches!(self.vars.as_slice(), [x, y, ..] if x == y)
     }
 
     /// Get the first factor (for binary products).
@@ -117,14 +121,18 @@ pub enum SignConstraint {
 
 /// Compute the sign of a product given factor signs.
 pub fn product_sign(factor_signs: &[i32]) -> i32 {
-    let mut sign = 1;
+    let mut negative = false;
     for &s in factor_signs {
         if s == 0 {
             return 0;
         }
-        sign *= s;
+        negative ^= s < 0;
     }
-    sign
+    if negative {
+        -1
+    } else {
+        1
+    }
 }
 
 /// Check if a sign constraint contradicts the expected sign.
@@ -184,9 +192,10 @@ pub fn extract_sign_constraint(
     value: bool,
 ) -> Option<(TermId, SignConstraint)> {
     match terms.get(term) {
-        TermData::App(Symbol::Named(name), args) if args.len() == 2 => {
-            let lhs = args[0];
-            let rhs = args[1];
+        TermData::App(Symbol::Named(name), args) => {
+            let &[lhs, rhs] = args.as_slice() else {
+                return None;
+            };
             let (subject, is_lhs) = if is_zero_constant(terms, rhs) {
                 (lhs, true)
             } else if is_zero_constant(terms, lhs) {
@@ -228,9 +237,10 @@ pub fn constant_value_of(terms: &TermStore, term: TermId) -> Option<BigRational>
     match terms.get(term) {
         TermData::Const(Constant::Int(n)) => Some(BigRational::from_integer(n.clone())),
         TermData::Const(Constant::Rational(r)) => Some(r.0.clone()),
-        TermData::App(Symbol::Named(name), args) if name == "-" && args.len() == 1 => {
-            constant_value_of(terms, args[0]).map(|c| -c)
-        }
+        TermData::App(Symbol::Named(name), args) if name == "-" => match args.as_slice() {
+            &[arg] => constant_value_of(terms, arg).map(|c| -c),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -300,11 +310,12 @@ pub fn record_sign_constraint(
 
 /// Check whether a monomial has all variables appearing an even number of times.
 pub fn is_even_degree_monomial(mon: &Monomial) -> bool {
-    let mut counts: HashMap<TermId, usize> = Default::default();
+    let mut odd: HashMap<TermId, bool> = Default::default();
     for &v in &mon.vars {
-        *counts.entry(v).or_default() += 1;
+        let parity = odd.entry(v).or_default();
+        *parity = !*parity;
     }
-    counts.values().all(|&c| c % 2 == 0)
+    odd.values().all(|&is_odd| !is_odd)
 }
 
 /// Check sign consistency for all monomials.
@@ -348,8 +359,10 @@ pub fn check_sign_consistency(
                 }
             }
         }
-        let mut factor_signs = Vec::with_capacity(mon.vars.len());
-        let mut factor_assertions = Vec::with_capacity(mon.vars.len());
+        let mut factor_signs =
+            Vec::with_capacity(mon.vars.len().min(MAX_PREALLOC_MONOMIAL_FACTORS));
+        let mut factor_assertions =
+            Vec::with_capacity(mon.vars.len().min(MAX_PREALLOC_MONOMIAL_FACTORS));
         let mut all_known = true;
         for &var in &mon.vars {
             if let Some((sign, assertion)) =
@@ -378,7 +391,8 @@ pub fn check_sign_consistency(
                 }
                 let mut relevant = factor_assertions.clone();
                 relevant.push(*mon_assertion);
-                let mut conflict = Vec::with_capacity(relevant.len());
+                let mut conflict =
+                    Vec::with_capacity(relevant.len().min(MAX_PREALLOC_MONOMIAL_FACTORS));
                 for &(t, v) in asserted {
                     if relevant.contains(&t) {
                         conflict.push(TheoryLit { term: t, value: v });
@@ -417,11 +431,10 @@ pub fn propagate_product_signs<'a>(
         let x_sign = sign_from_constraints_with_assertion(var_sign_constraints.get(&x));
         let y_sign = sign_from_constraints_with_assertion(var_sign_constraints.get(&y));
         if let (Some((xs, x_assertion)), Some((ys, _))) = (x_sign, y_sign) {
-            let prod = product_sign(&[xs, ys]) * mon.coeff_sign();
-            let constraint = match prod {
-                1 => SignConstraint::Positive,
-                -1 => SignConstraint::Negative,
-                0 => SignConstraint::Zero,
+            let constraint = match (product_sign(&[xs, ys]), mon.coeff_sign() < 0) {
+                (0, _) => SignConstraint::Zero,
+                (1, false) | (-1, true) => SignConstraint::Positive,
+                (1, true) | (-1, false) => SignConstraint::Negative,
                 _ => continue,
             };
             derived.push((mon.aux_var, constraint, x_assertion));

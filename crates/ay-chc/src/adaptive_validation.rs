@@ -25,7 +25,7 @@ use crate::pdr::{
     PredicateInterpretation,
 };
 use crate::portfolio::{PortfolioConfig, PortfolioResult, PortfolioSolver};
-use crate::{BmcSolver, ChcExpr, ChcProblem, ChcSort, ChcVar, PredicateId};
+use crate::{BmcSolver, CancellationToken, ChcExpr, ChcProblem, ChcSort, ChcVar, PredicateId};
 use ay_core::time::Instant;
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -112,10 +112,23 @@ impl AdaptivePortfolio {
     /// #8630: Wire solve_timeout so verification PdrSolvers bail
     /// cooperatively instead of hanging indefinitely.
     fn new_validation_solver(&self) -> PdrSolver {
+        self.new_validation_solver_with_limits(Duration::from_secs(30), None)
+    }
+
+    fn new_validation_solver_with_limits(
+        &self,
+        timeout: Duration,
+        external_cancellation: Option<&CancellationToken>,
+    ) -> PdrSolver {
+        let mut cancellation = self.cancellation_token.child();
+        if let Some(external) = external_cancellation {
+            cancellation.link_upstream(external);
+        }
         let config = PdrConfig {
             verbose: self.config.verbose,
             strict_proofs: true,
-            solve_timeout: Some(Duration::from_secs(30)),
+            cancellation_token: Some(cancellation),
+            solve_timeout: Some(timeout),
             disable_array_scalarization: true,
             preserve_original_clauses: true,
             ..PdrConfig::default()
@@ -130,15 +143,22 @@ impl AdaptivePortfolio {
     fn new_verified_result_validator(
         &self,
         remaining_budget: Option<Duration>,
+        external_cancellation: Option<&CancellationToken>,
     ) -> Option<PortfolioSolver> {
-        if remaining_budget.is_some_and(|budget| budget.is_zero()) {
+        if remaining_budget.is_some_and(|budget| budget.is_zero())
+            || external_cancellation.is_some_and(CancellationToken::is_cancelled)
+        {
             return None;
+        }
+        let mut cancellation = self.cancellation_token.child();
+        if let Some(external) = external_cancellation {
+            cancellation.link_upstream(external);
         }
 
         Some(PortfolioSolver::new(
             self.problem.clone(),
             PortfolioConfig {
-                external_cancellation: Some(self.cancellation_token.clone()),
+                external_cancellation: Some(cancellation),
                 engines: vec![],
                 parallel: false,
                 timeout: remaining_budget,
@@ -167,13 +187,28 @@ impl AdaptivePortfolio {
         cex: &Counterexample,
         remaining_budget: Option<Duration>,
     ) -> bool {
-        let Some(validator) = self.new_verified_result_validator(remaining_budget) else {
+        self.validate_final_unsafe_result_with_cancellation(cex, remaining_budget, None)
+    }
+
+    pub(crate) fn validate_final_unsafe_result_with_cancellation(
+        &self,
+        cex: &Counterexample,
+        remaining_budget: Option<Duration>,
+        external_cancellation: Option<&CancellationToken>,
+    ) -> bool {
+        let Some(validator) =
+            self.new_verified_result_validator(remaining_budget, external_cancellation)
+        else {
             tracing::debug!(
                 "Adaptive: final Unsafe result has no remaining validation budget, demoting to Unknown"
             );
             return false;
         };
-        validator.validate_unsafe_for_verified_result_with_budget(cex, remaining_budget)
+        let valid =
+            validator.validate_unsafe_for_verified_result_with_budget(cex, remaining_budget);
+        valid
+            && !self.cancellation_token.is_cancelled()
+            && !external_cancellation.is_some_and(CancellationToken::is_cancelled)
     }
 
     /// Cheap structural Safe guard for the public verified-result boundary.
@@ -241,9 +276,25 @@ impl AdaptivePortfolio {
         model: &InvariantModel,
         remaining_budget: Option<Duration>,
     ) -> Option<InvariantModel> {
-        if remaining_budget.is_some_and(|budget| budget.is_zero()) {
+        self.try_complete_final_safe_model_with_constant_interpretations_and_cancellation(
+            model,
+            remaining_budget,
+            None,
+        )
+    }
+
+    pub(crate) fn try_complete_final_safe_model_with_constant_interpretations_and_cancellation(
+        &self,
+        model: &InvariantModel,
+        remaining_budget: Option<Duration>,
+        external_cancellation: Option<&CancellationToken>,
+    ) -> Option<InvariantModel> {
+        if remaining_budget.is_some_and(|budget| budget.is_zero())
+            || external_cancellation.is_some_and(CancellationToken::is_cancelled)
+        {
             return None;
         }
+        let validation_deadline = remaining_budget.map(|budget| Instant::now() + budget);
 
         let missing: Vec<&crate::Predicate> = self
             .problem
@@ -309,16 +360,23 @@ impl AdaptivePortfolio {
 
             // Recompute the cap per attempt so a slow first candidate cannot
             // overdraw the remaining global budget.
-            let validation_budget = remaining_budget
-                .map_or(FINAL_SAFE_COMPLETION_VALIDATION_BUDGET, |remaining| {
-                    remaining.min(FINAL_SAFE_COMPLETION_VALIDATION_BUDGET)
+            let validation_budget =
+                validation_deadline.map_or(FINAL_SAFE_COMPLETION_VALIDATION_BUDGET, |deadline| {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(FINAL_SAFE_COMPLETION_VALIDATION_BUDGET)
                 });
             if validation_budget.is_zero() {
                 return None;
             }
+            let mut cancellation = self.cancellation_token.child();
+            if let Some(external) = external_cancellation {
+                cancellation.link_upstream(external);
+            }
             let validation_config = PdrConfig {
                 verbose: self.config.verbose,
                 strict_proofs: true,
+                cancellation_token: Some(cancellation),
                 solve_timeout: Some(validation_budget),
                 disable_array_scalarization: true,
                 preserve_original_clauses: true,
@@ -340,7 +398,10 @@ impl AdaptivePortfolio {
                 "Adaptive: final Safe model completion with constant interpretations"
             );
 
-            if verified {
+            if verified
+                && !self.cancellation_token.is_cancelled()
+                && !external_cancellation.is_some_and(CancellationToken::is_cancelled)
+            {
                 return Some(completed);
             }
         }
@@ -387,6 +448,14 @@ impl AdaptivePortfolio {
         &self,
         remaining_budget: Option<Duration>,
     ) -> bool {
+        self.final_safe_verdict_reproved_on_original_with_cancellation(remaining_budget, None)
+    }
+
+    pub(crate) fn final_safe_verdict_reproved_on_original_with_cancellation(
+        &self,
+        remaining_budget: Option<Duration>,
+        external_cancellation: Option<&CancellationToken>,
+    ) -> bool {
         // Decidable-finite acyclic only: mirrors `bmc_only_empty_safe_is_proof_grade`
         // (adaptive_engines.rs). A definite UNSAT of the fully-unrolled acyclic
         // query disjunction is a COMPLETE safety proof for any decidable
@@ -396,7 +465,8 @@ impl AdaptivePortfolio {
         // acyclic probe proves Safe in milliseconds). RECURSIVE datatypes, reals,
         // and arrays (unbounded value space) stay excluded — bounded unroll is
         // incomplete for them.
-        if self.problem.has_cycles()
+        if external_cancellation.is_some_and(CancellationToken::is_cancelled)
+            || self.problem.has_cycles()
             || self.problem.has_array_sorts()
             || self.problem.has_real_sorts()
             || self.problem.has_recursive_datatype_sorts()
@@ -419,12 +489,16 @@ impl AdaptivePortfolio {
         }
         let depth = features.dag_depth.max(features.num_predicates).max(1);
 
+        let mut cancellation = self.cancellation_token.child();
+        if let Some(external) = external_cancellation {
+            cancellation.link_upstream(external);
+        }
         let bmc = BmcSolver::new(
             self.problem.clone(),
             BmcConfig {
                 base: ChcEngineConfig {
                     verbose: self.config.verbose,
-                    ..ChcEngineConfig::default()
+                    cancellation_token: Some(cancellation),
                 },
                 max_depth: depth,
                 // Declare Safe only on exhaustive acyclic unrolling — the
@@ -440,7 +514,9 @@ impl AdaptivePortfolio {
                 sweep_past_spurious_sat: true,
             },
         );
-        let reproved = matches!(bmc.solve(), PortfolioResult::Safe(_));
+        let reproved = matches!(bmc.solve(), PortfolioResult::Safe(_))
+            && !self.cancellation_token.is_cancelled()
+            && !external_cancellation.is_some_and(CancellationToken::is_cancelled);
         tracing::debug!(
             depth,
             reproved,
@@ -551,7 +627,7 @@ impl AdaptivePortfolio {
                 // Extended budget: convergence models are typically from complex
                 // multi-predicate problems where standard 1.5s may be tight.
                 let budget = self.final_validation_budget(deadline, Duration::from_secs(3));
-                self.validate_adaptive_result_with_budget(result, budget)
+                self.validate_adaptive_result_with_budget(result, budget, None)
             }
             // Safe validation is mandatory: direct adaptive Safe results
             // bypass the portfolio's always-on Safe validation (#5382, #7688).
@@ -565,7 +641,7 @@ impl AdaptivePortfolio {
             PdrResult::Safe(_) => {
                 let budget =
                     self.final_validation_budget(deadline, Self::VALIDATION_BUDGET_1INDUCTIVE);
-                self.validate_adaptive_result_with_budget(result, budget)
+                self.validate_adaptive_result_with_budget(result, budget, None)
             }
             // Unsafe validation is mandatory for EVERY adaptive Unsafe
             // (inc-9, gate g4). Previously, without `config.validate` /
@@ -578,9 +654,49 @@ impl AdaptivePortfolio {
             PdrResult::Unsafe(_) => {
                 let budget =
                     self.final_validation_budget(deadline, Self::VALIDATION_BUDGET_1INDUCTIVE);
-                self.validate_adaptive_result_with_budget(result, budget)
+                self.validate_adaptive_result_with_budget(result, budget, None)
             }
             PdrResult::Unknown | PdrResult::NotApplicable => PdrResult::Unknown,
+        }
+    }
+
+    /// Strict absolute-boundary validation used by BMC-only embedding calls.
+    ///
+    /// Unlike the general adaptive final-validation policy, this route never
+    /// applies the historical nominal-budget floor past the caller's remaining
+    /// wall. The caller cancellation token is linked into the fresh verifier,
+    /// and a candidate finishing at/after either boundary is rejected.
+    pub(crate) fn validate_adaptive_result_with_boundary(
+        &self,
+        result: PdrResult,
+        deadline: Option<Instant>,
+        cancellation: &CancellationToken,
+    ) -> PdrResult {
+        let boundary_open = || {
+            !self.cancellation_token.is_cancelled()
+                && !cancellation.is_cancelled()
+                && deadline.is_none_or(|limit| Instant::now() < limit)
+        };
+        if !boundary_open() {
+            return PdrResult::Unknown;
+        }
+        let nominal = if matches!(&result, PdrResult::Safe(model) if model.convergence_proven) {
+            Duration::from_secs(3)
+        } else {
+            Self::VALIDATION_BUDGET_1INDUCTIVE
+        };
+        let budget = deadline
+            .map(|limit| limit.saturating_duration_since(Instant::now()).min(nominal))
+            .unwrap_or(nominal);
+        if budget.is_zero() {
+            return PdrResult::Unknown;
+        }
+        let validated =
+            self.validate_adaptive_result_with_budget(result, budget, Some(cancellation));
+        if boundary_open() {
+            validated
+        } else {
+            PdrResult::Unknown
         }
     }
 
@@ -592,10 +708,15 @@ impl AdaptivePortfolio {
         &self,
         result: PdrResult,
         safe_budget: Duration,
+        external_cancellation: Option<&CancellationToken>,
     ) -> PdrResult {
         match &result {
             PdrResult::Safe(model) => {
-                let mut verifier = self.new_validation_solver();
+                let mut verifier = if external_cancellation.is_some() {
+                    self.new_validation_solver_with_limits(safe_budget, external_cancellation)
+                } else {
+                    self.new_validation_solver()
+                };
                 if verifier.verify_model_with_budget(model, safe_budget) {
                     result
                 } else {
@@ -606,7 +727,17 @@ impl AdaptivePortfolio {
                 }
             }
             PdrResult::Unsafe(cex) => {
-                if self.validate_direct_unsafe_counterexample(cex) {
+                let valid = if external_cancellation.is_some() {
+                    let mut verifier =
+                        self.new_validation_solver_with_limits(safe_budget, external_cancellation);
+                    matches!(
+                        verifier.verify_counterexample(cex),
+                        CexVerificationResult::Valid
+                    )
+                } else {
+                    self.validate_direct_unsafe_counterexample(cex)
+                };
+                if valid {
                     result
                 } else {
                     tracing::debug!(

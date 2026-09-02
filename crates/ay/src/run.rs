@@ -2752,7 +2752,7 @@ fn z3_initial_statistics(state: &SmtTranscriptState) -> String {
 /// Z3 version reported under explicit `--z3-mode` (full impersonation). Matches
 /// the pinned Z3 baseline that `ay --z3-mode` is documented and smoke-tested
 /// against (the development design notes). Kept in sync with that baseline.
-const Z3_COMPAT_BASELINE_VERSION: &str = "5.0.0";
+const Z3_COMPAT_BASELINE_VERSION: &str = "5.1.0";
 
 fn z3_compat_get_info_output(
     state: &SmtTranscriptState,

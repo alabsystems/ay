@@ -15,8 +15,11 @@
 //! and pops in one atomic scope.
 
 use super::executor_adapter::{
-    accept_reparsed_sat_model, collect_dt_declarations, detect_logic, emit_declare_datatype,
-    parse_model_into, quote_symbol, sort_to_smtlib,
+    accept_reparsed_sat_model, build_uf_application_aliases_avoiding,
+    collect_dt_declarations_for_expr, collect_uninterpreted_function_declarations, detect_logic,
+    emit_declare_datatypes, emit_declare_uninterpreted_function, emit_uf_application_aliases,
+    install_uf_application_alias_values, parse_model_into, quote_symbol, sort_to_smtlib,
+    UfApplicationAliasEmissionError,
 };
 use super::types::SmtResult;
 use crate::pdr::model::InvariantModel;
@@ -34,6 +37,12 @@ enum PdrBackendError {
     Parse(#[from] ay_frontend::ParseError),
     #[error("executor error: {0}")]
     Execute(#[from] ay_dpll::ExecutorError),
+    #[error("invalid uninterpreted-function declaration: {0}")]
+    InvalidFunctionSignature(String),
+    #[error("invalid datatype declaration: {0}")]
+    InvalidDatatypeDeclaration(String),
+    #[error("UF application alias emission failed: {0}")]
+    UfAliasEmission(#[from] UfApplicationAliasEmissionError),
     #[error("check-sat produced no result")]
     MissingResult,
 }
@@ -51,10 +60,18 @@ pub(crate) struct PdrExecutorBackend {
     exec: Executor,
     logic: Option<String>,
     declared_vars: FxHashMap<String, ChcSort>,
+    /// Ordinary UF signatures already declared in the persistent session.
+    declared_functions: FxHashMap<String, (ChcSort, Vec<ChcSort>)>,
+    /// Monotonic source-name freshness for finite UF-application observations.
+    uf_application_alias_counter: usize,
     query_count: usize,
     initialized: bool,
-    /// Datatype names whose constructors were already declared.
-    declared_datatypes: FxHashSet<String>,
+    /// Canonical signatures of datatypes already declared in the persistent
+    /// session.  Remembering only names would silently accept a later
+    /// same-name/different-definition typed query under the old definition.
+    declared_datatypes: FxHashMap<String, String>,
+    /// Constructor surface names used while decoding datatype model values.
+    declared_datatype_constructors: FxHashSet<String>,
 }
 
 impl Default for PdrExecutorBackend {
@@ -70,9 +87,12 @@ impl PdrExecutorBackend {
             exec: Executor::new(),
             logic: None,
             declared_vars: FxHashMap::default(),
+            declared_functions: FxHashMap::default(),
+            uf_application_alias_counter: 0,
             query_count: 0,
             initialized: false,
-            declared_datatypes: FxHashSet::default(),
+            declared_datatypes: FxHashMap::default(),
+            declared_datatype_constructors: FxHashSet::default(),
         }
     }
 
@@ -118,6 +138,16 @@ impl PdrExecutorBackend {
         timeout: Duration,
         dv_off_first: bool,
     ) -> SmtResult {
+        // This admission must precede retry feature scans and every recursive
+        // div/mod or variable preprocessing helper.  It is iterative and
+        // aggregate-capped; an oversized typed term is not allowed to reach a
+        // stack-growing or allocation-producing path.
+        if let Err(reason) = collect_dt_declarations_for_expr(&[], expr) {
+            tracing::debug!(
+                "pdr_executor_backend: {reason}; returning Unknown before recursive preprocessing"
+            );
+            return SmtResult::Unknown;
+        }
         // Use catch_unwind for panic safety. The error closure resets state.
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             self.check_sat_with_retry(expr, timeout, dv_off_first)
@@ -206,6 +236,16 @@ impl PdrExecutorBackend {
         let mod_div_axiomatized = super::executor_adapter::axiomatize_mod_div_for_executor(expr);
         let solve_expr = mod_div_axiomatized.as_ref().unwrap_or(expr);
 
+        let dt_decls = match collect_dt_declarations_for_expr(&[], solve_expr) {
+            Ok(declarations) => declarations,
+            Err(reason) => {
+                tracing::debug!(
+                    "pdr_executor_backend: {reason}; returning Unknown after bounded preprocessing"
+                );
+                return (SmtResult::Unknown, false);
+            }
+        };
+
         // Step 1: Collect free variables.
         let vars = solve_expr.vars();
         if vars.is_empty() {
@@ -267,9 +307,14 @@ impl PdrExecutorBackend {
             }
         }
 
-        // Step 4: Declare datatype sorts and new variables.
-        if let Err(e) = self.declare_datatypes(&vars) {
+        // Step 4: Declare datatype sorts, ordinary UFs, and new variables.
+        if let Err(e) = self.declare_datatypes(&dt_decls) {
             tracing::debug!("pdr_executor_backend: dt declaration failed: {e}");
+            self.reset();
+            return (SmtResult::Unknown, false);
+        }
+        if let Err(e) = self.declare_missing_uninterpreted_functions(solve_expr) {
+            tracing::debug!("pdr_executor_backend: UF declaration failed: {e}");
             self.reset();
             return (SmtResult::Unknown, false);
         }
@@ -308,8 +353,13 @@ impl PdrExecutorBackend {
             let mut s = String::with_capacity(2048);
             s.push_str(&format!("(set-logic {required_logic})\n"));
             s.push_str("(set-option :produce-models true)\n");
-            for (dt_name, ctors) in collect_dt_declarations(&vars) {
-                s.push_str(&emit_declare_datatype(dt_name, ctors));
+            if let Ok(declarations) = emit_declare_datatypes(&dt_decls) {
+                s.push_str(&declarations);
+            }
+            if let Ok(declarations) = collect_uninterpreted_function_declarations(solve_expr) {
+                for declaration in &declarations {
+                    s.push_str(&emit_declare_uninterpreted_function(declaration));
+                }
             }
             for v in &vars {
                 s.push_str(&format!(
@@ -338,12 +388,40 @@ impl PdrExecutorBackend {
             let _ = std::fs::write(&path, &s);
         }
 
-        // Step 6: Push, assert, check-sat, get-model, pop.
+        let declared_vars = &self.declared_vars;
+        let declared_functions = &self.declared_functions;
+        let alias_counter = &mut self.uf_application_alias_counter;
+        let uf_application_aliases = match build_uf_application_aliases_avoiding(
+            std::iter::once(solve_expr),
+            alias_counter,
+            declared_vars
+                .keys()
+                .chain(declared_functions.keys())
+                .map(String::as_str),
+        ) {
+            Ok(aliases) => aliases,
+            Err(error) => {
+                tracing::debug!("pdr_executor_backend: UF application alias failed: {error}");
+                return (SmtResult::Unknown, false);
+            }
+        };
+
+        // Step 6: Push, alias finite UF applications, assert, check-sat,
+        // get-model, pop.
         let mut pushed = false;
         let mut raw_unknown = false;
         let result = (|| -> Result<SmtResult, PdrBackendError> {
             self.exec.execute(&Command::Push(1))?;
             pushed = true;
+
+            let alias_script = emit_uf_application_aliases(
+                &uf_application_aliases,
+                crate::smt::current_thread_solve_deadline(),
+            )?;
+            if !alias_script.is_empty() {
+                let commands = ay_frontend::parse(&alias_script)?;
+                self.exec.execute_all(&commands)?;
+            }
 
             // Assert conjuncts individually for better theory axiom generation.
             let conjuncts = solve_expr.conjuncts();
@@ -401,8 +479,14 @@ impl PdrExecutorBackend {
                 "sat" => {
                     let model_output = self.exec.execute(&Command::GetModel)?.unwrap_or_default();
                     let mut model = FxHashMap::default();
-                    let dt_ctor_names: FxHashSet<String> = self.declared_datatypes.clone();
-                    parse_model_into(&mut model, &model_output, &dt_ctor_names);
+                    parse_model_into(
+                        &mut model,
+                        &model_output,
+                        &self.declared_datatype_constructors,
+                    );
+                    if !install_uf_application_alias_values(&mut model, &uf_application_aliases) {
+                        return Ok(SmtResult::Unknown);
+                    }
                     let validation_exprs = [expr];
                     Ok(
                         if let Some(model) = accept_reparsed_sat_model(
@@ -495,16 +579,87 @@ impl PdrExecutorBackend {
     }
 
     /// Declare datatype sorts that haven't been declared yet.
-    fn declare_datatypes(&mut self, vars: &[ChcVar]) -> Result<(), PdrBackendError> {
-        let dt_decls = collect_dt_declarations(vars);
-        for (dt_name, ctors) in dt_decls {
-            if self.declared_datatypes.contains(dt_name) {
+    fn declare_datatypes(
+        &mut self,
+        dt_decls: &[(&str, &[crate::ChcDtConstructor])],
+    ) -> Result<(), PdrBackendError> {
+        let mut pending = Vec::new();
+        let mut pending_signatures = Vec::new();
+        for &(name, constructors) in dt_decls {
+            let signature = emit_declare_datatypes(&[(name, constructors)])
+                .map_err(|error| PdrBackendError::InvalidDatatypeDeclaration(error.to_string()))?;
+            if let Some(previous) = self.declared_datatypes.get(name) {
+                if previous != &signature {
+                    return Err(PdrBackendError::InvalidDatatypeDeclaration(format!(
+                        "datatype sort '{name}' conflicts with its persistent-session definition"
+                    )));
+                }
                 continue;
             }
-            let dt_script = emit_declare_datatype(dt_name, ctors);
-            let cmds = ay_frontend::parse(&dt_script)?;
-            self.exec.execute_all(&cmds)?;
-            self.declared_datatypes.insert(dt_name.to_string());
+            pending.push((name, constructors));
+            pending_signatures.push((name.to_string(), signature));
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let dt_script = emit_declare_datatypes(&pending)
+            .map_err(|error| PdrBackendError::InvalidDatatypeDeclaration(error.to_string()))?;
+        let cmds = ay_frontend::parse(&dt_script)?;
+        self.exec.execute_all(&cmds)?;
+        for (_, constructors) in &pending {
+            self.declared_datatype_constructors.extend(
+                constructors
+                    .iter()
+                    .map(|constructor| constructor.name.clone()),
+            );
+        }
+        for (name, signature) in pending_signatures {
+            self.declared_datatypes.insert(name, signature);
+        }
+        Ok(())
+    }
+
+    /// Declare ordinary UFs that have not appeared in an earlier query.
+    ///
+    /// SMT-LIB functions are session-global and non-overloadable.  A new use
+    /// of an existing name with a different signature therefore invalidates
+    /// the query rather than being silently interpreted under the first
+    /// declaration retained by the persistent executor.
+    fn declare_missing_uninterpreted_functions(
+        &mut self,
+        expr: &ChcExpr,
+    ) -> Result<(), PdrBackendError> {
+        let declarations = collect_uninterpreted_function_declarations(expr)
+            .map_err(|error| PdrBackendError::InvalidFunctionSignature(error.to_string()))?;
+        let mut missing = Vec::new();
+        for declaration in declarations {
+            let signature = (
+                declaration.return_sort.clone(),
+                declaration.argument_sorts.clone(),
+            );
+            if let Some(existing) = self.declared_functions.get(&declaration.name) {
+                if existing != &signature {
+                    return Err(PdrBackendError::InvalidFunctionSignature(format!(
+                        "function '{}' changed signature across persistent queries",
+                        declaration.name
+                    )));
+                }
+                continue;
+            }
+            missing.push((declaration, signature));
+        }
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut script = String::new();
+        for (declaration, _) in &missing {
+            script.push_str(&emit_declare_uninterpreted_function(declaration));
+        }
+        let commands = ay_frontend::parse(&script)?;
+        self.exec.execute_all(&commands)?;
+        for (declaration, signature) in missing {
+            self.declared_functions.insert(declaration.name, signature);
         }
         Ok(())
     }
@@ -546,7 +701,7 @@ impl PdrExecutorBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ChcExpr, ChcOp, ChcSort, ChcVar};
+    use crate::{ChcDtConstructor, ChcExpr, ChcOp, ChcSort, ChcVar};
     use std::sync::Arc;
 
     fn mk_var(name: &str) -> ChcExpr {
@@ -653,6 +808,125 @@ mod tests {
         let mut backend = PdrExecutorBackend::new();
         let result = backend.check_sat(&expr, Duration::from_secs(5));
         assert!(result.is_unsat(), "expected UNSAT, got: {result:?}");
+    }
+
+    #[test]
+    fn test_pdr_backend_declares_scalar_uf_before_query() {
+        let x = mk_var("x");
+        let y = mk_var("y");
+        let f_x = ChcExpr::FuncApp("f".to_string(), ChcSort::Int, vec![Arc::new(x.clone())]);
+        let f_y = ChcExpr::FuncApp("f".to_string(), ChcSort::Int, vec![Arc::new(y.clone())]);
+        let expr = ChcExpr::and_all([ChcExpr::eq(x, y), ChcExpr::not(ChcExpr::eq(f_x, f_y))]);
+
+        let mut backend = PdrExecutorBackend::new();
+        let result = backend.check_sat(&expr, Duration::from_secs(5));
+        assert!(
+            result.is_unsat(),
+            "persistent PDR backend must declare f and enforce congruence: {result:?}"
+        );
+        assert_eq!(
+            backend.declared_functions.get("f"),
+            Some(&(ChcSort::Int, vec![ChcSort::Int]))
+        );
+    }
+
+    #[test]
+    fn test_pdr_backend_declares_ground_expression_local_datatype() {
+        // The datatype occurs only as the result sort of ground constructor
+        // applications. It is absent from the sole free variable, so a
+        // vars-only declaration pass leaves Red/Blue undeclared while the UF
+        // classifier correctly suppresses them as datatype constructors.
+        let color = ChcSort::Datatype {
+            name: "PdrGroundColor".to_string(),
+            constructors: Arc::new(vec![
+                ChcDtConstructor {
+                    name: "PdrGroundRed".to_string(),
+                    selectors: vec![],
+                },
+                ChcDtConstructor {
+                    name: "PdrGroundBlue".to_string(),
+                    selectors: vec![],
+                },
+            ]),
+        };
+        let enabled = ChcExpr::var(ChcVar::new("ground_dt_enabled", ChcSort::Bool));
+        let red = ChcExpr::FuncApp("PdrGroundRed".to_string(), color.clone(), vec![]);
+        let blue = ChcExpr::FuncApp("PdrGroundBlue".to_string(), color, vec![]);
+        let expr = ChcExpr::and(enabled, ChcExpr::not(ChcExpr::eq(red, blue)));
+
+        let mut backend = PdrExecutorBackend::new();
+        let result = backend.check_sat(&expr, Duration::from_secs(5));
+        assert!(
+            result.is_sat(),
+            "ground expression-local datatype query must be executable: {result:?}"
+        );
+        assert!(
+            backend.declared_datatypes.contains_key("PdrGroundColor"),
+            "persistent session must declare datatype metadata discovered in the expression"
+        );
+    }
+
+    #[test]
+    fn test_pdr_backend_extracts_exact_scalar_uf_application_value() {
+        let x = mk_var("x_uf_sat");
+        let f_x = ChcExpr::FuncApp(
+            "f_uf_sat".to_string(),
+            ChcSort::Int,
+            vec![Arc::new(x.clone())],
+        );
+        let expr = ChcExpr::and_all([ChcExpr::eq(x, mk_int(3)), ChcExpr::eq(f_x, mk_int(9))]);
+
+        let mut backend = PdrExecutorBackend::new();
+        let result = backend.check_sat(&expr, Duration::from_secs(5));
+        let SmtResult::Sat(model) = result else {
+            panic!("persistent PDR UF witness should be strictly checkable: {result:?}");
+        };
+        assert_eq!(
+            crate::expr::evaluate::evaluate_expr(&expr, &model),
+            Some(crate::smt::SmtValue::Bool(true))
+        );
+    }
+
+    #[test]
+    fn test_pdr_backend_uf_alias_avoids_symbol_from_prior_query() {
+        let x = ChcVar::new("x_prior_alias", ChcSort::Int);
+        let x_expr = ChcExpr::var(x.clone());
+        let f_x = ChcExpr::FuncApp(
+            "f_prior_alias".to_string(),
+            ChcSort::Int,
+            vec![Arc::new(x_expr.clone())],
+        );
+        let prior = ChcVar::new("ay!uf!value!2", ChcSort::Int);
+        let first = ChcExpr::and_all([
+            ChcExpr::eq(f_x, mk_int(9)),
+            ChcExpr::eq(ChcExpr::var(prior), mk_int(7)),
+        ]);
+        let mut backend = PdrExecutorBackend::new();
+        let first_result = backend.check_sat(&first, Duration::from_secs(5));
+        assert!(
+            first_result.is_sat(),
+            "setup query must be SAT: {first_result:?}"
+        );
+
+        let f_x_again = ChcExpr::FuncApp(
+            "f_prior_alias".to_string(),
+            ChcSort::Int,
+            vec![Arc::new(x_expr.clone())],
+        );
+        let g_x = ChcExpr::FuncApp(
+            "g_prior_alias".to_string(),
+            ChcSort::Int,
+            vec![Arc::new(x_expr)],
+        );
+        let second = ChcExpr::and_all([
+            ChcExpr::eq(f_x_again, mk_int(9)),
+            ChcExpr::eq(g_x, mk_int(10)),
+        ]);
+        let second_result = backend.check_sat(&second, Duration::from_secs(5));
+        assert!(
+            second_result.is_sat(),
+            "a retained user declaration must not collide with a later UF alias: {second_result:?}"
+        );
     }
 
     /// Inc-21: a dv-off-first attempt sets `:ay-eq-diffvar false` on the

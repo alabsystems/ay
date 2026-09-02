@@ -336,8 +336,11 @@ fn an_assumption_ledger_admits_only_the_roots_it_actually_holds() {
 /// resolution as an opaque `distinct` atom and the other as `(= i j)`.
 ///
 /// Withholding is the correct answer, not suppression: the root keeps the
-/// canonical spelling the strict checker validated, and a confinable sibling
-/// root in the same document still gets its authored text.
+/// canonical spelling the strict checker validated, and a sibling root in the
+/// same document still publishes its authored text. The sibling here spells
+/// its root canonically, so it publishes that text with NO table entry;
+/// `a_withheld_root_does_not_cost_a_noncanonical_sibling_its_override` pins the
+/// same non-interference for a sibling that genuinely needs one.
 #[test]
 fn an_unconfinable_authored_spelling_is_withheld_not_suppressed() {
     let mut executor = Executor::new();
@@ -366,13 +369,74 @@ fn an_unconfinable_authored_spelling_is_withheld_not_suppressed() {
         !executor.last_unsat_proof_reconstruction_suppressed,
         "a spelling this pass declines to install is not a publication failure"
     );
+    // Two facts, where this used to pin one. `(assert (= i j))` already
+    // spells its root exactly as the printer renders it, so it publishes that
+    // authored text with no entry at all — and the ABSENCE is load bearing,
+    // not incidental: `restored_authored_override_map` compares any entry it
+    // holds for a root against whatever an earlier pass recorded there and
+    // declines the WHOLE reconstruction on disagreement, so a redundant
+    // identity entry is a live suppression risk for a root the problem file
+    // spells canonically.
+    assert!(
+        executor.last_proof_term_overrides.is_none(),
+        "neither root installs a spelling: one is withheld, the other is \
+         already canonical"
+    );
+    assert_eq!(
+        ay_proof::format_term_alethe(&executor.ctx.terms, equality),
+        "(= i j)",
+        "and the canonical text the sibling falls back to IS its authored spelling"
+    );
+    assert_eq!(
+        ay_proof::format_term_alethe(&executor.ctx.terms, disequality),
+        "(not (= i j))",
+        "`distinct` over a negated-equality root cannot be confined to its \
+         assume, so the withheld root keeps canonical text"
+    );
+}
+
+/// The non-interference half of `an_unconfinable_authored_spelling_is_withheld_not_suppressed`,
+/// with a sibling whose authored spelling is genuinely NOT the canonical one.
+/// A root this pass withholds must not cost a sibling in the same document the
+/// override it does need — withholding is per root, never per document.
+#[test]
+fn a_withheld_root_does_not_cost_a_noncanonical_sibling_its_override() {
+    let mut executor = Executor::new();
+    let i = executor.ctx.terms.mk_var("i", Sort::Int);
+    let j = executor.ctx.terms.mk_var("j", Sort::Int);
+    let equality = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("="), [i, j], Sort::Bool);
+    let disequality = executor.ctx.terms.mk_not_raw(equality);
+    // Elaboration normalizes `(+ j 0)` away, so this row's spelling differs
+    // from the canonical rendering while keeping the `=` head the printer
+    // needs to confine it to its own `assume`.
+    executor
+        .ctx
+        .add_assertion_with_parsed(equality, parsed_assertion("(assert (= i (+ j 0)))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(disequality, parsed_assertion("(assert (distinct i j))"));
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(equality, None);
+    let negative = proof.add_assume(disequality, None);
+    proof.add_resolution(Vec::new(), equality, positive, negative);
+    executor.last_proof_term_overrides = None;
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        !executor.last_unsat_proof_reconstruction_suppressed,
+        "a spelling this pass declines to install is not a publication failure"
+    );
     let overrides = executor
         .last_proof_term_overrides
         .as_ref()
         .expect("the confinable sibling root still records its authored text");
     assert_eq!(
         overrides.get(&equality).map(String::as_str),
-        Some("(= i j)"),
+        Some("(= i (+ j 0))"),
         "a root whose authored head matches the canonical head still restores"
     );
     assert_eq!(
@@ -477,8 +541,9 @@ fn a_composite_fold_root_keeps_the_spelling_an_earlier_pass_installed() {
 
 /// The other half of the same fact: with no earlier entry to preserve, a
 /// composite fold root gets NOTHING from this pass. It is withheld, never
-/// installed and never a suppression, and a confinable sibling root in the
-/// same document still restores its authored text.
+/// installed and never a suppression, and a sibling root in the same document
+/// still publishes its authored text — here by falling back to canonical text
+/// its own row spells exactly.
 ///
 /// Measured end to end on `(assert (and (= a b) (= x x)))` +
 /// `(assert (not (= a b)))`: the published document is
@@ -513,19 +578,20 @@ fn a_composite_fold_root_installs_nothing_when_no_earlier_pass_did() {
         !executor.last_unsat_proof_reconstruction_suppressed,
         "a spelling this pass declines to install is not a publication failure"
     );
-    let overrides = executor
-        .last_proof_term_overrides
-        .as_ref()
-        .expect("the confinable sibling root still records its authored text");
-    assert_eq!(
-        overrides.get(&equality),
-        None,
-        "an authored `and` over a folded `=` root is not installed by this pass"
+    // As above, two facts where this pinned one: nothing is installed for
+    // EITHER root — the folded `and` is withheld, and `(assert (not (= a b)))`
+    // already spells its root exactly as the printer renders it, so it
+    // authenticates canonical text instead of re-deriving it as an entry that
+    // an earlier pass's spelling could then collide with.
+    assert!(
+        executor.last_proof_term_overrides.is_none(),
+        "an authored `and` over a folded `=` root is not installed by this \
+         pass, and its sibling is already canonical"
     );
     assert_eq!(
-        overrides.get(&disequality).map(String::as_str),
-        Some("(not (= a b))"),
-        "a root whose authored head matches the canonical head still restores"
+        ay_proof::format_term_alethe(&executor.ctx.terms, disequality),
+        "(not (= a b))",
+        "and the canonical text the sibling falls back to IS its authored spelling"
     );
 }
 
@@ -598,6 +664,297 @@ fn an_over_cap_assumption_ledger_withholds_the_assumption_arm() {
         executor.last_unsat_proof_reconstruction_suppressed,
         "over the cap the assumption arm has no members, so a root only it \
          could have accounted for must still fail closed"
+    );
+}
+
+/// Falling back from a narrowed preprocessing provenance ledger to Context's
+/// immutable authored rows must not make every recovered row a proof premise.
+/// The exact export scope remains the authority boundary.
+#[test]
+fn fallback_does_not_authorize_a_recovered_row_outside_the_exact_scope() {
+    let mut executor = Executor::new();
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (>= (f b) 0))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(negated, parsed_assertion("(assert (not (<= 0 (f b))))"));
+    executor.proof_problem_assertion_provenance = Some(
+        crate::executor::theories::solve_harness::ProofProblemAssertionProvenance {
+            original_problem_assertions: vec![canonical],
+            problem_assertions: vec![canonical],
+            assertion_sources: Default::default(),
+        },
+    );
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(canonical, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), canonical, positive, negative);
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        executor.last_unsat_proof_reconstruction_suppressed,
+        "a recovered source row cannot widen the exact preprocessing/query scope"
+    );
+}
+
+/// Equal row counts are not enough for fallback alignment. This creates the
+/// smallest stale layout possible through Context's solver-facing APIs: a
+/// transient parsed row occupies index zero, an authored row records index
+/// one, then stack truncation leaves one row on each side but they are not the
+/// same row. Zipping by length would lend the transient spelling to the
+/// authored root.
+#[test]
+fn fallback_rejects_equal_length_but_misaligned_source_rows() {
+    let mut executor = Executor::new();
+    let transient = executor
+        .ctx
+        .terms
+        .mk_var("transient_source_row", Sort::Bool);
+    let authored = executor
+        .ctx
+        .terms
+        .mk_var("authored_source_root", Sort::Bool);
+    let not_authored = executor.ctx.terms.mk_not_raw(authored);
+    executor.ctx.add_transient_assertion_with_parsed(
+        transient,
+        parsed_assertion("(assert transient_source_row)"),
+    );
+    executor
+        .ctx
+        .add_assertion_with_parsed(authored, parsed_assertion("(assert authored_source_root)"));
+    executor.ctx.truncate_assertions(1);
+    assert_eq!(executor.ctx.assertions_parsed().len(), 1);
+    assert_eq!(executor.ctx.concrete_authored_assertion_terms().len(), 1);
+
+    executor.proof_problem_assertion_provenance = Some(
+        crate::executor::theories::solve_harness::ProofProblemAssertionProvenance {
+            original_problem_assertions: Vec::new(),
+            problem_assertions: vec![authored],
+            assertion_sources: Default::default(),
+        },
+    );
+    executor.last_assumptions = Some(vec![not_authored]);
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(authored, None);
+    let negative = proof.add_assume(not_authored, None);
+    proof.add_resolution(Vec::new(), authored, positive, negative);
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert!(
+        executor.last_unsat_proof_reconstruction_suppressed,
+        "fallback must validate the recorded parsed index, not only row counts"
+    );
+    assert!(
+        executor.last_proof_term_overrides.is_none(),
+        "the transient spelling must never be installed on the authored root"
+    );
+}
+
+#[test]
+fn fallback_scope_aggregate_cap_charges_rows_before_deduplication() {
+    let fixture = |assumption_rows: usize| {
+        let mut executor = Executor::new();
+        let root = executor
+            .ctx
+            .terms
+            .mk_var("fallback_scope_cap_root", Sort::Bool);
+        let not_root = executor.ctx.terms.mk_not_raw(root);
+        executor
+            .ctx
+            .add_assertion_with_parsed(root, parsed_assertion("(assert fallback_scope_cap_root)"));
+        executor.proof_problem_assertion_provenance = Some(
+            crate::executor::theories::solve_harness::ProofProblemAssertionProvenance {
+                original_problem_assertions: Vec::new(),
+                problem_assertions: vec![root],
+                assertion_sources: Default::default(),
+            },
+        );
+        executor.last_assumptions = Some(vec![not_root; assumption_rows]);
+        let mut proof = Proof::new();
+        let positive = proof.add_assume(root, None);
+        let negative = proof.add_assume(not_root, None);
+        proof.add_resolution(Vec::new(), root, positive, negative);
+        (executor, proof)
+    };
+
+    let cap = support::MAX_AUTHORED_ORIGINAL_INDEX_ROWS;
+    let (mut at_cap, proof) = fixture(cap - 1);
+    at_cap.restore_reachable_authored_assume_surface_overrides(&proof);
+    assert!(
+        !at_cap.last_unsat_proof_reconstruction_suppressed,
+        "problem row plus repeated assumptions at the aggregate cap remains admitted"
+    );
+
+    let (mut over_cap, proof) = fixture(cap);
+    over_cap.restore_reachable_authored_assume_surface_overrides(&proof);
+    assert!(
+        over_cap.last_unsat_proof_reconstruction_suppressed,
+        "repeated rows must be charged before set deduplication"
+    );
+}
+
+fn expanded_let_source_fixture() -> (Executor, Proof, TermId, TermId, String) {
+    let mut executor = Executor::new();
+    let p = executor.ctx.terms.mk_var("expanded_let_p", Sort::Bool);
+    let q = executor.ctx.terms.mk_var("expanded_let_q", Sort::Bool);
+    let not_q = executor.ctx.terms.mk_not_raw(q);
+    let root = executor
+        .ctx
+        .terms
+        .mk_app(Symbol::named("and"), [p, not_q], Sort::Bool);
+    let not_root = executor.ctx.terms.mk_not_raw(root);
+    let source = parsed_assertion(
+        "(assert (let ((expanded_alias expanded_let_p)) \
+         (and expanded_alias (not expanded_let_q))))",
+    );
+    let source_surface = crate::executor::proof_surface_syntax::format_frontend_term(&source);
+    executor.ctx.add_assertion_with_parsed(root, source);
+    executor.last_assumptions = Some(vec![not_root]);
+    executor.record_raw_authored_problem_assertion(root);
+    executor
+        .last_proof_expanded_let_sources
+        .push((root, 0, source_surface.clone()));
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(root, None);
+    let negative = proof.add_assume(not_root, None);
+    proof.add_resolution(Vec::new(), root, positive, negative);
+    (executor, proof, root, not_root, source_surface)
+}
+
+/// Every ledger field is untrusted at consumption time. Pin the independent
+/// index/type/text/expansion/override checks so a future producer refactor
+/// cannot turn the repair ledger into source-spelling authority by itself.
+#[test]
+fn expanded_let_source_metadata_is_revalidated_atomically() {
+    for corruption in 0..5 {
+        let (mut executor, proof, root, not_root, _) = expanded_let_source_fixture();
+        match corruption {
+            0 => executor.last_proof_expanded_let_sources[0].1 = usize::MAX,
+            1 => {
+                let non_let = parsed_assertion("(assert expanded_let_p)");
+                let non_let_surface =
+                    crate::executor::proof_surface_syntax::format_frontend_term(&non_let);
+                executor.ctx.add_assertion_with_parsed(root, non_let);
+                executor.last_proof_expanded_let_sources[0].1 = 1;
+                executor.last_proof_expanded_let_sources[0].2 = non_let_surface;
+            }
+            2 => executor.last_proof_expanded_let_sources[0]
+                .2
+                .push_str(" ; forged"),
+            3 => executor.last_proof_expanded_let_sources[0].0 = not_root,
+            4 => {
+                let mut overrides = DetHashMap::default();
+                overrides.insert(root, "forged-expanded-let-surface".to_string());
+                executor.last_proof_term_overrides = Some(overrides);
+            }
+            _ => unreachable!(),
+        }
+
+        executor.restore_reachable_authored_assume_surface_overrides(&proof);
+        assert!(
+            executor.last_unsat_proof_reconstruction_suppressed,
+            "expanded-let metadata corruption case {corruption} must fail closed"
+        );
+    }
+}
+
+#[test]
+fn canonical_row_supersedes_an_authenticated_expanded_let_surface() {
+    let (mut executor, proof, root, _, source_surface) = expanded_let_source_fixture();
+    executor.ctx.add_assertion_with_parsed(
+        root,
+        parsed_assertion("(assert (and expanded_let_p (not expanded_let_q)))"),
+    );
+    let mut overrides = DetHashMap::default();
+    overrides.insert(root, source_surface);
+    executor.last_proof_term_overrides = Some(overrides);
+
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert_eq!(
+        executor
+            .last_proof_term_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&root)),
+        None,
+        "the direct canonical row clears the now-redundant let override"
+    );
+    assert!(
+        !executor.last_unsat_proof_reconstruction_suppressed,
+        "canonical problem authority keeps the external proof publishable"
+    );
+}
+
+#[test]
+fn expanded_let_source_requires_both_proof_and_raw_source_grants() {
+    for has_canonical_row in [false, true] {
+        for missing_raw_grant in [false, true] {
+            let (mut executor, proof, root, _, _) = expanded_let_source_fixture();
+            if has_canonical_row {
+                executor.ctx.add_assertion_with_parsed(
+                    root,
+                    parsed_assertion("(assert (and expanded_let_p (not expanded_let_q)))"),
+                );
+            }
+            if missing_raw_grant {
+                executor.last_proof_raw_original_assertions.clear();
+            } else {
+                executor.last_proof_rebuild_originals.clear();
+            }
+
+            executor.restore_reachable_authored_assume_surface_overrides(&proof);
+            assert!(
+                executor.last_unsat_proof_reconstruction_suppressed,
+                "expanded-let source needs both grants even with canonical row: \
+                 canonical={has_canonical_row}, missing_raw={missing_raw_grant}"
+            );
+        }
+    }
+}
+
+#[test]
+fn conflicting_expanded_let_spellings_for_one_root_fail_closed() {
+    let (mut executor, proof, root, _, _) = expanded_let_source_fixture();
+    let second_source = parsed_assertion(
+        "(assert (let ((second_alias expanded_let_p)) \
+         (and second_alias (not expanded_let_q))))",
+    );
+    let second_surface =
+        crate::executor::proof_surface_syntax::format_frontend_term(&second_source);
+    executor.ctx.add_assertion_with_parsed(root, second_source);
+    executor
+        .last_proof_expanded_let_sources
+        .push((root, 1, second_surface));
+
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+    assert!(
+        executor.last_unsat_proof_reconstruction_suppressed,
+        "one raw root cannot select between two distinct authored let spellings"
+    );
+}
+
+#[test]
+fn expanded_let_consumer_uses_the_producer_cap() {
+    let producer_cap = crate::executor::proof_trust_surgery_provenance::MAX_PROVENANCE_REPAIR_TERMS;
+    let (mut at_cap, proof, root, _, source_surface) = expanded_let_source_fixture();
+    at_cap.last_proof_expanded_let_sources = vec![(root, 0, source_surface); producer_cap];
+    at_cap.restore_reachable_authored_assume_surface_overrides(&proof);
+    assert!(
+        !at_cap.last_unsat_proof_reconstruction_suppressed,
+        "the exact producer boundary remains consumable"
+    );
+
+    let (mut over_cap, proof, root, _, source_surface) = expanded_let_source_fixture();
+    over_cap.last_proof_expanded_let_sources = vec![(root, 0, source_surface); producer_cap + 1];
+    over_cap.restore_reachable_authored_assume_surface_overrides(&proof);
+    assert!(
+        over_cap.last_unsat_proof_reconstruction_suppressed,
+        "consumer work must stop at the same boundary enforced by the producer"
     );
 }
 
@@ -1038,5 +1395,94 @@ fn alignment_records_the_fold_point_and_refuses_two_spellings_for_one_term() {
         )
         .is_none(),
         "one term may not acquire two authored spellings"
+    );
+}
+
+/// Seed one stale earlier-pass spelling on `root` so the next pass has
+/// something to either clear, keep, or refuse.
+fn seed_stale_override(executor: &mut Executor, root: TermId, spelling: &str) {
+    let mut overrides = DetHashMap::default();
+    overrides.insert(root, spelling.to_string());
+    executor.last_proof_term_overrides = Some(overrides);
+}
+
+/// `duplicate_root_with_identity_row_uses_exact_canonical_surface` starts from
+/// an EMPTY override table, so it cannot tell an authenticated identity
+/// presentation apart from a silent `AletheSurfaceUnavailable` decline: both
+/// leave the table `None` and the suppression flag clear. Seeding a stale
+/// spelling separates them — only the identity classification actively REMOVES
+/// it, restoring the canonical text the duplicate's own `(assert (<= 0 (f b)))`
+/// row authenticates.
+#[test]
+fn duplicate_identity_row_clears_a_stale_spelling_on_its_root() {
+    let mut executor = Executor::new();
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (>= (f b) 0))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (<= 0 (f b)))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(negated, parsed_assertion("(assert (not (<= 0 (f b))))"));
+    seed_stale_override(&mut executor, canonical, "(>= (f b) 0)");
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(canonical, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), canonical, positive, negative);
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert_eq!(
+        executor
+            .last_proof_term_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&canonical)),
+        None,
+        "the identity row authenticates canonical text, so the stale spelling \
+         must be cleared rather than kept by a decline or replaced by one of \
+         the duplicate rows"
+    );
+    assert!(!executor.last_unsat_proof_reconstruction_suppressed);
+}
+
+/// The same authentication with ONE source row. A row that already spells the
+/// root exactly as the Alethe printer renders it is the problem file's own
+/// evidence for canonical text, so a stale earlier-pass spelling is cleared.
+/// Before this was wired, the single-row arm re-derived the identical spelling
+/// as an override, found the stale entry disagreed, and suppressed the whole
+/// reconstruction — publishing NO proof for a root the problem file spells
+/// canonically.
+#[test]
+fn single_identity_row_clears_a_stale_spelling_instead_of_suppressing() {
+    let mut executor = Executor::new();
+    let (canonical, negated) = comparison_surface_fixture(&mut executor);
+    executor
+        .ctx
+        .add_assertion_with_parsed(canonical, parsed_assertion("(assert (<= 0 (f b)))"));
+    executor
+        .ctx
+        .add_assertion_with_parsed(negated, parsed_assertion("(assert (not (<= 0 (f b))))"));
+    seed_stale_override(&mut executor, canonical, "(>= (f b) 0)");
+
+    let mut proof = Proof::new();
+    let positive = proof.add_assume(canonical, None);
+    let negative = proof.add_assume(negated, None);
+    proof.add_resolution(Vec::new(), canonical, positive, negative);
+    executor.restore_reachable_authored_assume_surface_overrides(&proof);
+
+    assert_eq!(
+        executor
+            .last_proof_term_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&canonical)),
+        None,
+        "an exact canonical source row clears a stale spelling for its root"
+    );
+    assert!(
+        !executor.last_unsat_proof_reconstruction_suppressed,
+        "a root the problem file spells canonically must never cost the query \
+         its whole external proof"
     );
 }

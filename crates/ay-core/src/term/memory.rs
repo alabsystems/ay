@@ -28,21 +28,21 @@ impl TermStore {
     /// HashMap table overhead, and BTreeMap node overhead), this method queries
     /// actual container capacities to compute a more precise estimate.
     pub fn true_memory_bytes(&self) -> usize {
-        let terms_heap = self.terms.capacity() * size_of::<TermEntry>();
+        let terms_heap = self.terms.capacity().saturating_mul(size_of::<TermEntry>());
         #[cfg(not(kani))]
         let hash_cons_table = self.hash_cons.allocation_size();
         #[cfg(kani)]
-        let hash_cons_table = self.hash_cons.len() * 64;
+        let hash_cons_table = self.hash_cons.len().saturating_mul(64);
         #[cfg(not(kani))]
         let names_table = self.names.allocation_size();
         #[cfg(kani)]
-        let names_table = self.names.len() * 64;
+        let names_table = self.names.len().saturating_mul(64);
 
         terms_heap
-            + hash_cons_table
-            + self.bucket_capacity_bytes
-            + names_table
-            + self.heap_data_bytes
+            .saturating_add(hash_cons_table)
+            .saturating_add(self.bucket_capacity_bytes)
+            .saturating_add(names_table)
+            .saturating_add(self.heap_data_bytes)
     }
 
     /// Upper-bound the heap allocations duplicated by [`Self::clone`].
@@ -98,23 +98,23 @@ impl TermStore {
             // Do not trust the incremental heap ledger here: checker-only
             // stores built by `from_entries` deliberately leave it at zero.
             add(bytes, Self::heap_size(&entry.term), limit)?;
-            add_sort(&entry.sort, bytes, limit, 0)?;
+            add_sort(&entry.sort, bytes, limit, MAX_ACCOUNTED_SORT_DEPTH)?;
             if let TermData::Forall(vars, ..) | TermData::Exists(vars, ..) = &entry.term {
                 for (_, sort) in vars {
-                    add_sort(sort, bytes, limit, 0)?;
+                    add_sort(sort, bytes, limit, MAX_ACCOUNTED_SORT_DEPTH)?;
                 }
             }
         }
         for (name, (_, sort)) in &self.names {
             add(bytes, name.capacity(), limit)?;
-            add_sort(sort, bytes, limit, 0)?;
+            add_sort(sort, bytes, limit, MAX_ACCOUNTED_SORT_DEPTH)?;
         }
         for name in &self.skolem_symbols {
             add(bytes, name.capacity(), limit)?;
         }
         for choice in self.skolem_choice.values() {
             add(bytes, choice.binder.capacity(), limit)?;
-            add_sort(&choice.sort, bytes, limit, 0)?;
+            add_sort(&choice.sort, bytes, limit, MAX_ACCOUNTED_SORT_DEPTH)?;
         }
         for name in self.quantifier_id.values().chain(self.skolem_id.values()) {
             add(bytes, name.capacity(), limit)?;
@@ -140,19 +140,21 @@ impl TermStore {
     }
 }
 
-fn add_sort(sort: &Sort, bytes: &mut usize, limit: usize, depth: usize) -> Option<()> {
-    if depth > MAX_ACCOUNTED_SORT_DEPTH {
-        return None;
-    }
+/// `depth_left` is a strictly decreasing recursion budget (callers start it at
+/// [`MAX_ACCOUNTED_SORT_DEPTH`]); traversal declines with `None` when a
+/// recursion step finds it exhausted.
+fn add_sort(sort: &Sort, bytes: &mut usize, limit: usize, depth_left: usize) -> Option<()> {
     match sort {
         Sort::Array(array) => {
             add(bytes, size_of::<crate::sort::ArraySort>(), limit)?;
-            add_sort(&array.index_sort, bytes, limit, depth + 1)?;
-            add_sort(&array.element_sort, bytes, limit, depth + 1)
+            let depth_left = depth_left.checked_sub(1)?;
+            add_sort(&array.index_sort, bytes, limit, depth_left)?;
+            add_sort(&array.element_sort, bytes, limit, depth_left)
         }
         Sort::Seq(element) => {
             add(bytes, size_of::<Sort>(), limit)?;
-            add_sort(element, bytes, limit, depth + 1)
+            let depth_left = depth_left.checked_sub(1)?;
+            add_sort(element, bytes, limit, depth_left)
         }
         Sort::Uninterpreted(name) | Sort::TypeVar(name) | Sort::FiniteDomain(name, _) => {
             add(bytes, name.capacity(), limit)
@@ -175,7 +177,7 @@ fn add_sort(sort: &Sort, bytes: &mut usize, limit: usize, depth: usize) -> Optio
                 )?;
                 for field in &constructor.fields {
                     add(bytes, field.name.capacity(), limit)?;
-                    add_sort(&field.sort, bytes, limit, depth + 1)?;
+                    add_sort(&field.sort, bytes, limit, depth_left.checked_sub(1)?)?;
                 }
             }
             Some(())

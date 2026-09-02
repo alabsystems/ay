@@ -373,7 +373,7 @@ fn test_string_accessors_capi() {
         let five = Z3_mk_int(ctx, 5, int_sort);
         assert!(!Z3_is_string(ctx, five));
 
-        // Version APIs report the pinned Z3 5.0.0 compatibility identity.
+        // Version APIs report the pinned Z3 5.1.0 compatibility identity.
         let mut major = 0;
         let mut minor = 0;
         let mut build = 0;
@@ -384,12 +384,12 @@ fn test_string_accessors_capi() {
             &raw mut build,
             &raw mut revision,
         );
-        assert_eq!((major, minor, build, revision), (5, 0, 0, 0));
+        assert_eq!((major, minor, build, revision), (5, 1, 0, 0));
         let ver = Z3_get_full_version();
         assert!(!ver.is_null());
         assert!(CStr::from_ptr(ver)
             .to_string_lossy()
-            .ends_with("(Z3 5.0.0.0 compatible)"));
+            .ends_with("(Z3 5.1.0.0 compatible)"));
         Z3_global_param_set(c"smt.random_seed".as_ptr(), c"1".as_ptr());
         Z3_global_param_reset_all();
 

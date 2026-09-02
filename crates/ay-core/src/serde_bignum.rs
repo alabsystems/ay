@@ -134,11 +134,10 @@ struct WireLimbs(Vec<u32>);
 /// Cap the pre-allocation a hostile `size_hint` can request, as `num-bigint`
 /// does. Inert for JSON (which cannot hint a sequence length) but this codec
 /// must not become the one place a self-describing format can force a large
-/// allocation from a small document.
-fn cautious(hint: Option<usize>) -> usize {
-    const MAX_PREALLOC_BYTES: usize = 1024 * 1024;
-    std::cmp::min(hint.unwrap_or(0), MAX_PREALLOC_BYTES / size_of::<u32>())
-}
+/// allocation from a small document. Applied with `.min` directly at the
+/// allocation site so the bound is checkable there.
+const MAX_PREALLOC_BYTES: usize = 1024 * 1024;
+const MAX_PREALLOC_LIMBS: usize = MAX_PREALLOC_BYTES / size_of::<u32>();
 
 struct LimbVisitor;
 
@@ -150,7 +149,7 @@ impl<'de> Visitor<'de> for LimbVisitor {
     }
 
     fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Self::Value, S::Error> {
-        let mut data = Vec::with_capacity(cautious(seq.size_hint()));
+        let mut data = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_PREALLOC_LIMBS));
         while let Some(value) = seq.next_element::<u32>()? {
             data.push(value);
         }
@@ -311,6 +310,7 @@ pub mod rational64 {
 pub mod rational64_vec {
     use super::{WireRational64, WireRational64Ref};
     use num_rational::Rational64;
+    use serde::ser::SerializeSeq;
     use serde::{Deserialize, Deserializer, Serializer};
 
     /// Encode as a sequence of `[numer, denom]` pairs.
@@ -318,7 +318,13 @@ pub mod rational64_vec {
         value: &[Rational64],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(value.iter().map(WireRational64Ref))
+        // `collect_seq` expanded by hand: a slice iterator's length hint is
+        // exact, so this emits the same bytes with a locally provable bound.
+        let mut seq = serializer.serialize_seq(Some(value.len()))?;
+        for item in value {
+            seq.serialize_element(&WireRational64Ref(item))?;
+        }
+        seq.end()
     }
 
     /// Decode a sequence of `[numer, denom]` pairs without reducing any of

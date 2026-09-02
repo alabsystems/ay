@@ -428,6 +428,17 @@ impl Executor {
                     continue;
                 }
                 ReachableAuthoredSource::Untouched => continue,
+                ReachableAuthoredSource::ExpandedLet(root, surface) => {
+                    if overrides
+                        .get(&root)
+                        .is_some_and(|existing| existing != &surface)
+                    {
+                        return None;
+                    }
+                    overrides.insert(root, surface);
+                    changed = true;
+                    continue;
+                }
                 ReachableAuthoredSource::Parsed(root, source, replaces_stale) => {
                     (root, source, replaces_stale)
                 }

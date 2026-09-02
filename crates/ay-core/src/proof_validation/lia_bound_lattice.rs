@@ -169,7 +169,7 @@ fn ite_constant_range_gap(terms: &TermStore, clause: &[TermId]) -> bool {
         while let TermData::Not(inner) = terms.get(atom) {
             atom = *inner;
             asserted = !asserted;
-            depth += 1;
+            depth = depth.saturating_add(1);
             if depth > MAX_ITE_RANGE_NOT_DEPTH {
                 return false;
             }

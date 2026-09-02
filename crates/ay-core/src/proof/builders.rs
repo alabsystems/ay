@@ -32,14 +32,14 @@ impl Proof {
     }
 
     /// Add a proof step
-    #[allow(clippy::cast_possible_truncation)] // Proof step count is bounded well under u32::MAX
     pub fn add_step(&mut self, step: ProofStep) -> ProofId {
-        debug_assert!(
-            self.steps.len() < u32::MAX as usize,
-            "BUG: proof exceeds u32::MAX steps ({})",
-            self.steps.len()
-        );
-        let id = ProofId(self.steps.len() as u32);
+        // A step index that does not fit u32 would mint a truncated ProofId
+        // aliasing an earlier step — an unsound proof, silently. The old
+        // debug_assert never ran in release; fail fast instead.
+        let Ok(raw) = u32::try_from(self.steps.len()) else {
+            panic!("proof exceeds u32::MAX steps ({})", self.steps.len());
+        };
+        let id = ProofId(raw);
         self.steps.push(step);
         id
     }

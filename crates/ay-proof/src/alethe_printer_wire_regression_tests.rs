@@ -372,6 +372,46 @@ fn test_eq_congruent_rejects_a_changed_bitvector_literal() {
     );
 }
 
+#[test]
+fn test_cong_bridges_equal_indexed_and_binary_bitvector_literals_with_refl() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::Symbol;
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("bv_lit_cong_x", Sort::bitvec(32));
+    let y = terms.mk_var("bv_lit_cong_y", Sort::bitvec(32));
+    let zero = terms.mk_bitvec(0_u8.into(), 32);
+    let left = terms.mk_app(Symbol::named("bv_lit_cong_f"), [x, zero], Sort::bitvec(1));
+    let right = terms.mk_app(Symbol::named("bv_lit_cong_f"), [y, zero], Sort::bitvec(1));
+    let premise_equality = terms.mk_eq(x, y);
+    let conclusion = terms.mk_eq(left, right);
+    let mut proof = Proof::new();
+    let premise = proof.add_assume(premise_equality, None);
+    proof.add_rule_step(
+        AletheRule::Cong,
+        vec![conclusion],
+        vec![premise],
+        Vec::new(),
+    );
+
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(left, "(bv_lit_cong_f bv_lit_cong_x (_ bv0 32))".to_string());
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &[premise_equality],
+        Some(&overrides),
+    )
+    .expect("equal indexed/binary BV literals must preserve congruence");
+    assert!(
+        output.contains(":rule refl")
+            && output.contains(":rule cong")
+            && output.contains("(_ bv0 32)")
+            && output.contains("#b00000000000000000000000000000000"),
+        "{output}"
+    );
+}
+
 fn assert_addition_permutation_declines(
     terms: &TermStore,
     proof: &Proof,
@@ -549,6 +589,38 @@ fn test_divisibility_lowers_to_checked_integer_lattice_steps() {
     );
     assert!(!output.contains(":rule hole"), "{output}");
     assert!(!output.contains(":rule lia_generic"), "{output}");
+}
+
+#[test]
+fn outer_negated_equality_override_drives_printed_farkas_signs() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{FarkasAnnotation, Symbol};
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("outer_sign_x", Sort::Real);
+    let zero = terms.mk_rational(num_bigint::BigInt::from(0).into());
+    let one = terms.mk_rational(num_bigint::BigInt::from(1).into());
+    let equals_zero = terms.mk_app(Symbol::named("="), [x, zero], Sort::Bool);
+    let equals_one = terms.mk_app(Symbol::named("="), [one, x], Sort::Bool);
+    let not_equals_zero = terms.mk_not_raw(equals_zero);
+    let not_equals_one = terms.mk_not_raw(equals_one);
+    let clause = vec![not_equals_zero, not_equals_one];
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_farkas("LRA", clause.clone(), FarkasAnnotation::from_ints(&[1, 1]));
+    let mut overrides = DetHashMap::default();
+    overrides.insert(not_equals_zero, "(not (= 0.0 outer_sign_x))".to_string());
+
+    let output = try_export_alethe_with_problem_scope_and_overrides(
+        &proof,
+        &terms,
+        &clause,
+        Some(&overrides),
+    )
+    .expect("the exact complete-literal replay has a printable sign vector");
+    assert!(
+        output.contains(":rule la_generic :args (1 -1)"),
+        "the outer override reverses only the first equality row:\n{output}"
+    );
 }
 
 /// The bridge's cross-check proves the two literals are COMPLEMENTARY; it does

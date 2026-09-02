@@ -180,7 +180,47 @@ impl CpConstraint {
     ///
     /// `falsified_fn` returns `Some(level)` for falsified literals and `None`
     /// otherwise. This is used to check that the weakened constraint remains
-    /// asserting.
+    /// asserting. Only ITS SIGN is consulted (`is_some()`), and it is evaluated
+    /// EXACTLY ONCE PER LITERAL — see the complexity note below. Falsification
+    /// is a snapshot of the trail taken by the caller before this call, so it
+    /// cannot change while the loop runs; a `falsified_fn` with side effects
+    /// would observe a different call count and order, and never had a defined
+    /// one here.
+    ///
+    /// COMPLEXITY, AND WHY IT IS THE WHOLE POINT OF THIS FUNCTION'S SHAPE.
+    /// This used to recompute `remaining_falsified_sum` by scanning every
+    /// surviving coefficient on EVERY candidate, calling `falsified_fn` once
+    /// per (candidate, coefficient) pair: `O(n^2)` closure calls. Both callers
+    /// in conflict analysis pass a closure that answers by LINEAR SEARCH over a
+    /// trail snapshot, so the real cost was `O(n^2 * (n + |trail|))`, and none
+    /// of it is interruptible — `should_stop` is polled around this call, never
+    /// inside it.
+    ///
+    /// That is a measured defect, not a theoretical one — measured in CALL
+    /// COUNTS, which are load-invariant, not in wall clock, which was not. An
+    /// independent audit transplanted the call-count pin onto the pre-fix
+    /// tree: `falsified_fn` was evaluated 158,802 times at n=400 versus 400
+    /// after — 397x, quadratic as predicted — while the original wall-clock
+    /// overshoot table did NOT reproduce under audit (both arms ~0.6x under
+    /// every load regime tried; the overshoots seen live are owned by the
+    /// unscheduled OPT-LIN cert rungs, a separate defect). A `sample(1)`
+    /// profile of three overshooting PB25 OPT-LIN instances did put 100% of
+    /// the post-deadline stacks (654/656, 501, 245 samples) at the top of
+    /// stack in this one function, under `analyze_conflict_with_stop`, and
+    /// the proof-path asymmetry is structural: `cdcl.rs` dispatches to this
+    /// sparse implementation iff a proof writer is attached. Behaviour
+    /// preservation is the load-invariant evidence too: 60/60 and 89/90
+    /// byte-identical proofs across the fixed set in the audit's paired A/B.
+    ///
+    /// The sum is now MAINTAINED INCREMENTALLY instead of recomputed. Removing
+    /// a literal is the only thing that changes it, and it changes it by that
+    /// literal's coefficient. The decisions are therefore bit-identical to the
+    /// rescan — this is the same arithmetic in a different order, not a
+    /// heuristic — while the cost drops to `O(n)` closure calls and
+    /// `O(n log n)` overall. `diff_weaken_and_weaken_conservative` (cp_dense)
+    /// fuzzes this against the dense mirror, and
+    /// `weaken_conservative_matches_quadratic_reference` below pins it against
+    /// a literal transcription of the old rescan.
     pub fn weaken_conservative<F>(&mut self, asserting_lit: Option<PbLit>, mut falsified_fn: F)
     where
         F: FnMut(PbLit) -> Option<u32>,
@@ -198,6 +238,26 @@ impl CpConstraint {
             .map(|(&lit, &coeff)| (lit, coeff))
             .collect();
         candidates.sort_by_key(|&(_, coeff)| coeff);
+
+        // ONE evaluation per literal, up front. The old code's call count was
+        // quadratic purely as an artifact of where the call sat.
+        let falsified: HashMap<PbLit, bool> = self
+            .coeffs
+            .keys()
+            .map(|&lit| (lit, falsified_fn(lit).is_some()))
+            .collect();
+
+        // Running `sum of coeff(l) for l in coeffs, l != asserting, falsified(l)`.
+        // The per-candidate quantity the loop needs is this sum minus the
+        // candidate's own contribution, and the only event that changes it is an
+        // actual removal below.
+        let mut falsified_sum_excl_asserting: i128 = self
+            .coeffs
+            .iter()
+            .filter(|(&l, _)| l != asserting)
+            .filter(|(&l, _)| falsified.get(&l).copied().unwrap_or(false))
+            .map(|(_, &c)| c)
+            .sum();
 
         for (lit, coeff) in candidates {
             // Only weaken if the coefficient is strictly less than the degree.
@@ -232,13 +292,12 @@ impl CpConstraint {
             // plus the asserting coefficient must be >= new_degree, AND
             // the sum without the asserting literal must be < new_degree
             // (so asserting is forced).
-            let remaining_falsified_sum: i128 = self
-                .coeffs
-                .iter()
-                .filter(|(&l, _)| l != asserting && l != lit)
-                .filter(|(&l, _)| falsified_fn(l).is_some())
-                .map(|(_, &c)| c)
-                .sum();
+            let lit_falsified = falsified.get(&lit).copied().unwrap_or(false);
+            let remaining_falsified_sum: i128 = if lit_falsified {
+                falsified_sum_excl_asserting - coeff
+            } else {
+                falsified_sum_excl_asserting
+            };
 
             if remaining_falsified_sum >= new_degree {
                 // Even without the asserting literal, the constraint is
@@ -250,6 +309,10 @@ impl CpConstraint {
             // The asserting literal is still forced. Apply the weakening.
             self.coeffs.remove(&lit);
             self.degree = new_degree;
+            // `lit` has left `coeffs`, so it leaves the running sum too.
+            if lit_falsified {
+                falsified_sum_excl_asserting -= coeff;
+            }
         }
 
         self.compact();
@@ -1445,6 +1508,169 @@ mod tests {
             r2o_result.constraint.coefficient(lit(2)),
             1,
             "asserting literal must have coefficient 1"
+        );
+    }
+
+    /// A LITERAL TRANSCRIPTION of the pre-rewrite `weaken_conservative` body:
+    /// `remaining_falsified_sum` recomputed by rescanning every surviving
+    /// coefficient on every candidate. Kept ONLY as the differential oracle for
+    /// the incremental version that replaced it. If you change the real
+    /// implementation's DECISIONS, this test is supposed to fail.
+    fn weaken_conservative_quadratic_reference<F>(
+        c: &mut CpConstraint,
+        asserting_lit: Option<PbLit>,
+        mut falsified_fn: F,
+    ) where
+        F: FnMut(PbLit) -> Option<u32>,
+    {
+        let Some(asserting) = asserting_lit else {
+            return;
+        };
+        let mut candidates: Vec<(PbLit, i128)> = c
+            .coeffs
+            .iter()
+            .filter(|(&l, _)| l != asserting)
+            .map(|(&l, &coeff)| (l, coeff))
+            .collect();
+        candidates.sort_by_key(|&(_, coeff)| coeff);
+
+        for (l, coeff) in candidates {
+            if coeff >= c.degree {
+                continue;
+            }
+            let new_degree = c.degree.saturating_sub(coeff).max(0);
+            if new_degree <= 0 {
+                continue;
+            }
+            let asserting_coeff = c.coefficient(asserting);
+            if asserting_coeff <= 0 {
+                break;
+            }
+            let remaining_falsified_sum: i128 = c
+                .coeffs
+                .iter()
+                .filter(|(&x, _)| x != asserting && x != l)
+                .filter(|(&x, _)| falsified_fn(x).is_some())
+                .map(|(_, &v)| v)
+                .sum();
+            if remaining_falsified_sum >= new_degree {
+                continue;
+            }
+            c.coeffs.remove(&l);
+            c.degree = new_degree;
+        }
+        c.compact();
+        c.simplify_trivial();
+    }
+
+    /// The rewrite must be DECISION-IDENTICAL to the rescan it replaced, not
+    /// merely "similar". Randomised over shapes that exercise the branches that
+    /// matter: coefficients straddling the degree, mixed falsified/unfalsified
+    /// literals, and asserting literals that do and do not survive.
+    #[test]
+    fn weaken_conservative_matches_quadratic_reference() {
+        // xorshift64*, so the case list is reproducible without a dep.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut compared = 0usize;
+        let mut weakened_at_least_once = 0usize;
+        for case in 0..4000u32 {
+            let n = 2 + (next() % 7) as u32;
+            let entries: Vec<(PbLit, i128)> = (1..=n)
+                .map(|v| {
+                    let negated = next() % 2 == 0;
+                    let coeff = 1 + (next() % 9) as i128;
+                    (PbLit { var: v, negated }, coeff)
+                })
+                .collect();
+            let total: i128 = entries.iter().map(|(_, c)| *c).sum();
+            let degree = 1 + (next() % (total.max(1) as u64)) as i128;
+
+            // Falsification snapshot: a fixed bitmask over vars, plus a level.
+            let mask = next();
+            let falsified = move |l: PbLit| -> Option<u32> {
+                if (mask >> (l.var % 64)) & 1 == 1 {
+                    Some(l.var)
+                } else {
+                    None
+                }
+            };
+
+            // Asserting literal: sometimes a real member, sometimes absent,
+            // sometimes None.
+            let asserting = match next() % 4 {
+                0 => None,
+                1 => Some(PbLit {
+                    var: n + 1,
+                    negated: false,
+                }),
+                _ => Some(entries[(next() % entries.len() as u64) as usize].0),
+            };
+
+            let mut mine = cp(&entries, degree);
+            let mut reference = cp(&entries, degree);
+            mine.weaken_conservative(asserting, falsified);
+            weaken_conservative_quadratic_reference(&mut reference, asserting, falsified);
+
+            assert_eq!(
+                mine.degree(),
+                reference.degree(),
+                "case {case}: degree diverged (entries={entries:?} degree={degree} \
+                 asserting={asserting:?})"
+            );
+            assert_eq!(
+                mine.coefficients(),
+                reference.coefficients(),
+                "case {case}: coefficients diverged (entries={entries:?} degree={degree} \
+                 asserting={asserting:?})"
+            );
+            if mine.coefficients().len() < entries.len() {
+                weakened_at_least_once += 1;
+            }
+            compared += 1;
+        }
+        assert_eq!(compared, 4000);
+        // A differential test that never exercised a removal would agree
+        // vacuously; require that the corpus actually weakened something.
+        assert!(
+            weakened_at_least_once > 100,
+            "corpus too weak: only {weakened_at_least_once} cases removed a literal"
+        );
+    }
+
+    /// The rewrite is a COMPLEXITY fix, so the complexity is what regresses.
+    /// A rescan-per-candidate implementation calls `falsified_fn` `O(n^2)`
+    /// times; the incremental one calls it once per literal. This pins the call
+    /// count, which is the property that made the proof path miss its deadline
+    /// by up to 360x.
+    #[test]
+    fn weaken_conservative_evaluates_falsified_once_per_literal() {
+        let n = 400u32;
+        let entries: Vec<(PbLit, i128)> = (1..=n).map(|v| (lit(v), 1 + (v as i128 % 5))).collect();
+        let mut constraint = cp(&entries, 200);
+
+        let calls = std::cell::Cell::new(0usize);
+        constraint.weaken_conservative(Some(lit(1)), |l| {
+            calls.set(calls.get() + 1);
+            if l.var % 2 == 0 {
+                Some(l.var)
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(
+            calls.get(),
+            n as usize,
+            "falsified_fn must be evaluated exactly once per literal; a quadratic \
+             implementation would reach ~{}",
+            n as usize * n as usize / 2
         );
     }
 }

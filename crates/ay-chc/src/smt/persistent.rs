@@ -8,7 +8,11 @@
 
 use super::context::SmtContext;
 use super::executor_adapter::{
-    accept_reparsed_sat_model, detect_logic, parse_model_into, quote_symbol, sort_to_smtlib,
+    accept_reparsed_sat_model, build_uf_application_aliases_avoiding,
+    collect_dt_declarations_for_expr, collect_uninterpreted_function_declarations, detect_logic,
+    emit_declare_uninterpreted_function, emit_uf_application_aliases,
+    install_uf_application_alias_values, parse_model_into, quote_symbol, sort_to_smtlib,
+    UfApplicationAliasEmissionError,
 };
 use super::types::{SmtResult, SmtValue};
 use crate::pdr::model::InvariantModel;
@@ -32,6 +36,12 @@ enum PersistentExecutorError {
         existing: ChcSort,
         new: ChcSort,
     },
+    #[error("invalid uninterpreted-function declaration: {0}")]
+    InvalidFunctionSignature(String),
+    #[error("executor expression admission failed: {0}")]
+    InvalidExpressionSurface(String),
+    #[error("UF application alias emission failed: {0}")]
+    UfAliasEmission(#[from] UfApplicationAliasEmissionError),
     #[error("check-sat produced no result")]
     MissingResult,
 }
@@ -42,6 +52,8 @@ struct PersistentExecutorAdapter {
     background_hash: Option<u64>,
     logic: Option<String>,
     declared_vars: FxHashMap<String, ChcSort>,
+    declared_functions: FxHashMap<String, (ChcSort, Vec<ChcSort>)>,
+    uf_application_alias_counter: usize,
     query_count: usize,
 }
 
@@ -53,6 +65,8 @@ impl PersistentExecutorAdapter {
             background_hash: None,
             logic: None,
             declared_vars: FxHashMap::default(),
+            declared_functions: FxHashMap::default(),
+            uf_application_alias_counter: 0,
             query_count: 0,
         }
     }
@@ -76,12 +90,22 @@ impl PersistentExecutorAdapter {
 
         let namespace = format!("bg{background_hash}");
         let normalized = SmtContext::preprocess_incremental_assumption(background, &namespace);
+        collect_dt_declarations_for_expr(&[], &normalized).map_err(|error| {
+            PersistentExecutorError::InvalidExpressionSurface(error.to_string())
+        })?;
         let vars = collect_unique_vars(std::slice::from_ref(&normalized));
 
         let mut script = String::new();
         script.push_str(&format!("(set-logic {logic})\n"));
         script.push_str("(set-option :produce-models true)\n");
         script.push_str(&format_timeout_option(timeout));
+        let function_declarations = collect_uninterpreted_function_declarations(&normalized)
+            .map_err(|error| {
+                PersistentExecutorError::InvalidFunctionSignature(error.to_string())
+            })?;
+        for declaration in &function_declarations {
+            script.push_str(&emit_declare_uninterpreted_function(declaration));
+        }
         append_var_declarations(&mut script, &vars);
         append_assertion(&mut script, &normalized);
 
@@ -93,6 +117,51 @@ impl PersistentExecutorAdapter {
             .into_iter()
             .map(|var| (var.name, var.sort))
             .collect::<FxHashMap<_, _>>();
+        self.declared_functions = function_declarations
+            .into_iter()
+            .map(|declaration| {
+                (
+                    declaration.name,
+                    (declaration.return_sort, declaration.argument_sorts),
+                )
+            })
+            .collect();
+        Ok(())
+    }
+
+    fn declare_missing_functions(&mut self, expr: &ChcExpr) -> Result<(), PersistentExecutorError> {
+        let declarations = collect_uninterpreted_function_declarations(expr).map_err(|error| {
+            PersistentExecutorError::InvalidFunctionSignature(error.to_string())
+        })?;
+        let mut missing = Vec::new();
+        for declaration in declarations {
+            let signature = (
+                declaration.return_sort.clone(),
+                declaration.argument_sorts.clone(),
+            );
+            if let Some(existing) = self.declared_functions.get(&declaration.name) {
+                if existing != &signature {
+                    return Err(PersistentExecutorError::InvalidFunctionSignature(format!(
+                        "function '{}' changed signature across persistent queries",
+                        declaration.name
+                    )));
+                }
+                continue;
+            }
+            missing.push((declaration, signature));
+        }
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut script = String::new();
+        for (declaration, _) in &missing {
+            script.push_str(&emit_declare_uninterpreted_function(declaration));
+        }
+        self.execute_script(&script)?;
+        for (declaration, signature) in missing {
+            self.declared_functions.insert(declaration.name, signature);
+        }
         Ok(())
     }
 
@@ -194,6 +263,12 @@ impl PersistentExecutorSmtContext {
     }
 
     pub(crate) fn ensure_background(&mut self, background: &ChcExpr, timeout: Duration) -> bool {
+        if let Err(reason) = collect_dt_declarations_for_expr(&[], background) {
+            tracing::debug!(
+                "persistent executor background admission failed before recursive preprocessing: {reason}"
+            );
+            return false;
+        }
         let vars = collect_unique_vars(std::slice::from_ref(background));
         let logic = detect_logic(&vars, background);
         match self.backend.ensure_background(background, logic, timeout) {
@@ -216,10 +291,23 @@ impl PersistentExecutorSmtContext {
             return SmtResult::Unknown;
         };
 
+        if let Err(reason) = collect_dt_declarations_for_expr(&[], query_delta) {
+            tracing::debug!(
+                "persistent executor query admission failed before recursive preprocessing: {reason}"
+            );
+            return SmtResult::Unknown;
+        }
+
         let namespace = format!("q{}", self.backend.query_count);
         let normalized_query =
             SmtContext::preprocess_incremental_assumption(query_delta, &namespace);
         let combined = ChcExpr::and(background.clone(), normalized_query.clone());
+        if let Err(reason) = collect_dt_declarations_for_expr(&[], &combined) {
+            tracing::debug!(
+                "persistent executor combined admission failed after bounded preprocessing: {reason}"
+            );
+            return SmtResult::Unknown;
+        }
         let vars = collect_unique_vars(&[background.clone(), normalized_query.clone()]);
         let required_logic = detect_logic(&vars, &combined);
 
@@ -232,6 +320,12 @@ impl PersistentExecutorSmtContext {
                 self.reset_backend();
                 return SmtResult::Unknown;
             }
+        }
+
+        if let Err(error) = self.backend.declare_missing_functions(&normalized_query) {
+            tracing::debug!("persistent executor UF declaration failed: {error}");
+            self.reset_backend();
+            return SmtResult::Unknown;
         }
 
         if let Err(error) = self.backend.declare_missing_vars(&normalized_query) {
@@ -356,6 +450,24 @@ impl PersistentExecutorSmtContext {
         timeout: Duration,
         disable_eq_diffvar: bool,
     ) -> (SmtResult, bool) {
+        let declared_vars = &self.backend.declared_vars;
+        let declared_functions = &self.backend.declared_functions;
+        let alias_counter = &mut self.backend.uf_application_alias_counter;
+        let uf_application_aliases = match build_uf_application_aliases_avoiding(
+            [background, normalized_query],
+            alias_counter,
+            declared_vars
+                .keys()
+                .chain(declared_functions.keys())
+                .map(String::as_str),
+        ) {
+            Ok(aliases) => aliases,
+            Err(error) => {
+                tracing::debug!("persistent executor UF application alias failed: {error}");
+                return (SmtResult::Unknown, false);
+            }
+        };
+
         if let Err(error) = self.backend.execute_script(&format_timeout_option(timeout)) {
             tracing::debug!("persistent executor timeout update failed: {error}");
             self.reset_backend();
@@ -379,7 +491,10 @@ impl PersistentExecutorSmtContext {
             self.backend.exec.execute(&Command::Push(1))?;
             pushed = true;
 
-            let mut query_script = String::new();
+            let mut query_script = emit_uf_application_aliases(
+                &uf_application_aliases,
+                crate::smt::current_thread_solve_deadline(),
+            )?;
             append_assertion(&mut query_script, normalized_query);
             self.backend.execute_script(&query_script)?;
 
@@ -435,6 +550,9 @@ impl PersistentExecutorSmtContext {
                         .unwrap_or_default();
                     let mut model = propagated_model.clone();
                     parse_model_into(&mut model, &model_output, &FxHashSet::default());
+                    if !install_uf_application_alias_values(&mut model, &uf_application_aliases) {
+                        return Ok(SmtResult::Unknown);
+                    }
                     let validation_exprs = [background, normalized_query];
                     Ok(
                         if let Some(model) = accept_reparsed_sat_model(

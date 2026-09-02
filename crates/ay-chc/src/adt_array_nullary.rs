@@ -20,8 +20,9 @@ use crate::pdr::counterexample::{DerivationWitness, DerivationWitnessEntry};
 use crate::pdr::model::InvariantModel;
 use crate::pdr::{CexVerificationResult, Counterexample, CounterexampleStep, PdrConfig, PdrSolver};
 use crate::smt::executor_adapter::{
-    collect_dt_declarations_for_expr, detect_logic, emit_declare_datatype, parse_model_into,
-    quote_symbol, sort_to_smtlib,
+    collect_dt_declarations_for_expr, collect_uninterpreted_function_declarations, detect_logic,
+    emit_declare_datatypes, emit_declare_uninterpreted_function, parse_model_into, quote_symbol,
+    sort_to_smtlib,
 };
 use crate::smt::{SmtResult, SmtValue};
 use crate::{ChcExpr, ChcProblem, ChcSort, ChcVar, HornClause, PredicateId};
@@ -347,6 +348,12 @@ fn solve_marker_dag_tree(
     let Some(formula) = marker_dag_formula(problem, query_clause, &nodes, root) else {
         return MarkerDagSolve::Unknown;
     };
+    if collect_dt_declarations_for_expr(&[], &formula).is_err() {
+        // The solver and seed-model fallbacks below both run recursive
+        // expression helpers. Decline the entire reconstructed path before
+        // either can observe an over-cap in-memory surface.
+        return MarkerDagSolve::Unknown;
+    }
 
     let mut smt = problem.make_smt_context();
     // `smt_confirmed` tracks whether an actual SMT/executor `check_sat` proved
@@ -933,10 +940,21 @@ fn merge_seed_value(existing: SmtValue, incoming: SmtValue) -> SmtValue {
         (SmtValue::Int(existing), SmtValue::Int(incoming)) => {
             SmtValue::Int(if incoming == 0 { existing } else { incoming })
         }
-        (SmtValue::BitVec(existing, width), SmtValue::BitVec(incoming, incoming_width))
-            if width == incoming_width =>
-        {
-            SmtValue::BitVec(if incoming == 0 { existing } else { incoming }, width)
+        (
+            left @ (SmtValue::BitVec(..) | SmtValue::BigBitVec(..)),
+            right @ (SmtValue::BitVec(..) | SmtValue::BigBitVec(..)),
+        ) => {
+            let (_, left_width) = left
+                .bitvec_to_biguint()
+                .unwrap_or_else(|| unreachable!("matched bitvector must expose exact bits"));
+            let (right_value, right_width) = right
+                .bitvec_to_biguint()
+                .unwrap_or_else(|| unreachable!("matched bitvector must expose exact bits"));
+            if left_width == right_width && right_value == num_bigint::BigUint::from(0u8) {
+                left
+            } else {
+                right
+            }
         }
         (
             SmtValue::Datatype(left_ctor, left_fields),
@@ -1007,6 +1025,13 @@ fn merge_seed_arrays(
 }
 
 fn marker_dag_raw_executor_model(formula: &ChcExpr, budget: Duration) -> SmtResult {
+    // This executor escape hatch must share the same iterative admission point
+    // as the primary adapter.  In particular, do not call the recursive
+    // `vars`/logic helpers on an unbounded in-memory expression.
+    let dt_decls = match collect_dt_declarations_for_expr(&[], formula) {
+        Ok(declarations) => declarations,
+        Err(_) => return SmtResult::Unknown,
+    };
     let vars = formula.vars();
     if vars.is_empty() {
         return SmtResult::Unknown;
@@ -1026,9 +1051,16 @@ fn marker_dag_raw_executor_model(formula: &ChcExpr, budget: Duration) -> SmtResu
         smt.push_str(&format!("(set-option :timeout {timeout_ms})\n"));
     }
 
-    let dt_decls = collect_dt_declarations_for_expr(&vars, formula);
-    for (dt_name, ctors) in &dt_decls {
-        smt.push_str(&emit_declare_datatype(dt_name, ctors));
+    match emit_declare_datatypes(&dt_decls) {
+        Ok(declarations) => smt.push_str(&declarations),
+        Err(_) => return SmtResult::Unknown,
+    }
+    let uf_decls = match collect_uninterpreted_function_declarations(formula) {
+        Ok(declarations) => declarations,
+        Err(_) => return SmtResult::Unknown,
+    };
+    for declaration in &uf_decls {
+        smt.push_str(&emit_declare_uninterpreted_function(declaration));
     }
     for var in &vars {
         smt.push_str(&format!(
@@ -1132,7 +1164,10 @@ fn default_smt_value_for_sort(sort: &ChcSort, remaining_depth: usize) -> Option<
         ChcSort::Real => Some(SmtValue::Real(num_rational::BigRational::from_integer(
             0.into(),
         ))),
-        ChcSort::BitVec(width) => Some(SmtValue::BitVec(0, *width)),
+        ChcSort::BitVec(width) => Some(SmtValue::bitvec_from_biguint(
+            num_bigint::BigUint::from(0u8),
+            *width,
+        )),
         ChcSort::Array(_, value_sort) => Some(SmtValue::ConstArray(Box::new(
             default_smt_value_for_sort(value_sort, remaining_depth - 1)?,
         ))),
@@ -1453,7 +1488,7 @@ fn scalar_value_from_literal(expr: &ChcExpr, sort: &ChcSort) -> Option<SmtValue>
         (ChcExpr::BitVec(value, width), ChcSort::BitVec(expected_width))
             if width == expected_width =>
         {
-            Some(SmtValue::BitVec(*value, *width))
+            Some(SmtValue::bitvec_from_u128(*value, *width))
         }
         _ => None,
     }
@@ -1464,7 +1499,9 @@ fn default_scalar_assignment(var: ChcVar) -> Option<(ChcVar, SmtValue)> {
         ChcSort::Bool => SmtValue::Bool(false),
         ChcSort::Int => SmtValue::Int(0),
         ChcSort::Real => SmtValue::Real(num_rational::BigRational::from_integer(0.into())),
-        ChcSort::BitVec(width) => SmtValue::BitVec(0, width),
+        ChcSort::BitVec(width) => {
+            SmtValue::bitvec_from_biguint(num_bigint::BigUint::from(0u8), width)
+        }
         ChcSort::Array(_, _) | ChcSort::Uninterpreted(_) | ChcSort::Datatype { .. } => {
             return None;
         }
@@ -1485,9 +1522,10 @@ fn smt_value_matches_sort_deep(value: &SmtValue, sort: &ChcSort, remaining_depth
         (SmtValue::Bool(_), ChcSort::Bool)
         | (SmtValue::Int(_), ChcSort::Int)
         | (SmtValue::Real(_), ChcSort::Real) => true,
-        (SmtValue::BitVec(_, value_width), ChcSort::BitVec(sort_width)) => {
-            value_width == sort_width
-        }
+        (
+            SmtValue::BitVec(_, value_width) | SmtValue::BigBitVec(_, value_width),
+            ChcSort::BitVec(sort_width),
+        ) => value_width == sort_width,
         (SmtValue::ConstArray(default), ChcSort::Array(_, value_sort)) => {
             smt_value_matches_sort_deep(default, value_sort, remaining_depth - 1)
         }

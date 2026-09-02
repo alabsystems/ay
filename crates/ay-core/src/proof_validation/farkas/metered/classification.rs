@@ -86,10 +86,11 @@ fn classify_row(
     let TermData::App(Symbol::Named(name), args) = terms.get(term) else {
         return Ok(None);
     };
-    let [lhs, rhs] = args.as_slice() else {
+    let mut operands = args.iter();
+    let (Some(&lhs), Some(&rhs), None) = (operands.next(), operands.next(), operands.next()) else {
         return Ok(None);
     };
-    if affine_shape(terms, *lhs, visit)?.is_none() || affine_shape(terms, *rhs, visit)?.is_none() {
+    if affine_shape(terms, lhs, visit)?.is_none() || affine_shape(terms, rhs, visit)?.is_none() {
         return Ok(None);
     }
     let kind = match name.as_str() {
@@ -120,9 +121,12 @@ fn affine_shape(
             "+" => aggregate_affine(terms, args, visit)?,
             "-" if args.len() == 1 || args.len() >= 2 => aggregate_affine(terms, args, visit)?,
             "*" => product_shape(terms, args, visit)?,
-            "/" if args.len() == 2 && literal_nonzero_number(terms, args[1], visit)? => {
-                affine_shape(terms, args[0], visit)?
-            }
+            "/" => match args.as_slice() {
+                &[dividend, divisor] if literal_nonzero_number(terms, divisor, visit)? => {
+                    affine_shape(terms, dividend, visit)?
+                }
+                _ => None,
+            },
             _ => None,
         },
         _ => None,
@@ -155,23 +159,23 @@ fn product_shape(
     args: &[TermId],
     visit: &mut dyn FnMut() -> bool,
 ) -> Result<Option<AffineShape>, ()> {
-    let mut linear_factors = 0usize;
+    let mut linear = false;
     for &arg in args {
         match affine_shape(terms, arg, visit)? {
             Some(AffineShape::Constant) => {}
             Some(AffineShape::Linear) => {
-                linear_factors += 1;
-                if linear_factors > 1 {
+                if linear {
                     return Ok(None);
                 }
+                linear = true;
             }
             None => return Ok(None),
         }
     }
-    Ok(Some(if linear_factors == 0 {
-        AffineShape::Constant
-    } else {
+    Ok(Some(if linear {
         AffineShape::Linear
+    } else {
+        AffineShape::Constant
     }))
 }
 

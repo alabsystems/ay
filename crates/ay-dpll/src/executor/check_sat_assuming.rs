@@ -20,7 +20,7 @@ use crate::ematching::contains_quantifier;
 use crate::executor_types::{
     ExecutorError, Result, SolveResult, Statistics, UnknownOrigin, UnknownReason,
 };
-use crate::logic_detection::{LogicCategory, TheoryKind};
+use crate::logic_detection::{LogicCategory, TheoryKind, FAIL_CLOSED_COMBINED};
 
 #[path = "check_sat_assuming/publication.rs"]
 mod publication;
@@ -557,6 +557,7 @@ impl Executor {
         self.clear_preprocessing_proof_records();
         self.last_proof_rebuild_originals.clear();
         self.last_proof_raw_original_assertions.clear();
+        self.last_proof_expanded_let_sources.clear();
         self.skip_model_eval = false;
         self.read_pin_repair_done = false;
         self.nra_algebraic_model.clear();
@@ -617,6 +618,18 @@ impl Executor {
         }
         if let Some(result) = self.reject_unsupported_fp_model_format(&solve_roots) {
             return Ok(result);
+        }
+        // Match plain check-sat's public W7 admission boundary over the exact
+        // caller-authored base-plus-assumption window. This must precede RM
+        // coverage, singleton-sort axioms, and every direct theory route so a
+        // generated simplification cannot erase the feature that caused the
+        // closed validator to decline. Optimization/soft roots are not part of
+        // the first satisfiability-only slice.
+        if self.named_bv_lia_authored_slice_declined(&solve_roots) {
+            self.last_statistics
+                .set_string("solver.logic_category", "Other");
+            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            return Ok(self.finalize_assumption_unknown(publication));
         }
         // Datatype-carrying-array degrade-gate bypass for the assumption
         // routes: computed at ENTRY (assertions + assumptions still in their
@@ -720,8 +733,25 @@ impl Executor {
         let mut all_assertions = initial_base_assertions.clone();
         all_assertions.extend(assumptions.iter().copied());
 
-        let (_, pre_quantifier_features) = self.detect_logic_category(&all_assertions);
-        if pre_quantifier_features.has_bv_int_conversion {
+        let (pre_quantifier_category, pre_quantifier_features) =
+            self.detect_logic_category(&all_assertions);
+        let named_bv_lia_logic = self.declares_named_bv_lia_combination();
+        // Preserve the authored live-window admission decision before either
+        // the BV/LIA bridge or quantifier preprocessing can erase the feature
+        // which caused the dedicated validator to decline.
+        if named_bv_lia_logic && pre_quantifier_category == LogicCategory::Other {
+            self.last_statistics
+                .set_string("solver.logic_category", "Other");
+            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            return Ok(self.finish_check_sat_assuming_result(
+                assumptions,
+                SolveResult::Unknown,
+                publication,
+            ));
+        }
+        let route_admitted =
+            !named_bv_lia_logic || pre_quantifier_category == LogicCategory::QfBvLia;
+        if route_admitted && (named_bv_lia_logic || pre_quantifier_features.has_bv_int_conversion) {
             let bridge_result = self.solve_bv_lia_bridge_with_assumptions(assumptions)?;
             if bridge_result.is_unsat() {
                 return Ok(self.finish_check_sat_assuming_result(
@@ -1267,10 +1297,14 @@ impl Executor {
                 Ok(SolveResult::Unknown)
             }
             LogicCategory::Other => {
-                // DT + FP has no sound combined solver yet (#8728). Return
-                // Unknown+Incomplete rather than an error so callers see the
-                // soundness-preserving standard SMT-LIB `unknown`.
-                if features.has_fpa && self.ctx.datatype_iter().next().is_some() {
+                // Match plain check-sat: recognized-but-declined combination
+                // logics return the standard SMT-LIB `unknown`, including when
+                // their dedicated live-content validator rejected an
+                // assumption-only coupling.
+                let declared = self.ctx.logic().unwrap_or("");
+                if FAIL_CLOSED_COMBINED.contains(&declared)
+                    || (features.has_fpa && self.ctx.datatype_iter().next().is_some())
+                {
                     self.last_unknown_reason = Some(UnknownReason::Incomplete);
                     Ok(SolveResult::Unknown)
                 } else {

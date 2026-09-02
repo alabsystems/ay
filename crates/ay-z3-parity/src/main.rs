@@ -38,7 +38,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const DEFAULT_AY: &str = "target/debug/libay_ffi.dylib";
-const DEFAULT_Z3: &str = "/opt/homebrew/lib/python3.14/site-packages/z3/lib/libz3.dylib";
+const DEFAULT_Z3: &str = "/opt/homebrew/opt/z3/lib/libz3.dylib";
 const DEFAULT_DIFF_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_BENCH_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_BENCH_JSON: &str = "ay-z3-bench.json";

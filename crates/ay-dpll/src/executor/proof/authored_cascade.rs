@@ -15,6 +15,7 @@ use super::Executor;
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum RepairEntry {
     Check,
+    CascadeKnownUnpublishable,
     NativeStrictWireGap,
 }
 
@@ -29,15 +30,16 @@ impl Executor {
                 .is_ok_and(|quality| quality.is_complete())
     }
 
-    /// Give a native-strict proof with an external wire gap only the two
-    /// authored retries that can change it, in their established cascade order.
+    /// Give a native-strict proof with an external wire gap only the generic
+    /// retries that can change it, in their established cascade order.
     ///
     /// Every other cascade member deliberately returns immediately when the
     /// native checker already accepts the proof. Running through all of them
-    /// therefore only repeats the same expensive strict check. Conjunct repair
-    /// retains priority; equality-chain repair runs only if the actual wire gap
-    /// remains. Once both bounded attempts finish, the ordinary publication
-    /// funnel either accepts the resulting presentation or fails closed.
+    /// therefore only repeats the same expensive strict check. Each generic
+    /// repair runs only while the actual wire gap survives. Once the bounded
+    /// attempts finish, the ordinary publication funnel accepts the resulting
+    /// presentation or fails closed. Artifact-shaped repairs run before this
+    /// strict-native classification in `run_authored_replacement_cascade`.
     fn retry_native_strict_wire_gap(&mut self, proof: &mut Proof) -> bool {
         if !self.proof_has_known_wire_gap(proof)
             || !self
@@ -50,6 +52,12 @@ impl Executor {
             proof,
             RepairEntry::NativeStrictWireGap,
         );
+        if self.proof_has_known_wire_gap(proof) {
+            self.replace_with_exact_authored_poly_refutation(
+                proof,
+                RepairEntry::NativeStrictWireGap,
+            );
+        }
         if self.proof_has_known_wire_gap(proof) {
             self.replace_with_exact_authored_equality_chain_refutation(
                 proof,
@@ -67,6 +75,16 @@ impl Executor {
 
     /// Run every authored replacement while reusing verdicts for unchanged proofs.
     pub(super) fn run_authored_replacement_cascade(&mut self, proof: &mut Proof) {
+        // These two historical replay shapes can arrive as native-strict
+        // proofs whose only defect is their Alethe spelling. Run their exact,
+        // independently checked planners before classifying that native proof;
+        // the generic retry fast path otherwise returns before the ordinary
+        // cascade reaches either artifact-shaped member. Both planners depend
+        // only on the immutable authored/raw scope, so this is also their sole
+        // invocation: retrying later cannot expose a new source shape and would
+        // merely reset their proof-wide resource budgets.
+        self.replace_with_exact_authored_bv_high_zero_refutation(proof);
+        self.replace_with_exact_authored_negated_conjunct_bridge(proof);
         if self.retry_native_strict_wire_gap(proof) {
             return;
         }
@@ -102,6 +120,10 @@ impl Executor {
         strict_gated_cascade_member!(replace_with_exact_authored_string_length_refutation);
         strict_gated_cascade_member!(replace_with_exact_authored_datatype_refutation);
         strict_gated_cascade_member!(replace_with_exact_authored_order_ite_refutation);
+        strict_gated_cascade_member!(
+            replace_with_exact_authored_poly_refutation,
+            RepairEntry::CascadeKnownUnpublishable
+        );
         strict_gated_cascade_member!(
             replace_with_exact_authored_equality_chain_refutation,
             RepairEntry::Check

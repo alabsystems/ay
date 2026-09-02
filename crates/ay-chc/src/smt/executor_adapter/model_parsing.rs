@@ -8,6 +8,28 @@
 
 use crate::smt::types::SmtValue;
 use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
+use num_bigint::BigUint;
+
+fn bitvec_from_digits(digits: &str, radix: u32, width: u32) -> Option<SmtValue> {
+    if width == 0 || width > crate::MAX_BITVECTOR_WIDTH {
+        return None;
+    }
+    let value = BigUint::parse_bytes(digits.as_bytes(), radix)?;
+    Some(SmtValue::bitvec_from_biguint(value, width))
+}
+
+fn indexed_bitvec_to_smt_value(
+    name: &str,
+    indices: &[ay_frontend::Index],
+    args: &[ay_frontend::Term],
+) -> Option<SmtValue> {
+    if !args.is_empty() || indices.len() != 1 {
+        return None;
+    }
+    let digits = name.strip_prefix("bv")?;
+    let width = indices.first()?.as_numeral()?.parse::<u32>().ok()?;
+    bitvec_from_digits(digits, 10, width)
+}
 
 /// Parse an SMT-LIB model string into a FxHashMap<String, SmtValue>.
 ///
@@ -96,29 +118,17 @@ pub(crate) fn term_body_to_smt_value(
             // before parsing so the width and value are computed from the raw
             // hex digits, not the prefixed string.
             let hex = s.strip_prefix("#x").unwrap_or(s);
-            let width = (hex.len() * 4) as u32;
-            let val = if hex.len() > 32 {
-                // Wide BV (>128-bit): truncate to low 128 bits.
-                // The internal solver decomposes wide BV into ≤128-bit chunks,
-                // so this only fires for executor fallback model values.
-                let low = &hex[hex.len() - 32..];
-                u128::from_str_radix(low, 16).unwrap_or(0)
-            } else {
-                u128::from_str_radix(hex, 16).ok()?
-            };
-            Some(SmtValue::BitVec(val, width))
+            let width = u32::try_from(hex.len()).ok()?.checked_mul(4)?;
+            bitvec_from_digits(hex, 16, width)
         }
         ay_frontend::Term::Const(Constant::Binary(s)) => {
             // Strip the `#b` prefix (see the Hexadecimal arm above).
             let bin = s.strip_prefix("#b").unwrap_or(s);
-            let width = bin.len() as u32;
-            let val = if bin.len() > 128 {
-                let low = &bin[bin.len() - 128..];
-                u128::from_str_radix(low, 2).unwrap_or(0)
-            } else {
-                u128::from_str_radix(bin, 2).ok()?
-            };
-            Some(SmtValue::BitVec(val, width))
+            let width = u32::try_from(bin.len()).ok()?;
+            bitvec_from_digits(bin, 2, width)
+        }
+        ay_frontend::Term::IndexedApp(name, indices, args) => {
+            indexed_bitvec_to_smt_value(name, indices, args)
         }
         // Nullary constructor: App with empty args that matches a known ctor name.
         ay_frontend::Term::App(name, args)
@@ -271,7 +281,28 @@ pub(crate) fn parse_model_simple(model: &mut FxHashMap<String, SmtValue>, model_
 
 /// Parse a simple "SORT VALUE)" string into SmtValue.
 pub(crate) fn parse_simple_value(s: &str) -> Option<SmtValue> {
-    let s = s.trim().trim_end_matches(')').trim();
+    let s = s.trim();
+    if let Some(bitvec) = s.strip_prefix("(_ BitVec ") {
+        let (width, value) = bitvec.split_once(") ")?;
+        let width = width.parse::<u32>().ok()?;
+        let value = value.trim_end_matches(')').trim();
+        if let Some(hex) = value.strip_prefix("#x") {
+            return bitvec_from_digits(hex, 16, width);
+        }
+        if let Some(bin) = value.strip_prefix("#b") {
+            return bitvec_from_digits(bin, 2, width);
+        }
+        if let Some(indexed) = value.strip_prefix("(_ bv") {
+            let (digits, literal_width) = indexed.split_once(' ')?;
+            if literal_width.parse::<u32>().ok()? != width {
+                return None;
+            }
+            return bitvec_from_digits(digits, 10, width);
+        }
+        return None;
+    }
+
+    let s = s.trim_end_matches(')').trim();
     if s.starts_with("Int ") {
         let val_str = s.strip_prefix("Int ")?.trim();
         if val_str.starts_with("(- ") {
@@ -312,5 +343,65 @@ pub(crate) fn parse_simple_value(s: &str) -> Option<SmtValue> {
         }
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_bigint::BigInt;
+
+    #[test]
+    fn wide_literals_preserve_high_bits() {
+        let constructors = FxHashSet::default();
+        let term = ay_frontend::Term::Const(ay_frontend::Constant::Binary(format!(
+            "1{}",
+            "0".repeat(128)
+        )));
+        let expected = BigUint::from(1u8) << 128;
+        assert_eq!(
+            term_body_to_smt_value(&term, &constructors),
+            Some(SmtValue::bitvec_from_biguint(expected, 129))
+        );
+    }
+
+    #[test]
+    fn indexed_wide_literal_is_exact() {
+        let constructors = FxHashSet::default();
+        let term = ay_frontend::Term::IndexedApp(
+            format!("bv{}", BigUint::from(1u8) << 128),
+            vec![ay_frontend::Index::Numeral("129".to_string())],
+            vec![],
+        );
+        assert_eq!(
+            term_body_to_smt_value(&term, &constructors),
+            Some(SmtValue::bitvec_from_biguint(
+                BigUint::from(1u8) << 128,
+                129
+            ))
+        );
+    }
+
+    #[test]
+    fn executor_model_wide_bitvec_roundtrips_exactly() {
+        let value: BigUint = (BigUint::from(1u8) << 191_usize) | BigUint::from(3u8);
+        let printed = ay_dpll::format_bitvec(&BigInt::from(value.clone()), 192);
+        let model_text = format!("(model (define-fun w () (_ BitVec 192) {printed}))");
+        let mut model = FxHashMap::default();
+        parse_model_into(&mut model, &model_text, &FxHashSet::default());
+        assert_eq!(
+            model.get("w"),
+            Some(&SmtValue::bitvec_from_biguint(value, 192))
+        );
+    }
+
+    #[test]
+    fn fallback_model_parser_keeps_wide_bitvec_exact() {
+        let value = BigUint::from(1u8) << 128;
+        let model_value = format!("(_ BitVec 129) #b1{})", "0".repeat(128));
+        assert_eq!(
+            parse_simple_value(&model_value),
+            Some(SmtValue::bitvec_from_biguint(value, 129))
+        );
     }
 }

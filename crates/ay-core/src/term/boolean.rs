@@ -107,8 +107,8 @@ impl TermStore {
         if args.is_empty() {
             return self.true_term();
         }
-        if args.len() == 1 {
-            return args[0];
+        if let &[only] = args.as_slice() {
+            return only;
         }
 
         if self.has_flatten_hidden_complement_pair(&args, "and") {
@@ -133,8 +133,8 @@ impl TermStore {
         if filtered.is_empty() {
             return self.true_term();
         }
-        if filtered.len() == 1 {
-            return filtered[0];
+        if let &[only] = filtered.as_slice() {
+            return only;
         }
 
         // Sort for canonical form
@@ -152,8 +152,8 @@ impl TermStore {
             }
         }
 
-        if filtered.len() == 1 {
-            return filtered[0];
+        if let &[only] = filtered.as_slice() {
+            return only;
         }
 
         // Absorption: (and x (or x y)) -> x
@@ -180,8 +180,8 @@ impl TermStore {
         if absorbed.is_empty() {
             return self.true_term();
         }
-        if absorbed.len() == 1 {
-            return absorbed[0];
+        if let &[only] = absorbed.as_slice() {
+            return only;
         }
 
         // Negation-through absorption: (and x (or (not x) y z)) -> (and x (or y z))
@@ -242,8 +242,8 @@ impl TermStore {
         if args.is_empty() {
             return self.false_term();
         }
-        if args.len() == 1 {
-            return args[0];
+        if let &[only] = args.as_slice() {
+            return only;
         }
 
         if self.has_flatten_hidden_complement_pair(&args, "or") {
@@ -268,8 +268,8 @@ impl TermStore {
         if filtered.is_empty() {
             return self.false_term();
         }
-        if filtered.len() == 1 {
-            return filtered[0];
+        if let &[only] = filtered.as_slice() {
+            return only;
         }
 
         // Sort for canonical form
@@ -287,8 +287,8 @@ impl TermStore {
             }
         }
 
-        if filtered.len() == 1 {
-            return filtered[0];
+        if let &[only] = filtered.as_slice() {
+            return only;
         }
 
         // Absorption: (or x (and x y)) -> x
@@ -315,8 +315,8 @@ impl TermStore {
         if absorbed.is_empty() {
             return self.false_term();
         }
-        if absorbed.len() == 1 {
-            return absorbed[0];
+        if let &[only] = absorbed.as_slice() {
+            return only;
         }
 
         // Negation-through absorption: (or x (and (not x) y z)) -> (or x (and y z))

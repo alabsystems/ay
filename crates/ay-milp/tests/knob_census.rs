@@ -488,6 +488,15 @@ const HARNESS_FLAGS: &[(&str, &str, &str)] = &[
     ),
     (
         "src/bin/ay-milp.rs",
+        "skip-finalize-reverify",
+        "WIRED, in `solve_options.rs`: `SolveOpts::with_skip_finalize_reverify(true)`, \
+         the opt-in that skips the tree-certificate emission self-verify (a duplicate \
+         CHECK; the certificate bytes are identical either way). Deliberately NOT in \
+         any engine builder table: it is `solve`'s own evidence-policy switch, like \
+         its sibling `--tree-cert-leaves` in `VALUE_FLAGS`.",
+    ),
+    (
+        "src/bin/ay-milp.rs",
         "phase-ledger",
         "WIRED, harness-local, REPORTING ONLY. Read once in `cmd_solve` into `let \
          ledger` and gating exactly one `eprintln!` that attributes this process's \

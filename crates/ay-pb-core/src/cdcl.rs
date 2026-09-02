@@ -4576,12 +4576,21 @@ impl PbCdclSolver {
         // Build a snapshot of the trail levels for the weakening callback.
         // We need this because weaken_conservative takes a closure that checks
         // falsified literal levels, and we can't borrow self inside it.
-        let trail_levels: Vec<(u32, u32)> = self
-            .trail
-            .iter()
-            .map(|entry| (entry.lit.unsigned_abs(), entry.level))
-            .collect();
-        let propagator_snapshot: Vec<(PbLit, bool)> = learned
+        // KEYED, NOT SCANNED. Both snapshots used to be `Vec`s that the closure
+        // searched linearly on every call, which is the `(n + |trail|)` factor in
+        // the `O(n^2 * (n + |trail|))` conflict-analysis stall this call site was
+        // measured causing (see `CpConstraint::weaken_conservative`). The maps
+        // answer the same questions with the same answers in O(log n).
+        //
+        // `trail_levels` was searched with `.rev().find(..)`, i.e. LAST entry
+        // wins; inserting in forward trail order and letting later entries
+        // overwrite reproduces that exactly.
+        let mut trail_levels: std::collections::BTreeMap<u32, u32> =
+            std::collections::BTreeMap::new();
+        for entry in self.trail.iter() {
+            trail_levels.insert(entry.lit.unsigned_abs(), entry.level);
+        }
+        let propagator_snapshot: std::collections::BTreeMap<PbLit, bool> = learned
             .coefficients()
             .keys()
             .map(|&lit| {
@@ -4593,19 +4602,12 @@ impl PbCdclSolver {
 
         learned.weaken_conservative(asserting_lit, |lit| {
             // Check if this literal is falsified and return its decision level.
-            let is_false = propagator_snapshot
-                .iter()
-                .find(|(l, _)| *l == lit)
-                .map_or(false, |(_, f)| *f);
+            let is_false = propagator_snapshot.get(&lit).copied().unwrap_or(false);
             if !is_false {
                 return None;
             }
             // Find the decision level of the variable in the trail.
-            trail_levels
-                .iter()
-                .rev()
-                .find(|(var, _)| *var == lit.var)
-                .map(|(_, level)| *level)
+            trail_levels.get(&lit.var).copied()
         });
 
         if should_stop.should_stop(self) {

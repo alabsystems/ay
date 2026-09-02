@@ -246,10 +246,14 @@ impl Mbp {
         bounds: &[(ChcExpr, bool)],
         model: &FxHashMap<String, SmtValue>,
     ) -> Option<(ChcExpr, bool)> {
-        bounds
+        let evaluated: Option<Vec<_>> = bounds
             .iter()
-            .max_by_key(|(term, _)| self.eval_bv(term, model).map(|(v, _)| v).unwrap_or(0))
-            .cloned()
+            .map(|bound @ (term, _)| self.eval_bv(term, model).map(|(value, _)| (bound, value)))
+            .collect();
+        evaluated?
+            .into_iter()
+            .max_by_key(|(_, value)| *value)
+            .map(|(bound, _)| bound.clone())
     }
 
     /// Pick the tightest BV upper bound by evaluating under model.
@@ -258,14 +262,14 @@ impl Mbp {
         bounds: &[(ChcExpr, bool)],
         model: &FxHashMap<String, SmtValue>,
     ) -> Option<(ChcExpr, bool)> {
-        bounds
+        let evaluated: Option<Vec<_>> = bounds
             .iter()
-            .min_by_key(|(term, _)| {
-                self.eval_bv(term, model)
-                    .map(|(v, _)| v)
-                    .unwrap_or(u128::MAX)
-            })
-            .cloned()
+            .map(|bound @ (term, _)| self.eval_bv(term, model).map(|(value, _)| (bound, value)))
+            .collect();
+        evaluated?
+            .into_iter()
+            .min_by_key(|(_, value)| *value)
+            .map(|(bound, _)| bound.clone())
     }
 
     /// Pick the tightest signed BV lower bound (max value in signed order).
@@ -279,14 +283,17 @@ impl Mbp {
             ChcSort::BitVec(w) => *w,
             _ => return bounds.first().cloned(),
         };
-        bounds
+        let evaluated: Option<Vec<_>> = bounds
             .iter()
-            .max_by_key(|(term, _)| {
+            .map(|bound @ (term, _)| {
                 self.eval_bv(term, model)
-                    .map(|(v, _)| bv_to_signed(v, w))
-                    .unwrap_or(i128::MIN)
+                    .map(|(value, _)| (bound, bv_to_signed(value, w)))
             })
-            .cloned()
+            .collect();
+        evaluated?
+            .into_iter()
+            .max_by_key(|(_, value)| *value)
+            .map(|(bound, _)| bound.clone())
     }
 
     /// Pick the tightest signed BV upper bound (min value in signed order).
@@ -300,14 +307,17 @@ impl Mbp {
             ChcSort::BitVec(w) => *w,
             _ => return bounds.first().cloned(),
         };
-        bounds
+        let evaluated: Option<Vec<_>> = bounds
             .iter()
-            .min_by_key(|(term, _)| {
+            .map(|bound @ (term, _)| {
                 self.eval_bv(term, model)
-                    .map(|(v, _)| bv_to_signed(v, w))
-                    .unwrap_or(i128::MAX)
+                    .map(|(value, _)| (bound, bv_to_signed(value, w)))
             })
-            .cloned()
+            .collect();
+        evaluated?
+            .into_iter()
+            .min_by_key(|(_, value)| *value)
+            .map(|(bound, _)| bound.clone())
     }
 }
 

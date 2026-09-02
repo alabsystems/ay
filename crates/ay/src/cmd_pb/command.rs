@@ -125,6 +125,21 @@ pub(crate) enum PbCommand {
         #[arg(long, value_name = "FILE")]
         proof: Option<PathBuf>,
 
+        /// Per-process memory budget in MiB for THIS solve (default: physical
+        /// RAM / 16).
+        ///
+        /// The budget is kernel-held and armed before this parser runs, so the
+        /// value is read straight from `argv` by `ay_sys::govern`; this
+        /// declaration exists so the flag is accepted and documented, and the
+        /// field is deliberately unused. Raise it when a certified PB run is
+        /// being SIGKILLed (exit 137) rather than answering: measured on
+        /// `normalized-hanoi5.opb` in proof mode, the default 3.0 GiB budget on
+        /// this 48 GiB box kills the process at 47 s with the optimum already
+        /// in hand, while 4000 lets it finish and report honestly. Lowering it
+        /// is equally valid and is the multi-tenant setting.
+        #[arg(long, value_name = "MB")]
+        memory_mb: Option<u64>,
+
         /// Print PB-specific comments before the result.
         #[arg(long)]
         stats: bool,

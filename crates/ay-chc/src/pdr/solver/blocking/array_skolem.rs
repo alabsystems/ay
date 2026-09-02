@@ -337,9 +337,10 @@ impl PdrSolver {
                 let denom = rational.denom().to_i64()?;
                 Some(ChcExpr::Real(numer, denom))
             }
-            (SmtValue::BitVec(bits, width), ChcSort::BitVec(_)) => {
-                Some(ChcExpr::BitVec(*bits, *width))
-            }
+            (
+                value @ (SmtValue::BitVec(_, actual_width) | SmtValue::BigBitVec(_, actual_width)),
+                ChcSort::BitVec(expected_width),
+            ) if actual_width == expected_width => value.bitvec_to_chc_expr(),
             // Datatype values are not expected in array element positions for
             // Skolemization (arrays typically contain scalars). Skip gracefully.
             _ => None,

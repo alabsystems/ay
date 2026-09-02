@@ -4,9 +4,20 @@
 
 //! Fail-closed work budget for the opaque-datatype completion widening.
 
+mod field_scans;
+mod render_cost;
+
+#[cfg(not(test))]
+use field_scans::MAX_DT_FIELD_SCAN_COMPARISONS;
+#[cfg(test)]
+pub(super) use field_scans::{
+    MAX_DT_FIELD_SCAN_COMPARISONS, MAX_DT_FIELD_SCAN_FIELDS, MAX_DT_FIELD_SCAN_ROWS,
+};
+
 use ay_model_check::ModelValue;
 
 use super::EvalValue;
+use render_cost::{canonical_render_bytes, model_value_work};
 
 /// Opaque applications were previously an immediate construction bailout.
 /// Keep their new post-solve completion lane deliberately small.
@@ -207,6 +218,11 @@ fn pair_count(arity: usize) -> Option<usize> {
 pub(super) struct OpaqueDtConstructionBudget {
     active: bool,
     remaining: usize,
+    /// Field-by-selector scans also run in native datatype construction, where
+    /// the opaque work budget is intentionally inactive. Keep their aggregate
+    /// comparison envelope unconditional so a large schema/query product
+    /// cannot escape accounting on that lane.
+    field_scan_remaining: usize,
     exhausted: bool,
 }
 
@@ -218,6 +234,7 @@ impl OpaqueDtConstructionBudget {
         Some(Self {
             active: opaque_terms != 0,
             remaining: MAX_OPAQUE_DT_WORK,
+            field_scan_remaining: MAX_DT_FIELD_SCAN_COMPARISONS,
             exhausted: false,
         })
     }
@@ -258,7 +275,8 @@ impl OpaqueDtConstructionBudget {
         self.charge(work)
     }
 
-    /// Precharge the exact canonical output length before rendering it.
+    /// Precharge a checked upper bound on the canonical output length before
+    /// rendering it.
     pub(super) fn charge_render(&mut self, value: &ModelValue) -> bool {
         if !self.active {
             return true;
@@ -317,24 +335,6 @@ impl OpaqueDtConstructionBudget {
         self.charge(work)
     }
 
-    /// Precharge a schema-field scan over retained selector applications and
-    /// constructor argument rows before any nested loops or name comparisons.
-    pub(super) fn charge_field_scans(
-        &mut self,
-        fields: usize,
-        selectors: usize,
-        constructor_rows: usize,
-    ) -> bool {
-        let Some(scans) = selectors
-            .checked_add(constructor_rows)
-            .and_then(|rows| rows.checked_mul(fields))
-            .and_then(|work| work.checked_mul(272))
-        else {
-            return self.fail();
-        };
-        self.charge(scans)
-    }
-
     /// Precharge one retained constructor-name clone.
     pub(super) fn charge_name_clone(&mut self, name: &str) -> bool {
         self.charge(name.len().saturating_add(1))
@@ -381,118 +381,8 @@ impl OpaqueDtConstructionBudget {
         Self {
             active: true,
             remaining: limit,
+            field_scan_remaining: MAX_DT_FIELD_SCAN_COMPARISONS,
             exhausted: false,
         }
     }
-}
-
-fn model_value_work(value: &ModelValue, limit: usize) -> Option<usize> {
-    let mut stack = vec![value];
-    let mut work = 0usize;
-    while let Some(value) = stack.pop() {
-        let payload = match value {
-            ModelValue::Bool(_) => 1,
-            ModelValue::Int(value) => usize::try_from(value.bits()).ok()?.div_ceil(8) + 1,
-            ModelValue::Real(value) => {
-                usize::try_from(value.numer().bits()).ok()?.div_ceil(8)
-                    + usize::try_from(value.denom().bits()).ok()?.div_ceil(8)
-                    + 1
-            }
-            ModelValue::BitVec { width, value } => {
-                usize::try_from(u64::from(*width).max(value.bits()))
-                    .ok()?
-                    .div_ceil(8)
-                    + 1
-            }
-            ModelValue::Str(value) | ModelValue::Uninterpreted(value) => value.len() + 1,
-            ModelValue::Datatype { ctor, args } => {
-                if args.len() > limit.saturating_sub(work) {
-                    return None;
-                }
-                stack.extend(args);
-                ctor.len().checked_add(1)?
-            }
-            ModelValue::Seq(args) => {
-                if args.len() > limit.saturating_sub(work) {
-                    return None;
-                }
-                stack.extend(args);
-                1
-            }
-            ModelValue::Array(array) => {
-                let extra = 1usize.checked_add(array.store.len().checked_mul(2)?)?;
-                if extra > limit.saturating_sub(work) {
-                    return None;
-                }
-                stack.push(&array.default);
-                for (key, cell) in &array.store {
-                    stack.push(key);
-                    stack.push(cell);
-                }
-                1
-            }
-            ModelValue::FloatingPoint { .. } | ModelValue::Algebraic(_) => return None,
-        };
-        work = work.checked_add(payload)?;
-        if work > limit {
-            return None;
-        }
-    }
-    Some(work)
-}
-
-fn canonical_render_bytes(value: &ModelValue, limit: usize) -> Option<usize> {
-    let mut stack = vec![value];
-    let mut bytes = 0usize;
-    while let Some(value) = stack.pop() {
-        let payload = match value {
-            ModelValue::Bool(true) => 4,
-            ModelValue::Bool(false) => 5,
-            ModelValue::BitVec { width, value }
-                if *width <= 256
-                    && value.sign() != num_bigint::Sign::Minus
-                    && value.bits() <= u64::from(*width) =>
-            {
-                let width = usize::try_from(*width).ok()?;
-                2usize.checked_add(if width % 4 == 0 {
-                    (width / 4).max(1)
-                } else {
-                    width.max(1)
-                })?
-            }
-            // Numeric, element-token, and string payloads render as their
-            // digit/byte length plus small fixed syntax (`(- n)`, `(/ a b)`,
-            // quotes). These are the scalar fields ordinary total-DT
-            // construction has always emitted (#dt-opaque-app-model); each is
-            // charged by actual size so an oversized payload fails closed.
-            ModelValue::Int(value) => usize::try_from(value.bits())
-                .ok()?
-                .div_ceil(3)
-                .checked_add(5)?,
-            ModelValue::Real(value) => usize::try_from(value.numer().bits())
-                .ok()?
-                .div_ceil(3)
-                .checked_add(usize::try_from(value.denom().bits()).ok()?.div_ceil(3))?
-                .checked_add(9)?,
-            ModelValue::Str(text) => text.len().checked_add(2)?,
-            ModelValue::Uninterpreted(token) => token.len().checked_add(1)?,
-            ModelValue::Datatype { ctor, args } => {
-                if args.len() > limit.saturating_sub(bytes) {
-                    return None;
-                }
-                stack.extend(args);
-                ctor.len().checked_add(if args.is_empty() {
-                    0
-                } else {
-                    2usize.checked_add(args.len())?
-                })?
-            }
-            _ => return None,
-        };
-        bytes = bytes.checked_add(payload)?;
-        if bytes > limit {
-            return None;
-        }
-    }
-    Some(bytes)
 }

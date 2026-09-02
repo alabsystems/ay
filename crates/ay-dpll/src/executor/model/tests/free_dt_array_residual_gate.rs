@@ -61,6 +61,35 @@ fn free_dt_array_alias_consistent_reads_is_sat() {
     );
 }
 
+/// MODEL_CHECKER_CONSUMER-shaped positive control: the free datatype-element arrays are
+/// indexed by BV64, including a high-bit-set address. The full executor must
+/// publish `sat` only after the independent gate materializes and replays the
+/// consistent residual witness.
+#[test]
+fn free_dt_array_bv64_alias_consistent_reads_is_confirmed_sat() {
+    let input = r#"
+        (declare-datatype S ((mk (f Int) (g Int))))
+        (declare-const a (Array (_ BitVec 64) S))
+        (declare-const b (Array (_ BitVec 64) S))
+        (assert (= a b))
+        (assert (= 5 (f (select a #x8000000000000001))))
+        (assert (= 5 (f (select b #x8000000000000001))))
+        (assert (= 7 (g (select b #x8000000000000001))))
+        (check-sat)
+    "#;
+    let (exec, verdict) = solve(input);
+    let gate = exec.confirm_sat_with_independent_gate();
+    assert_eq!(
+        verdict, "sat",
+        "consistent BV64-indexed residual reads are genuinely SAT; the full \
+         executor must publish the independently confirmed witness (gate: {gate:?})"
+    );
+    assert!(
+        matches!(gate, GateVerdict::ConfirmedSat),
+        "the BV64-indexed residual witness must pass independent replay"
+    );
+}
+
 /// ADVERSARIAL control (genuinely UNSAT): the SAME shape with CONFLICTING
 /// reads at one (class, index, field) slot — `f(a[0]) = 5` vs `f(b[0]) = 6`
 /// under `a = b`. The residual decision must NOT confirm; the verdict must
@@ -91,6 +120,38 @@ fn free_dt_array_alias_conflicting_reads_never_sat() {
                 GateVerdict::ConfirmedSat
             ),
             "the gate must not confirm a conflicting residual"
+        );
+    }
+}
+
+/// MODEL_CHECKER_CONSUMER-shaped adversarial control: contradictory field requirements at
+/// the same BV64 address under an array alias are UNSAT. Search may prove
+/// `unsat` or fail closed to `unknown`, but neither the gate nor publication
+/// may turn the conflict into `sat`.
+#[test]
+fn free_dt_array_bv64_alias_conflicting_reads_never_sat() {
+    let input = r#"
+        (declare-datatype S ((mk (f Int) (g Int))))
+        (declare-const a (Array (_ BitVec 64) S))
+        (declare-const b (Array (_ BitVec 64) S))
+        (assert (= a b))
+        (assert (= 5 (f (select a #x8000000000000001))))
+        (assert (= 6 (f (select b #x8000000000000001))))
+        (check-sat)
+    "#;
+    let (exec, verdict) = solve(input);
+    assert_ne!(
+        verdict, "sat",
+        "conflicting reads at one aliased BV64 cell are UNSAT and must never \
+         pass the publication gate"
+    );
+    if exec.last_model.is_some() {
+        assert!(
+            !matches!(
+                exec.confirm_sat_with_independent_gate(),
+                GateVerdict::ConfirmedSat
+            ),
+            "the independent gate must not confirm a conflicting BV64 residual"
         );
     }
 }

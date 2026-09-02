@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::panic)]
 use super::*;
-use crate::{ChcDtConstructor, ChcDtSelector, ChcOp};
+use crate::{ChcDtConstructor, ChcDtSelector, ChcOp, ClauseBody, ClauseHead, HornClause};
 use std::sync::Arc;
 #[test]
 fn parse_define_fun_basic_model_entry() {
@@ -447,6 +447,73 @@ fn bitvector_model_output_round_trips_as_typed_chc_ops() {
     let canonical = model.to_smtlib(&problem);
     let reparsed = InvariantModel::parse_smtlib(&canonical, &problem)
         .expect("AY's emitted BV model must parse back");
+    assert_eq!(reparsed.to_smtlib(&problem), canonical);
+}
+
+#[test]
+fn indexed_bitvector_literal_beyond_u128_round_trips_exactly() {
+    const DECIMAL: &str = "340282366920938463463374607431768211457"; // 2^128 + 1
+    const WIDTH: u32 = 129;
+
+    let mut problem = ChcProblem::new();
+    let inv = problem.declare_predicate("Inv", vec![ChcSort::BitVec(WIDTH)]);
+    let source =
+        format!("(define-fun Inv ((x (_ BitVec {WIDTH}))) Bool (= x (_ bv{DECIMAL} {WIDTH})))");
+    let model = InvariantModel::parse_smtlib(&source, &problem)
+        .expect("a width-bounded indexed literal beyond u128 should parse exactly");
+    let interpretation = model.get(&inv).expect("Inv interpretation");
+    let expected_literal = ChcExpr::bitvec_from_str_radix(DECIMAL, 10, WIDTH)
+        .expect("the checked public constructor accepts the same exact literal");
+    assert_eq!(
+        interpretation.formula,
+        ChcExpr::eq(
+            ChcExpr::var(ChcVar::new("x", ChcSort::BitVec(WIDTH))),
+            expected_literal,
+        )
+    );
+    assert!(matches!(
+        validate_qf_expression(&problem, &interpretation.vars, &interpretation.formula),
+        Ok(ChcSort::Bool)
+    ));
+
+    // AY canonicalizes a wide leaf into a bounded concat tree. That canonical
+    // form must remain accepted by the same strict artifact parser.
+    let canonical = model.to_smtlib(&problem);
+    let reparsed = InvariantModel::parse_smtlib(&canonical, &problem)
+        .expect("AY's canonical wide invariant must parse back");
+    assert_eq!(reparsed.to_smtlib(&problem), canonical);
+}
+
+#[test]
+fn scalar_uf_invariant_round_trips_and_passes_strict_type_check() {
+    let mut problem = ChcProblem::new();
+    let inv = problem.declare_predicate("Inv", vec![ChcSort::Int]);
+    let source_x = ChcVar::new("source_x", ChcSort::Int);
+    let source_f_x = ChcExpr::FuncApp(
+        "source_f".to_string(),
+        ChcSort::Int,
+        vec![Arc::new(ChcExpr::var(source_x))],
+    );
+    // `ChcProblem` reconstructs ordinary-UF declarations from source terms.
+    // Keep one real source occurrence so an artifact cannot smuggle in a UF
+    // that the solved problem never declared.
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(source_f_x, ChcExpr::int(0))),
+        ClauseHead::False,
+    ));
+
+    let source = "(define-fun Inv ((x Int)) Bool (= (source_f x) (source_f x)))";
+    let model = InvariantModel::parse_smtlib(source, &problem)
+        .expect("a source scalar UF should be visible to invariant replay");
+    let interpretation = model.get(&inv).expect("Inv interpretation");
+    assert!(matches!(
+        validate_qf_expression(&problem, &interpretation.vars, &interpretation.formula),
+        Ok(ChcSort::Bool)
+    ));
+
+    let canonical = model.to_smtlib(&problem);
+    let reparsed = InvariantModel::parse_smtlib(&canonical, &problem)
+        .expect("AY's scalar-UF invariant must parse back");
     assert_eq!(reparsed.to_smtlib(&problem), canonical);
 }
 

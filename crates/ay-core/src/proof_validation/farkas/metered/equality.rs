@@ -150,8 +150,14 @@ fn verify_branch(
     reverse_disequality: bool,
     meter: &mut ProgressMeter<'_>,
 ) -> Result<(), FarkasValidationError> {
-    let literal = &conflict[disequality_index];
-    let coefficient = &farkas.coefficients[disequality_index];
+    let Some(literal) = conflict.get(disequality_index) else {
+        return Err(FarkasValidationError::NonArithmeticLiteral {
+            term: conflict.first().map_or(TermId(0), |literal| literal.term),
+        });
+    };
+    let Some(coefficient) = farkas.coefficients.get(disequality_index) else {
+        return Err(FarkasValidationError::NonArithmeticLiteral { term: literal.term });
+    };
     let mut expression = normalize_row(terms, literal, FarkasProgressRowKind::Disequality, meter)?;
     if reverse_disequality {
         expression.negate(meter)?;
@@ -224,11 +230,16 @@ fn normalize_row(
     let TermData::App(Symbol::Named(predicate), args) = terms.get(term) else {
         return Err(FarkasValidationError::NonArithmeticLiteral { term });
     };
-    if args.len() != 2 || !matches!(predicate.as_str(), "=" | "distinct") {
+    let mut operands = args.iter();
+    let (Some(&left), Some(&right), None) = (operands.next(), operands.next(), operands.next())
+    else {
+        return Err(FarkasValidationError::NonArithmeticLiteral { term });
+    };
+    if !matches!(predicate.as_str(), "=" | "distinct") {
         return Err(FarkasValidationError::NonArithmeticLiteral { term });
     }
-    let mut expression = parse_linear_expr(terms, args[0], meter)?;
-    let right = parse_linear_expr(terms, args[1], meter)?;
+    let mut expression = parse_linear_expr(terms, left, meter)?;
+    let right = parse_linear_expr(terms, right, meter)?;
     let minus_one = meter.rational_from_i64_pair(&-Rational64::one())?;
     expression.add_scaled(&right, &minus_one, meter)?;
     meter.charge_rational_drop(&minus_one)?;

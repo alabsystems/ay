@@ -113,6 +113,10 @@ pub(crate) struct CondenseSuperpass {
     wall_budget: Option<Duration>,
     /// FIX #2a: mean-constraint-node-count gate. `0` disables the gate.
     mean_node_gate: usize,
+    /// Optional authoritative caller boundary. Unlike `wall_budget`, this is
+    /// absolute and also observes caller cancellation between constituents.
+    caller_deadline: Option<Instant>,
+    cancellation: Option<crate::CancellationToken>,
 }
 
 impl CondenseSuperpass {
@@ -122,6 +126,8 @@ impl CondenseSuperpass {
             preserve_query_body_predicates: false,
             wall_budget: condense_wall_budget_from_env(),
             mean_node_gate: condense_mean_node_gate_from_env(),
+            caller_deadline: None,
+            cancellation: None,
         }
     }
 
@@ -141,6 +147,16 @@ impl CondenseSuperpass {
     /// constituents and returns the best-so-far (exact) prefix on expiry.
     pub(crate) fn with_wall_budget(mut self, budget: Option<Duration>) -> Self {
         self.wall_budget = budget;
+        self
+    }
+
+    pub(crate) fn with_caller_boundary(
+        mut self,
+        deadline: Option<Instant>,
+        cancellation: crate::CancellationToken,
+    ) -> Self {
+        self.caller_deadline = deadline;
+        self.cancellation = Some(cancellation);
         self
     }
 
@@ -181,6 +197,19 @@ impl CondenseSuperpass {
     /// transform stack composed so far is exact, so returning the best-so-far
     /// problem is always sound — the loop must never hang.
     fn should_bail(&self, start: Instant, current: &ChcProblem) -> Option<String> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(crate::CancellationToken::is_cancelled)
+        {
+            return Some("caller cancellation requested".to_string());
+        }
+        if self
+            .caller_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Some("caller deadline exhausted".to_string());
+        }
         if let Some(budget) = self.wall_budget {
             let elapsed = start.elapsed();
             if elapsed >= budget {

@@ -161,10 +161,25 @@ fn test_carcara_trust_free_composed_authored_roots() {
             !proof.contains(":rule trust") && !proof.contains(":rule hole"),
             "{label}: composed-root proof must not contain unchecked rules:\n{proof}"
         );
-        assert!(
-            run_carcara_trust_free(&carcara, label, carcara_problem, &proof),
-            "{label}: composed-root proof must be trust-free verifiable by carcara"
-        );
+        if label == "trust_free_qf_lia_let_linear_and_fold" {
+            // This proof deliberately certifies source-level let elimination.
+            // Carcara's parser-side `--expand-let-bindings` option erases the
+            // left-hand let before the `let` rule can validate it, so exercise
+            // that rule in the ordinary parser mode, just like the dedicated
+            // let-bridge regression below.
+            let (valid, diagnostic) =
+                exact_carcara_verdict(&carcara, carcara_problem, &proof);
+            assert!(
+                valid,
+                "{label}: source-exact composed-root proof must be trust-free \
+                 verifiable by carcara: {diagnostic}"
+            );
+        } else {
+            assert!(
+                run_carcara_trust_free(&carcara, label, carcara_problem, &proof),
+                "{label}: composed-root proof must be trust-free verifiable by carcara"
+            );
+        }
     }
 }
 

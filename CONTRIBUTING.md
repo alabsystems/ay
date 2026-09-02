@@ -6,7 +6,13 @@
 cargo build --release --locked -p ay --features cli --bin ay
 ```
 
-A current stable Rust toolchain is the only requirement.
+A current stable Rust toolchain is the only requirement. That is a statement
+about this published snapshot, whose `rust-toolchain.toml` pins stock stable
+Rust; publication installs that pin, so no consumer or contributor needs a
+verifying compiler to build, test, or patch AY. ALab's development tree pins
+the Trust verifying compiler as its default instead (verification on, in an
+advisory policy), which is why some in-tree notes talk about proof obligations
+that plain stable Rust never emits.
 
 ## Test
 

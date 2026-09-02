@@ -97,7 +97,9 @@ fn disjunct_branches(terms: &TermStore, disjunct: TermId) -> Option<Vec<Rows>> {
             match terms.get(inner) {
                 TermData::App(Symbol::Named(name), args) if name == "=" && args.len() == 2 => {
                     // Disequality over ℤ: exactly `F ≥ b+1` or `F ≤ b−1`.
-                    let (a, b) = (args[0], args[1]);
+                    let &[a, b] = args.as_slice() else {
+                        return None;
+                    };
                     let eq = int_equality_row(terms, a, b)?;
                     Some(disequality_branches(&eq))
                 }
@@ -113,7 +115,10 @@ fn disjunct_branches(terms: &TermStore, disjunct: TermId) -> Option<Vec<Rows>> {
             }
         }
         TermData::App(Symbol::Named(name), args) if name == "=" && args.len() == 2 => {
-            let eq = int_equality_row(terms, args[0], args[1])?;
+            let &[a, b] = args.as_slice() else {
+                return None;
+            };
+            let eq = int_equality_row(terms, a, b)?;
             Some(vec![Rows {
                 eqs: vec![eq],
                 ges: Vec::new(),

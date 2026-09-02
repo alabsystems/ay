@@ -12,7 +12,11 @@
 //!
 //! Part of #8631: BvConcat parser support needed by model-checker-consumer.
 
-use ay_chc::{AdaptiveConfig, AdaptivePortfolio, ChcParser, VerifiedChcResult};
+use ay_chc::{
+    AdaptiveConfig, AdaptivePortfolio, ChcParser, ChcSort, SmtValue, VerifiedChcResult,
+    MAX_BITVECTOR_WIDTH,
+};
+use num_bigint::{BigInt, BigUint};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -192,5 +196,39 @@ fn test_chc_bv_concat_parsing_8631() {
     assert!(
         !problem.clauses().is_empty(),
         "Parsed CHC problem should have clauses"
+    );
+}
+
+#[test]
+fn checked_public_wide_model_value_api_is_exact_and_bounded() {
+    let value: BigUint = (BigUint::from(1_u8) << 128_usize) | BigUint::from(3_u8);
+    let model_value = SmtValue::try_bitvec_from_biguint(value.clone(), 129)
+        .expect("129-bit public model values are supported");
+    assert_eq!(model_value.bitvec_to_biguint(), Some((value, 129)));
+    assert_eq!(
+        model_value
+            .bitvec_to_chc_expr()
+            .expect("bounded model value reconstructs")
+            .sort(),
+        ChcSort::BitVec(129)
+    );
+
+    let negative = SmtValue::try_bitvec_from_bigint(BigInt::from(-1), 129)
+        .expect("signed public construction uses modulo semantics");
+    assert_eq!(
+        negative.bitvec_to_biguint(),
+        Some(((BigUint::from(1_u8) << 129) - BigUint::from(1_u8), 129))
+    );
+
+    assert!(SmtValue::try_bitvec_from_u128(0, 0).is_err());
+    assert!(SmtValue::try_bitvec_from_bigint(BigInt::from(-1), MAX_BITVECTOR_WIDTH + 1,).is_err());
+    assert_eq!(SmtValue::BitVec(0, 0).bitvec_to_biguint(), None);
+    assert_eq!(
+        SmtValue::BigBitVec(
+            std::sync::Arc::new(BigUint::from(0_u8)),
+            MAX_BITVECTOR_WIDTH + 1,
+        )
+        .bitvec_to_biguint(),
+        None
     );
 }

@@ -6,6 +6,24 @@
 
 use super::*;
 
+use crate::constraint::logic;
+use ay_dpll::api::Logic;
+
+#[test]
+fn test_named_bv_lia_logics_parse_for_direct_execution() {
+    for (name, expected) in [
+        (logic::QF_UFBVLIA, Logic::QfUfbvlia),
+        (logic::QF_AUFBVLIA, Logic::QfAufbvlia),
+    ] {
+        let mut program = AYProgram::new();
+        program.set_logic(name);
+        assert_eq!(
+            super::super::logic::parse_logic(&program).expect("public logic must parse"),
+            expected
+        );
+    }
+}
+
 #[test]
 fn test_execute_bool_sat() {
     // Use QF_UF (simpler logic) to avoid ay-dpll LIA model validation bugs

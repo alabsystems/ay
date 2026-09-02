@@ -1048,7 +1048,10 @@ fn parse_poly_uncached(
             }
         }
         TermData::App(Symbol::Named(name), args)
-            if name == "to_real" && args.len() == 1 && matches!(terms.sort(t), Sort::Real) =>
+            if name == "to_real"
+                && !terms.to_real_is_shadowed()
+                && args.len() == 1
+                && matches!(terms.sort(t), Sort::Real) =>
         {
             // `to_real` is the Int -> Real injection: in EVERY model the value
             // of `(to_real x)` equals the value of `x` read as a real, so the

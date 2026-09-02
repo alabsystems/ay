@@ -871,6 +871,18 @@ impl SmtContext {
             .is_some_and(|budget| self.terms.instance_memory_exceeded(budget))
     }
 
+    /// Exact capacity census for cold result-publication boundaries, including
+    /// the process-wide term/RSS envelope. Hot loops use
+    /// [`Self::term_memory_exceeded`]'s 64 KiB refresh window; a definite
+    /// SAT/UNSAT result must not use that bounded overshoot allowance or ignore
+    /// a sibling that trips the global ceiling during result postprocessing.
+    pub(crate) fn exact_term_memory_exceeded(&self) -> bool {
+        ay_core::TermStore::global_memory_exceeded()
+            || self
+                .term_memory_budget
+                .is_some_and(|budget| self.terms.true_memory_bytes() > budget)
+    }
+
     /// Set the thread-local per-engine term memory budget and return an RAII guard
     /// that restores the previous value on drop.
     ///

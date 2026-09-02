@@ -225,9 +225,47 @@ fn substitution_kill_switch_is_decisive_and_cli_sourced() {
 #[test]
 #[timeout(30_000)]
 fn bve_density_threshold_is_named_only_when_it_changes_admission() {
+    // NEGATIVE case. Since 14bd679a6 the real gate's fixed-edge small-circuit
+    // arm (num_vars <= 10_000 && density <= 16.0) re-admits this 2-var
+    // density-1.5 fixture AFTER the tunable density check fails, so the CLI
+    // knob below changes nothing: BVE stays ON and the density threshold must
+    // NOT be named as changing admission. (This test used to assert off+cli;
+    // the provenance mirror emitting a self-contradictory "on ... jointly
+    // change admission: ... max_density=1" line is the defect it now pins.)
     let scratch = tempdir().expect("temp dir");
     let input = scratch.path().join("unsat.cnf");
     std::fs::write(&input, TWO_VAR_UNSAT_CNF).expect("write CNF");
+    let output = ay_command()
+        .arg("--stats")
+        .arg(&input)
+        .args(["--sat-bve-sparse-max-density", "1"])
+        .output()
+        .expect("run changed BVE density threshold");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(20), "stderr={stderr}");
+    let line = capability_line(&stderr, "bve");
+    assert!(line.contains("on"), "{line}");
+    assert!(!line.contains("jointly change admission"), "{line}");
+}
+
+#[test]
+#[timeout(30_000)]
+fn bve_density_threshold_is_named_when_it_does_change_admission() {
+    // POSITIVE case: outside the small-circuit arm (num_vars > 10_000), the
+    // tunable density knob IS decisive again, and the ledger must attribute
+    // the OFF state to it. Instant level-0 UNSAT via unit clauses 1 and -1;
+    // binary filler pushes density to ~1.5 > the configured max of 1.
+    let scratch = tempdir().expect("temp dir");
+    let input = scratch.path().join("unsat-large.cnf");
+    let vars = 10_001usize;
+    let filler = 15_000usize;
+    let mut cnf = format!("p cnf {} {}\n1 0\n-1 0\n", vars, filler + 2);
+    for i in 0..filler {
+        let a = 2 + (i % (vars - 1));
+        let b = 2 + ((i + 1) % (vars - 1));
+        cnf.push_str(&format!("{} -{} 0\n", a, b));
+    }
+    std::fs::write(&input, cnf).expect("write CNF");
     let output = ay_command()
         .arg("--stats")
         .arg(&input)

@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::ChcParser;
-use crate::{ChcError, ChcExpr, ChcOp, ChcResult, ChcSort};
+use crate::{ChcError, ChcExpr, ChcOp, ChcResult, ChcSort, MAX_BITVECTOR_WIDTH};
 use std::sync::Arc;
 
 impl ChcParser {
@@ -46,21 +46,30 @@ impl ChcParser {
 
         match name.as_str() {
             _ if name.starts_with("bv") && name[2..].chars().all(|c| c.is_ascii_digit()) => {
+                if idx_args.len() != 1 {
+                    return Err(ChcError::Parse(
+                        "indexed bitvector literals require exactly one width".into(),
+                    ));
+                }
                 let width: u32 = idx_args
                     .first()
                     .ok_or_else(|| ChcError::Parse("Missing bitvector width".into()))?
                     .parse()
                     .map_err(|_| ChcError::Parse("Invalid bitvector width".into()))?;
                 // Bound the width before encode_wide_decimal_bv's ~width/128
-                // chunk loop (and make_all_ones_bv recursion) allocate from it.
-                if width == 0 || width > super::sorts::MAX_BV_WIDTH {
+                // chunk loop allocates from it.
+                if width == 0 || width > MAX_BITVECTOR_WIDTH {
                     return Err(ChcError::Parse(format!(
                         "bitvector width {width} is outside the supported range 1..={}",
-                        super::sorts::MAX_BV_WIDTH
+                        MAX_BITVECTOR_WIDTH
                     )));
                 }
-                if let Ok(value) = name[2..].parse::<u128>() {
-                    Ok(ChcExpr::BitVec(value, width))
+                if width <= 128 {
+                    if let Ok(value) = name[2..].parse::<u128>() {
+                        Ok(ChcExpr::BitVec(value, width))
+                    } else {
+                        Self::encode_wide_decimal_bv(&name[2..], width)
+                    }
                 } else {
                     Self::encode_wide_decimal_bv(&name[2..], width)
                 }
@@ -76,6 +85,20 @@ impl ChcParser {
                 let n: u32 = idx_args[0].parse().map_err(|_| {
                     ChcError::Parse(format!("Invalid index for {name}: {}", idx_args[0]))
                 })?;
+                let width_sized_index = matches!(
+                    name.as_str(),
+                    "zero_extend" | "sign_extend" | "repeat" | "int2bv"
+                );
+                if width_sized_index && n > MAX_BITVECTOR_WIDTH {
+                    return Err(ChcError::Parse(format!(
+                        "{name} index {n} exceeds the supported bitvector width {MAX_BITVECTOR_WIDTH}"
+                    )));
+                }
+                if matches!(name.as_str(), "repeat" | "int2bv") && n == 0 {
+                    return Err(ChcError::Parse(format!(
+                        "{name} requires a positive bitvector width/count"
+                    )));
+                }
                 let op = match name.as_str() {
                     "zero_extend" => ChcOp::BvZeroExtend(n),
                     "sign_extend" => ChcOp::BvSignExtend(n),
@@ -135,7 +158,15 @@ impl ChcParser {
                 if hex_str.is_empty() {
                     return Err(ChcError::Parse("Empty hex bitvector literal #x".into()));
                 }
-                let width = (hex_str.len() * 4) as u32;
+                let width = u32::try_from(hex_str.len())
+                    .ok()
+                    .and_then(|digits| digits.checked_mul(4))
+                    .filter(|width| *width <= MAX_BITVECTOR_WIDTH)
+                    .ok_or_else(|| {
+                        ChcError::Parse(format!(
+                            "hex bitvector literal width exceeds the supported maximum {MAX_BITVECTOR_WIDTH}"
+                        ))
+                    })?;
                 if width <= 128 {
                     let value = u128::from_str_radix(hex_str, 16).map_err(|e| {
                         ChcError::Parse(format!("Invalid hex bitvector literal #x{hex_str}: {e}"))
@@ -158,7 +189,14 @@ impl ChcParser {
                 if bin_str.is_empty() {
                     return Err(ChcError::Parse("Empty binary bitvector literal #b".into()));
                 }
-                let width = bin_str.len() as u32;
+                let width = u32::try_from(bin_str.len())
+                    .ok()
+                    .filter(|width| *width <= MAX_BITVECTOR_WIDTH)
+                    .ok_or_else(|| {
+                        ChcError::Parse(format!(
+                            "binary bitvector literal width exceeds the supported maximum {MAX_BITVECTOR_WIDTH}"
+                        ))
+                    })?;
                 if width <= 128 {
                     let value = u128::from_str_radix(bin_str, 2).map_err(|e| {
                         ChcError::Parse(format!(
@@ -189,11 +227,34 @@ impl ChcParser {
             };
             ChcExpr::BitVec(mask, width)
         } else {
-            let low_width = 128u32;
-            let high_width = width - low_width;
-            let low = ChcExpr::BitVec(u128::MAX, low_width);
-            let high = Self::make_all_ones_bv(high_width);
-            ChcExpr::Op(ChcOp::BvConcat, vec![Arc::new(high), Arc::new(low)])
+            // Build left-to-right rather than recursively.  The public parser
+            // permits widths up to MAX_BITVECTOR_WIDTH; recursing once per
+            // 128-bit chunk at that bound would require 8,192 stack frames.
+            let high_width = ((width - 1) % 128) + 1;
+            let high_mask = if high_width == 128 {
+                u128::MAX
+            } else {
+                (1u128 << high_width) - 1
+            };
+            let mut result = ChcExpr::BitVec(high_mask, high_width);
+            let mut remaining = width - high_width;
+            while remaining != 0 {
+                let chunk_width = remaining.min(128);
+                let chunk_mask = if chunk_width == 128 {
+                    u128::MAX
+                } else {
+                    (1u128 << chunk_width) - 1
+                };
+                result = ChcExpr::Op(
+                    ChcOp::BvConcat,
+                    vec![
+                        Arc::new(result),
+                        Arc::new(ChcExpr::BitVec(chunk_mask, chunk_width)),
+                    ],
+                );
+                remaining -= chunk_width;
+            }
+            result
         }
     }
 
@@ -261,59 +322,14 @@ impl ChcParser {
         decimal_str: &str,
         total_width: u32,
     ) -> ChcResult<ChcExpr> {
-        use num_bigint::BigUint;
-
-        let big_val: BigUint = decimal_str.parse().map_err(|_| {
-            ChcError::Parse(format!(
-                "Invalid wide bitvector decimal literal: {decimal_str}"
-            ))
-        })?;
-
-        let mask_128 = BigUint::from(u128::MAX);
-        let mut remaining = big_val;
-        let mut chunks: Vec<(u128, u32)> = Vec::new();
-        let mut bits_left = total_width;
-
-        while bits_left > 0 {
-            let chunk_width = bits_left.min(128);
-            let chunk_mask = if chunk_width == 128 {
-                mask_128.clone()
-            } else {
-                (BigUint::from(1u128) << chunk_width as usize) - BigUint::from(1u128)
-            };
-            let chunk_val: u128 = (&remaining & &chunk_mask).try_into().unwrap_or(0);
-            chunks.push((chunk_val, chunk_width));
-            remaining >>= chunk_width as usize;
-            bits_left -= chunk_width;
-        }
-
-        chunks.reverse();
-
-        if chunks.is_empty() {
-            return Ok(ChcExpr::BitVec(0, total_width));
-        }
-
-        let last = chunks
-            .last()
-            .expect("invariant: non-zero width produces ≥1 chunk");
-        let mut result = ChcExpr::BitVec(last.0, last.1);
-        for &(value, width) in chunks.iter().rev().skip(1) {
-            let chunk = ChcExpr::BitVec(value, width);
-            result = ChcExpr::Op(ChcOp::BvConcat, vec![Arc::new(chunk), Arc::new(result)]);
-        }
-        Ok(result)
+        ChcExpr::bitvec_from_str_radix(decimal_str, 10, total_width)
     }
 }
 
 /// Infer BV width from a ChcExpr (for desugaring Z3-specific safe-division operators).
 pub(super) fn infer_bv_width_from_expr(expr: &ChcExpr) -> Option<u32> {
-    match expr {
-        ChcExpr::BitVec(_, width) => Some(*width),
-        ChcExpr::Var(v) => match &v.sort {
-            ChcSort::BitVec(w) => Some(*w),
-            _ => None,
-        },
-        ChcExpr::Op(_, args) => args.iter().find_map(|a| infer_bv_width_from_expr(a)),
+    match expr.sort() {
+        ChcSort::BitVec(width) => Some(width),
         _ => None,
     }
 }

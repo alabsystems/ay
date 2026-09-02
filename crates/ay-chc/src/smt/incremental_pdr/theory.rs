@@ -113,9 +113,9 @@ impl IncrementalPdrContext {
         for (name, value) in propagated_equalities {
             values.insert(name.clone(), SmtValue::Int(*value));
         }
-        // #5877: Insert BV var=const equalities with proper SmtValue::BitVec type.
+        // #5877: Insert BV var=const equalities with their exact BV type.
         for (name, (value, width)) in propagated_bv_equalities {
-            values.insert(name.clone(), SmtValue::BitVec(*value, *width));
+            values.insert(name.clone(), SmtValue::bitvec_from_u128(*value, *width));
         }
 
         let lia_model = lia.extract_model();

@@ -104,24 +104,42 @@ pub const MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA: u64 = 50_000_000;
 /// process-RSS limit; callers that require a hard peak must still enforce one.
 pub const MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA: usize = 768 * 1024 * 1024;
 
-/// Largest WORK precharge for one expensive BV-family proof lemma.
-///
-/// Executor-owned progress envelopes use this as a reserve on top of their
-/// ordinary proof-validation allowance. `u64` is the portable publication
-/// type: conversion to a platform `usize` remains checked by each caller.
-pub const MAX_EXPENSIVE_BV_WORK_PER_LEMMA: u64 =
+const MAX_LEGACY_EXPENSIVE_BV_WORK_PER_LEMMA: u64 =
     if MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA > MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA {
         MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA
     } else {
         MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA
     };
 
+/// Largest WORK precharge for one expensive BV-family proof lemma.
+///
+/// Executor-owned progress envelopes use this as a reserve on top of their
+/// ordinary proof-validation allowance. `u64` is the portable publication
+/// type: conversion to a platform `usize` remains checked by each caller.
+pub const MAX_EXPENSIVE_BV_WORK_PER_LEMMA: u64 = if MAX_LEGACY_EXPENSIVE_BV_WORK_PER_LEMMA
+    > super::closed_bv_evaluate::MAX_CLOSED_BV_EVALUATE_WORK_PER_LEMMA
+{
+    MAX_LEGACY_EXPENSIVE_BV_WORK_PER_LEMMA
+} else {
+    super::closed_bv_evaluate::MAX_CLOSED_BV_EVALUATE_WORK_PER_LEMMA
+};
+
 /// Largest BYTE precharge for one expensive BV-family proof lemma.
 pub const MAX_EXPENSIVE_BV_BYTES_PER_LEMMA: usize =
     if MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA > MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA {
-        MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA
-    } else {
+        if MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA
+            > super::closed_bv_evaluate::MAX_CLOSED_BV_EVALUATE_BYTES_PER_LEMMA
+        {
+            MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA
+        } else {
+            super::closed_bv_evaluate::MAX_CLOSED_BV_EVALUATE_BYTES_PER_LEMMA
+        }
+    } else if MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA
+        > super::closed_bv_evaluate::MAX_CLOSED_BV_EVALUATE_BYTES_PER_LEMMA
+    {
         MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA
+    } else {
+        super::closed_bv_evaluate::MAX_CLOSED_BV_EVALUATE_BYTES_PER_LEMMA
     };
 
 /// Whether validating `clause` can require the proof-producing fallback.
@@ -160,25 +178,45 @@ pub(crate) fn validate_expensive_bv_budget(
     let mut work = 0_usize;
     let mut bytes = 0_usize;
     for (index, step) in proof.steps.iter().enumerate() {
-        let ProofStep::TheoryLemma { clause, kind, .. } = step else {
-            continue;
-        };
-        let charge = match kind {
-            TheoryLemmaKind::BvBitBlast | TheoryLemmaKind::BvBitBlastGate { .. }
-                if bv_bitblast_requires_proof_producer(terms, clause) =>
+        let charge = match step {
+            ProofStep::TheoryLemma { clause, kind, .. } => match kind {
+                TheoryLemmaKind::BvBitBlast | TheoryLemmaKind::BvBitBlastGate { .. }
+                    if bv_bitblast_requires_proof_producer(terms, clause) =>
+                {
+                    Some((
+                        usize::try_from(MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA)
+                            .map_err(|_| ProofCheckError::ResourceLimit)?,
+                        MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA,
+                    ))
+                }
+                TheoryLemmaKind::BvLiaTautology
+                | TheoryLemmaKind::SeqExtensionalCompanionContradiction => Some((
+                    usize::try_from(MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA)
+                        .map_err(|_| ProofCheckError::ResourceLimit)?,
+                    MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA,
+                )),
+                _ => None,
+            },
+            ProofStep::Step {
+                rule: ay_core::AletheRule::Evaluate,
+                clause,
+                premises,
+                args,
+            } if super::closed_bv_evaluate::requires_expensive_budget(
+                terms,
+                clause,
+                premises.len(),
+                args,
+            ) =>
             {
                 Some((
-                    usize::try_from(MAX_PROOF_PRODUCING_BV_WORK_PER_LEMMA)
-                        .map_err(|_| ProofCheckError::ResourceLimit)?,
-                    MAX_PROOF_PRODUCING_BV_BYTES_PER_LEMMA,
+                    usize::try_from(
+                        super::closed_bv_evaluate::MAX_CLOSED_BV_EVALUATE_WORK_PER_LEMMA,
+                    )
+                    .map_err(|_| ProofCheckError::ResourceLimit)?,
+                    super::closed_bv_evaluate::MAX_CLOSED_BV_EVALUATE_BYTES_PER_LEMMA,
                 ))
             }
-            TheoryLemmaKind::BvLiaTautology
-            | TheoryLemmaKind::SeqExtensionalCompanionContradiction => Some((
-                usize::try_from(MAX_BV_LIA_TAUTOLOGY_WORK_PER_LEMMA)
-                    .map_err(|_| ProofCheckError::ResourceLimit)?,
-                MAX_BV_LIA_TAUTOLOGY_BYTES_PER_LEMMA,
-            )),
             _ => None,
         };
         let Some((step_work, step_bytes)) = charge else {
@@ -190,8 +228,8 @@ pub(crate) fn validate_expensive_bv_budget(
                 step: ProofId(index as u32),
                 reason: format!(
                     "proof contains more than {MAX_EXPENSIVE_BV_LEMMAS_PER_PROOF} expensive BV \
-                     lemmas; the proof-producing BV checker and BV/LIA checker share this \
-                     whole-proof cap"
+                     steps; the proof-producing BV checker, BV/LIA checker, and closed-BV \
+                     evaluator share this whole-proof cap"
                 ),
             });
         }
@@ -205,16 +243,27 @@ pub(crate) fn validate_expensive_bv_budget(
     Ok(ExpensiveBvAggregateCharge { work, bytes })
 }
 
-/// Recognize the deliberately narrow `evaluate` fragment used to certify a
-/// preprocessing-folded bitvector concat: one unit equality from a closed
-/// concat tree to its exact BV constant, with total width at most 64 bits.
+/// Recognize the deliberately narrow `evaluate` fragments used to certify a
+/// preprocessing-folded bitvector term: either a closed concat tree of at most
+/// 64 bits, or the separately bounded exact evaluator for ground
+/// `zero_extend`/`bvmul`/`extract` terms.
 ///
 /// Keeping this separate from [`recognize_bv_bitblast`] avoids widening that
 /// rule's bounded symbolic truth-table surface merely to check one closed
 /// constant-folding fact.
 #[must_use]
 pub fn recognize_bv_ground_evaluate(terms: &TermStore, clause: &[TermId]) -> bool {
+    let mut unbounded = |_: usize, _: usize| true;
     validate_bv_ground_evaluate(terms, ProofId(0), clause, 0, &[]).is_ok()
+        || super::closed_bv_evaluate::validate_closed_bv_evaluate(
+            terms,
+            ProofId(0),
+            clause,
+            0,
+            &[],
+            &mut unbounded,
+        )
+        .is_ok()
 }
 
 /// Strictly validate the Carcara `evaluate` shape emitted for folded BV

@@ -9,10 +9,13 @@ impl TermStore {
         let TermData::App(Symbol::Indexed(name, indices), args) = self.get(term) else {
             return None;
         };
-        if name != "extract" || indices.len() != 2 || args.len() != 1 || indices[0] < indices[1] {
+        let (&[high, low], &[arg]) = (indices.as_slice(), args.as_slice()) else {
+            return None;
+        };
+        if name != "extract" || high < low {
             return None;
         }
-        Some((args[0], indices[0], indices[1]))
+        Some((arg, high, low))
     }
 
     /// Extract bits `[high:low]` from a bitvector (SMT-LIB: `(_ extract i j)`)
@@ -153,25 +156,36 @@ impl TermStore {
                 .all(|&a| matches!(self.sort(a), Sort::BitVec(_))),
             "BUG: mk_bvconcat expects all BitVec args"
         );
-        if args.len() != 2 {
-            // concat is binary
-            let width = args.iter().filter_map(|&a| self.get_bv_width(a)).sum();
-            return self.intern(
-                TermData::App(Symbol::named("concat"), args),
-                Sort::bitvec(width),
-            );
-        }
+        let (high, low) = match args.as_slice() {
+            &[high, low] => (high, low),
+            _ => {
+                // concat is binary
+                let width = args.iter().filter_map(|&a| self.get_bv_width(a)).sum();
+                return self.intern(
+                    TermData::App(Symbol::named("concat"), args),
+                    Sort::bitvec(width),
+                );
+            }
+        };
 
-        let (high, low) = (args[0], args[1]);
-        let (Some(high_width), Some(low_width)) = (self.get_bv_width(high), self.get_bv_width(low))
-        else {
-            let width = self.get_bv_width(high).unwrap_or(0) + self.get_bv_width(low).unwrap_or(0);
+        let (high_w, low_w) = (self.get_bv_width(high), self.get_bv_width(low));
+        let (Some(high_width), Some(low_width)) = (high_w, low_w) else {
+            // At least one width is unknown; the known one (if any) is the
+            // best-effort result width.
+            let width = high_w.or(low_w).unwrap_or(0);
             return self.intern(
                 TermData::App(Symbol::named("concat"), args),
                 Sort::bitvec(width),
             );
         };
-        let result_width = high_width + low_width;
+        let Some(result_width) = high_width.checked_add(low_width) else {
+            // Combined width is not representable as a BitVec sort; construct
+            // without folding, clamped to the representable maximum.
+            return self.intern(
+                TermData::App(Symbol::named("concat"), args),
+                Sort::bitvec(u32::MAX),
+            );
+        };
 
         // Constant folding
         if let (Some((v_high, _)), Some((v_low, _))) = (self.get_bitvec(high), self.get_bitvec(low))
@@ -211,54 +225,68 @@ impl TermStore {
     /// Simplifications:
     /// - Zero extension by 0: zero_extend(0,x) → x
     /// - Constant folding: zero_extend(4,#x0F) → #x00F
-    pub fn mk_bvzero_extend(&mut self, i: u32, arg: TermId) -> TermId {
-        debug_assert!(
-            matches!(self.sort(arg), Sort::BitVec(_)),
-            "BUG: mk_bvzero_extend expects BitVec arg, got {:?}",
-            self.sort(arg)
-        );
-        let Some(src_width) = self.get_bv_width(arg) else {
-            // Graceful fallback: construct the term without simplification (#7933).
-            // When extending by 0 bits, preserve the input sort; otherwise
-            // use the extension amount as best-effort width.
-            let sort = if i == 0 {
-                self.sort(arg).clone()
-            } else {
-                Sort::bitvec(i)
-            };
-            return self.intern(
-                TermData::App(Symbol::indexed("zero_extend", vec![i]), vec![arg]),
-                sort,
+    pub fn mk_bvzero_extend(&mut self, mut i: u32, mut arg: TermId) -> TermId {
+        loop {
+            debug_assert!(
+                matches!(self.sort(arg), Sort::BitVec(_)),
+                "BUG: mk_bvzero_extend expects BitVec arg, got {:?}",
+                self.sort(arg)
             );
-        };
-        let result_width = src_width + i;
+            let Some(result_width) = self.get_bv_width(arg).and_then(|w| w.checked_add(i)) else {
+                // Graceful fallback when the width is unknown or the result
+                // width overflows u32: construct the term without
+                // simplification (#7933). When extending by 0 bits, preserve
+                // the input sort; otherwise use the extension amount as
+                // best-effort width.
+                let sort = if i == 0 {
+                    self.sort(arg).clone()
+                } else {
+                    Sort::bitvec(i)
+                };
+                return self.intern(
+                    TermData::App(Symbol::indexed("zero_extend", vec![i]), vec![arg]),
+                    sort,
+                );
+            };
 
-        // Zero extension by 0 bits is identity
-        if i == 0 {
-            return arg;
-        }
+            // Zero extension by 0 bits is identity
+            if i == 0 {
+                return arg;
+            }
 
-        // Constant folding (value stays the same, just wider representation)
-        if let Some((val, _)) = self.get_bitvec(arg) {
-            return self.mk_bitvec(val.clone(), result_width);
-        }
+            // Constant folding (value stays the same, just wider representation)
+            if let Some((val, _)) = self.get_bitvec(arg) {
+                return self.mk_bitvec(val.clone(), result_width);
+            }
 
-        // zero_extend(i, zero_extend(j, x)) -> zero_extend(i + j, x)
-        if let TermData::App(Symbol::Indexed(name, indices), ext_args) = self.get(arg).clone() {
-            if name == "zero_extend" && indices.len() == 1 && ext_args.len() == 1 {
-                let inner = ext_args[0];
-                if self.get_bv_width(inner).is_some() {
-                    if let Some(total_i) = i.checked_add(indices[0]) {
-                        return self.mk_bvzero_extend(total_i, inner);
+            // zero_extend(i, zero_extend(j, x)) -> zero_extend(i + j, x),
+            // iterated in place of the former tail recursion.
+            if let TermData::App(Symbol::Indexed(name, indices), ext_args) = self.get(arg).clone() {
+                if name == "zero_extend" {
+                    let mut index_iter = indices.iter();
+                    let mut arg_iter = ext_args.iter();
+                    if let (Some(&j), None, Some(&inner), None) = (
+                        index_iter.next(),
+                        index_iter.next(),
+                        arg_iter.next(),
+                        arg_iter.next(),
+                    ) {
+                        if self.get_bv_width(inner).is_some() {
+                            if let Some(total_i) = i.checked_add(j) {
+                                i = total_i;
+                                arg = inner;
+                                continue;
+                            }
+                        }
                     }
                 }
             }
-        }
 
-        self.intern(
-            TermData::App(Symbol::indexed("zero_extend", vec![i]), vec![arg]),
-            Sort::bitvec(result_width),
-        )
+            return self.intern(
+                TermData::App(Symbol::indexed("zero_extend", vec![i]), vec![arg]),
+                Sort::bitvec(result_width),
+            );
+        }
     }
 
     /// Sign-extend a bitvector by i bits (SMT-LIB: (_ sign_extend i))
@@ -274,8 +302,9 @@ impl TermStore {
             "BUG: mk_bvsign_extend expects BitVec arg, got {:?}",
             self.sort(arg)
         );
-        let Some(src_width) = self.get_bv_width(arg) else {
-            // Graceful fallback (#7933): preserve input sort when extending
+        let Some(result_width) = self.get_bv_width(arg).and_then(|w| w.checked_add(i)) else {
+            // Graceful fallback (#7933) when the width is unknown or the
+            // result width overflows u32: preserve input sort when extending
             // by 0 bits; otherwise use extension amount as best-effort width.
             let sort = if i == 0 {
                 self.sort(arg).clone()
@@ -287,7 +316,6 @@ impl TermStore {
                 sort,
             );
         };
-        let result_width = src_width + i;
 
         // Sign extension by 0 bits is identity
         if i == 0 {
@@ -296,16 +324,20 @@ impl TermStore {
 
         // Constant folding
         if let Some((val, w)) = self.get_bitvec(arg) {
-            let sign_bit = (val >> (w - 1)) & BigInt::one();
-            let result = if sign_bit.is_zero() {
-                // Positive: same as zero extension
-                val.clone()
-            } else {
-                // Negative: set all the new high bits to 1
-                let extension_mask = Self::bv_ones(i) << w;
-                val | &extension_mask
-            };
-            return self.mk_bitvec(result, result_width);
+            // w >= 1 for any well-formed constant; a zero-width constant has
+            // no sign bit to read, so leave it unfolded.
+            if let Some(sign_shift) = w.checked_sub(1) {
+                let sign_bit = (val >> sign_shift) & BigInt::one();
+                let result = if sign_bit.is_zero() {
+                    // Positive: same as zero extension
+                    val.clone()
+                } else {
+                    // Negative: set all the new high bits to 1
+                    let extension_mask = Self::bv_ones(i) << w;
+                    val | &extension_mask
+                };
+                return self.mk_bitvec(result, result_width);
+            }
         }
 
         self.intern(
@@ -349,11 +381,15 @@ impl TermStore {
 
         // Constant folding
         if let Some((val, w)) = self.get_bitvec(arg) {
-            let mask = Self::bv_ones(w);
-            let left_part = (val << rotation) & &mask;
-            let right_part = val >> (w - rotation);
-            let result = left_part | right_part;
-            return self.mk_bitvec(result, w);
+            // rotation < width, and w = width for any well-formed constant;
+            // a constant narrower than the rotation is left unfolded.
+            if let Some(right_shift) = w.checked_sub(rotation) {
+                let mask = Self::bv_ones(w);
+                let left_part = (val << rotation) & &mask;
+                let right_part = val >> right_shift;
+                let result = left_part | right_part;
+                return self.mk_bitvec(result, w);
+            }
         }
 
         self.intern(
@@ -396,11 +432,15 @@ impl TermStore {
 
         // Constant folding
         if let Some((val, w)) = self.get_bitvec(arg) {
-            let mask = Self::bv_ones(w);
-            let right_part = val >> rotation;
-            let left_part = (val << (w - rotation)) & &mask;
-            let result = left_part | right_part;
-            return self.mk_bitvec(result, w);
+            // rotation < width, and w = width for any well-formed constant;
+            // a constant narrower than the rotation is left unfolded.
+            if let Some(left_shift) = w.checked_sub(rotation) {
+                let mask = Self::bv_ones(w);
+                let right_part = val >> rotation;
+                let left_part = (val << left_shift) & &mask;
+                let result = left_part | right_part;
+                return self.mk_bitvec(result, w);
+            }
         }
 
         self.intern(
@@ -423,15 +463,15 @@ impl TermStore {
             "BUG: mk_bvrepeat expects BitVec arg, got {:?}",
             self.sort(arg)
         );
-        let Some(src_width) = self.get_bv_width(arg) else {
-            // Width unknown: preserve the input sort (#7933).
+        let Some(result_width) = self.get_bv_width(arg).and_then(|w| w.checked_mul(i)) else {
+            // Width unknown (or the result width overflows u32): preserve the
+            // input sort (#7933).
             let sort = self.sort(arg).clone();
             return self.intern(
                 TermData::App(Symbol::indexed("repeat", vec![i]), vec![arg]),
                 sort,
             );
         };
-        let result_width = src_width * i;
 
         // Repeat 1 is identity
         if i == 1 {

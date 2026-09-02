@@ -27,7 +27,10 @@
 //! so the independence is at the operator/composition level — exactly where the
 //! historical wrong-`sat` bugs lived.
 
+mod array_extensionality;
+mod array_model;
 mod current_assertion_confirmation;
+mod datatype_array_cells;
 mod forall_exists_witness;
 mod point_table;
 mod printed_uf_interpretation;
@@ -37,7 +40,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use ay_core::kani_compat::{DetHashMap, DetHashSet};
+use ay_core::kani_compat::DetHashMap;
 use ay_core::term::{Symbol, TermData, TermEntryStamp, TermStoreSnapshotStamp};
 use ay_core::{Sort, TermId, TermStore};
 use ay_fp::FpModelValue;
@@ -47,6 +50,13 @@ use ay_model_check::{
     ProvenUnconstrainedKind,
 };
 
+#[cfg(test)]
+use super::datatype_array_fields::sexpr_items;
+use super::datatype_array_fields::{
+    normalize_datatype_array_value, parse_bounded_typed_array_text, SemanticNormalizationBudget,
+    TypedArrayParseBudget, MAX_TYPED_ARRAY_DEPTH,
+};
+use super::gate_decision::gate_keeps_sat;
 use super::{EvalValue, Model, QuantifiedConfirmationModelEpoch};
 use crate::ematching::contains_quantifier;
 use crate::executor::quantifier_loop::result_mapping::CheckedGroundDecision;
@@ -54,6 +64,9 @@ use crate::executor::{Executor, QueryAuthorityEpoch};
 use crate::executor_format::format_default_value_surface;
 use crate::executor_types::{SolveResult, UnknownReason};
 use crate::logic_detection::LogicCategory;
+use datatype_array_cells::ExactDatatypeCellValues;
+#[cfg(test)]
+use datatype_array_cells::{merge_exact_datatype_cell_value, ExactDatatypeCellValue};
 
 mod quantified_table;
 use forall_exists_witness::{
@@ -131,38 +144,6 @@ impl SharedViewCaches {
             datatype_guard: Rc::new(OnceCell::new()),
             exact_datatype_cells: Rc::new(OnceCell::new()),
         }
-    }
-}
-
-/// One unique, structurally typed datatype value per exact cell spelling.
-/// `None` poisons a spelling for which the fixed model supplied two different
-/// constructor trees. Both the raw EUF carrier (`@D!n`) and the exact rendered
-/// tree are indexed, so array extraction and completion may use either spelling
-/// without handing equality two encodings of the same semantic value.
-type ExactDatatypeCellValues = HashMap<Sort, HashMap<String, Option<ExactDatatypeCellValue>>>;
-
-#[derive(Clone)]
-struct ExactDatatypeCellValue {
-    rendered: String,
-    value: ModelValue,
-}
-
-fn merge_exact_datatype_cell_value(
-    values: &mut ExactDatatypeCellValues,
-    sort: &Sort,
-    spelling: &str,
-    candidate: &ExactDatatypeCellValue,
-) {
-    let slot = values
-        .entry(sort.clone())
-        .or_default()
-        .entry(spelling.to_string())
-        .or_insert_with(|| Some(candidate.clone()));
-    if slot
-        .as_ref()
-        .is_some_and(|existing| existing.rendered != candidate.rendered)
-    {
-        *slot = None;
     }
 }
 
@@ -334,115 +315,9 @@ impl ModelView for IndependentModelView<'_> {
                         .map(|class| sequence_euf_class_value(&sort, class))
                 })
             }
-            // Datatype leaves (native or UF-abstracted): prefer the leaf's
-            // asserted definitional equality to a constructor expression,
-            // evaluated by the gate itself, so a tester/selector over the leaf
-            // sees the full constructor value instead of an opaque token. Fall
-            // back to the theory leaf lookup when there is no definition.
+            // Datatype leaves prefer exact structured model evidence.
             _ if self.exec.datatype_sort_name(&sort).is_some() => {
-                // FAIL-CLOSED BACKSTOP (#mv-gate-reads-printed-dt): the model
-                // PRINTER's single source of truth for a datatype-sorted
-                // constant is `dt_egraph_value` — the concrete constructor tree
-                // it emits into `(get-model)` and hands to the external
-                // validator (output.rs checks it FIRST, unconditionally, for
-                // every DT-sorted const). The gate must re-evaluate THAT exact
-                // tree, not a representative token: reading an abstract
-                // `@nat!N`/`@list!N`/`@tree!N` here makes an assertion over the
-                // printed structure `Unevaluable` (a monitored coverage gap),
-                // so a printed reconstruction that STRUCTURALLY FALSIFIES an
-                // assertion — the mutually-recursive-datatype ModelUnsat class
-                // (Barrett nat/list/tree) — slips past as `sat`. Parsing the
-                // rendered value back into a gate value and evaluating it under
-                // the same structural selector-projection semantics the
-                // validator uses turns such a witness into an enforced
-                // `ModelViolates` (Sat → Unknown). Faithful by construction:
-                // whenever `dt_egraph_value` is `Some`, the printer emits
-                // exactly this value; when it is `None` (poisoned / no export /
-                // combined lanes) the leaf falls through to the unchanged
-                // resolution chain below, so no currently-confirmed model can
-                // regress.
-                //
-                // PERF CONFINEMENT (STAGE 1, #mv-backstop-selector-bearing):
-                // the printed-value re-read is CONFINED to SELECTOR-BEARING
-                // datatypes — the only shape the ModelUnsat class occurs in
-                // (mutually-recursive nat/list/tree). An ENUM-ONLY datatype
-                // (all-nullary, e.g. the Bouvier `vlsat` Petri-net markings —
-                // hundreds of nullary constants) is resolved correctly by the
-                // native nullary-constructor / theory-leaf path below WITHOUT
-                // the backstop (those models were validator-VALID pre-backstop),
-                // and running the backstop's legacy `resolve_dt_value`
-                // reconstruction (an O(terms) tester scan) over each of its
-                // hundreds of enum constants — once per gate leaf, and again in
-                // `gate_emit_reconstructions` — was a ~39x model-EMIT regression
-                // (vlsat3_h00 1.38s→53s) that risked TIMING OUT the heavy enum
-                // instances (AY's margin over SMTInterpol). Skipping it there is
-                // sound (enum leaves never take the recursive-tree path) and
-                // restores the pre-backstop emit time.
-                let dt_selector_bearing = self.exec.selector_bearing_datatype(&sort);
-                if dt_selector_bearing {
-                    if let Some(rendered) = self.exec.dt_egraph_value(self.model, t) {
-                        if let Some(v) = self.exec.parse_rendered_dt_value_cached(
-                            &rendered,
-                            &sort,
-                            self.datatype_guard(),
-                        ) {
-                            return Some(v);
-                        }
-                    }
-                }
-                // A NULLARY constructor lowered to a bare leaf (e.g. `None`
-                // emitted as a `Sort::Uninterpreted` constant whose NAME is the
-                // constructor) denotes exactly that constructor value — resolve
-                // it to the full `Datatype` value so testers/`=` over it evaluate
-                // (an opaque token would be incomparable to a `Datatype`).
-                if let Some(v) = self.nullary_constructor_leaf(t, &sort) {
-                    return Some(v);
-                }
-                // Total-datatype-model construction (#dt-total-model): the
-                // constructed ground value for this leaf, identical to the
-                // value the solver-side validators evaluated and the printer
-                // emits, so the gate confirms/refutes the SAME witness.
-                if let Some(mv) = self.model.dt_ground.get(&t) {
-                    return Some(mv.clone());
-                }
-                if let Some(v) = self.datatype_leaf(t) {
-                    return Some(v);
-                }
-                if let Some(v) = self.reconstruct_datatype_value(t, 0) {
-                    return Some(v);
-                }
-                // Legacy printer resolution (#mv-gate-reads-printed-dt): a
-                // datatype const the gate's own reconstruction cannot pin is
-                // still PRINTED — the printer falls to `resolve_dt_value`'s
-                // tester / EUF-class strategies (Uninterpreted-lowered datatype
-                // sorts, output.rs). The gate must re-check THAT printed
-                // constructor tree, or a legacy-emitted witness that
-                // structurally falsifies an assertion ships as `sat` (the v2
-                // nat/list/tree ModelUnsat: `x1 = (succ zero)` printed against
-                // `(not (= x1 (succ zero)))`). Parse the printed value so it is
-                // caught as `ModelViolates`; the printer emits this SAME value,
-                // so a valid witness re-checks true and never regresses.
-                if dt_selector_bearing {
-                    if let Sort::Uninterpreted(sort_name) = &sort {
-                        if let Some(rendered) = self.exec.resolve_dt_value(sort_name, t, self.model)
-                        {
-                            if let Some(v) = self.exec.parse_rendered_dt_value_cached(
-                                &rendered,
-                                &sort,
-                                self.datatype_guard(),
-                            ) {
-                                return Some(v);
-                            }
-                        }
-                    }
-                }
-                // #dt-element-canon: the theory leaf lookup hands back an
-                // OPAQUE element token for a datatype-sorted leaf; re-encode a
-                // nullary-constructor token into the canonical `Datatype`
-                // value so it is comparable with the identical value arriving
-                // through `nullary_constructor_leaf` above.
-                let ev = self.exec.evaluate_var(self.model, t, &sort);
-                self.model_value_for(&ev, &sort)
+                self.datatype_leaf_value(t, &sort)
             }
             // Every scalar / seq / uninterpreted leaf is resolved by the model's
             // existing leaf lookup, then converted into a gate value.
@@ -519,6 +394,10 @@ impl ModelView for IndependentModelView<'_> {
         if !matches!(self.exec.ctx.terms.get(t), TermData::App(_, _)) {
             return None;
         }
+        let sort = self.exec.ctx.terms.sort(t).clone();
+        if self.exec.datatype_sort_carries_array_field(&sort) {
+            return self.exact_datatype_cell_value_for_term(t, &sort);
+        }
         match self.certified_const_interp_value(t) {
             Ok(Some(value)) => return Some(value),
             Ok(None) => {}
@@ -532,118 +411,9 @@ impl ModelView for IndependentModelView<'_> {
         if let Some(mv) = self.model.dt_ground.get(&t) {
             return Some(mv.clone());
         }
-        let sort = self.exec.ctx.terms.sort(t).clone();
-        // Single-source e-graph assignment (#mv-dt-single-source x
-        // #mv-gate-reads-printed-dt, mv-rerun-20260718 regression): when the
-        // DT lane exported its e-graph, `construct_total_datatype_model`
-        // STEPS ASIDE, so `dt_ground` has no structured value for a
-        // wrong-constructor selector chain — but the assignment DOES commit a
-        // per-class value for it (the very value the printer's total selector
-        // definitions emit and Dolmen re-checks). Without this, the chain
-        // resolves to an opaque EUF `Element` token below and every equality
-        // against a structured `Datatype` value observes as "incomparable" —
-        // the gate then CannotConfirm a witness it should confirm (166
-        // Barrett QF_DT sats fail-closed to unknown; bisected to merge
-        // 547590f8, both parents sat). Parse the SAME rendered value the
-        // printer emits into a structured value, exactly as `leaf_value`
-        // already does for datatype leaves. FAIL-CLOSED: `dt_egraph_value`
-        // never fabricates (no assignment / poisoned class / failed
-        // self-check => `None`), and an unparseable rendering leaves the
-        // application unpinned as today.
         if self.exec.datatype_sort_name(&sort).is_some() {
-            if let Some(rendered) = self.exec.dt_egraph_value(self.model, t) {
-                if let Some(v) = self.exec.parse_rendered_dt_value_cached(
-                    &rendered,
-                    &sort,
-                    self.datatype_guard(),
-                ) {
-                    return Some(v);
-                }
-            }
-            // A datatype-returning UF application can be pinned only by an
-            // authored ground equality (for example `(= (bridge x) (tail
-            // x))`) while the extracted EUF payload remains an opaque
-            // `Element`.  Resolve that application through the same
-            // unconditional definitional-equality index used for datatype
-            // leaves before converting the opaque payload.  This is model
-            // completion, not an assertion skip: UF applications are still
-            // keyed by independently evaluated argument values below, and the
-            // gate still checks every authored ground sibling, so conflicting
-            // definitions or non-functional rows are rejected.
-            if let Some(v) = self.datatype_leaf(t) {
-                return Some(v);
-            }
-            // #dt-app-element-encoding — the SAME enum value must not reach the
-            // gate in two encodings. A datatype-sorted application with no
-            // e-graph value and no defining equality falls through to
-            // `evaluate_term`, which yields `EvalValue::Element("v1")`, and
-            // `eval_value_to_model_value` maps every `Element` to
-            // `ModelValue::Uninterpreted` regardless of sort — while the same
-            // value reached as a LEAF is normalized to `ModelValue::Datatype`
-            // by `nullary_constructor_leaf`. Comparing the two then observes
-            // "incomparable" and the gate cannot confirm a correct model.
-            //
-            // Normalize here through the leaf path's OWN parser, which returns
-            // `Datatype { ctor, args: [] }` only for a real nullary constructor
-            // name and `None` for anything else (abstract `@Unit!0` tokens,
-            // wrong arity). Fail-closed: a non-constructor token leaves the
-            // application exactly as unpinned as before, no value is
-            // fabricated, and congruence is still enforced by `uf_graph`.
-            if let EvalValue::Element(token) = self.exec.evaluate_term(self.model, t) {
-                if let Some(v) =
-                    self.exec
-                        .parse_rendered_dt_value_cached(&token, &sort, self.datatype_guard())
-                {
-                    return Some(v);
-                }
-            }
-            // For an all-nullary datatype, the exact EUF class may be the only
-            // model evidence tying this application to a constructor. Read the
-            // unique constructor from that class without falling back to a
-            // fabricated datatype default.
-            //
-            // #dt-app-euf-class — the SAME producer gap one level deeper, and
-            // the one that costs the FINITE-ENUM sats.
-            //
-            // For an all-nullary (enum) datatype the model commits `(f a)`'s
-            // value ONLY as an equivalence-class membership: the executor's
-            // `add_finite_enum_domain_coverage` asserts `(or (= t c0) … )`, the
-            // SAT layer picks a disjunct, and EUF merges `(f a)` into that
-            // constructor's class. But the class is NAMED by a minted
-            // `@Enum!n` representative (`ay-euf` model_extraction mints
-            // `@{sort}!{n}` for every `Sort::Uninterpreted` class, and an enum
-            // datatype is lowered to exactly that), so the branch above sees a
-            // token that is not a constructor NAME and declines, and the value
-            // reaches the gate as `Uninterpreted("@Enum!0")` — while the same
-            // value reached as a LEAF is `Datatype { ctor: "c0" }` via
-            // `nullary_constructor_leaf`. `value_eq` then reports
-            // "equality between incomparable model values (Datatype vs
-            // Uninterpreted)" and the gate CannotConfirm a correct witness:
-            //
-            //   (declare-datatypes ((Enum 0)) (((c0) (c1) (c2))))
-            //   (declare-fun f (Enum) Enum) (declare-const a Enum)
-            //   (assert (not (= a (f a))))     ; z3: sat — AY published unknown
-            //
-            // ONE VALUE IN TWO ENCODINGS, fixed at the PRODUCER exactly as
-            // `#dt-element-canon` prescribes: `value_eq` is untouched, and the
-            // class match is the SAME one `(get-value ((f a)))` already prints
-            // (`resolve_dt_value` strategy 2 — verified: it prints `c1`, not
-            // the canonical default `c0`, when the class holds `c1`).
-            //
-            // NOT `resolve_dt_value` itself: that function ends in
-            // `datatype_canonical_value`, a FABRICATED default for a value
-            // nothing determines. Adopting it here would be the gate inventing
-            // a value — the one thing it must never do. `dt_euf_class_constructor`
-            // is the model-reading half alone, and declines (leaving the
-            // application exactly as unpinned as today) when no unique nullary
-            // constructor shares the class.
-            if let Some(ctor) = self.exec.dt_euf_class_constructor(self.model, t) {
-                if let Some(v) =
-                    self.exec
-                        .parse_rendered_dt_value_cached(&ctor, &sort, self.datatype_guard())
-                {
-                    return Some(v);
-                }
+            if let Some(value) = self.datatype_uf_app_value(t, &sort) {
+                return Some(value);
             }
         }
         // An ARRAY-sorted UF application is the mirror of the datatype case
@@ -859,6 +629,23 @@ impl ModelView for IndependentModelView<'_> {
         let (array, index) = (args[0], args[1]);
         let sort = self.exec.ctx.terms.sort(t).clone();
         let ev = self.exec.evaluate_select(self.model, array, index);
+        if self.exec.datatype_sort_carries_array_field(&sort) {
+            self.exec.ctx.terms.entry_stamp(t)?;
+            let carrier = self.model.euf_model.as_ref()?.term_values.get(&t)?;
+            let EvalValue::Element(emitted) = &ev else {
+                return None;
+            };
+            let authenticated = self.exact_datatype_cell_value(carrier, &sort)?;
+            if emitted == carrier {
+                return Some(authenticated);
+            }
+            let emitted = self.exact_datatype_cell_value(emitted, &sort)?;
+            let mut budget = SemanticNormalizationBudget::new();
+            let authenticated_normalized =
+                normalize_datatype_array_value(&authenticated, &mut budget)?;
+            let emitted_normalized = normalize_datatype_array_value(&emitted, &mut budget)?;
+            return (authenticated_normalized == emitted_normalized).then_some(authenticated);
+        }
         // #dt-element-canon: an array over a datatype element sort reads back an
         // opaque element token for the same reason a UF application does.
         self.model_value_for(&ev, &sort)
@@ -897,203 +684,232 @@ impl IndependentModelView<'_> {
             .get_or_init(|| super::rendered_dt_guard::RenderedDatatypeGuard::new(self.exec))
     }
 
-    /// Resolve one array-cell spelling only when Phase 5 produced a unique,
-    /// exactly typed constructor tree for that spelling's same-sort EUF class.
-    /// This deliberately runs before the generic scalar parser collapses a
-    /// datatype carrier to `ModelValue::Uninterpreted`.
-    fn exact_datatype_cell_value(&self, spelling: &str, sort: &Sort) -> Option<ModelValue> {
-        self.exact_datatype_cells
-            .get_or_init(|| self.build_exact_datatype_cell_values())
-            .get(sort)?
-            .get(spelling)?
-            .as_ref()
-            .map(|entry| entry.value.clone())
-    }
-
-    fn build_exact_datatype_cell_values(&self) -> ExactDatatypeCellValues {
-        const MAX_TERMS: usize = 4_096;
-        const MAX_GROUND: usize = 1_024;
-        const MAX_WORK: usize = 4 * 1_024 * 1_024;
-
-        let mut values = ExactDatatypeCellValues::new();
-        let Some(euf) = self.model.euf_model.as_ref() else {
-            return values;
-        };
-        if euf.term_values.len() > MAX_TERMS || self.model.dt_ground.len() > MAX_GROUND {
-            return values;
+    /// Resolve one datatype leaf from exact emitted or reconstructed evidence.
+    fn datatype_leaf_value(&self, t: TermId, sort: &Sort) -> Option<ModelValue> {
+        // Array-field datatype rows are authoritative only when this
+        // exact, birth-stamped term belongs to a fully revalidated W6
+        // inventory class. Raw dt_ground/e-graph/legacy rows cannot
+        // stand in for omitted or stale inventory.
+        if self.exec.datatype_sort_carries_array_field(sort) {
+            return self.exact_datatype_cell_value_for_term(t, sort);
         }
-        let guard = self.datatype_guard();
-        if !guard.is_bounded() {
-            return values;
-        }
-        let mut constructor_tokens = DetHashSet::default();
-        for (_, constructors) in self.exec.ctx.datatype_iter() {
-            for constructor in constructors {
-                constructor_tokens.insert(constructor.clone());
-                constructor_tokens.insert(self.exec.dt_surface(constructor).to_string());
-            }
-        }
-        let mut work = 0usize;
-        for (&term, value) in &self.model.dt_ground {
-            if self.exec.ctx.terms.entry_stamp(term).is_none() {
-                continue;
-            }
-            let sort = self.exec.ctx.terms.sort(term);
-            let registered = guard.is_registered(sort);
-            let shape_matches =
-                registered && self.structured_datatype_value_matches_sort(value, sort, guard);
-            if !shape_matches {
-                continue;
-            }
-            let Some(value_work) = super::rendered_dt_limits::model_value_work(value) else {
-                continue;
-            };
-            let Some(rendered) = self.exec.format_gate_model_value(value, sort) else {
-                continue;
-            };
-            let Some(next_work) = work
-                .checked_add(value_work)
-                .and_then(|next| next.checked_add(rendered.len()))
-            else {
-                return ExactDatatypeCellValues::new();
-            };
-            if next_work > MAX_WORK {
-                return ExactDatatypeCellValues::new();
-            }
-            work = next_work;
-            let entry = ExactDatatypeCellValue {
-                rendered: rendered.clone(),
-                value: value.clone(),
-            };
-            merge_exact_datatype_cell_value(&mut values, sort, &rendered, &entry);
-
-            let Some(carrier) = euf.term_values.get(&term) else {
-                continue;
-            };
-            if super::datatype_cell_authority::exact_datatype_carrier_token(
-                guard,
-                &constructor_tokens,
-                sort,
-                carrier,
-            ) {
-                let Some(next_work) = work.checked_add(carrier.len()) else {
-                    return ExactDatatypeCellValues::new();
-                };
-                if next_work > MAX_WORK {
-                    return ExactDatatypeCellValues::new();
-                }
-                work = next_work;
-                merge_exact_datatype_cell_value(&mut values, sort, carrier, &entry);
-            }
-        }
-        values
-    }
-
-    /// Re-check constructor owner, arity, every field sort, and all nested
-    /// container cells before an opaque carrier can be normalized. The walk is
-    /// bounded independently of the construction phase and rejects every
-    /// unsupported or mismatched shape.
-    fn structured_datatype_value_matches_sort(
-        &self,
-        root: &ModelValue,
-        root_sort: &Sort,
-        guard: &super::rendered_dt_guard::RenderedDatatypeGuard,
-    ) -> bool {
-        const MAX_NODES: usize = 1_024;
-        const MAX_DEPTH: usize = 32;
-
-        let mut stack = vec![(root, root_sort.clone(), 0usize)];
-        let mut nodes = 0usize;
-        while let Some((value, sort, depth)) = stack.pop() {
-            if depth > MAX_DEPTH {
-                return false;
-            }
-            nodes = match nodes.checked_add(1) {
-                Some(next) if next <= MAX_NODES => next,
-                _ => return false,
-            };
-            if let Some(expected_datatype) = guard.datatype_name(&sort) {
-                let ModelValue::Datatype { ctor, args } = value else {
-                    return false;
-                };
-                let Some((actual_datatype, internal_ctor)) = self.exec.ctx.is_constructor(ctor)
-                else {
-                    return false;
-                };
-                if actual_datatype != expected_datatype || internal_ctor.as_str() != ctor.as_str() {
-                    return false;
-                }
-                let Some(fields) = self.exec.ctx.constructor_selector_info(ctor) else {
-                    return false;
-                };
-                if fields.len() != args.len()
-                    || stack
-                        .len()
-                        .checked_add(args.len())
-                        .is_none_or(|pending| pending > MAX_NODES)
+        // FAIL-CLOSED BACKSTOP (#mv-gate-reads-printed-dt): the model
+        // PRINTER's single source of truth for a datatype-sorted
+        // constant is `dt_egraph_value` — the concrete constructor tree
+        // it emits into `(get-model)` and hands to the external
+        // validator (output.rs checks it FIRST, unconditionally, for
+        // every DT-sorted const). The gate must re-evaluate THAT exact
+        // tree, not a representative token: reading an abstract
+        // `@nat!N`/`@list!N`/`@tree!N` here makes an assertion over the
+        // printed structure `Unevaluable` (a monitored coverage gap),
+        // so a printed reconstruction that STRUCTURALLY FALSIFIES an
+        // assertion — the mutually-recursive-datatype ModelUnsat class
+        // (Barrett nat/list/tree) — slips past as `sat`. Parsing the
+        // rendered value back into a gate value and evaluating it under
+        // the same structural selector-projection semantics the
+        // validator uses turns such a witness into an enforced
+        // `ModelViolates` (Sat → Unknown). Faithful by construction:
+        // whenever `dt_egraph_value` is `Some`, the printer emits
+        // exactly this value; when it is `None` (poisoned / no export /
+        // combined lanes) the leaf falls through to the unchanged
+        // resolution chain below, so no currently-confirmed model can
+        // regress.
+        //
+        // PERF CONFINEMENT (STAGE 1, #mv-backstop-selector-bearing):
+        // the printed-value re-read is CONFINED to SELECTOR-BEARING
+        // datatypes — the only shape the ModelUnsat class occurs in
+        // (mutually-recursive nat/list/tree). An ENUM-ONLY datatype
+        // (all-nullary, e.g. the Bouvier `vlsat` Petri-net markings —
+        // hundreds of nullary constants) is resolved correctly by the
+        // native nullary-constructor / theory-leaf path below WITHOUT
+        // the backstop (those models were validator-VALID pre-backstop),
+        // and running the backstop's legacy `resolve_dt_value`
+        // reconstruction (an O(terms) tester scan) over each of its
+        // hundreds of enum constants — once per gate leaf, and again in
+        // `gate_emit_reconstructions` — was a ~39x model-EMIT regression
+        // (vlsat3_h00 1.38s→53s) that risked TIMING OUT the heavy enum
+        // instances (AY's margin over SMTInterpol). Skipping it there is
+        // sound (enum leaves never take the recursive-tree path) and
+        // restores the pre-backstop emit time.
+        let dt_selector_bearing = self.exec.selector_bearing_datatype(sort);
+        if dt_selector_bearing {
+            if let Some(rendered) = self.exec.dt_egraph_value(self.model, t) {
+                if let Some(v) =
+                    self.exec
+                        .parse_rendered_dt_value_cached(&rendered, sort, self.datatype_guard())
                 {
-                    return false;
+                    return Some(v);
                 }
-                stack.extend(
-                    args.iter()
-                        .zip(fields)
-                        .map(|(arg, (_, field_sort))| (arg, field_sort.clone(), depth + 1)),
-                );
-                continue;
-            }
-            match (value, &sort) {
-                (ModelValue::Bool(_), Sort::Bool)
-                | (ModelValue::Int(_), Sort::Int)
-                | (ModelValue::Real(_), Sort::Real)
-                | (ModelValue::Str(_), Sort::String)
-                | (ModelValue::Uninterpreted(_), Sort::Uninterpreted(_)) => {}
-                (ModelValue::BitVec { width, value }, Sort::BitVec(bitvec))
-                    if *width == bitvec.width
-                        && value.sign() != num_bigint::Sign::Minus
-                        && value.bits() <= u64::from(*width) => {}
-                (ModelValue::Array(array), Sort::Array(array_sort)) => {
-                    let extra = match array
-                        .store
-                        .len()
-                        .checked_mul(2)
-                        .and_then(|n| n.checked_add(1))
-                    {
-                        Some(extra) => extra,
-                        None => return false,
-                    };
-                    if stack
-                        .len()
-                        .checked_add(extra)
-                        .is_none_or(|pending| pending > MAX_NODES)
-                    {
-                        return false;
-                    }
-                    stack.push((&array.default, array_sort.element_sort.clone(), depth + 1));
-                    for (index, cell) in &array.store {
-                        stack.push((index, array_sort.index_sort.clone(), depth + 1));
-                        stack.push((cell, array_sort.element_sort.clone(), depth + 1));
-                    }
-                }
-                (ModelValue::Seq(elements), Sort::Seq(element_sort)) => {
-                    if stack
-                        .len()
-                        .checked_add(elements.len())
-                        .is_none_or(|pending| pending > MAX_NODES)
-                    {
-                        return false;
-                    }
-                    stack.extend(
-                        elements
-                            .iter()
-                            .map(|element| (element, element_sort.as_ref().clone(), depth + 1)),
-                    );
-                }
-                _ => return false,
             }
         }
-        true
+        // A NULLARY constructor lowered to a bare leaf (e.g. `None`
+        // emitted as a `Sort::Uninterpreted` constant whose NAME is the
+        // constructor) denotes exactly that constructor value — resolve
+        // it to the full `Datatype` value so testers/`=` over it evaluate
+        // (an opaque token would be incomparable to a `Datatype`).
+        if let Some(v) = self.nullary_constructor_leaf(t, sort) {
+            return Some(v);
+        }
+        // Total-datatype-model construction (#dt-total-model): the
+        // constructed ground value for this leaf, identical to the
+        // value the solver-side validators evaluated and the printer
+        // emits, so the gate confirms/refutes the SAME witness.
+        if let Some(mv) = self.model.dt_ground.get(&t) {
+            return Some(mv.clone());
+        }
+        if let Some(v) = self.datatype_leaf(t) {
+            return Some(v);
+        }
+        if let Some(v) = self.reconstruct_datatype_value(t, 0) {
+            return Some(v);
+        }
+        // Legacy printer resolution (#mv-gate-reads-printed-dt): a
+        // datatype const the gate's own reconstruction cannot pin is
+        // still PRINTED — the printer falls to `resolve_dt_value`'s
+        // tester / EUF-class strategies (Uninterpreted-lowered datatype
+        // sorts, output.rs). The gate must re-check THAT printed
+        // constructor tree, or a legacy-emitted witness that
+        // structurally falsifies an assertion ships as `sat` (the v2
+        // nat/list/tree ModelUnsat: `x1 = (succ zero)` printed against
+        // `(not (= x1 (succ zero)))`). Parse the printed value so it is
+        // caught as `ModelViolates`; the printer emits this SAME value,
+        // so a valid witness re-checks true and never regresses.
+        if dt_selector_bearing {
+            if let Sort::Uninterpreted(sort_name) = sort {
+                if let Some(rendered) = self.exec.resolve_dt_value(sort_name, t, self.model) {
+                    if let Some(v) = self.exec.parse_rendered_dt_value_cached(
+                        &rendered,
+                        sort,
+                        self.datatype_guard(),
+                    ) {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        // #dt-element-canon: the theory leaf lookup hands back an
+        // OPAQUE element token for a datatype-sorted leaf; re-encode a
+        // nullary-constructor token into the canonical `Datatype`
+        // value so it is comparable with the identical value arriving
+        // through `nullary_constructor_leaf` above.
+        let ev = self.exec.evaluate_var(self.model, t, sort);
+        self.model_value_for(&ev, sort)
     }
+    /// Resolve exact evidence for a datatype-sorted UF application.
+    fn datatype_uf_app_value(&self, t: TermId, sort: &Sort) -> Option<ModelValue> {
+        // Single-source e-graph assignment (#mv-dt-single-source x
+        // #mv-gate-reads-printed-dt, mv-rerun-20260718 regression): when the
+        // DT lane exported its e-graph, `construct_total_datatype_model`
+        // STEPS ASIDE, so `dt_ground` has no structured value for a
+        // wrong-constructor selector chain — but the assignment DOES commit a
+        // per-class value for it (the very value the printer's total selector
+        // definitions emit and Dolmen re-checks). Without this, the chain
+        // resolves to an opaque EUF `Element` token below and every equality
+        // against a structured `Datatype` value observes as "incomparable" —
+        // the gate then CannotConfirm a witness it should confirm (166
+        // Barrett QF_DT sats fail-closed to unknown; bisected to merge
+        // 547590f8, both parents sat). Parse the SAME rendered value the
+        // printer emits into a structured value, exactly as `leaf_value`
+        // already does for datatype leaves. FAIL-CLOSED: `dt_egraph_value`
+        // never fabricates (no assignment / poisoned class / failed
+        // self-check => `None`), and an unparseable rendering leaves the
+        // application unpinned as today.
+        if let Some(rendered) = self.exec.dt_egraph_value(self.model, t) {
+            if let Some(v) =
+                self.exec
+                    .parse_rendered_dt_value_cached(&rendered, sort, self.datatype_guard())
+            {
+                return Some(v);
+            }
+        }
+        // A datatype-returning UF application can be pinned only by an
+        // authored ground equality (for example `(= (bridge x) (tail
+        // x))`) while the extracted EUF payload remains an opaque
+        // `Element`.  Resolve that application through the same
+        // unconditional definitional-equality index used for datatype
+        // leaves before converting the opaque payload.  This is model
+        // completion, not an assertion skip: UF applications are still
+        // keyed by independently evaluated argument values below, and the
+        // gate still checks every authored ground sibling, so conflicting
+        // definitions or non-functional rows are rejected.
+        if let Some(v) = self.datatype_leaf(t) {
+            return Some(v);
+        }
+        // #dt-app-element-encoding — the SAME enum value must not reach the
+        // gate in two encodings. A datatype-sorted application with no
+        // e-graph value and no defining equality falls through to
+        // `evaluate_term`, which yields `EvalValue::Element("v1")`, and
+        // `eval_value_to_model_value` maps every `Element` to
+        // `ModelValue::Uninterpreted` regardless of sort — while the same
+        // value reached as a LEAF is normalized to `ModelValue::Datatype`
+        // by `nullary_constructor_leaf`. Comparing the two then observes
+        // "incomparable" and the gate cannot confirm a correct model.
+        //
+        // Normalize here through the leaf path's OWN parser, which returns
+        // `Datatype { ctor, args: [] }` only for a real nullary constructor
+        // name and `None` for anything else (abstract `@Unit!0` tokens,
+        // wrong arity). Fail-closed: a non-constructor token leaves the
+        // application exactly as unpinned as before, no value is
+        // fabricated, and congruence is still enforced by `uf_graph`.
+        if let EvalValue::Element(token) = self.exec.evaluate_term(self.model, t) {
+            if let Some(v) =
+                self.exec
+                    .parse_rendered_dt_value_cached(&token, sort, self.datatype_guard())
+            {
+                return Some(v);
+            }
+        }
+        // For an all-nullary datatype, the exact EUF class may be the only
+        // model evidence tying this application to a constructor. Read the
+        // unique constructor from that class without falling back to a
+        // fabricated datatype default.
+        //
+        // #dt-app-euf-class — the SAME producer gap one level deeper, and
+        // the one that costs the FINITE-ENUM sats.
+        //
+        // For an all-nullary (enum) datatype the model commits `(f a)`'s
+        // value ONLY as an equivalence-class membership: the executor's
+        // `add_finite_enum_domain_coverage` asserts `(or (= t c0) … )`, the
+        // SAT layer picks a disjunct, and EUF merges `(f a)` into that
+        // constructor's class. But the class is NAMED by a minted
+        // `@Enum!n` representative (`ay-euf` model_extraction mints
+        // `@{sort}!{n}` for every `Sort::Uninterpreted` class, and an enum
+        // datatype is lowered to exactly that), so the branch above sees a
+        // token that is not a constructor NAME and declines, and the value
+        // reaches the gate as `Uninterpreted("@Enum!0")` — while the same
+        // value reached as a LEAF is `Datatype { ctor: "c0" }` via
+        // `nullary_constructor_leaf`. `value_eq` then reports
+        // "equality between incomparable model values (Datatype vs
+        // Uninterpreted)" and the gate CannotConfirm a correct witness:
+        //
+        //   (declare-datatypes ((Enum 0)) (((c0) (c1) (c2))))
+        //   (declare-fun f (Enum) Enum) (declare-const a Enum)
+        //   (assert (not (= a (f a))))     ; z3: sat — AY published unknown
+        //
+        // ONE VALUE IN TWO ENCODINGS, fixed at the PRODUCER exactly as
+        // `#dt-element-canon` prescribes: `value_eq` is untouched, and the
+        // class match is the SAME one `(get-value ((f a)))` already prints
+        // (`resolve_dt_value` strategy 2 — verified: it prints `c1`, not
+        // the canonical default `c0`, when the class holds `c1`).
+        //
+        // NOT `resolve_dt_value` itself: that function ends in
+        // `datatype_canonical_value`, a FABRICATED default for a value
+        // nothing determines. Adopting it here would be the gate inventing
+        // a value — the one thing it must never do. `dt_euf_class_constructor`
+        // is the model-reading half alone, and declines (leaving the
+        // application exactly as unpinned as today) when no unique nullary
+        // constructor shares the class.
+        if let Some(ctor) = self.exec.dt_euf_class_constructor(self.model, t) {
+            if let Some(v) =
+                self.exec
+                    .parse_rendered_dt_value_cached(&ctor, sort, self.datatype_guard())
+            {
+                return Some(v);
+            }
+        }
 
+        None
+    }
     /// Whether every live declaration at a canonical theory-operator identity
     /// is positively owned by the theory layer.
     ///
@@ -1206,401 +1022,6 @@ impl IndependentModelView<'_> {
         ay_model_check::algebraic::Algebraic::root_of(coefficients, lo.clone(), hi.clone())
             .ok()
             .map(|a| ModelValue::Algebraic(Box::new(a)))
-    }
-
-    fn array_leaf(&self, t: TermId, index_sort: &Sort, element_sort: &Sort) -> Option<ModelValue> {
-        if let Some(cached) = self.resolved.borrow().get(&t) {
-            return Some(cached.clone());
-        }
-        if self.resolved_none.borrow().contains(&t) {
-            return None; // cached stack-independent failure (#gate-none-cache)
-        }
-        if !self.resolving.borrow_mut().insert(t) {
-            self.cycle_hits.set(self.cycle_hits.get() + 1);
-            return None; // cycle
-        }
-        let hits_before = self.cycle_hits.get();
-        let result = self.array_leaf_inner(t, index_sort, element_sort);
-        self.resolving.borrow_mut().remove(&t);
-        match &result {
-            Some(v) => {
-                self.resolved.borrow_mut().insert(t, v.clone());
-            }
-            // A failure whose frame observed NO cycle re-entry never consulted
-            // the in-flight stack, so it is a pure function of the fixed model
-            // — cacheable (#gate-none-cache). A post-cycle failure is not.
-            None if self.cycle_hits.get() == hits_before => {
-                self.resolved_none.borrow_mut().insert(t);
-            }
-            None => {}
-        }
-        result
-    }
-
-    fn array_leaf_inner(
-        &self,
-        t: TermId,
-        index_sort: &Sort,
-        element_sort: &Sort,
-    ) -> Option<ModelValue> {
-        // 1. Definitional equality `(= t <array-expr>)`: evaluate the defining
-        //    expression compositionally with the gate's own evaluator. A leaf can
-        //    carry SEVERAL asserted definitions (e.g. a fresh `(= d (const-array
-        //    x))` plus alias equalities `(= d other!fld_data)`); they are all
-        //    asserted EQUAL, so ANY that the gate can fully evaluate yields the
-        //    array's value — try them in order and take the first that resolves to
-        //    a concrete array. Consistency between the alternatives is still
-        //    enforced: each OTHER definition is itself a top-level assertion the
-        //    gate ground-checks, so two definitions that disagree under the model
-        //    produce a `ModelViolates` there (never suppressed here).
-        for def in self.array_definitions(t) {
-            let ev = Evaluator::new(&self.exec.ctx.terms, self);
-            if let EvalOutcome::Value(v @ ModelValue::Array(_)) = ev.evaluate(def) {
-                return Some(v);
-            }
-            // else: try the next definition / fall through to the reconstructed
-            // model (branch 2 below).
-        }
-
-        // 1b. A preprocessing-recorded variable substitution is also an exact
-        // definition, even though the defining equality has been consumed and
-        // therefore cannot appear in `array_definitions`. Resolve only the
-        // recorded forward edge, require the replacement to have the identical
-        // array sort, and evaluate it compositionally through this independent
-        // view. This is stronger evidence than the poisoned theory model below:
-        // the preprocessor may replace `a24 -> a9`, while `a9` itself resolves
-        // through an authored equality to a concrete store chain.
-        //
-        // The outer `array_leaf` cycle guard is already active for `t`, so a
-        // malformed/cyclic substitution chain (`a -> b -> a`) fails closed.
-        if let Some(&replacement) = self.exec.recorded_var_substitutions.get(&t) {
-            if self.exec.ctx.terms.sort(replacement) == self.exec.ctx.terms.sort(t) {
-                let ev = Evaluator::new(&self.exec.ctx.terms, self);
-                if let EvalOutcome::Value(v @ ModelValue::Array(_)) = ev.evaluate(replacement) {
-                    return Some(v);
-                }
-            }
-        }
-
-        // A read-conflicted theory interpretation is not evidence for the
-        // array value, but an independently evaluated authored definition
-        // above is.  Keep the conflict fail-closed for every fallback below;
-        // this ordering permits only the stronger, assertion-derived value.
-        if self
-            .model
-            .array_model
-            .as_ref()
-            .is_some_and(|arrays| arrays.read_conflicted.contains(&t))
-        {
-            return None;
-        }
-
-        // 2. Fallback: the array theory's reconstructed model entry.
-        if let Some(v) = self.array_from_model(t, index_sort, element_sort) {
-            return Some(v);
-        }
-
-        // 3. EXTENSIONALITY-COVERING MERGE. An array leaf the theory model does
-        //    not reconstruct, but which is asserted EQUAL to other array leaves
-        //    (a mutual SSA-copy class `(= a b)`, `(= b c)`), is resolved by
-        //    giving the WHOLE class ONE shared canonical array value: the fixed
-        //    canonical default of the element sort (a deterministic function of
-        //    the sort, identical for every member) plus the merged committed
-        //    direct-select reads of the class. Because every member then denotes
-        //    the IDENTICAL array, `select(a,i)` and `select(b,i)` read the same
-        //    value at every index, so the asserted equalities confirm.
-        //
-        //    SOUND: the members are asserted mutually equal, so a model in which
-        //    they are the identical array satisfies those equalities; the shared
-        //    default only sets indices in NO committed read (hence in no other
-        //    constraint besides the extensionality), and the gate still
-        //    re-checks every assertion, so any real conflict ⇒ `ModelViolates`.
-        //    Guards: only array-`Var == Var` equalities that are top-level or
-        //    top-level-`and` conjuncts join the class (never `or`/`ite`/`not`);
-        //    a committed-read VALUE conflict between members fails the whole
-        //    class closed; the default is a fixed function of the element sort.
-        //
-        //    NOTE (#seed-1213-case-187): a printed-witness fallback was tried
-        //    here and REVERTED — parsing back the printer's total array and
-        //    refuting against it is UNSOUND, because the printer fabricates a
-        //    single canonical default for the array's unread indices, so a
-        //    satisfiable `(distinct -3 (select a z) (select a x))` with z != x
-        //    and `a` genuinely unpinned would be falsely refuted (both reads
-        //    collapse to the fabricated default). A refutation is only sound
-        //    when it holds in EVERY completion of the unpinned leaf; that
-        //    "for-all-completions" reasoning is the job of the authoritative
-        //    congruent-read fail-closed gate, not this per-leaf resolver. Case
-        //    187 is fixed by CONSTRUCTION (same-array read-congruence
-        //    propagation in ay-arrays), so no wrong model reaches here for that
-        //    class; an unpinned leaf stays a coverage gap (keeps `sat`).
-        self.array_extensionality_value(t, index_sort, element_sort)
-    }
-
-    /// Branch 2 of [`array_leaf_inner`]: the array theory's reconstructed model
-    /// entry for `t`, or `None` if partial/absent.
-    fn array_from_model(
-        &self,
-        t: TermId,
-        index_sort: &Sort,
-        element_sort: &Sort,
-    ) -> Option<ModelValue> {
-        let array_model = self.model.array_model.as_ref()?;
-        // Extraction dropped at least one disputed cell.  Neither an existing
-        // default nor a later completion may turn that deliberately-partial
-        // interpretation into independent evidence for a total array.
-        if array_model.read_conflicted.contains(&t) {
-            return None;
-        }
-        let interp = array_model.array_values.get(&t)?;
-        let default_str = interp.default.as_ref()?; // a partial array fails closed
-        let default = self.parse_leaf(default_str, element_sort)?;
-        let mut store = Vec::with_capacity(interp.stores.len());
-        // ArrayInterpretation is authoritative/newest first, whereas the
-        // independent evaluator's ArrayValue is oldest first (and selects by
-        // scanning in reverse). Reverse at this representation boundary so a
-        // repeated store index keeps the same winner the solver/emitter use.
-        for (k_s, v_s) in interp.stores.iter().rev() {
-            let key = self.parse_leaf(k_s, index_sort)?;
-            let val = self.parse_leaf(v_s, element_sort)?;
-            store.push((key, val));
-        }
-        Some(ModelValue::Array(Box::new(ArrayValue { default, store })))
-    }
-
-    /// Branch 3 of [`array_leaf_inner`]: the extensionality-covering shared value
-    /// for `t`'s asserted-equality class. Returns `None` when `t` is not in a
-    /// nontrivial array-`Var==Var` class, when the class carries an asserted
-    /// read the model does not pin, or when any two pinned values disagree
-    /// (fail closed).
-    fn array_extensionality_value(
-        &self,
-        t: TermId,
-        index_sort: &Sort,
-        element_sort: &Sort,
-    ) -> Option<ModelValue> {
-        let class = self.array_equality_class(t);
-        if class.len() < 2 {
-            return None; // not an extensionality case
-        }
-        if self.model.array_model.as_ref().is_some_and(|arrays| {
-            class
-                .iter()
-                .any(|member| arrays.read_conflicted.contains(member))
-        }) {
-            return None;
-        }
-        // 3a. ADOPT AN EMITTED ENTRY (#ext-class-adopt-emitted). The members
-        //    are asserted mutually equal, so a member's COMPLETE emitted
-        //    array-model entry is already the interpretation `(get-model)`
-        //    serializes for the whole class — adopt it instead of
-        //    manufacturing anything (this reads the emitted witness and
-        //    fabricates nothing). Two complete entries that disagree mean the
-        //    emitted model is not single-valued on the class ⇒ fail closed.
-        let mut adopted: Option<ModelValue> = None;
-        for &m in &class {
-            if let Some(v) = self.array_from_model(m, index_sort, element_sort) {
-                match &adopted {
-                    Some(prev) if !values_equal(prev, &v) => return None, // ⇒ fail closed
-                    Some(_) => {}
-                    None => adopted = Some(v),
-                }
-            }
-        }
-        // 3b. Merge the class's committed reads (fail-closed on a value
-        //    conflict at one index): (i) the array theory's per-member store
-        //    entries; (ii) every ASSERTED direct `select` over a class member
-        //    (#ext-class-read-cover), keyed by its model-evaluated index, with
-        //    its model-committed value. (ii) enforces this branch's own
-        //    soundness condition — "the shared default only sets indices in NO
-        //    committed read" — so an asserted read the model does not pin
-        //    fails the class CLOSED (resolution degrades to the monitored
-        //    `CannotConfirm` coverage-gap posture) instead of fabricating a
-        //    default value the constraints may contradict. A fabricated value
-        //    is not evidence about the emitted witness, so it must never
-        //    ground a `ModelViolates` refutation.
-        let mut store: Vec<(ModelValue, ModelValue)> = Vec::new();
-        for &m in &class {
-            let Some(am) = self.model.array_model.as_ref() else {
-                continue;
-            };
-            let Some(interp) = am.array_values.get(&m) else {
-                continue;
-            };
-            let mut seen_member_keys: Vec<ModelValue> = Vec::new();
-            for (k_s, v_s) in &interp.stores {
-                let key = self.parse_leaf(k_s, index_sort)?;
-                // Interpretation stores are authoritative/newest first. An
-                // older duplicate is shadowed within this member and is not a
-                // second committed read (nor a cross-member conflict).
-                if seen_member_keys.iter().any(|seen| values_equal(seen, &key)) {
-                    continue;
-                }
-                seen_member_keys.push(key.clone());
-                let val = self.parse_leaf(v_s, element_sort)?;
-                if let Some((_, prev)) = store.iter().find(|(k, _)| values_equal(k, &key)) {
-                    if !values_equal(prev, &val) {
-                        return None; // committed read conflict ⇒ fail closed
-                    }
-                } else {
-                    store.push((key, val));
-                }
-            }
-        }
-        // (ii): walk the assertions' subterms for direct reads of a member.
-        {
-            let terms = &self.exec.ctx.terms;
-            let mut stack: Vec<TermId> = self.exec.ctx.assertions.to_vec();
-            let mut seen: HashSet<TermId> = HashSet::new();
-            while let Some(cur) = stack.pop() {
-                if !seen.insert(cur) {
-                    continue;
-                }
-                match terms.get(cur) {
-                    TermData::App(sym, args) => {
-                        if sym.name() == "select" && args.len() == 2 && class.contains(&args[0]) {
-                            let idx_ev = self.exec.evaluate_term(self.model, args[1]);
-                            let key = eval_value_to_model_value(&idx_ev, index_sort)?;
-                            let val = self.committed_read_value(cur, element_sort)?;
-                            if let Some((_, prev)) =
-                                store.iter().find(|(k, _)| values_equal(k, &key))
-                            {
-                                if !values_equal(prev, &val) {
-                                    return None; // committed read conflict ⇒ fail closed
-                                }
-                            } else {
-                                store.push((key, val));
-                            }
-                        }
-                        stack.extend(args.iter().copied());
-                    }
-                    TermData::Not(inner) => stack.push(*inner),
-                    TermData::Ite(c, a, b) => {
-                        stack.push(*c);
-                        stack.push(*a);
-                        stack.push(*b);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        // An adopted entry is TOTAL, so the merged committed reads must agree
-        // with it at every index; a disagreement means the emitted model
-        // contradicts its own committed reads ⇒ fail closed.
-        if let Some(ModelValue::Array(base)) = adopted {
-            for (k, v) in &store {
-                let at = base
-                    .store
-                    .iter()
-                    .rev()
-                    .find(|(bk, _)| values_equal(bk, k))
-                    .map(|(_, bv)| bv)
-                    .unwrap_or(&base.default);
-                if !values_equal(at, v) {
-                    return None; // reads contradict the emitted entry ⇒ fail closed
-                }
-            }
-            return Some(ModelValue::Array(base));
-        }
-        let default = self.canonical_model_value(element_sort)?;
-        Some(ModelValue::Array(Box::new(ArrayValue { default, store })))
-    }
-
-    /// The model-committed value of one asserted read `sel = (select a i)`
-    /// over an extensionality-class member: the solver evaluator's structural
-    /// value when it resolves, cross-checked against — or, when structural
-    /// evaluation cannot resolve, taken from — the read's committed OPAQUE
-    /// per-term value in the EUF/LIA views (a select the array theory never
-    /// materialized is committed there as a plain term value). `None` (⇒ the
-    /// class fails closed) when the model pins nothing, or pins two
-    /// disagreeing values (an internally inconsistent model must not ground
-    /// either a confirmation or a refutation).
-    fn committed_read_value(&self, sel: TermId, element_sort: &Sort) -> Option<ModelValue> {
-        let structural = {
-            let ev = self.exec.evaluate_term(self.model, sel);
-            eval_value_to_model_value(&ev, element_sort)
-        };
-        let opaque = self
-            .model
-            .euf_model
-            .as_ref()
-            .and_then(|e| e.term_values.get(&sel))
-            .and_then(|s| self.parse_leaf(s, element_sort))
-            .or_else(|| match element_sort {
-                Sort::Int => self
-                    .model
-                    .lia_model
-                    .as_ref()
-                    .and_then(|l| l.values.get(&sel))
-                    .map(|v| ModelValue::Int(v.clone())),
-                _ => None,
-            });
-        match (structural, opaque) {
-            (Some(a), Some(b)) => values_equal(&a, &b).then_some(a), // disagree ⇒ fail closed
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        }
-    }
-
-    /// The asserted array-`Var == Var` equality class of `t` (reflexive-transitive
-    /// closure), joining ONLY top-level or top-level-`and`-conjunct equalities
-    /// between two array-sorted variables — never conditional (`or`/`ite`/`not`).
-    fn array_equality_class(&self, t: TermId) -> Vec<TermId> {
-        let terms = &self.exec.ctx.terms;
-        // Gather all qualifying array Var==Var equalities as undirected edges.
-        let mut edges: Vec<(TermId, TermId)> = Vec::new();
-        let mut stack: Vec<(TermId, u32)> = self
-            .exec
-            .ctx
-            .assertions
-            .iter()
-            .map(|&a| (a, 32u32))
-            .collect();
-        while let Some((cand, depth)) = stack.pop() {
-            if depth == 0 {
-                continue;
-            }
-            match terms.get(cand) {
-                TermData::App(sym, args) if sym.name() == "=" && args.len() == 2 => {
-                    let (l, r) = (args[0], args[1]);
-                    if l != r
-                        && matches!(terms.sort(l), Sort::Array(_))
-                        && matches!(terms.get(l), TermData::Var(_, _))
-                        && matches!(terms.get(r), TermData::Var(_, _))
-                    {
-                        edges.push((l, r));
-                    }
-                }
-                TermData::App(sym, args) if sym.name() == "and" => {
-                    for &c in args {
-                        stack.push((c, depth - 1));
-                    }
-                }
-                _ => {}
-            }
-        }
-        // BFS the closure from `t`.
-        let mut class = vec![t];
-        let mut i = 0;
-        while i < class.len() {
-            let cur = class[i];
-            for &(a, b) in &edges {
-                let other = if a == cur {
-                    Some(b)
-                } else if b == cur {
-                    Some(a)
-                } else {
-                    None
-                };
-                if let Some(o) = other {
-                    if !class.contains(&o) {
-                        class.push(o);
-                    }
-                }
-            }
-            i += 1;
-        }
-        class
     }
 
     /// A fixed, deterministic canonical model value for `sort` — the shared
@@ -2247,6 +1668,13 @@ impl IndependentModelView<'_> {
     /// [`Self::canonical_dt_element`] first (#dt-element-canon); everything else
     /// converts exactly as before.
     fn model_value_for(&self, ev: &EvalValue, sort: &Sort) -> Option<ModelValue> {
+        if self.exec.datatype_sort_carries_array_field(sort) {
+            // A naked element token has no occurrence stamp/current EUF
+            // binding. Term-bearing producers route through
+            // `exact_datatype_cell_value_for_term`; rendered outer-array cells
+            // route through the bounded typed parser in `parse_leaf_at_depth`.
+            return None;
+        }
         if let Some(v) = self.canonical_dt_element(ev, sort) {
             return Some(v);
         }
@@ -2269,6 +1697,10 @@ impl IndependentModelView<'_> {
     fn reconstruct_datatype_value(&self, t: TermId, depth: u32) -> Option<ModelValue> {
         if depth > 24 {
             return None;
+        }
+        let sort = self.exec.ctx.terms.sort(t);
+        if self.exec.datatype_sort_carries_array_field(sort) {
+            return self.exact_datatype_cell_value_for_term(t, sort);
         }
         if !self.resolving.borrow_mut().insert(t) {
             self.cycle_hits.set(self.cycle_hits.get() + 1);
@@ -2318,6 +1750,10 @@ impl IndependentModelView<'_> {
     }
 
     fn datatype_leaf(&self, t: TermId) -> Option<ModelValue> {
+        let sort = self.exec.ctx.terms.sort(t);
+        if self.exec.datatype_sort_carries_array_field(sort) {
+            return self.exact_datatype_cell_value_for_term(t, sort);
+        }
         if let Some(cached) = self.resolved.borrow().get(&t) {
             return Some(cached.clone());
         }
@@ -2454,7 +1890,7 @@ impl IndependentModelView<'_> {
     /// Parse a model-emitted value string for the given sort into a gate value,
     /// reusing the solver's own parser (a pure leaf-value helper).
     fn parse_leaf(&self, s: &str, sort: &Sort) -> Option<ModelValue> {
-        self.parse_leaf_at_depth(s, sort, 0)
+        self.parse_leaf_at_depth(s, sort, 0, &mut TypedArrayParseBudget::new())
     }
 
     /// [`Self::parse_leaf`] carrying the nesting budget the array-text reader
@@ -2484,12 +1920,19 @@ impl IndependentModelView<'_> {
     /// witness, and the gate still re-checks every assertion against the parsed
     /// value — a misparse can only surface as `ModelViolates`, never confirm a
     /// wider model.
-    fn parse_leaf_at_depth(&self, s: &str, sort: &Sort, depth: u32) -> Option<ModelValue> {
+    fn parse_leaf_at_depth(
+        &self,
+        s: &str,
+        sort: &Sort,
+        depth: u32,
+        budget: &mut TypedArrayParseBudget,
+    ) -> Option<ModelValue> {
         if depth > 32 {
             return None;
         }
         if let Sort::Array(arr) = sort {
-            if let Some(v) = self.parse_array_text(s, &arr.index_sort, &arr.element_sort, depth + 1)
+            if let Some(v) =
+                self.parse_array_text(s, &arr.index_sort, &arr.element_sort, depth + 1, budget)
             {
                 return Some(v);
             }
@@ -2500,8 +1943,14 @@ impl IndependentModelView<'_> {
         // only that unique, structurally rechecked class value. Generic opaque
         // tokens, missing classes, and poisoned conflicts still fall through
         // and remain incomparable with datatypes.
+        if !budget.charge_text(s) {
+            return None;
+        }
         if let Some(value) = self.exact_datatype_cell_value(s, sort) {
             return Some(value);
+        }
+        if self.exec.datatype_sort_carries_array_field(sort) {
+            return None;
         }
         // Parse exact array-cell constructor text before the scalar parser collapses it to an
         // opaque `Element`; malformed trees and abstract carriers still fail closed.
@@ -2541,109 +1990,31 @@ impl IndependentModelView<'_> {
         index_sort: &Sort,
         element_sort: &Sort,
         depth: u32,
+        budget: &mut TypedArrayParseBudget,
     ) -> Option<ModelValue> {
-        if depth > 32 {
+        let mut source_budget = super::rendered_dt_limits::SchemaSourceBudget::new();
+        if !source_budget.charge_array_sort(index_sort, element_sort)
+            || source_budget.work()? > super::rendered_dt_limits::MAX_RENDERED_DT_BYTES
+        {
             return None;
         }
-        let items = sexpr_items(s)?;
-        match items.first()?.as_str() {
-            // `(store <array> <index> <value>)`
-            "store" if items.len() == 4 => {
-                let base = self.parse_array_text(&items[1], index_sort, element_sort, depth + 1)?;
-                let ModelValue::Array(mut arr) = base else {
-                    return None;
-                };
-                let key = self.parse_leaf_at_depth(&items[2], index_sort, depth + 1)?;
-                let val = self.parse_leaf_at_depth(&items[3], element_sort, depth + 1)?;
-                arr.store.push((key, val));
-                Some(ModelValue::Array(arr))
-            }
-            // `((as const <sort>) <default>)` — the head is itself the
-            // parenthesised `(as const <sort>)` qualifier.
-            head if items.len() == 2 && head.starts_with('(') => {
-                let qual = sexpr_items(head)?;
-                if qual.len() != 3 || qual[0] != "as" || qual[1] != "const" {
-                    return None;
-                }
-                let default = self.parse_leaf_at_depth(&items[1], element_sort, depth + 1)?;
-                Some(ModelValue::Array(Box::new(ArrayValue {
-                    default,
-                    store: Vec::new(),
-                })))
-            }
-            _ => None,
-        }
+        let array_sort = Sort::array(index_sort.clone(), element_sort.clone());
+        let expected_sort =
+            crate::executor_format::format_sort_surface(&self.exec.ctx, &array_sort);
+        let mut parse_leaf =
+            |text: &str, sort: &Sort, leaf_depth: u32, budget: &mut TypedArrayParseBudget| {
+                self.parse_leaf_at_depth(text, sort, leaf_depth, budget)
+            };
+        parse_bounded_typed_array_text(
+            s,
+            &expected_sort,
+            index_sort,
+            element_sort,
+            depth,
+            budget,
+            &mut parse_leaf,
+        )
     }
-}
-
-/// Split the BODY of a parenthesised s-expression into its top-level items,
-/// respecting nesting, `"…"` string literals (with the SMT-LIB `""` escape) and
-/// `|…|` quoted symbols. `None` when `s` is not ONE balanced parenthesised form
-/// — so a bare atom, a truncated rendering, or `(a)(b)` all decline rather than
-/// parse into something the caller would mistake for a value.
-fn sexpr_items(s: &str) -> Option<Vec<String>> {
-    let body = s.trim().strip_prefix('(')?.strip_suffix(')')?;
-    let mut items: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut depth: i32 = 0;
-    let mut in_str = false;
-    let mut in_sym = false;
-    let mut chars = body.chars().peekable();
-    while let Some(c) = chars.next() {
-        if in_str {
-            cur.push(c);
-            if c == '"' {
-                // `""` is an escaped quote inside an SMT-LIB string literal.
-                if chars.peek() == Some(&'"') {
-                    cur.push(chars.next()?);
-                } else {
-                    in_str = false;
-                }
-            }
-            continue;
-        }
-        if in_sym {
-            cur.push(c);
-            if c == '|' {
-                in_sym = false;
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                in_str = true;
-                cur.push(c);
-            }
-            '|' => {
-                in_sym = true;
-                cur.push(c);
-            }
-            '(' => {
-                depth += 1;
-                cur.push(c);
-            }
-            ')' => {
-                depth -= 1;
-                if depth < 0 {
-                    return None; // the leading `(` did not match the trailing one
-                }
-                cur.push(c);
-            }
-            c if c.is_whitespace() && depth == 0 => {
-                if !cur.is_empty() {
-                    items.push(std::mem::take(&mut cur));
-                }
-            }
-            _ => cur.push(c),
-        }
-    }
-    if depth != 0 || in_str || in_sym {
-        return None;
-    }
-    if !cur.is_empty() {
-        items.push(cur);
-    }
-    Some(items)
 }
 
 /// Conservative structural equality of two gate [`ModelValue`]s, used only to
@@ -2973,30 +2344,6 @@ fn parse_atom(cur: &mut &str) -> String {
     atom
 }
 
-/// Pure, contract-carrying decision core of the independent SAT gate — the SMT
-/// twin of the SAT-side Verified-SAT-Gate (`decision_sat_self_checked` in
-/// `crates/ay/src/cmd_pb.rs`, proven in `decision_sat_vig_realbody.rs`).
-///
-/// DIRECTIONAL SOUNDNESS: the gate keeps a `Sat` verdict (`true`) EXACTLY when the
-/// incoming verdict was `Sat` AND the model was independently `confirmed`, OR
-/// the generic proof model supplies `enforce = false`. Every live unconfirmed
-/// publication call site supplies `enforce = true`; `CannotConfirm` bypasses
-/// this helper only to downgrade directly (see
-/// [`Executor::apply_independent_model_gate`]). Consequences, both
-/// machine-checkable: it can NEVER manufacture `Sat` from a non-`Sat` verdict
-/// (`result ==> was_sat`), and once enforcement is on it NEVER keeps an
-/// unconfirmed model (`result && enforce ==> confirmed`). The gate only ever maps
-/// `Sat -> {Sat, Unknown}`, never toward unsoundness.
-///
-/// The `` contract is inert in the stock build
-/// (`deductive_verify` is unset, so no `trust` dependency and zero codegen) and is
-/// discharged by the stage2 deductive-checks pipeline; the P1 soundness proof and its
-/// refuted `no_check` control live in
-/// the development proof harness.
-fn gate_keeps_sat(was_sat: bool, confirmed: bool, enforce: bool) -> bool {
-    was_sat && (confirmed || !enforce)
-}
-
 /// Compact human display of an [`EvalValue`] for the soundness-gate alarm's
 /// falsifying-assignment line. Best-effort and debug-only — never parsed.
 fn eval_value_display(v: &EvalValue) -> String {
@@ -3043,6 +2390,82 @@ enum CongruentReadEval {
 }
 
 impl Executor {
+    #[cfg(test)]
+    pub(in crate::executor::model) fn independent_exact_datatype_cell_value_for_test(
+        &self,
+        model: &Model,
+        spelling: &str,
+        sort: &Sort,
+    ) -> Option<ModelValue> {
+        IndependentModelView::new(self, model).exact_datatype_cell_value(spelling, sort)
+    }
+
+    #[cfg(test)]
+    pub(in crate::executor::model) fn independent_datatype_element_value_for_test(
+        &self,
+        model: &Model,
+        spelling: &str,
+        sort: &Sort,
+    ) -> Option<ModelValue> {
+        IndependentModelView::new(self, model)
+            .model_value_for(&EvalValue::Element(spelling.to_string()), sort)
+    }
+
+    #[cfg(test)]
+    pub(in crate::executor::model) fn independent_datatype_term_value_for_test(
+        &self,
+        model: &Model,
+        term: TermId,
+    ) -> Option<ModelValue> {
+        let view = IndependentModelView::new(self, model);
+        match self.ctx.terms.get(term) {
+            TermData::App(_, _) => view.uf_app_value(term),
+            _ => view.leaf_value(term),
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::executor::model) fn independent_array_select_value_for_test(
+        &self,
+        model: &Model,
+        term: TermId,
+    ) -> Option<ModelValue> {
+        IndependentModelView::new(self, model).array_select_value(term)
+    }
+
+    #[cfg(test)]
+    pub(in crate::executor::model) fn independent_array_leaf_value_for_test(
+        &self,
+        model: &Model,
+        term: TermId,
+    ) -> Option<ModelValue> {
+        let Sort::Array(sort) = self.ctx.terms.sort(term) else {
+            return None;
+        };
+        IndependentModelView::new(self, model).array_leaf(
+            term,
+            &sort.index_sort,
+            &sort.element_sort,
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::executor::model) fn independent_array_text_value_for_test(
+        &self,
+        model: &Model,
+        text: &str,
+        index_sort: &Sort,
+        element_sort: &Sort,
+    ) -> Option<ModelValue> {
+        IndependentModelView::new(self, model).parse_array_text(
+            text,
+            index_sort,
+            element_sort,
+            0,
+            &mut TypedArrayParseBudget::new(),
+        )
+    }
+
     /// Rebuild the `DatatypeSort` for a datatype declared as `Sort::Datatype`
     /// OR abstracted to `Sort::Uninterpreted(name)` (the eager DtAufbv lowering)
     /// from the front-end declaration tables. Shared by the independent gate's
@@ -3117,12 +2540,27 @@ impl Executor {
         sort: &Sort,
         guard: &super::rendered_dt_guard::RenderedDatatypeGuard,
     ) -> Option<ModelValue> {
+        self.parse_rendered_dt_value_cached_with_budget(
+            s,
+            sort,
+            guard,
+            &mut TypedArrayParseBudget::new(),
+        )
+    }
+
+    fn parse_rendered_dt_value_cached_with_budget(
+        &self,
+        s: &str,
+        sort: &Sort,
+        guard: &super::rendered_dt_guard::RenderedDatatypeGuard,
+        budget: &mut TypedArrayParseBudget,
+    ) -> Option<ModelValue> {
         // Every caller uses this as a top-level datatype parser. An invalid or
         // oversized registry must not fall through to the generic
         // uninterpreted-value parser below: that would turn constructor text
         // into opaque model authority instead of failing closed.
         guard.datatype_name(sort)?;
-        if !super::rendered_dt_guard::rendered_sexp_within_limits(s) {
+        if !budget.charge_text(s) {
             return None;
         }
         let mut cur = s;
@@ -3131,7 +2569,7 @@ impl Executor {
         if !cur.trim_start().is_empty() {
             return None;
         }
-        self.sexp_to_model_value_guarded(&sx, sort, guard)
+        self.sexp_to_model_value_guarded(&sx, sort, guard, 0, budget)
     }
 
     #[cfg(test)]
@@ -3189,9 +2627,42 @@ impl Executor {
         sx: &Sexp,
         sort: &Sort,
         guard: &super::rendered_dt_guard::RenderedDatatypeGuard,
+        depth: u32,
+        budget: &mut TypedArrayParseBudget,
     ) -> Option<ModelValue> {
+        if depth > MAX_TYPED_ARRAY_DEPTH {
+            return None;
+        }
         if guard.datatype_name(sort).is_some() {
-            return self.sexp_to_dt_value_guarded(sx, sort, guard);
+            return self.sexp_to_dt_value_guarded(sx, sort, guard, depth, budget);
+        }
+        if let Sort::Array(array) = sort {
+            let text = sx.render();
+            let expected_sort = crate::executor_format::format_sort_surface(&self.ctx, sort);
+            let mut parse_leaf =
+                |leaf_text: &str,
+                 leaf_sort: &Sort,
+                 leaf_depth: u32,
+                 budget: &mut TypedArrayParseBudget| {
+                    if leaf_depth > MAX_TYPED_ARRAY_DEPTH {
+                        return None;
+                    }
+                    let mut cursor = leaf_text;
+                    let leaf = parse_sexp(&mut cursor)?;
+                    if !cursor.trim_start().is_empty() {
+                        return None;
+                    }
+                    self.sexp_to_model_value_guarded(&leaf, leaf_sort, guard, leaf_depth, budget)
+                };
+            return parse_bounded_typed_array_text(
+                &text,
+                &expected_sort,
+                &array.index_sort,
+                &array.element_sort,
+                depth,
+                budget,
+                &mut parse_leaf,
+            );
         }
         if let Sort::BitVec(bitvec) = sort {
             if !guarded_bitvec_literal_matches_sort(sx, bitvec.width) {
@@ -3199,6 +2670,9 @@ impl Executor {
             }
         }
         let text = sx.render();
+        if !budget.charge_text(&text) {
+            return None;
+        }
         let ev = self.parse_model_value_string(&text, &Some(sort.clone()));
         if let Some(mv) = super::dt_construct::eval_to_mv(&ev, sort) {
             return Some(mv);
@@ -3252,7 +2726,12 @@ impl Executor {
         sx: &Sexp,
         sort: &Sort,
         guard: &super::rendered_dt_guard::RenderedDatatypeGuard,
+        depth: u32,
+        budget: &mut TypedArrayParseBudget,
     ) -> Option<ModelValue> {
+        if depth > MAX_TYPED_ARRAY_DEPTH {
+            return None;
+        }
         let (head, arg_sexps): (&str, &[Sexp]) = match sx {
             Sexp::Atom(a) => (a.as_str(), &[]),
             Sexp::List(items) => {
@@ -3268,7 +2747,13 @@ impl Executor {
         }
         let mut args = Vec::with_capacity(fields.len());
         for (field_sort, arg) in fields.iter().zip(arg_sexps) {
-            args.push(self.sexp_to_model_value_guarded(arg, field_sort, guard)?);
+            args.push(self.sexp_to_model_value_guarded(
+                arg,
+                field_sort,
+                guard,
+                depth + 1,
+                budget,
+            )?);
         }
         Some(ModelValue::Datatype {
             ctor: internal.to_string(),
@@ -8932,6 +8417,7 @@ mod tests {
             completed_values: DetHashMap::default(),
             dt_ground: DetHashMap::default(),
             dt_pins: DetHashMap::default(),
+            dt_array_field_classes: Vec::new(),
         }
     }
 

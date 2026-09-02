@@ -98,9 +98,13 @@ impl TermStore {
             }
             // Large shift produces zero
             if let Some(shift) = v.to_u32() {
-                if shift >= width {
+                // `high = width - 1` phrased so `width >= 1` is local: the
+                // `None` arm coincides with `shift >= width` (a zero width
+                // satisfies it for every shift), so both keep the exact
+                // saturate-to-zero result the guard always produced.
+                let (Some(high), true) = (width.checked_sub(1), shift < width) else {
                     return self.mk_bitvec(zero, width);
-                }
+                };
                 // Constant-shift-to-concat: bvlshr(x, K) →
                 // concat(bv_zero(K), extract(x, n-1, K)). Keep the concat RAW:
                 // `mk_bvconcat` canonicalizes a zero high half back to
@@ -108,7 +112,7 @@ impl TermStore {
                 // checked `bitblast_concat`/`bitblast_extract` rules but no
                 // `zero_extend` rule. This is a semantic normalization, not a
                 // proof assertion; the printer still has to derive every use.
-                let extracted = self.mk_bvextract(width - 1, shift, a);
+                let extracted = self.mk_bvextract(high, shift, a);
                 let zero_bits = self.mk_bitvec(BigInt::zero(), shift);
                 return self.intern(
                     TermData::App(Symbol::named("concat"), vec![zero_bits, extracted]),
@@ -146,7 +150,8 @@ impl TermStore {
         // Constant folding
         if let (Some((v1, w1)), Some((v2, _))) = (self.get_bitvec(a), self.get_bitvec(b)) {
             if let Some(shift) = v2.to_u32() {
-                let sign_bit = BigInt::one() << (w1 - 1);
+                // Saturating: constants carry the width of their BitVec sort, so w1 >= 1.
+                let sign_bit = BigInt::one() << w1.saturating_sub(1);
                 let is_negative = v1 >= &sign_bit;
 
                 if shift >= w1 {
@@ -159,9 +164,12 @@ impl TermStore {
                 }
 
                 let mut result = v1 >> shift;
-                // Sign extend: fill upper bits with sign bit
+                // Sign extend: fill upper bits with sign bit. `shift < w1`
+                // holds (the `shift >= w1` arm returned above), so the
+                // saturating form is exact on every reachable input and the
+                // subtraction is total.
                 if is_negative {
-                    let fill_mask = Self::bv_ones(shift) << (w1 - shift);
+                    let fill_mask = Self::bv_ones(shift) << (w1.saturating_sub(shift));
                     result |= fill_mask;
                 }
                 return self.mk_bitvec(Self::bv_mask(&result, w1), w1);
@@ -175,16 +183,18 @@ impl TermStore {
             }
             // Large shift: all bits become sign bit (symbolic, so create term)
             if let Some(shift) = v.to_u32() {
-                if shift >= width {
-                    // bvashr(x, K>=n) is either all-zeros or all-ones depending on sign.
-                    // Cannot simplify further without knowing the sign bit at this level.
-                    // Fall through to create the bvashr term.
-                } else {
+                // `high = width - 1` phrased so `width >= 1` is local; the
+                // `None` arm coincides with `shift >= width` (a zero width
+                // satisfies it for every shift) and falls through with it.
+                if let (Some(high), true) = (width.checked_sub(1), shift < width) {
                     // Constant-shift-to-extract: bvashr(x, K) → sign_extend(K, extract(x, n-1, K))
                     // This avoids building a barrel-shifter circuit for constant shifts.
-                    let extracted = self.mk_bvextract(width - 1, shift, a);
+                    let extracted = self.mk_bvextract(high, shift, a);
                     return self.mk_bvsign_extend(shift, extracted);
                 }
+                // bvashr(x, K>=n) is either all-zeros or all-ones depending on sign.
+                // Cannot simplify further without knowing the sign bit at this level.
+                // Fall through to create the bvashr term.
             }
         }
 

@@ -83,11 +83,18 @@ fn test_parallel_portfolio_spawn_failure_returns_unknown() {
         strict_proofs: false,
     };
     let solver = PortfolioSolver::new(problem, config);
-    let result = solver.solve();
+    let mut report = BudgetReport::new();
+    let result = solver.solve_parallel_with_report(&mut report);
     assert!(
         matches!(result, PortfolioResult::Unknown),
         "spawn failure should degrade to Unknown, got: {result:?}"
     );
+    assert_eq!(report.entries.len(), 2);
+    assert_eq!(report.entries[0].index, 0);
+    assert_eq!(report.entries[1].index, 1);
+    assert!(report.entries.iter().all(|entry| {
+        entry.stop_reason == EngineStopReason::LaunchFailed && entry.elapsed == Duration::ZERO
+    }));
 }
 
 #[test]

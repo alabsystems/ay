@@ -35,6 +35,7 @@ use crate::executor_types::{ExecutorError, Result};
 use super::Executor;
 mod array_reconcile;
 mod completion;
+mod datatype_array_fields;
 mod datatype_cell_authority;
 mod datatype_opaque_scope;
 mod dt_bounds;
@@ -53,6 +54,13 @@ mod eval_seq;
 mod eval_string;
 mod eval_uf;
 mod eval_var;
+// The gate's decision core lives alone in a file so its native `ensures` clause —
+// raw grammar, unparseable by a compiler without the extension and unhideable by
+// any `cfg`, since cfg-stripping runs after parsing — cannot take the rest of the
+// module down with it. `gate_decision_stock.rs` is the same decision without the
+// clause; `tests/smt_model_gate_conformance.rs` pins the two together.
+#[path = "gate_decision_stock.rs"]
+mod gate_decision;
 mod independent_gate;
 pub(in crate::executor) use independent_gate::probe_budget::QuantifiedGateProbeBudget;
 pub(in crate::executor) use independent_gate::QuantifiedModelConfirmation;
@@ -280,16 +288,14 @@ pub(super) struct Model {
     /// the LAST resort — a theory-model value always wins — which keeps the
     /// slot fill-only at the evaluation level.
     pub(super) completed_values: HashMap<TermId, EvalValue>,
-    /// Total-datatype-model construction: the constructed ground value per
-    /// datatype-sorted term (model/dt_construct.rs, #dt-total-model). Filled
-    /// BEFORE validation so every validator (term evaluator, strict DtOracle,
-    /// independent gate) and the printers read the SAME total assignment.
+    /// Total ground datatype values shared by all validators and printers
+    /// after model construction (`#dt-total-model`).
     pub(super) dt_ground: HashMap<TermId, ay_model_check::ModelValue>,
-    /// Evaluation pins derived from `dt_ground`: `Element(canonical)` for
-    /// datatype-sorted terms, projected/committed scalar values for selector
-    /// applications, and Bool values for tester applications
-    /// (#dt-total-model). Consulted at the top of `evaluate_term`.
+    /// Evaluation pins derived from `dt_ground` for datatype, selector, and
+    /// tester terms; consulted first by `evaluate_term`.
     pub(super) dt_pins: HashMap<TermId, EvalValue>,
+    /// Current exact array-field evidence; every consumer must revalidate it.
+    pub(in crate::executor::model) dt_array_field_classes: datatype_array_fields::ArrayFieldClasses,
 }
 
 mod model_base;
@@ -401,7 +407,7 @@ impl Executor {
                     .array_ext_shadow
                     .emitted
                     .iter()
-                    .map(|&(eq_term, ..)| eq_term)
+                    .map(|entry| entry.eq_term)
                     .collect();
                 for eq_term in atoms {
                     if self.term_value(&model.sat_model, &model.term_to_var, eq_term) == Some(false)
@@ -422,7 +428,7 @@ impl Executor {
             .array_ext_shadow
             .emitted
             .iter()
-            .map(|&(eq_term, ..)| eq_term)
+            .map(|entry| entry.eq_term)
             .collect();
         for eq_term in atoms {
             if self.array_eq_forced_false_top_level(eq_term) {

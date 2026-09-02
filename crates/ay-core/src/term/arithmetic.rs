@@ -46,13 +46,10 @@ impl TermStore {
             return None;
         }
         match self.get(id) {
-            TermData::App(sym, args)
-                if sym.name() == "to_real"
-                    && args.len() == 1
-                    && *self.sort(args[0]) == Sort::Int =>
-            {
-                Some(args[0])
-            }
+            TermData::App(sym, args) if sym.name() == "to_real" => match args.as_slice() {
+                [arg] if *self.sort(*arg) == Sort::Int => Some(*arg),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -65,9 +62,10 @@ impl TermStore {
             TermData::Const(Constant::Rational(r)) if r.0.denom().is_one() => {
                 Some(r.0.numer().clone())
             }
-            TermData::App(Symbol::Named(name), args) if name == "-" && args.len() == 1 => {
-                self.extract_integer_constant(args[0]).map(|n| -n)
-            }
+            TermData::App(Symbol::Named(name), args) if name == "-" => match args.as_slice() {
+                [arg] => self.extract_integer_constant(*arg).map(|n| -n),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -96,8 +94,10 @@ impl TermStore {
     {
         // Check for negation: (- x) → (-1, x)
         if let TermData::App(Symbol::Named(name), args) = self.get(id) {
-            if name == "-" && args.len() == 1 {
-                return (neg_one_coeff, args[0]);
+            if name == "-" {
+                if let [arg] = args.as_slice() {
+                    return (neg_one_coeff, *arg);
+                }
             }
         }
 
@@ -122,8 +122,8 @@ impl TermStore {
                             // Just a constant, shouldn't happen in practice.
                             return (coeff, mk_one(self));
                         }
-                        if remainder.len() == 1 {
-                            return (coeff, remainder[0]);
+                        if let [only] = remainder.as_slice() {
+                            return (coeff, *only);
                         }
                         return (coeff, self.mk_mul(remainder));
                     }
@@ -186,8 +186,10 @@ impl TermStore {
 
         // Double negation: -(-x) = x
         if let TermData::App(Symbol::Named(name), args) = self.get(arg) {
-            if name == "-" && args.len() == 1 {
-                return args[0];
+            if name == "-" {
+                if let [inner] = args.as_slice() {
+                    return *inner;
+                }
             }
         }
 
@@ -206,14 +208,14 @@ impl TermStore {
         // Note: mk_mul places constants at the end of the args list, so we check the last argument
         // This normalizes negation to appear as coefficient, enabling further simplification
         if let TermData::App(Symbol::Named(name), args) = self.get(arg) {
-            if name == "*" && !args.is_empty() {
+            if name == "*" {
                 let args_clone = args.clone();
                 // Check if last argument is a constant (mk_mul places constants last)
-                if let Some(&last) = args_clone.last() {
+                if let Some((&last, rest)) = args_clone.split_last() {
                     if self.get_int(last).is_some() || self.get_rational(last).is_some() {
                         // -(rest * c) → (rest * (-c))
                         let neg_last = self.mk_neg(last);
-                        let mut new_args: Vec<TermId> = args_clone[..args_clone.len() - 1].to_vec();
+                        let mut new_args: Vec<TermId> = rest.to_vec();
                         new_args.push(neg_last);
                         return self.mk_mul(new_args);
                     }
@@ -227,11 +229,11 @@ impl TermStore {
     /// Create addition with constant folding
     #[allow(clippy::needless_pass_by_value)]
     pub fn mk_add(&mut self, args: Vec<TermId>) -> TermId {
-        if args.is_empty() {
+        let Some(&first) = args.first() else {
             return self.mk_int(BigInt::zero());
-        }
+        };
         if args.len() == 1 {
-            return args[0];
+            return first;
         }
 
         debug_assert!(
@@ -240,11 +242,13 @@ impl TermStore {
             "BUG: mk_add expects Int or Real args"
         );
         debug_assert!(
-            args.windows(2).all(|w| self.sort(w[0]) == self.sort(w[1])),
+            args.iter()
+                .zip(args.iter().skip(1))
+                .all(|(&a, &b)| self.sort(a) == self.sort(b)),
             "BUG: mk_add expects same sort args"
         );
 
-        let sort = self.sort(args[0]).clone();
+        let sort = self.sort(first).clone();
 
         // Phase 1: Flatten nested additions
         // (+ (+ a b) c) -> (+ a b c)
@@ -377,8 +381,8 @@ impl TermStore {
                 if result_args.is_empty() {
                     return self.mk_int(BigInt::zero());
                 }
-                if result_args.len() == 1 {
-                    return result_args[0];
+                if let [only] = result_args.as_slice() {
+                    return *only;
                 }
             }
         }
@@ -423,8 +427,8 @@ impl TermStore {
                 if result_args.is_empty() {
                     return self.mk_rational(BigRational::zero());
                 }
-                if result_args.len() == 1 {
-                    return result_args[0];
+                if let [only] = result_args.as_slice() {
+                    return *only;
                 }
             }
         }
@@ -437,8 +441,8 @@ impl TermStore {
                 self.mk_rational(BigRational::zero())
             };
         }
-        if result_args.len() == 1 {
-            return result_args[0];
+        if let [only] = result_args.as_slice() {
+            return *only;
         }
 
         self.intern(TermData::App(Symbol::named("+"), result_args), sort)

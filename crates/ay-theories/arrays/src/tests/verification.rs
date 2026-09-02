@@ -1023,6 +1023,105 @@ fn test_array_var_tracking_notify_equality_repopulate_keeps_merged_state() {
     );
 }
 
+/// An array equality may be notified before either endpoint has select/store
+/// structure. If terms are interned later, the active equality must be replayed
+/// over the enlarged structural base, and its regenerated undo record must keep
+/// those late structural entries intact after backtracking.
+#[test]
+fn test_late_array_structure_replays_active_merge_and_preserves_base_on_pop() {
+    let mut store = TermStore::new();
+    let arr_sort = make_array_sort();
+
+    let a = store.mk_var("a", arr_sort.clone());
+    let b = store.mk_var("b", arr_sort.clone());
+    let c = store.mk_var("c", arr_sort);
+    let i = store.mk_var("i", Sort::Int);
+    let j = store.mk_var("j", Sort::Int);
+    let k = store.mk_var("k", Sort::Int);
+    let v = store.mk_var("v", Sort::Int);
+    let store_on_a = store.mk_store(a, i, v);
+    let late_select_b = store.mk_select(b, j);
+    let late_select_a = store.mk_select(a, k);
+
+    let mut solver = ArraySolver::new(&store);
+    solver.dirty = false;
+    let late_start = late_select_b.index();
+    for idx in 0..late_start {
+        solver.register_term(TermId(idx as u32));
+    }
+    solver.populated_terms = late_start;
+
+    // Direct tests cannot append to a TermStore while ArraySolver borrows it.
+    // Temporarily expose the prefix as complete so the real notification path
+    // records an equality with a currently data-less source; then restore the
+    // high-water mark to make both selects a synthetic newly-interned suffix.
+    solver.push();
+    solver.populated_terms = store.len();
+    solver.notify_equality(a, b);
+    solver.notify_equality(c, b);
+    solver.populated_terms = late_start;
+    assert_eq!(solver.array_var_merge_log, vec![(a, b), (c, b)]);
+    assert_eq!(
+        solver.array_var_merge_log.len(),
+        solver.array_var_merge_undo.len()
+    );
+
+    solver.populate_caches();
+    assert_eq!(
+        solver.array_var_merge_log.len(),
+        solver.array_var_merge_undo.len()
+    );
+
+    let merged = solver
+        .array_vars
+        .get(&a)
+        .expect("the equality target must retain rebuilt array data");
+    assert_eq!(
+        merged.parent_selects,
+        vec![late_select_a, late_select_b],
+        "the rebuilt target must contain its late structural select and the source's select"
+    );
+    assert!(
+        solver
+            .pending_row2_upward
+            .contains(&(late_select_b, store_on_a)),
+        "a late source select must queue upward ROW2 work against a store on the equal target"
+    );
+    assert!(
+        solver.pending_axioms.contains(&PendingAxiom::Row2Down {
+            store: store_on_a,
+            select: late_select_b,
+        }),
+        "a late source select must emit the cross-equality downward ROW2 obligation"
+    );
+
+    solver.pop();
+    solver.populate_caches();
+
+    assert_eq!(
+        solver
+            .array_vars
+            .get(&a)
+            .map(|data| data.parent_selects.as_slice()),
+        Some([late_select_a].as_slice()),
+        "undoing the equality must preserve late structural data owned by the target"
+    );
+    assert_eq!(
+        solver
+            .array_vars
+            .get(&b)
+            .map(|data| data.parent_selects.as_slice()),
+        Some([late_select_b].as_slice()),
+        "undoing the equality must preserve late structural data owned by the source"
+    );
+    assert!(
+        !solver.array_vars.contains_key(&c),
+        "undoing a merge that created its target must remove the empty target key"
+    );
+    assert!(solver.array_var_merge_log.is_empty());
+    assert!(solver.array_var_merge_undo.is_empty());
+}
+
 #[test]
 fn test_array_var_tracking_assert_literal_true_queues_cross_equal_row2() {
     let mut store = TermStore::new();

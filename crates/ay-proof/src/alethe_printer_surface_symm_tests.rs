@@ -44,7 +44,7 @@ fn surface_symm_collapsed_to_identical_literal_prints_weakening() {
 #[test]
 fn surface_symm_exact_string_and_quoted_symbol_reversal_stays_symm() {
     let mut terms = TermStore::new();
-    let symbol = terms.mk_var("x|y", Sort::String);
+    let symbol = terms.mk_var("x y", Sort::String);
     let string = terms.mk_string("a\"b".to_string());
     let premise = raw_equality(&mut terms, symbol, string);
     let conclusion = raw_equality(&mut terms, string, symbol);
@@ -56,10 +56,27 @@ fn surface_symm_exact_string_and_quoted_symbol_reversal_stays_symm() {
         try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[premise], None)
             .expect("an exact printed reversal must remain symm");
     assert!(
-        output.contains(r#"(step t1 (cl (= "a""b" |x\|y|)) :rule symm :premises (t0))"#),
+        output.contains(r#"(step t1 (cl (= "a""b" |x y|)) :rule symm :premises (t0))"#),
         "{output}"
     );
     assert!(!output.contains(":rule weakening"), "{output}");
+}
+
+#[test]
+fn surface_symm_rejects_z3_escaped_quoted_symbol_before_publication() {
+    let mut terms = TermStore::new();
+    let symbol = terms.mk_var("x|y", Sort::String);
+    let string = terms.mk_string("a\"b".to_string());
+    let premise = raw_equality(&mut terms, symbol, string);
+    let conclusion = raw_equality(&mut terms, string, symbol);
+    let mut proof = Proof::new();
+    let assumed = proof.add_assume(premise, None);
+    proof.add_rule_step(AletheRule::Symm, vec![conclusion], vec![assumed], vec![]);
+
+    assert!(matches!(
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[premise], None),
+        Err(AlethePrintError::UnavailableAuthenticatedSurface { .. })
+    ));
 }
 
 #[test]

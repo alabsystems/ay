@@ -11,15 +11,16 @@ use super::proof_farkas::try_lra_farkas_reconstruction;
 use super::proof_farkas_validation::blocking_clause_to_conflict;
 use super::proof_resolution::congruence::substitute_in_term;
 
-/// Synthesize Farkas coefficients for integer equality contradiction clauses.
+/// Synthesize Farkas coefficients for arithmetic equality contradiction clauses.
 ///
 /// Handles clauses of the form `(not (= t c1)) (not (= t c2))` where `t`
-/// is an integer-sorted term and `c1 != c2` are distinct integer constants.
+/// is Int/Real-sorted and `c1 != c2` are distinct exact numeric constants.
 pub(in crate::executor) fn synthesize_equality_farkas(
     terms: &TermStore,
     clause: &[TermId],
 ) -> Option<ay_core::FarkasAnnotation> {
-    use ay_core::{FarkasAnnotation, Sort};
+    use ay_core::{Constant, FarkasAnnotation, Sort};
+    use num_rational::BigRational;
 
     if clause.len() != 2 {
         return None;
@@ -40,22 +41,33 @@ pub(in crate::executor) fn synthesize_equality_farkas(
 
     let (lhs1, rhs1) = decode_negated_eq(clause[0])?;
     let (lhs2, rhs2) = decode_negated_eq(clause[1])?;
-    if !matches!(terms.sort(lhs1), Sort::Int) {
+    if !matches!(terms.sort(lhs1), Sort::Int | Sort::Real) {
         return None;
     }
 
-    let extract_int_const = |term: TermId| -> Option<i64> {
+    let extract_numeric_const = |term: TermId| -> Option<BigRational> {
         match terms.get(term) {
-            TermData::Const(ay_core::Constant::Int(n)) => n.try_into().ok(),
+            TermData::Const(Constant::Int(value)) => Some(BigRational::from_integer(value.clone())),
+            TermData::Const(Constant::Rational(value)) => Some(value.0.clone()),
             _ => None,
         }
     };
-    let constants_differ = |first: TermId, second: TermId| -> Option<bool> {
-        Some(extract_int_const(first)? != extract_int_const(second)?)
+    let split_numeric_equality = |lhs: TermId, rhs: TermId| {
+        match (extract_numeric_const(lhs), extract_numeric_const(rhs)) {
+            (None, Some(constant)) => Some((lhs, constant)),
+            (Some(constant), None) => Some((rhs, constant)),
+            // This lane proves two distinct values for one shared arithmetic
+            // term.  Constant-vs-constant rows and rows with no exact numeric
+            // endpoint belong to other reconstruction paths.
+            _ => None,
+        }
     };
 
-    if (lhs1 == lhs2 && constants_differ(rhs1, rhs2)?)
-        || (rhs1 == rhs2 && constants_differ(lhs1, lhs2)?)
+    let (term1, constant1) = split_numeric_equality(lhs1, rhs1)?;
+    let (term2, constant2) = split_numeric_equality(lhs2, rhs2)?;
+    if term1 == term2
+        && matches!(terms.sort(term1), Sort::Int | Sort::Real)
+        && constant1 != constant2
     {
         return Some(FarkasAnnotation::from_ints(&[1, 1]));
     }

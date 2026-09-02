@@ -23,7 +23,7 @@
 use super::*;
 use crate::pdr::model::InvariantModel;
 use crate::smt::executor_adapter::check_unsat_smtlib_via_executor;
-use crate::ChcOp;
+use crate::{ChcOp, SmtValue};
 
 /// Deterministic splitmix64 RNG — no external dependency, reproducible runs.
 struct Rng(u64);
@@ -371,8 +371,76 @@ fn bv_sign_extend_above_u128_backing_store_uses_zero_sign_bit() {
         vec![Arc::new(ChcExpr::BitVec(u128::MAX, 129))],
     );
 
+    let simplified = sign_extend.simplify_constants();
+    assert_eq!(simplified.sort(), ChcSort::BitVec(136));
     assert_eq!(
-        sign_extend.simplify_constants(),
-        ChcExpr::BitVec(u128::MAX, 136)
+        evaluate_expr(&simplified, &FxHashMap::default()),
+        Some(SmtValue::bitvec_from_u128(u128::MAX, 136))
+    );
+}
+
+#[test]
+fn noncanonical_bv_literals_fold_modulo_their_declared_width() {
+    let semantic_zero = ChcExpr::BitVec(2, 1);
+    assert_eq!(
+        ChcExpr::eq(semantic_zero.clone(), ChcExpr::BitVec(0, 1)).simplify_constants(),
+        ChcExpr::Bool(true)
+    );
+    assert_eq!(
+        ChcExpr::Op(
+            ChcOp::BvULt,
+            vec![
+                Arc::new(semantic_zero.clone()),
+                Arc::new(ChcExpr::BitVec(1, 1))
+            ],
+        )
+        .simplify_constants(),
+        ChcExpr::Bool(true)
+    );
+    assert_eq!(
+        ChcExpr::Op(
+            ChcOp::BvConcat,
+            vec![
+                Arc::new(ChcExpr::BitVec(0, 1)),
+                Arc::new(semantic_zero.clone())
+            ],
+        )
+        .simplify_constants(),
+        ChcExpr::BitVec(0, 2)
+    );
+    assert_eq!(
+        ChcExpr::Op(
+            ChcOp::BvZeroExtend(1),
+            vec![Arc::new(semantic_zero.clone())]
+        )
+        .simplify_constants(),
+        ChcExpr::BitVec(0, 2)
+    );
+    assert_eq!(
+        ChcExpr::Op(ChcOp::BvSignExtend(1), vec![Arc::new(semantic_zero)]).simplify_constants(),
+        ChcExpr::BitVec(0, 2)
+    );
+}
+
+#[test]
+fn mixed_width_bv_literal_equality_stays_symbolic() {
+    let equality = ChcExpr::eq(ChcExpr::BitVec(1, 1), ChcExpr::BitVec(1, 2));
+    assert!(matches!(
+        equality.simplify_constants(),
+        ChcExpr::Op(ChcOp::Eq, _)
+    ));
+}
+
+#[test]
+fn sign_extend_128_to_129_preserves_the_new_high_bit() {
+    let sign_extend = ChcExpr::Op(
+        ChcOp::BvSignExtend(1),
+        vec![Arc::new(ChcExpr::BitVec(1_u128 << 127, 128))],
+    );
+    let simplified = sign_extend.simplify_constants();
+    let expected = (num_bigint::BigUint::from(3_u8)) << 127;
+    assert_eq!(
+        evaluate_expr(&simplified, &FxHashMap::default()),
+        Some(SmtValue::bitvec_from_biguint(expected, 129))
     );
 }

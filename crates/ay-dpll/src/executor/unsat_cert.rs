@@ -3873,11 +3873,47 @@ impl Executor {
         if conflict_limit == Some(0) || decision_limit == Some(0) {
             return false;
         }
+        let certification_deadline = self.certification_deadline.get();
+        let resources_live = |child: Option<&Executor>| {
+            !self
+                .solve_interrupt
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                && certification_deadline
+                    .is_none_or(|deadline| ay_core::time::Instant::now() < deadline)
+                && !crate::memory::memory_exceeded(self.memory_limit())
+                && !ay_sys::process_memory_exceeded()
+                && !ay_core::TermStore::global_memory_exceeded()
+                && !self.term_memory_exceeded()
+                && !self
+                    .term_memory_limit()
+                    .is_some_and(|limit| self.ctx.terms.true_memory_bytes() > limit)
+                && child.is_none_or(|executor| {
+                    !executor.term_memory_exceeded()
+                        && !executor
+                            .term_memory_limit()
+                            .is_some_and(|limit| executor.ctx.terms.true_memory_bytes() > limit)
+                })
+        };
+        if !resources_live(None)
+            || !crate::memory::probe_clone_fits(
+                self.ctx.terms.true_memory_bytes(),
+                self.memory_limit(),
+            )
+        {
+            return false;
+        }
         // This whole-problem re-solve accounted for 94.1% of mint cost on
         // dillig12_m despite only 94/1019 mints reaching it (#cert-accounting 6).
         let _nested_timer = cert_accounting::NestedCorroborationTimer::start();
         let mut exec = Executor::new();
         exec.ctx = self.ctx.clone();
+        exec.set_memory_limit(self.memory_limit());
+        exec.set_term_memory_limit(self.term_memory_limit());
+        exec.set_solve_controls(self.solve_interrupt.clone(), certification_deadline);
+        if !resources_live(Some(&exec)) {
+            return false;
+        }
         // Re-decide the AUTHORED problem, NOT `self.ctx.assertions` — the same
         // set steps (1) and (2) use, which `proof_export_scope_assertions`
         // builds to INCLUDE the query's `check-sat-assuming` assumptions.
@@ -3890,6 +3926,9 @@ impl Executor {
         // CORRECT `unsat` was published UNCONFIRMED. Sound but over-conservative
         // — `base |= false` implies `base AND A |= false`, never the reverse.
         exec.ctx.assertions = problem.to_vec();
+        if !resources_live(Some(&exec)) {
+            return false;
+        }
         // REBUILD THE ARENA AROUND THIS QUERY.
         //
         // The clone above is deliberate and stays — a thin re-translate of the
@@ -3915,12 +3954,23 @@ impl Executor {
         //
         // Fail-closed: a context that could not be fully relabelled is
         // abandoned, never solved.
+        if !resources_live(Some(&exec))
+            || !crate::memory::probe_clone_fits(
+                exec.ctx.terms.true_memory_bytes(),
+                self.memory_limit(),
+            )
+        {
+            return false;
+        }
         if !exec.ctx.compact_terms_for_derived_query() {
             probe_cert_reject(|| {
                 "RECONFIRM(4) DECLINED: derived-query arena rebuild could not \
                  relabel every held term"
                     .to_string()
             });
+            return false;
+        }
+        if !resources_live(Some(&exec)) {
             return false;
         }
         // Mint exact authored-root/proof provenance for the nested obligation.
@@ -3942,8 +3992,6 @@ impl Executor {
         // certification, not the nominal quantified timeout that ordinary
         // solves may relax into a later hang-protection backstop.
         exec.set_quantifier_deadline_policy(QuantifierDeadlinePolicy::Exact);
-        exec.set_memory_limit(self.memory_limit());
-        exec.set_solve_controls(self.solve_interrupt.clone(), self.solve_deadline.get());
         let trace_rc = ay_core::misc_cli_flags().phase_trace;
         let verdict = exec.check_sat();
         self.probe_reconfirmation_outcome(&exec, &verdict, problem);
@@ -3969,23 +4017,6 @@ impl Executor {
             return false;
         };
         let strict = exec.check_proof_strict_with_datatypes(proof);
-        if trace_rc {
-            // Three arms, not two. With only Ok/Err this printed "DECLINED" and
-            // then ACCEPTED below, so the one diagnostic that localises this
-            // lane actively lied about its own outcome — and this trace is what
-            // identified the defect in the first place.
-            match &strict {
-                Ok(_) => eprintln!("c phase-trace reconfirm ACCEPTED"),
-                Err(e) if Self::is_deferred_discharge_rejection(e) => eprintln!(
-                    "c phase-trace reconfirm ACCEPTED: re-solve proof rejected only for a \
-                     trust-kind step or a metered envelope refusal ({e}), which is this \
-                     fallback's entry condition"
-                ),
-                Err(e) => eprintln!(
-                    "c phase-trace reconfirm DECLINED: strict check of re-solve proof failed: {e}"
-                ),
-            }
-        }
         // STRUCTURAL screen, not a trust-freeness demand.
         //
         // Requiring `strict.is_ok()` here made this fallback UNREACHABLE for the
@@ -4016,10 +4047,28 @@ impl Executor {
         // original proof is still fully strict-validated, the per-clause
         // standalone-tautology discharge still runs before this, and `unsat`
         // remains the only accepting verdict.
-        match &strict {
+        let structurally_accepted = match &strict {
             Ok(_) => true,
             Err(error) => Self::is_deferred_discharge_rejection(error),
+        };
+        let landed_live = resources_live(Some(&exec));
+        if trace_rc {
+            match (&strict, landed_live) {
+                (_, false) => eprintln!(
+                    "c phase-trace reconfirm DECLINED: publication resource envelope fired"
+                ),
+                (Ok(_), true) => eprintln!("c phase-trace reconfirm ACCEPTED"),
+                (Err(e), true) if Self::is_deferred_discharge_rejection(e) => eprintln!(
+                    "c phase-trace reconfirm ACCEPTED: re-solve proof rejected only for a \
+                     trust-kind step or a metered envelope refusal ({e}), which is this \
+                     fallback's entry condition"
+                ),
+                (Err(e), true) => eprintln!(
+                    "c phase-trace reconfirm DECLINED: strict check of re-solve proof failed: {e}"
+                ),
+            }
         }
+        structurally_accepted && landed_live
     }
 
     /// The rejection family the deferred-discharge path is defined over.
@@ -4221,6 +4270,43 @@ impl Executor {
         if conflict_limit == Some(0) || decision_limit == Some(0) {
             return false;
         }
+        let Some(local_deadline) =
+            ay_core::time::Instant::now().checked_add(std::time::Duration::from_millis(budget_ms))
+        else {
+            return false;
+        };
+        let deadline = self
+            .certification_deadline
+            .get()
+            .map_or(local_deadline, |outer| outer.min(local_deadline));
+        let resources_live = |child: Option<&Executor>| {
+            !self
+                .solve_interrupt
+                .as_ref()
+                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                && ay_core::time::Instant::now() < deadline
+                && !crate::memory::memory_exceeded(self.memory_limit())
+                && !ay_sys::process_memory_exceeded()
+                && !ay_core::TermStore::global_memory_exceeded()
+                && !self.term_memory_exceeded()
+                && !self
+                    .term_memory_limit()
+                    .is_some_and(|limit| self.ctx.terms.true_memory_bytes() > limit)
+                && child.is_none_or(|executor| {
+                    !executor.term_memory_exceeded()
+                        && !executor
+                            .term_memory_limit()
+                            .is_some_and(|limit| executor.ctx.terms.true_memory_bytes() > limit)
+                })
+        };
+        if !resources_live(None)
+            || !crate::memory::probe_clone_fits(
+                self.ctx.terms.true_memory_bytes(),
+                self.memory_limit(),
+            )
+        {
+            return false;
+        }
         // #cert-accounting item 6: a WHOLE-PROBLEM re-solve on a fresh
         // executor, run from inside a certificate mint. Measured on
         // dillig12_m as 94.1% of all mint cost from only 94 of 1019 mints,
@@ -4229,6 +4315,12 @@ impl Executor {
         let _nested_timer = cert_accounting::NestedCorroborationTimer::start();
         let mut exec = Executor::new();
         exec.ctx = self.ctx.clone();
+        exec.set_memory_limit(self.memory_limit());
+        exec.set_term_memory_limit(self.term_memory_limit());
+        exec.set_solve_controls(self.solve_interrupt.clone(), Some(deadline));
+        if !resources_live(Some(&exec)) {
+            return false;
+        }
         // Re-decide the AUTHORED assertions, NOT `self.ctx.assertions`.
         //
         // By certification time the working set has been through the solve
@@ -4249,14 +4341,9 @@ impl Executor {
         // sound answers is precisely the failure mode this funnel exists to
         // prevent.
         exec.ctx.assertions = authored.to_vec();
-        let local_deadline =
-            ay_core::time::Instant::now().checked_add(std::time::Duration::from_millis(budget_ms));
-        let outer_deadline = self.solve_deadline.get();
-        let deadline = match (outer_deadline, local_deadline) {
-            (Some(outer), Some(local)) => Some(outer.min(local)),
-            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-            (None, None) => None,
-        };
+        if !resources_live(Some(&exec)) {
+            return false;
+        }
         // Although this guard is downgrade-only, it is still part of the
         // caller's solve/publication transaction. Never let its private latency
         // cap replace an earlier caller deadline, and do not let quantified
@@ -4269,9 +4356,8 @@ impl Executor {
         // caller opt-out (or reintroduce a limit when both sides are unbounded).
         exec.set_ground_budget_enabled(false);
         exec.set_quantifier_deadline_policy(QuantifierDeadlinePolicy::Exact);
-        exec.set_memory_limit(self.memory_limit());
-        exec.set_solve_controls(self.solve_interrupt.clone(), deadline);
-        matches!(exec.check_sat(), Ok(result) if result.is_sat())
+        let result = exec.check_sat();
+        resources_live(Some(&exec)) && matches!(result, Ok(result) if result.is_sat())
     }
 
     /// The authored obligation this query actually decided.
@@ -4590,10 +4676,24 @@ impl Executor {
         // vacuously true on an empty list — without this conjunct such a proof
         // would be ACCEPTED having discharged nothing at all. Require a real
         // clause-by-clause discharge here; the empty case is step (4)'s.
+        let discharge_controls = crate::api::proofs::TrustClauseDischargeControls {
+            interrupt: self.solve_interrupt.clone(),
+            // Certification owns the outer command envelope; search lanes may
+            // temporarily narrow or relax `solve_deadline` without changing
+            // this publication boundary.
+            deadline: self.certification_deadline.get(),
+            memory_limit: self.memory_limit(),
+            term_memory_limit: self.term_memory_limit(),
+        };
         let all_discharged = !collected.is_empty()
             && collected.iter().all(|(_, clause)| {
-                crate::api::proofs::discharge_trust_clause(&self.ctx.terms, clause, &problem)
-                    .is_some()
+                crate::api::proofs::discharge_trust_clause_with_controls(
+                    &self.ctx.terms,
+                    clause,
+                    &problem,
+                    &discharge_controls,
+                )
+                .is_some()
             });
         if all_discharged {
             probe_cert_reject(|| {
@@ -5774,6 +5874,16 @@ mod tests {
     }
 
     #[test]
+    fn control_lifetime_child_term_limit_declines_strict_unsat_reconfirmation() {
+        let mut executor = Executor::new();
+        let problem = strict_boolean_contradiction(&mut executor);
+        let exact_parent_baseline = executor.ctx.terms.true_memory_bytes();
+        executor.set_term_memory_limit(Some(exact_parent_baseline));
+        assert!(!executor.term_memory_exceeded());
+        assert!(!executor.reconfirms_unsat_within(&problem, WHOLE_PROBLEM_RECONFIRMATION_LIMITS));
+    }
+
+    #[test]
     fn control_lifetime_tiny_outer_rlimit_declines_strict_unsat_reconfirmation() {
         let mut executor = Executor::new();
         let problem = pigeonhole_contradiction(&mut executor);
@@ -5809,6 +5919,16 @@ mod tests {
             .checked_sub(Duration::from_millis(1))
             .expect("one millisecond must fit before the current instant");
         executor.set_solve_controls(None, Some(expired));
+        assert!(!executor.redecides_definitive_sat_within(&[assertion], 60_000));
+    }
+
+    #[test]
+    fn control_lifetime_child_term_limit_declines_forged_unsat_guard() {
+        let mut executor = Executor::new();
+        let assertion = satisfiable_boolean_assertion(&mut executor);
+        let exact_parent_baseline = executor.ctx.terms.true_memory_bytes();
+        executor.set_term_memory_limit(Some(exact_parent_baseline));
+        assert!(!executor.term_memory_exceeded());
         assert!(!executor.redecides_definitive_sat_within(&[assertion], 60_000));
     }
 
@@ -6931,6 +7051,52 @@ mod tests {
                 .as_ref()
                 .map(|token| &token.0),
             Some(UnsatCertificateKind::CheckedSatRefutation { .. })
+        ));
+    }
+
+    #[test]
+    fn suppressed_native_proof_cannot_mint_a_promised_strict_presentation() {
+        let (mut executor, proposed) = independently_checked_boolean_contradiction();
+        let proof = executor
+            .last_proof
+            .as_ref()
+            .expect("fixture must retain its native proof");
+        executor
+            .check_proof_strict_with_datatypes(proof)
+            .expect("the native proof itself is strict");
+
+        executor.set_produce_proofs(true);
+        executor.last_unsat_proof_reconstruction_suppressed = true;
+        assert!(matches!(
+            executor.check_strict_unsat_presentation(),
+            Err(StrictProofPresentationFailure::Missing)
+        ));
+
+        let published = executor.certify_unsat_for_publication(proposed, &[]);
+
+        assert!(published.is_unknown());
+        assert!(executor.take_unsat_certificate().is_none());
+    }
+
+    #[test]
+    fn suppressed_native_proof_still_certifies_bare_self_check_truth() {
+        let (mut executor, proposed) = independently_checked_boolean_contradiction();
+        executor.set_self_check(true);
+        executor.last_unsat_proof_reconstruction_suppressed = true;
+
+        assert!(
+            executor.check_strict_unsat_presentation().is_ok(),
+            "bare self-check may replay the retained strict native proof"
+        );
+        let published = executor.certify_unsat_for_publication(proposed, &[]);
+
+        assert!(published.is_unsat());
+        assert!(matches!(
+            executor
+                .last_unsat_certificate
+                .as_ref()
+                .map(|token| &token.0),
+            Some(UnsatCertificateKind::StrictProof(_))
         ));
     }
 

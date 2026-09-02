@@ -19,6 +19,29 @@
 
 use super::*;
 
+/// Arity guards as slice patterns, so every element access in the rebuild
+/// dispatchers below is structurally in bounds.
+fn unary(args: &[TermId]) -> Option<TermId> {
+    match args {
+        &[a] => Some(a),
+        _ => None,
+    }
+}
+
+fn binary(args: &[TermId]) -> Option<(TermId, TermId)> {
+    match args {
+        &[a, b] => Some((a, b)),
+        _ => None,
+    }
+}
+
+fn ternary(args: &[TermId]) -> Option<(TermId, TermId, TermId)> {
+    match args {
+        &[a, b, c] => Some((a, b, c)),
+        _ => None,
+    }
+}
+
 impl TermStore {
     /// Simultaneously replace each `from[i]` subterm of `term` with `to[i]`.
     ///
@@ -36,12 +59,11 @@ impl TermStore {
     /// intended use is replacing ground constants, which has no capture concern.
     /// Binders are still traversed structurally (their bodies are rewritten).
     pub fn substitute(&mut self, term: TermId, from: &[TermId], to: &[TermId]) -> TermId {
-        let n = from.len().min(to.len());
-        if n == 0 {
+        if from.is_empty() || to.is_empty() {
             return term;
         }
         let mut cache = crate::kani_compat::det_hash_map_new();
-        self.substitute_inner(term, &from[..n], &to[..n], &mut cache)
+        self.substitute_inner(term, from, to, &mut cache)
     }
 
     /// Rebuild `term` bottom-up through the simplifying `mk_*` constructors,
@@ -152,9 +174,11 @@ impl TermStore {
     ) -> TermId {
         // Direct hit: replace WITHOUT recursing into the replacement
         // (simultaneous semantics). Checked first so a top-level match wins.
-        for (i, &f) in from.iter().enumerate() {
+        // `zip` honors only the common prefix, so unequal `from`/`to` lengths
+        // need no pre-truncation.
+        for (&f, &t) in from.iter().zip(to.iter()) {
             if term == f {
-                return to[i];
+                return t;
             }
         }
         if let Some(&cached) = cache.get(&term) {
@@ -252,129 +276,177 @@ impl TermStore {
     /// Mirrors the dispatch used by quantifier-instantiation substitution so the
     /// two paths produce identical interned terms.
     pub fn rebuild_app(&mut self, sym: &Symbol, args: Vec<TermId>, original: TermId) -> TermId {
+        // Dispatch is split by operator family: one flat match over every
+        // operator exceeds Trust's per-function VC-generation budget.
         let name = sym.name();
         match name {
-            // Boolean connectives
-            "and" => self.mk_and(args),
-            "or" => self.mk_or(args),
-            "=>" | "implies" if args.len() == 2 => self.mk_implies(args[0], args[1]),
-            "xor" if args.len() == 2 => self.mk_xor(args[0], args[1]),
-            // Equality / distinct
-            "=" if args.len() == 2 => self.mk_eq_coerce(args[0], args[1]),
-            "distinct" => self.mk_distinct(args),
-            // Arithmetic
-            "+" => self.mk_add(args),
-            "-" if args.len() == 1 => self.mk_neg(args[0]),
-            "-" => self.mk_sub(args),
-            "*" => self.mk_mul(args),
-            "/" if args.len() == 2 => self.mk_div(args[0], args[1]),
-            "div" if args.len() == 2 => self.mk_intdiv(args[0], args[1]),
-            "mod" if args.len() == 2 => self.mk_mod(args[0], args[1]),
-            "rem" if args.len() == 2 => self.mk_rem(args[0], args[1]),
-            "abs" if args.len() == 1 => self.mk_abs(args[0]),
-            "to_int" if args.len() == 1 => self.mk_to_int(args[0]),
-            "to_real" if args.len() == 1 => self.mk_to_real(args[0]),
-            "is_int" if args.len() == 1 => self.mk_is_int(args[0]),
-            "<" if args.len() == 2 => self.mk_lt(args[0], args[1]),
-            "<=" if args.len() == 2 => self.mk_le(args[0], args[1]),
-            ">" if args.len() == 2 => self.mk_gt(args[0], args[1]),
-            ">=" if args.len() == 2 => self.mk_ge(args[0], args[1]),
-            // Arrays
-            "select" if args.len() == 2 => self.mk_select(args[0], args[1]),
-            "store" if args.len() == 3 => self.mk_store(args[0], args[1], args[2]),
-            // BitVector binary
-            "bvadd" if args.len() == 2 => self.mk_bvadd(args),
-            "bvsub" if args.len() == 2 => self.mk_bvsub(args),
-            "bvmul" if args.len() == 2 => self.mk_bvmul(args),
-            "bvand" if args.len() == 2 => self.mk_bvand(args),
-            "bvor" if args.len() == 2 => self.mk_bvor(args),
-            "bvxor" if args.len() == 2 => self.mk_bvxor(args),
-            "bvnand" if args.len() == 2 => self.mk_bvnand(args),
-            "bvnor" if args.len() == 2 => self.mk_bvnor(args),
-            "bvxnor" if args.len() == 2 => self.mk_bvxnor(args),
-            "bvshl" if args.len() == 2 => self.mk_bvshl(args),
-            "bvlshr" if args.len() == 2 => self.mk_bvlshr(args),
-            "bvashr" if args.len() == 2 => self.mk_bvashr(args),
-            "bvudiv" if args.len() == 2 => self.mk_bvudiv(args),
-            "bvurem" if args.len() == 2 => self.mk_bvurem(args),
-            "bvsdiv" if args.len() == 2 => self.mk_bvsdiv(args),
-            "bvsrem" if args.len() == 2 => self.mk_bvsrem(args),
-            "bvsmod" if args.len() == 2 => self.mk_bvsmod(args),
-            "bvcomp" if args.len() == 2 => self.mk_bvcomp(args[0], args[1]),
-            "bvconcat" | "concat" if args.len() == 2 => self.mk_bvconcat(args),
-            // BitVector comparisons
-            "bvult" if args.len() == 2 => self.mk_bvult(args[0], args[1]),
-            "bvule" if args.len() == 2 => self.mk_bvule(args[0], args[1]),
-            "bvugt" if args.len() == 2 => self.mk_bvugt(args[0], args[1]),
-            "bvuge" if args.len() == 2 => self.mk_bvuge(args[0], args[1]),
-            "bvslt" if args.len() == 2 => self.mk_bvslt(args[0], args[1]),
-            "bvsle" if args.len() == 2 => self.mk_bvsle(args[0], args[1]),
-            "bvsgt" if args.len() == 2 => self.mk_bvsgt(args[0], args[1]),
-            "bvsge" if args.len() == 2 => self.mk_bvsge(args[0], args[1]),
-            // BitVector unary
-            "bvnot" if args.len() == 1 => self.mk_bvnot(args[0]),
-            "bvneg" if args.len() == 1 => self.mk_bvneg(args[0]),
-            // Indexed BitVector extract / repeat / rotate
-            "extract" if args.len() == 1 => match sym {
-                Symbol::Indexed(_, indices) if indices.len() >= 2 => {
-                    self.mk_bvextract(indices[0], indices[1], args[0])
-                }
-                _ => {
-                    let sort = self.sort(original).clone();
-                    self.mk_app(sym.clone(), args, sort)
-                }
-            },
-            "repeat" if args.len() == 1 => match sym {
-                Symbol::Indexed(_, indices) if !indices.is_empty() => {
-                    self.mk_bvrepeat(indices[0], args[0])
-                }
-                _ => {
-                    let sort = self.sort(original).clone();
-                    self.mk_app(sym.clone(), args, sort)
-                }
-            },
-            "rotate_left" if args.len() == 1 => match sym {
-                Symbol::Indexed(_, indices) if !indices.is_empty() => {
-                    self.mk_bvrotate_left(indices[0], args[0])
-                }
-                _ => {
-                    let sort = self.sort(original).clone();
-                    self.mk_app(sym.clone(), args, sort)
-                }
-            },
-            "rotate_right" if args.len() == 1 => match sym {
-                Symbol::Indexed(_, indices) if !indices.is_empty() => {
-                    self.mk_bvrotate_right(indices[0], args[0])
-                }
-                _ => {
-                    let sort = self.sort(original).clone();
-                    self.mk_app(sym.clone(), args, sort)
-                }
-            },
-            // Indexed BitVector extend
-            "zero_extend" if args.len() == 1 => match sym {
-                Symbol::Indexed(_, indices) if !indices.is_empty() => {
-                    self.mk_bvzero_extend(indices[0], args[0])
-                }
-                _ => {
-                    let sort = self.sort(original).clone();
-                    self.mk_app(sym.clone(), args, sort)
-                }
-            },
-            "sign_extend" if args.len() == 1 => match sym {
-                Symbol::Indexed(_, indices) if !indices.is_empty() => {
-                    self.mk_bvsign_extend(indices[0], args[0])
-                }
-                _ => {
-                    let sort = self.sort(original).clone();
-                    self.mk_app(sym.clone(), args, sort)
-                }
-            },
-            // Fallback: uninterpreted / other operators keep the original sort.
-            _ => {
-                let sort = self.sort(original).clone();
-                self.mk_app(sym.clone(), args, sort)
+            "and" | "or" | "=>" | "implies" | "xor" | "=" | "distinct" => {
+                self.rebuild_bool_app(name, sym, args, original)
             }
+            "+" | "-" | "*" | "/" | "div" | "mod" | "rem" | "abs" | "to_int" | "to_real"
+            | "is_int" | "<" | "<=" | ">" | ">=" => {
+                self.rebuild_arith_app(name, sym, args, original)
+            }
+            "select" | "store" => self.rebuild_array_app(name, sym, args, original),
+            "bvadd" | "bvsub" | "bvmul" | "bvand" | "bvor" | "bvxor" | "bvnand" | "bvnor"
+            | "bvxnor" | "bvshl" | "bvlshr" | "bvashr" | "bvudiv" | "bvurem" | "bvsdiv"
+            | "bvsrem" | "bvsmod" | "bvcomp" | "bvconcat" | "concat" => {
+                self.rebuild_bv_binary_app(name, sym, args, original)
+            }
+            "bvult" | "bvule" | "bvugt" | "bvuge" | "bvslt" | "bvsle" | "bvsgt" | "bvsge"
+            | "bvnot" | "bvneg" => self.rebuild_bv_cmp_unary_app(name, sym, args, original),
+            "extract" | "repeat" | "rotate_left" | "rotate_right" | "zero_extend"
+            | "sign_extend" => self.rebuild_bv_indexed_app(name, sym, args, original),
+            // Fallback: uninterpreted / other operators keep the original sort.
+            _ => self.rebuild_other_app(sym, args, original),
+        }
+    }
+
+    /// Shared fallback for operators without a folding builder (and for arity
+    /// guard misses inside the family dispatchers): raw `mk_app` carrying the
+    /// original node's sort.
+    fn rebuild_other_app(&mut self, sym: &Symbol, args: Vec<TermId>, original: TermId) -> TermId {
+        let sort = self.sort(original).clone();
+        self.mk_app(sym.clone(), args, sort)
+    }
+
+    fn rebuild_bool_app(
+        &mut self,
+        name: &str,
+        sym: &Symbol,
+        args: Vec<TermId>,
+        original: TermId,
+    ) -> TermId {
+        match (name, binary(&args)) {
+            ("and", _) => self.mk_and(args),
+            ("or", _) => self.mk_or(args),
+            ("=>" | "implies", Some((a, b))) => self.mk_implies(a, b),
+            ("xor", Some((a, b))) => self.mk_xor(a, b),
+            ("=", Some((a, b))) => self.mk_eq_coerce(a, b),
+            ("distinct", _) => self.mk_distinct(args),
+            _ => self.rebuild_other_app(sym, args, original),
+        }
+    }
+
+    fn rebuild_arith_app(
+        &mut self,
+        name: &str,
+        sym: &Symbol,
+        args: Vec<TermId>,
+        original: TermId,
+    ) -> TermId {
+        match (name, unary(&args), binary(&args)) {
+            ("+", ..) => self.mk_add(args),
+            ("-", Some(a), _) => self.mk_neg(a),
+            ("-", ..) => self.mk_sub(args),
+            ("*", ..) => self.mk_mul(args),
+            ("/", _, Some((a, b))) => self.mk_div(a, b),
+            ("div", _, Some((a, b))) => self.mk_intdiv(a, b),
+            ("mod", _, Some((a, b))) => self.mk_mod(a, b),
+            ("rem", _, Some((a, b))) => self.mk_rem(a, b),
+            ("abs", Some(a), _) => self.mk_abs(a),
+            ("to_int", Some(a), _) => self.mk_to_int(a),
+            ("to_real", Some(a), _) => self.mk_to_real(a),
+            ("is_int", Some(a), _) => self.mk_is_int(a),
+            ("<", _, Some((a, b))) => self.mk_lt(a, b),
+            ("<=", _, Some((a, b))) => self.mk_le(a, b),
+            (">", _, Some((a, b))) => self.mk_gt(a, b),
+            (">=", _, Some((a, b))) => self.mk_ge(a, b),
+            _ => self.rebuild_other_app(sym, args, original),
+        }
+    }
+
+    fn rebuild_array_app(
+        &mut self,
+        name: &str,
+        sym: &Symbol,
+        args: Vec<TermId>,
+        original: TermId,
+    ) -> TermId {
+        match (name, binary(&args), ternary(&args)) {
+            ("select", Some((a, i)), _) => self.mk_select(a, i),
+            ("store", _, Some((a, i, v))) => self.mk_store(a, i, v),
+            _ => self.rebuild_other_app(sym, args, original),
+        }
+    }
+
+    fn rebuild_bv_binary_app(
+        &mut self,
+        name: &str,
+        sym: &Symbol,
+        args: Vec<TermId>,
+        original: TermId,
+    ) -> TermId {
+        let Some((a, b)) = binary(&args) else {
+            return self.rebuild_other_app(sym, args, original);
+        };
+        match name {
+            "bvadd" => self.mk_bvadd(args),
+            "bvsub" => self.mk_bvsub(args),
+            "bvmul" => self.mk_bvmul(args),
+            "bvand" => self.mk_bvand(args),
+            "bvor" => self.mk_bvor(args),
+            "bvxor" => self.mk_bvxor(args),
+            "bvnand" => self.mk_bvnand(args),
+            "bvnor" => self.mk_bvnor(args),
+            "bvxnor" => self.mk_bvxnor(args),
+            "bvshl" => self.mk_bvshl(args),
+            "bvlshr" => self.mk_bvlshr(args),
+            "bvashr" => self.mk_bvashr(args),
+            "bvudiv" => self.mk_bvudiv(args),
+            "bvurem" => self.mk_bvurem(args),
+            "bvsdiv" => self.mk_bvsdiv(args),
+            "bvsrem" => self.mk_bvsrem(args),
+            "bvsmod" => self.mk_bvsmod(args),
+            "bvcomp" => self.mk_bvcomp(a, b),
+            "bvconcat" | "concat" => self.mk_bvconcat(args),
+            _ => self.rebuild_other_app(sym, args, original),
+        }
+    }
+
+    fn rebuild_bv_cmp_unary_app(
+        &mut self,
+        name: &str,
+        sym: &Symbol,
+        args: Vec<TermId>,
+        original: TermId,
+    ) -> TermId {
+        match (name, unary(&args), binary(&args)) {
+            ("bvult", _, Some((a, b))) => self.mk_bvult(a, b),
+            ("bvule", _, Some((a, b))) => self.mk_bvule(a, b),
+            ("bvugt", _, Some((a, b))) => self.mk_bvugt(a, b),
+            ("bvuge", _, Some((a, b))) => self.mk_bvuge(a, b),
+            ("bvslt", _, Some((a, b))) => self.mk_bvslt(a, b),
+            ("bvsle", _, Some((a, b))) => self.mk_bvsle(a, b),
+            ("bvsgt", _, Some((a, b))) => self.mk_bvsgt(a, b),
+            ("bvsge", _, Some((a, b))) => self.mk_bvsge(a, b),
+            ("bvnot", Some(a), _) => self.mk_bvnot(a),
+            ("bvneg", Some(a), _) => self.mk_bvneg(a),
+            _ => self.rebuild_other_app(sym, args, original),
+        }
+    }
+
+    fn rebuild_bv_indexed_app(
+        &mut self,
+        name: &str,
+        sym: &Symbol,
+        args: Vec<TermId>,
+        original: TermId,
+    ) -> TermId {
+        let Some(arg) = unary(&args) else {
+            return self.rebuild_other_app(sym, args, original);
+        };
+        match sym {
+            Symbol::Indexed(_, indices) => match (name, indices.as_slice()) {
+                ("extract", &[high, low, ..]) => self.mk_bvextract(high, low, arg),
+                ("repeat", &[i, ..]) => self.mk_bvrepeat(i, arg),
+                ("rotate_left", &[i, ..]) => self.mk_bvrotate_left(i, arg),
+                ("rotate_right", &[i, ..]) => self.mk_bvrotate_right(i, arg),
+                ("zero_extend", &[i, ..]) => self.mk_bvzero_extend(i, arg),
+                ("sign_extend", &[i, ..]) => self.mk_bvsign_extend(i, arg),
+                _ => self.rebuild_other_app(sym, args, original),
+            },
+            _ => self.rebuild_other_app(sym, args, original),
         }
     }
 }

@@ -619,6 +619,18 @@ pub struct Executor {
     /// Cleared and rolled back at the same query boundaries as the general
     /// rebuild scope.
     pub(crate) last_proof_raw_original_assertions: Vec<TermId>,
+    /// Source-exact `let` presentations whose capture-safe expansion was
+    /// independently raw-interned as an authored proof premise.
+    ///
+    /// Each row is `(expanded_root, parsed_assertion_index, source_surface)`.
+    /// This provenance is deliberately distinct from the two generic raw-term
+    /// authority ledgers above: the identity spelling of `expanded_root` is
+    /// the expanded body, while the external premise must retain the authored
+    /// `let` spelling and enter the printer through its certified let bridge.
+    /// The source resolver revalidates the indexed immutable parsed row before
+    /// retaining the override. Cleared and rolled back with the other proof
+    /// rebuild state.
+    pub(crate) last_proof_expanded_let_sources: Vec<(TermId, usize, String)>,
     /// Why the last refutation carries no derivation, when it carries none.
     ///
     /// Diagnostic only: nothing consults this to decide a verdict, mint a
@@ -1106,6 +1118,13 @@ pub struct Executor {
     /// `:timeout` deadline — checked at theory-loop boundaries via
     /// [`Self::should_abort_theory_loop`]. See [`Self::set_memory_limit`].
     pub(crate) memory_limit: Option<usize>,
+    /// Per-executor `TermStore` ceiling (bytes).
+    ///
+    /// Unlike `memory_limit`, this is independent of process RSS and therefore
+    /// composes across concurrent solver instances. Enforcement polls this
+    /// executor's own capacity-aware `TermStore` accounting at theory-loop and
+    /// publication boundaries. `None` means unbounded.
+    pub(crate) term_memory_limit: Option<usize>,
     /// Re-entry guard for pivot-bounded word equation enumeration (#3826).
     /// When > 0, the pivot enumeration pre-pass in solve_strings_lia is
     /// skipped to prevent infinite recursion.
@@ -2129,7 +2148,7 @@ impl Executor {
             }
             Command::Reset => {
                 self.incremental_mode = false;
-                self.lemma_cache.clear();
+                self.clear_query_scoped_authority();
                 // `(reset)` is strictly stronger than `(reset-assertions)`, so
                 // anything the latter clears this must clear too. The lane
                 // account was missed: review measured `(reset)` between two
@@ -2155,7 +2174,7 @@ impl Executor {
                 // Discard all incremental state. A fresh state will be
                 // created on the next push. Stay in incremental_mode per
                 // SMT-LIB 2.6 §4.2.2.
-                self.lemma_cache.clear();
+                self.clear_query_scoped_authority();
                 self.finite_model_lane.reset();
                 for_each_incremental_subsystem!(drop self);
             }

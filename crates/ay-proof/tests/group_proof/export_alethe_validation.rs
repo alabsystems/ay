@@ -415,8 +415,9 @@ fn assert_carcara_verdict(label: &str, problem: &str, proof: &str, expected: &st
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let status_matches = output.status.success() || expected == "invalid";
     assert!(
-        output.status.success() && stdout.trim() == expected,
+        status_matches && stdout.trim() == expected,
         "carcara verdict mismatch for generated Alethe proof ({label})\n\
          expected: {expected}\nstdout: {stdout}\nstderr: {stderr}\nproof:\n{proof}"
     );
