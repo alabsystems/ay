@@ -103,12 +103,12 @@ fn test_dpllt_unsat_core_with_euf() {
     let b = terms.mk_var("b", Sort::Uninterpreted("U".to_string()));
 
     let f_a = terms.mk_app(
-        Symbol::Named("f".to_string()),
+        Symbol::named("f"),
         vec![a],
         Sort::Uninterpreted("U".to_string()),
     );
     let f_b = terms.mk_app(
-        Symbol::Named("f".to_string()),
+        Symbol::named("f"),
         vec![b],
         Sort::Uninterpreted("U".to_string()),
     );

@@ -237,7 +237,7 @@ fn native_sequence_term_anchors_class_but_is_never_completed() {
     let unit = exec
         .ctx
         .terms
-        .mk_app(Symbol::Named("seq.unit".to_string()), vec![seven], seq_int);
+        .mk_app(Symbol::named("seq.unit"), vec![seven], seq_int);
     let equal = exec.ctx.terms.mk_eq(x, unit);
     exec.ctx.assertions.push(equal);
 

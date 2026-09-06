@@ -129,9 +129,11 @@ impl Solver {
             self.terms_mut().mark_is_int_shadowed();
         }
         let result_sort = self.lower_live_sort(&func.range);
-        let result =
-            self.terms_mut()
-                .mk_app(Symbol::Named(func.core_name.clone()), arg_ids, result_sort);
+        let result = self.terms_mut().mk_app(
+            Symbol::Named(func.core_name.clone().into()),
+            arg_ids,
+            result_sort,
+        );
         Ok(self.wrap_term(result))
     }
 

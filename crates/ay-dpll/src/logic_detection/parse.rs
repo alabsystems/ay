@@ -207,6 +207,11 @@ impl LogicCategory {
             "QF_UFDTLIA" | "QF_DTLIA" => Self::DtAuflia,
             "QF_UFDTLRA" | "QF_DTLRA" => Self::DtAuflra,
             "QF_UFDTLIRA" | "QF_DTLIRA" => Self::DtAuflira,
+            // QF_UFDTNIA had NO entry here, so it fell to `Other` and was
+            // rejected as an unsupported logic in 0.02 s before routing ever ran
+            // -- an instant hard zero on all 80 division instances. A 0.02 s
+            // `unknown` is a logic-table rejection, never a search failure.
+            "QF_UFDTNIA" | "QF_DTNIA" => Self::Ufdtnia,
             // Default to unsupported for unknown logics
             _ => Self::Other,
         }

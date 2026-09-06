@@ -266,7 +266,7 @@ impl SatProofManager<'_> {
                 if args.as_slice() == [subject] && name.starts_with("is-") =>
             {
                 Some(self.terms.mk_app(
-                    ay_core::Symbol::named(name),
+                    ay_core::Symbol::named(name.to_string()),
                     vec![neighbor],
                     ay_core::Sort::Bool,
                 ))

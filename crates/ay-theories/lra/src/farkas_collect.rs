@@ -722,6 +722,8 @@ impl LraSolver {
             self.trail.push((var, side, old_bound));
             // Bound retracted -> LIA algebraic-detection memo is stale.
             self.bump_bound_revision();
+            // The implied-bounds slot may hold the retracted bound's overlay.
+            self.note_direct_bound_widened(var);
             retracted += 1;
             if self.debug_lra {
                 safe_eprintln!(
@@ -733,8 +735,6 @@ impl LraSolver {
         if retracted > 0 {
             self.stats.unjustified_bound_retractions += retracted as u64;
             self.dirty = true;
-            // Bound state changed since the implied-bounds overlay was built.
-            self.direct_bounds_changed_since_implied = true;
             // The basic variable may have become feasible (its violated bound
             // was retracted) or may now admit a pivot — re-track it so the
             // error heap stays consistent.
@@ -802,6 +802,8 @@ impl LraSolver {
             self.trail.push((var, side, old_bound));
             // Bound retracted -> LIA algebraic-detection memo is stale.
             self.bump_bound_revision();
+            // The implied-bounds slot may hold the retracted bound's overlay.
+            self.note_direct_bound_widened(var);
             retracted += 1;
             if self.debug_lra {
                 safe_eprintln!(
@@ -813,7 +815,6 @@ impl LraSolver {
         if retracted > 0 {
             self.stats.unjustified_bound_retractions += retracted as u64;
             self.dirty = true;
-            self.direct_bounds_changed_since_implied = true;
             self.track_var_feasibility(var);
         }
         retracted

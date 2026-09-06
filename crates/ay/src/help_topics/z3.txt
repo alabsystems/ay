@@ -1,0 +1,186 @@
+ay accepts z3's command-line spellings and its stdin semantics, so a
+wrapper built for z3 can usually be pointed at ay by swapping the binary.
+The option forms a z3 caller already emits (-t:, -T:, -memory:, -in,
+-model, -st, -file:, and the module=value parameters) are accepted, and the
+catalog flags answer from tables extracted mechanically from libz3 5.0.0.
+
+Accepted is not the same as identical. ay is a different solver, so this
+page gives you the map, then names the exact three places where ay's
+behavior diverges from z3's. Two of those three change an exit code, so
+read them before you trust ay's exit status in a script.
+
+Named or symlinked as z3, ay enables --z3-mode on its own, so the
+transcript carries no ay provenance comments:
+
+  $ ln -s /path/to/ay ~/bin/z3
+  $ z3 -T:10 -st problem.smt2
+
+ACCEPTED SPELLINGS
+
+  -t:N                 Timeout in milliseconds. See DIVERGENCES 2.
+  -T:N                 Timeout in seconds. Same deadline, times 1000.
+  -memory:N            Memory ceiling in megabytes.
+  -in                  Read a live command stream from stdin, answering
+                       each command before the next, so a caller can
+                       hold stdin open. This is z3's -in, not a batch
+                       read: `-` below waits for EOF instead.
+  -                    Read the whole formula from stdin, then solve.
+  -file:PATH           Solve PATH.
+  -model               Print the model after a satisfiable check-sat.
+  -st                  Print an (:statistics ...) block after the run.
+  -wcnf, -pbo, -lp     Select the WCNF, PB or CPLEX LP parser. A
+                       .wcnf/.opb/.lp suffix selects the same parser.
+  -smt2                Accepted, dropped: ay detects the format itself.
+  -dimacs              Accepted, dropped: ay detects the format itself.
+  -nw                  Accepted, dropped: no warning channel here.
+  -v:N                 Accepted, dropped: does not change ay's output.
+  -?                   Help. -v and -version print the version.
+  --                   End option parsing, for files named -something.
+  timeout=N            Same as -t:N.
+  memory_max_size=N    Same as -memory:N.
+  stats=true           Same as -st.
+  dump_models=true     Same as -model. dump-models= is accepted too.
+
+  -p, -pd              Print every libz3 5.0.0 parameter, then exit.
+  -pm[:MODULE]         List the modules, or one module's parameters.
+  -pmmd[:MODULE]       The same listing, as Markdown.
+  -pp:NAME             Describe one parameter.
+  -tactics[:NAME]      List tactics, or one tactic's parameters.
+  -tacticsmd:NAME      Describe one tactic, as Markdown.
+  -simplifiers[:NAME]  List simplifiers, or one's parameters.
+  -probes              List the probes.
+  --z3-mode            z3-shaped transcript: no ay provenance comments,
+                       and bare ( ... ) models. See DIVERGENCES 3.
+
+Like z3's left-to-right parser, the parameter lookups -p, -pd, -pm, -pmmd
+and -pp consume the rest of argv and exit without solving. The catalog
+listings -tactics, -tacticsmd:, -simplifiers and -probes print and then go
+on to read the input.
+
+  $ ay -pp:sat.restart
+  sat.restart sat restart
+    name:           restart
+    module:         sat
+    qualified name: sat.restart
+    type:           symbol
+    description:    restart strategy: static, luby, ema or geometric
+    default value:  ema
+
+ACCEPTED BUT IGNORED
+
+Every module-qualified parameter libz3 5.0.0 exposes is accepted, because
+consumers such as Why3, Dafny and Boogie pass them on every invocation and
+a fatal error there would leave you with no verdict at all. The ones ay has
+no equivalent knob for are ignored, and ay says so on stderr rather than
+dropping them silently:
+
+  $ ay smt.mbqi=false problem.smt2
+  c accepted but NOT honored (ay has no such tuning knob): smt.mbqi
+
+Ignoring a strategy knob cannot make an answer unsound; at most it changes
+what ay would have explored. Compatibility no-ops in the same family:
+auto_config=, ctrl_c=, model.v2=, model.compact=, model.completion=,
+pp.single-line=, pp.bv-literals=, pp.fixed-indent=, type-check=,
+well-sorted-check=, trace=, trace_file_name=, fp.engine=spacer.
+
+A name z3 itself rejects, ay also rejects, so a typo is never swallowed:
+
+  $ ay smt.bogus_knob=1 problem.smt2
+  Error: unsupported Z3 parameter 'smt.bogus_knob=1'      (exit 1)
+
+REJECTED
+
+  -dl    Datalog input is not supported by the ay solve path.   exit 1
+  -log   z3 log input is not supported.                         exit 1
+  -opb   exit 109, reproducing z3 5.0.0's own refusal:
+           Error: invalid command line option: -opb
+           For usage information: z3 -h
+         Use -pbo for the PB parser; that spelling ay does accept.
+
+These are refusals, not gaps waiting to be filled in. ay has no Datalog
+frontend and no log replayer. A flag accepted and quietly dropped would let
+a wrapper believe it had handed ay a problem ay never read, and the verdict
+printed underneath would be answering a different question. A refusal costs
+you one run and tells you exactly what to change; an emulated flag that
+lies costs you the result, silently, and every result built on it.
+
+KNOWN DIVERGENCES
+
+1. A discarded command makes ay answer unknown where z3 answers sat, and
+   makes the whole run exit 1 whatever the verdict.
+
+   When a problem-contributing command (an assert, a declaration, a
+   definition, a stack op) fails to parse or elaborate, both solvers
+   report the error and continue on what remains. Dropping a constraint
+   can only turn unsat into sat, so ay fails closed:
+
+     $ ay drop.smt2    # (assert bogus) (assert (> x 5)) (check-sat)
+     (error "line 3 column 8: unknown constant bogus")
+     unknown
+     (:reason-unknown "a problem-contributing command was discarded")
+                                                             (exit 1)
+
+   z3 answers sat there. The error line and the verdict are on stdout;
+   the reason line is on stderr, and --z3-mode suppresses it -- including
+   under the z3 symlink above, where --z3-mode is already on. So do not
+   build the check on that line. What survives in every mode is the exit
+   code and the queryable reason, and the queryable reason is a
+   DIFFERENT string: (get-info :reason-unknown) answers
+
+  (:reason-unknown "(incomplete a problem-contributing command was discarded)")
+
+   Match a substring, not the stderr sentence.
+
+   An unsat remainder is published as unsat only when every discarded
+   command was an assert: dropping assertions weakens the problem, so a
+   refutation of the remainder refutes the whole. Discard a declaration
+   or a definition and even an unsat remainder answers unknown, because
+   the surviving terms need no longer mean what they meant. Both cases
+   still exit 1 -- a published unsat after a discard is not exit 0.
+
+2. -t: is a hard whole-process deadline; z3's -t: is a per-query soft
+   one. (-T: is whole-process in both.)
+
+   z3 documents -T: as the process timeout and -t: as a soft timeout that
+   "only kills the current query". ay maps both onto one wall-clock
+   watchdog, armed once at startup and never rearmed per check-sat, so a
+   script with ten queries shares a single budget and -t: is not soft.
+
+   How the run ends depends on whether a verdict already reached stdout.
+   Nothing decided yet: unknown, the reason on stderr, exit 124.
+
+     $ ay --z3-mode -T:3 hard.smt2
+     unknown
+     (:reason-unknown "timeout")                           (exit 124)
+
+   A sat or unsat already printed: the deadline counts as teardown
+   overrun, the verdict stands, and the exit code is the verdict's.
+
+     $ ay --z3-mode -T:5 two-queries.smt2
+     unsat
+     unknown
+     c timeout after the verdict was published; verdict stands
+                                                             (exit 0)
+
+   That second shape is the one to guard against. A later query cut short
+   prints unknown under an exit code of 0, with no (:reason-unknown
+   "timeout") anywhere. On multi-query input, read the verdicts; the exit
+   status alone will not tell you a query was truncated.
+
+   The deadline is wall-clock and the stop is not instant: a two-second
+   grace period for clean shutdown is followed by a hard process exit, so
+   -T:20 on an uninterruptible query returns at about 22 seconds.
+
+3. The model's shape depends on --z3-mode.
+
+   By default ay prints its native (model ...) head; under --z3-mode it
+   prints the bare ( ... ) sequence SMT-LIB 2.6 and z3 emit, which is what
+   a strict 2.6 reader expects. The define-funs are byte-identical:
+
+     default              --z3-mode
+     (model               (
+       (define-fun ...)     (define-fun ...)
+     )                    )
+
+Next: run `ay diagnose problem.smt2` to solve one file, validate ay's own
+model, and cross-check the verdict against the z3 on your PATH.

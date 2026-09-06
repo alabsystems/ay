@@ -560,3 +560,200 @@ fn reachable_step_mask_matches_the_authority_gate_cone() {
         "a dead assume is outside the cone the #8821 gate inspects"
     );
 }
+
+/// The `index_range` shape (verification-consumer should_succeed, obligation 2 of 7): the
+/// authored disequality reads `(select V36 (+ V37 4))`, constant propagation
+/// pinned `V37` to `0` and folded the index, and the leaf the exported proof
+/// assumed is `(not (= 4 (select V16 4)))`. `cong` cannot relate `(+ V37 4)` to
+/// `4` (an application against a constant) and no authored midpoint exists for
+/// `trans`, so this is exactly the leaf the bridge used to give up on.
+#[test]
+fn plan_substitution_bridge_crosses_a_folded_arithmetic_index() {
+    let mut exec = Executor::new();
+    let terms = &mut exec.ctx.terms;
+    let array_sort = Sort::array(Sort::Int, Sort::Int);
+    let v16 = terms.mk_var("V16", array_sort.clone());
+    let v36 = terms.mk_var("V36", array_sort.clone());
+    let v37 = terms.mk_var("V37", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0_u8));
+    let four = terms.mk_int(BigInt::from(4_u8));
+    let offset = terms.mk_app(Symbol::named("+"), [v37, four], Sort::Int);
+    let authored_select = terms.mk_app(Symbol::named("select"), [v36, offset], Sort::Int);
+    let authored_eq = terms.mk_app(Symbol::named("="), [four, authored_select], Sort::Bool);
+    let a154 = terms.mk_not_raw(authored_eq);
+    let a133 = terms.mk_app(Symbol::named("="), [v16, v36], Sort::Bool);
+    let a144 = terms.mk_app(Symbol::named("="), [zero, v37], Sort::Bool);
+    let leaf_select = terms.mk_app(Symbol::named("select"), [v16, four], Sort::Int);
+    let leaf_eq = terms.mk_app(Symbol::named("="), [four, leaf_select], Sort::Bool);
+    let goal = terms.mk_not_raw(leaf_eq);
+    let originals = vec![a154, a133, a144];
+
+    let plan = exec
+        .plan_substitution_bridge(goal, &originals)
+        .expect("authored pins must bridge the folded arithmetic index");
+    assert!(
+        plan.uses_ground_evaluate(),
+        "the folded index must be closed by the externally checkable evaluate rule"
+    );
+
+    let mut proof = Proof::new();
+    let assume_ids: HashMap<TermId, ProofId> = originals
+        .iter()
+        .map(|&term| (term, proof.add_assume(term, None)))
+        .collect();
+    let positive_leaf = proof.add_assume(leaf_eq, None);
+    let goal_unit =
+        Executor::emit_substitution_bridge(&mut exec.ctx.terms, &mut proof, &plan, &assume_ids)
+            .expect("planned arithmetic bridge must emit");
+    proof.add_resolution(Vec::new(), leaf_eq, positive_leaf, goal_unit);
+    ay_proof::check_proof_strict(&proof, &exec.ctx.terms)
+        .expect("every emitted arithmetic bridge step must pass the strict checker");
+    assert!(
+        ay_proof::validate_reachable_assumes_in_problem_scope(&proof, &[a154, a133, a144, leaf_eq])
+            .is_ok(),
+        "the bridge may only assume authored originals"
+    );
+}
+
+/// The `cc/fmap` shape (verification-consumer should_succeed, obligation 0 of 13): the
+/// authored disjunction carries `(= 0 V23)`, `V23` is pinned to `1` only
+/// TRANSITIVELY (`V23 = V29`, `1 = V29`), and the leaf reads `(or false ..)`.
+/// The Boolean-valued argument has to be resolved to `false` by evaluating the
+/// inner equality after its own arguments become constants.
+#[test]
+fn plan_eq_folds_a_transitively_pinned_equality_to_false() {
+    let mut exec = Executor::new();
+    let terms = &mut exec.ctx.terms;
+    let v23 = terms.mk_var("V23", Sort::Int);
+    let v29 = terms.mk_var("V29", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0_u8));
+    let one = terms.mk_int(BigInt::from(1_u8));
+    let false_term = terms.mk_bool(false);
+    let authored_disjunct = terms.mk_app(Symbol::named("="), [zero, v23], Sort::Bool);
+    let a61 = terms.mk_app(Symbol::named("="), [v23, v29], Sort::Bool);
+    let a62 = terms.mk_app(Symbol::named("="), [one, v29], Sort::Bool);
+    let originals = vec![a61, a62];
+
+    let mut budget = EQ_PLAN_BUDGET;
+    let plan = exec
+        .plan_eq(authored_disjunct, false_term, &originals, 0, &mut budget)
+        .expect("a transitively pinned equality must fold to its truth value");
+    assert!(plan.uses_ground_evaluate());
+    let mut assumed = Vec::new();
+    plan.collect_assumed(&mut assumed);
+    assert!(
+        assumed.iter().all(|term| originals.contains(term)),
+        "only authored equalities may be assumed"
+    );
+
+    let mut proof = Proof::new();
+    let assume_ids: HashMap<TermId, ProofId> = originals
+        .iter()
+        .map(|&term| (term, proof.add_assume(term, None)))
+        .collect();
+    let negated_goal = exec.ctx.terms.mk_not_raw(plan.eq);
+    let negated_goal_assume = proof.add_assume(negated_goal, None);
+    let goal_unit = Executor::emit_eq_plan(&mut proof, &plan, &assume_ids)
+        .expect("planned Boolean fold must emit");
+    proof.add_resolution(Vec::new(), plan.eq, goal_unit, negated_goal_assume);
+    ay_proof::check_proof_strict(&proof, &exec.ctx.terms)
+        .expect("every emitted Boolean fold step must pass the strict checker");
+}
+
+/// Fail-closed: the value has to come from the ORIGINAL assertions. With the
+/// pin withheld there is no derivation of `(= (+ V37 4) 4)` and the planner
+/// must decline rather than evaluate a term it merely GUESSED was ground.
+#[test]
+fn plan_eq_refuses_a_folded_index_without_the_authored_pin() {
+    let mut exec = Executor::new();
+    let terms = &mut exec.ctx.terms;
+    let v37 = terms.mk_var("V37", Sort::Int);
+    let other = terms.mk_var("V38", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0_u8));
+    let four = terms.mk_int(BigInt::from(4_u8));
+    let offset = terms.mk_app(Symbol::named("+"), [v37, four], Sort::Int);
+    // Pins a DIFFERENT variable: the candidate constant `0` is present in the
+    // problem, but nothing connects it to `V37`.
+    let decoy = terms.mk_app(Symbol::named("="), [zero, other], Sort::Bool);
+
+    let mut budget = EQ_PLAN_BUDGET;
+    assert!(
+        exec.plan_eq(offset, four, &[decoy], 0, &mut budget)
+            .is_none(),
+        "an unpinned argument must not be evaluated"
+    );
+    let mut budget = EQ_PLAN_BUDGET;
+    assert!(
+        exec.plan_eq(offset, four, &[], 0, &mut budget).is_none(),
+        "with no originals at all there is nothing to derive the fold from"
+    );
+}
+
+/// Fail-closed: a pin that makes the fold FALSE must not produce a plan. The
+/// emitted `evaluate` step is only ever the one the strict recognizer closes.
+#[test]
+fn plan_eq_refuses_a_false_arithmetic_fold() {
+    let mut exec = Executor::new();
+    let terms = &mut exec.ctx.terms;
+    let v37 = terms.mk_var("V37", Sort::Int);
+    let one = terms.mk_int(BigInt::from(1_u8));
+    let four = terms.mk_int(BigInt::from(4_u8));
+    let offset = terms.mk_app(Symbol::named("+"), [v37, four], Sort::Int);
+    let pin = terms.mk_app(Symbol::named("="), [one, v37], Sort::Bool);
+
+    let mut budget = EQ_PLAN_BUDGET;
+    assert!(
+        exec.plan_eq(offset, four, &[pin], 0, &mut budget).is_none(),
+        "(+ 1 4) is 5, not 4 — the recognizer must refuse and the plan collapse"
+    );
+}
+
+/// Candidate starvation, measured on verification-consumer `cc/fmap`: the authored set pins
+/// `v23` only through `v23 = v29`, `1 = v29`, and it ALSO names `v23 = v24`
+/// with nothing else mentioning `v24`. Planning a wrong candidate (`0`, from
+/// an unrelated pin authored earlier) walks that mutual definition to the depth
+/// bound; with one undivided counter it consumed the whole `EQ_PLAN_BUDGET` and
+/// the `1` that actually resolves `v23` was never tried. The per-candidate
+/// slice is what makes the search order-insensitive.
+#[test]
+fn plan_eq_folds_to_false_despite_an_earlier_hopeless_candidate() {
+    let mut exec = Executor::new();
+    let terms = &mut exec.ctx.terms;
+    let v23 = terms.mk_var("v23", Sort::Int);
+    let v24 = terms.mk_var("v24", Sort::Int);
+    let v29 = terms.mk_var("v29", Sort::Int);
+    let unrelated = terms.mk_var("unrelated", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0_u8));
+    let one = terms.mk_int(BigInt::from(1_u8));
+    let false_term = terms.mk_bool(false);
+    // `v23 = v24` with nothing else naming `v24`: a definition that leads
+    // nowhere but is walkable in both directions.
+    let dead_end = terms.mk_app(Symbol::named("="), [v23, v24], Sort::Bool);
+    let zero_pin = terms.mk_app(Symbol::named("="), [unrelated, zero], Sort::Bool);
+    let chain = terms.mk_app(Symbol::named("="), [v23, v29], Sort::Bool);
+    let value_pin = terms.mk_app(Symbol::named("="), [one, v29], Sort::Bool);
+    let disjunct = terms.mk_app(Symbol::named("="), [zero, v23], Sort::Bool);
+    let originals = vec![dead_end, zero_pin, chain, value_pin];
+
+    let mut budget = EQ_PLAN_BUDGET;
+    let plan = exec
+        .plan_eq(disjunct, false_term, &originals, 0, &mut budget)
+        .expect("a hopeless earlier candidate must not starve the good one");
+    assert!(plan.uses_ground_evaluate());
+    let mut assumed = Vec::new();
+    plan.collect_assumed(&mut assumed);
+    assert!(assumed.iter().all(|term| originals.contains(term)));
+
+    let mut proof = Proof::new();
+    let assume_ids: HashMap<TermId, ProofId> = originals
+        .iter()
+        .map(|&term| (term, proof.add_assume(term, None)))
+        .collect();
+    let negated_goal = exec.ctx.terms.mk_not_raw(plan.eq);
+    let negated_goal_assume = proof.add_assume(negated_goal, None);
+    let goal_unit = Executor::emit_eq_plan(&mut proof, &plan, &assume_ids)
+        .expect("planned Boolean fold must emit");
+    proof.add_resolution(Vec::new(), plan.eq, goal_unit, negated_goal_assume);
+    ay_proof::check_proof_strict(&proof, &exec.ctx.terms)
+        .expect("every emitted step must pass the strict checker");
+}

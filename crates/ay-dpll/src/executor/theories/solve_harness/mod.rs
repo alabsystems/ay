@@ -39,6 +39,33 @@ fn eliminate_mod_div_assertions_with_optional_sources(
     let mut rewritten_assertions = Vec::with_capacity(assertions.len());
     let mut rewritten_sources = Vec::with_capacity(source_sets.len());
     for (assertion, maybe_sources) in assertions.into_iter().zip(source_sets) {
+        // #modelim-gate: skip the rewrite entirely when the assertion contains no
+        // `mod`/`div`/`rem` at all. `eliminate_*` is called PER ASSERTION and builds
+        // a FRESH `ModDivElimState` each time, so its memo is not shared across
+        // assertions: on a formula set over one large shared term graph the same
+        // sub-graph is re-walked and re-cloned (`TermData::clone` + `String::clone`
+        // per node) once per assertion. Measured on a QF_UFDTLIA instance with ZERO
+        // mod/div and a recursive datatype (8 constructors, up to 7 recursive
+        // fields): 4.76 GB peak RSS in 6.6 s, and `mod_div_elim::rewrite_term` /
+        // `rewrite_args` dominating the allocation profile. When the predicate is
+        // false the pass is a no-op by construction — it returns the assertion
+        // unchanged with no constraints — so skipping is semantics-preserving, not
+        // an approximation. The same guard is already applied at
+        // `assumption_solving.rs:138` and `theories/lia/mod.rs:831`.
+        let needs_elim = if symbolic_divisors {
+            crate::executor::mod_div_elim::contains_symbolic_int_mod_div(terms, &[assertion])
+                || crate::executor::mod_div_elim::contains_int_mod_div_by_constant(
+                    terms,
+                    &[assertion],
+                )
+        } else {
+            crate::executor::mod_div_elim::contains_int_mod_div_by_constant(terms, &[assertion])
+        };
+        if !needs_elim {
+            rewritten_assertions.push(assertion);
+            rewritten_sources.push(maybe_sources);
+            continue;
+        }
         let mod_elim = if symbolic_divisors {
             eliminate_int_mod_div(terms, &[assertion])
         } else {
@@ -946,7 +973,18 @@ impl Executor {
             normalized_sources.sort_by_key(|term| term.index());
             normalized_sources.dedup();
 
-            let mod_elim = eliminate_int_mod_div_by_constant(&mut self.ctx.terms, &[assertion]);
+            // #modelim-gate (see the note on the shared helper above): the pass is
+            // called PER ASSERTION with a FRESH memo, so on a large shared term graph
+            // the same sub-graph is re-walked and re-cloned once per assertion. When
+            // the assertion has no mod/div the pass is a no-op by construction.
+            let mod_elim = if crate::executor::mod_div_elim::contains_int_mod_div_by_constant(
+                &self.ctx.terms,
+                &[assertion],
+            ) {
+                eliminate_int_mod_div_by_constant(&mut self.ctx.terms, &[assertion])
+            } else {
+                crate::executor::mod_div_elim::ModDivElimResult::identity(assertion)
+            };
             introduced_unconstrained_div_mod |= mod_elim.introduced_unconstrained_div_mod;
             for derived in mod_elim.constraints.into_iter().chain(mod_elim.rewritten) {
                 preprocessed.push(derived);
@@ -1064,7 +1102,18 @@ impl Executor {
         let mut preprocessed = Vec::new();
         let mut assertion_sources = HashMap::default();
         for &assertion in assertions {
-            let mod_elim = eliminate_int_mod_div_by_constant(&mut self.ctx.terms, &[assertion]);
+            // #modelim-gate (see the note on the shared helper above): the pass is
+            // called PER ASSERTION with a FRESH memo, so on a large shared term graph
+            // the same sub-graph is re-walked and re-cloned once per assertion. When
+            // the assertion has no mod/div the pass is a no-op by construction.
+            let mod_elim = if crate::executor::mod_div_elim::contains_int_mod_div_by_constant(
+                &self.ctx.terms,
+                &[assertion],
+            ) {
+                eliminate_int_mod_div_by_constant(&mut self.ctx.terms, &[assertion])
+            } else {
+                crate::executor::mod_div_elim::ModDivElimResult::identity(assertion)
+            };
             preprocessed.extend(mod_elim.constraints);
             for rewritten in mod_elim.rewritten {
                 preprocessed.push(rewritten);
@@ -1163,12 +1212,25 @@ impl Executor {
         let mut preprocessed_assertions = Vec::new();
         let mut source_sets: Vec<Option<Vec<Vec<TermId>>>> = Vec::new();
 
+        // #modelim-gate: ONE scan over the whole assertion list, not one per
+        // assertion. `contains_int_mod_div_by_constant` allocates a fresh `visited`
+        // set and walks the term graph on every call, so testing it per assertion
+        // costs the same O(assertions x shared-graph) it is meant to avoid.
+        let any_mod_div = crate::executor::mod_div_elim::contains_int_mod_div_by_constant(
+            &self.ctx.terms,
+            &original_assertions,
+        );
+
         for (assertion, sources) in flattened {
             let mut normalized_sources = sources;
             normalized_sources.sort_by_key(|term| term.index());
             normalized_sources.dedup();
 
-            let mod_elim = eliminate_int_mod_div_by_constant(&mut self.ctx.terms, &[assertion]);
+            let mod_elim = if any_mod_div {
+                eliminate_int_mod_div_by_constant(&mut self.ctx.terms, &[assertion])
+            } else {
+                crate::executor::mod_div_elim::ModDivElimResult::identity(assertion)
+            };
             let constraint_count = mod_elim.constraints.len();
             preprocessed_assertions.extend(mod_elim.constraints);
             source_sets.extend(std::iter::repeat_with(|| None).take(constraint_count));

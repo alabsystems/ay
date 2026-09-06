@@ -39,7 +39,7 @@ fn count_ites(terms: &TermStore, t: TermId) -> usize {
 /// Top-level operator name of an `App`, if any.
 fn top_op(terms: &TermStore, t: TermId) -> Option<String> {
     match terms.get(t) {
-        TermData::App(Symbol::Named(name), _) => Some(name.clone()),
+        TermData::App(Symbol::Named(name), _) => Some(name.to_string()),
         _ => None,
     }
 }

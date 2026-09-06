@@ -135,10 +135,14 @@ impl DtEgraphPass {
     /// The constructor name of a scanned constructor application/constant.
     fn ctor_name_of<'t>(&self, terms: &'t TermStore, term: TermId) -> Option<&'t str> {
         match terms.get(term) {
-            TermData::App(Symbol::Named(name), _) if self.ctor_to_dt.contains_key(name) => {
+            TermData::App(Symbol::Named(name), _)
+                if self.ctor_to_dt.contains_key(name.as_str()) =>
+            {
                 Some(name.as_str())
             }
-            TermData::Var(name, _) if self.ctor_to_dt.contains_key(name) => Some(name.as_str()),
+            TermData::Var(name, _) if self.ctor_to_dt.contains_key(name.as_str()) => {
+                Some(name.as_str())
+            }
             _ => None,
         }
     }
@@ -159,11 +163,11 @@ impl DtEgraphPass {
             }
             match terms.get(t) {
                 TermData::Var(name, _) => {
-                    let g = self.ctor_to_dt.contains_key(name);
+                    let g = self.ctor_to_dt.contains_key(name.as_str());
                     self.ground_memo.insert(t, g);
                 }
                 TermData::App(Symbol::Named(name), args) => {
-                    if !self.ctor_to_dt.contains_key(name) {
+                    if !self.ctor_to_dt.contains_key(name.as_str()) {
                         self.ground_memo.insert(t, false);
                         continue;
                     }
@@ -583,11 +587,11 @@ mod tests {
         let mut terms = TermStore::new();
         let nat = Sort::Uninterpreted("nat".to_string());
         let x = terms.mk_var("x", nat.clone());
-        let px = terms.mk_app(Symbol::Named("pred".to_string()), [x], nat.clone());
-        let ppx = terms.mk_app(Symbol::Named("pred".to_string()), [px], nat.clone());
+        let px = terms.mk_app(Symbol::named("pred"), [x], nat.clone());
+        let ppx = terms.mk_app(Symbol::named("pred"), [px], nat.clone());
         let zero = terms.mk_var("zero", nat.clone());
-        let succ_px = terms.mk_app(Symbol::Named("succ".to_string()), [px], nat.clone());
-        let succ_ppx = terms.mk_app(Symbol::Named("succ".to_string()), [ppx], nat.clone());
+        let succ_px = terms.mk_app(Symbol::named("succ"), [px], nat.clone());
+        let succ_ppx = terms.mk_app(Symbol::named("succ"), [ppx], nat.clone());
         let mut pass = DtEgraphPass::new();
         pass.register_datatype("nat", &["succ".to_string(), "zero".to_string()]);
         (terms, pass, x, px, ppx, zero, succ_px, succ_ppx)
@@ -681,8 +685,8 @@ mod tests {
         let mut terms = TermStore::new();
         let nat = Sort::Uninterpreted("nat".to_string());
         let zero = terms.mk_var("zero", nat.clone());
-        let s_zero = terms.mk_app(Symbol::Named("succ".to_string()), [zero], nat.clone());
-        let ss_zero = terms.mk_app(Symbol::Named("succ".to_string()), [s_zero], nat.clone());
+        let s_zero = terms.mk_app(Symbol::named("succ"), [zero], nat.clone());
+        let ss_zero = terms.mk_app(Symbol::named("succ"), [s_zero], nat.clone());
         let x = terms.mk_var("x", nat.clone());
         let y = terms.mk_var("y", nat.clone());
         let mut pass = DtEgraphPass::new();
@@ -717,7 +721,7 @@ mod tests {
         // path to succ(zero)) must NOT conflict.
         let mut terms2 = TermStore::new();
         let zero2 = terms2.mk_var("zero", nat.clone());
-        let s_zero2 = terms2.mk_app(Symbol::Named("succ".to_string()), [zero2], nat.clone());
+        let s_zero2 = terms2.mk_app(Symbol::named("succ"), [zero2], nat.clone());
         let w = terms2.mk_var("w", nat.clone());
         let eq_a = terms2.mk_eq(w, s_zero2);
         let mut pass2 = DtEgraphPass::new();
@@ -740,7 +744,7 @@ mod tests {
         // 1b conflict even though the args are not known equal.
         let v = terms.mk_var("v", Sort::Uninterpreted("nat".to_string()));
         let succ_v = terms.mk_app(
-            Symbol::Named("succ".to_string()),
+            Symbol::named("succ"),
             [v],
             Sort::Uninterpreted("nat".to_string()),
         );

@@ -814,7 +814,7 @@ impl Executor {
                 TermData::App(Symbol::Named(n), _) => n.clone(),
                 _ => continue,
             };
-            hits.push((term, ctor_term, ctor_name, other, dt_name));
+            hits.push((term, ctor_term, ctor_name.to_string(), other, dt_name));
         }
         if hits.is_empty() {
             return Vec::new();
@@ -902,7 +902,7 @@ impl Executor {
             if let Some(nested) = nested_dt {
                 let nested_ctor: Option<String> = match self.ctx.terms.get(arg) {
                     TermData::App(Symbol::Named(n), _) if self.ctx.is_constructor(n).is_some() => {
-                        Some(n.clone())
+                        Some(n.clone().to_string())
                     }
                     _ => None,
                 };
@@ -2519,7 +2519,7 @@ impl Executor {
             let head = match self.ctx.terms.get(t) {
                 TermData::Ite(g, x, y) => Head::Ite(*g, *x, *y),
                 TermData::App(Symbol::Named(n), _) if self.ctx.is_constructor(n).is_some() => {
-                    Head::Ctor(n.clone())
+                    Head::Ctor(n.clone().to_string())
                 }
                 _ => Head::Other,
             };
@@ -2602,7 +2602,7 @@ impl Executor {
             let head = match self.ctx.terms.get(t) {
                 TermData::Ite(g, x, y) => Head::Ite(*g, *x, *y),
                 TermData::App(Symbol::Named(n), _) if self.ctx.is_constructor(n).is_some() => {
-                    Head::Ctor(n.clone())
+                    Head::Ctor(n.clone().to_string())
                 }
                 _ => Head::Other,
             };
@@ -2819,7 +2819,7 @@ impl Executor {
     fn dt_ctor_app_parts(&self, term: TermId) -> Option<(String, Vec<TermId>)> {
         match self.ctx.terms.get(term) {
             TermData::App(Symbol::Named(n), args) if self.ctx.is_constructor(n).is_some() => {
-                Some((n.clone(), args.clone()))
+                Some((n.clone().to_string(), args.clone()))
             }
             TermData::Var(n, _) if self.ctx.is_constructor(n).is_some() => {
                 Some((n.clone(), Vec::new()))
@@ -2947,9 +2947,9 @@ impl Executor {
                         // Check if name is a selector by looking for it in any constructor's
                         // selector list.
                         for (_ctor_name, sel_list) in self.ctx.ctor_selectors_iter() {
-                            if sel_list.contains(&name.clone()) {
+                            if sel_list.contains(&name.clone().to_string()) {
                                 selector_apps
-                                    .entry(name.clone())
+                                    .entry(name.clone().to_string())
                                     .or_default()
                                     .push((term, args[0]));
                                 break;
@@ -3005,7 +3005,7 @@ impl Executor {
                                                     var_to_ctor.insert(
                                                         p,
                                                         (
-                                                            ctor_name.clone(),
+                                                            ctor_name.clone().to_string(),
                                                             ctor_args.clone(),
                                                             selector_syms,
                                                             Some((term, ctor_term)),

@@ -978,6 +978,18 @@ pub(crate) struct ColdState {
     /// solve is free of ambient filesystem I/O. Authority-gated proof paths
     /// remain fail-closed when this is disabled.
     pub(super) ambient_artifacts_enabled: bool,
+    /// Explicit destination for the Fmla learned-LRAT dry-run proof artifact.
+    ///
+    /// `None` (the default) means this solver exports no dry-run artifact at
+    /// all. The destination is *never* discovered from the process
+    /// environment inside the solver: the process-configuration owner (the
+    /// CLI/DIMACS layer) resolves
+    /// `AY_SAT_FMLA_LEARNED_LRAT_DRY_RUN_ARTIFACT` once and installs it here
+    /// with `set_fmla_learned_lrat_dry_run_artifact_path`. Reading a
+    /// process-global path at finalization time made every solve in a process
+    /// write to one shared destination, so unrelated solvers overwrote each
+    /// other's artifacts.
+    pub(super) fmla_learned_lrat_dry_run_artifact_path: Option<std::path::PathBuf>,
     /// Whether backward LRAT steps are retained in the returned
     /// `ProofCertificate` after they have been emitted to the proof writer.
     pub(super) retain_unsat_certificate: bool,
@@ -1021,6 +1033,16 @@ pub(crate) struct ColdState {
     ///
     /// Computed once at `init_solve()` based on the original clause database.
     pub(super) jump_reasons_enabled: bool,
+    /// Bitset over variable indices: root-level facts already stated as unit
+    /// clauses on the strict-deletion (VeriPB) proof surface.
+    ///
+    /// A unit stated once stays in the checker's database for the rest of the
+    /// proof stream — `VeripbWriter::delete` drops unit deletions — so later
+    /// lost-support restatements of the same fact are redundant lines. The
+    /// bitset makes `proof_emit_level0_unit_for_lost_reason` idempotent per
+    /// variable, bounding restatement cost at one line per root-fixed var.
+    /// Grown lazily; empty on the DRAT/LRAT surfaces, which never state.
+    pub(super) veripb_stated_root_units: Vec<u64>,
     /// Whether the empty clause derivation was already written to proof_manager.
     /// Prevents duplicate empty-clause entries between mark_empty_clause and
     /// finalize_unsat_proof (#4123).
@@ -2106,6 +2128,7 @@ impl ColdState {
             internal_lrat_enabled: false,
             unsat_certificate_enabled: true,
             ambient_artifacts_enabled: true,
+            fmla_learned_lrat_dry_run_artifact_path: None,
             retain_unsat_certificate: true,
             backward_proof_limits: None,
             backward_proof_failure: None,
@@ -2115,6 +2138,7 @@ impl ColdState {
             fmla_decompose_lrat_preflight_route_enabled: false,
             fmla_decompose_lrat_preflight_route_consumed: false,
             jump_reasons_enabled: false, // computed in init_solve (#8034)
+            veripb_stated_root_units: Vec::new(),
             empty_clause_in_proof: false,
             empty_clause_lrat_id: None,
             empty_clause_scope_depth: 0,

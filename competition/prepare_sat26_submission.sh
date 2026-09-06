@@ -1438,6 +1438,19 @@ run_pgo_training_instance() {
     profile_identity="$(manifest_value profile_identity)"
     # Train on the surface the SCORED run uses. Profiling the LRAT writer while
     # run.sh emits VeriPB optimizes a program the competition never executes.
+    #
+    # The flags below are pinned to veripb rather than derived from
+    # $PROOF_FORMAT, and that is only safe while veripb is the ONLY format a
+    # submission can be generated with. `load_sat_profile_metadata` enforces
+    # that (SUPPORTED_CHECKERS = {"veripb": "veripb"}), but it runs in
+    # `preflight_generated_root` — AFTER `build_source_with_pgo` — so it cannot
+    # protect the training surface, only the shipped artifact. Assert the
+    # coupling here so that adding a checker to SUPPORTED_CHECKERS fails loudly
+    # at the training site instead of silently profiling the wrong writer.
+    if [[ "$PROOF_FORMAT" != "veripb" ]]; then
+        fail_pgo "training-surface-mismatch" \
+            "PGO training is pinned to veripb but the submission would emit '$PROOF_FORMAT'; derive the training flags from \$PROOF_FORMAT before supporting another surface"
+    fi
     proof_path="$training_out/$(basename "$training_cnf").pbp"
 
     mkdir -p "$training_out"

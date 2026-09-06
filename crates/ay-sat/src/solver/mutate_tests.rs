@@ -1589,3 +1589,115 @@ fn test_delete_clause_checked_materializes_nested_level0_unit_proofs() {
         "delete-unit helper must preserve LRAT hint order: antecedent unit IDs first, deleted clause ID last\nproof:\n{proof}"
     );
 }
+
+/// Regression, b6de3c794e223fe515682f52e5d81272 (third DRAT-leniency family
+/// member, after 6aa0bbe61c and b2875b3b6a): a root fact whose reason edge
+/// does NOT name the clause that derives it (literal-tagged binary reasons
+/// under jump reasons + ChrBT, or a previously cleared edge) was invisible to
+/// every `reason == cref` protection, so deleting that clause removed the
+/// fact's only checker-side derivation. VeriPB honours the deletion; DRAT
+/// checkers skip it. The lost-support check must state the unit BEFORE the
+/// `del spec`, keyed on values alone, not on reason bookkeeping.
+#[test]
+fn test_veripb_delete_states_root_fact_even_without_matching_reason_edge() {
+    let proof = ProofOutput::veripb(Vec::new());
+    let mut solver: Solver = Solver::with_proof_output(3, proof);
+
+    let a = Literal::positive(Variable(0));
+    let b = Literal::positive(Variable(1));
+
+    // Binary clause (a | b): with b root-false and a root-true it is a live
+    // unit-propagation derivation of a.
+    solver.add_clause_db(&[a, b], false);
+
+    // Root-assign WITHOUT a clause reason edge (reason stays NO_REASON —
+    // the same visibility the literal-tagged binary reason encoding has to
+    // the reason-clause marks and `reason == cref` scans).
+    assign_level0_test_lit(&mut solver, b.negated());
+    assign_level0_test_lit(&mut solver, a);
+
+    solver
+        .proof_emit_delete(&[a, b], 0)
+        .expect("proof delete should succeed");
+
+    let writer = solver.take_proof_writer().expect("proof writer");
+    let proof_text = String::from_utf8(writer.into_vec().expect("flush")).expect("utf8");
+    assert_eq!(
+        proof_text,
+        "pseudo-Boolean proof version 3.0\n\
+         red 1 x1 >= 1 : x1 -> 1 ;\n\
+         del spec 1 x1 1 x2 >= 1 ;\n",
+        "the root fact must be stated while the deleted clause still justifies it"
+    );
+}
+
+/// The lost-support statement is idempotent per variable: once stated, the
+/// unit lives in the checker database for the rest of the stream (unit
+/// deletions are dropped), so a second deletion deriving the same fact must
+/// not add another line.
+#[test]
+fn test_veripb_lost_support_unit_is_stated_once_per_variable() {
+    let proof = ProofOutput::veripb(Vec::new());
+    let mut solver: Solver = Solver::with_proof_output(3, proof);
+
+    let a = Literal::positive(Variable(0));
+    let b = Literal::positive(Variable(1));
+    let c = Literal::positive(Variable(2));
+
+    solver.add_clause_db(&[a, b], false);
+    solver.add_clause_db(&[a, c], false);
+
+    assign_level0_test_lit(&mut solver, b.negated());
+    assign_level0_test_lit(&mut solver, c.negated());
+    assign_level0_test_lit(&mut solver, a);
+
+    solver.proof_emit_delete(&[a, b], 0).expect("delete 1");
+    solver.proof_emit_delete(&[a, c], 0).expect("delete 2");
+
+    let writer = solver.take_proof_writer().expect("proof writer");
+    let proof_text = String::from_utf8(writer.into_vec().expect("flush")).expect("utf8");
+    let unit_lines = proof_text
+        .lines()
+        .filter(|line| *line == "red 1 x1 >= 1 : x1 -> 1 ;")
+        .count();
+    assert_eq!(
+        unit_lines, 1,
+        "exactly one statement of the root fact expected\nproof:\n{proof_text}"
+    );
+}
+
+/// A deleted clause that does NOT currently unit-derive a root fact (two
+/// root-true literals, or an unassigned literal) must not trigger a unit
+/// statement: such a clause can never be the fact's derivation.
+#[test]
+fn test_veripb_delete_without_root_derivation_states_nothing() {
+    let proof = ProofOutput::veripb(Vec::new());
+    let mut solver: Solver = Solver::with_proof_output(4, proof);
+
+    let a = Literal::positive(Variable(0));
+    let b = Literal::positive(Variable(1));
+    let c = Literal::positive(Variable(2));
+    let d = Literal::positive(Variable(3));
+
+    // (a | b) with BOTH root-true: satisfied twice, derives nothing.
+    solver.add_clause_db(&[a, b], false);
+    // (c | d) with d unassigned: not a root derivation either.
+    solver.add_clause_db(&[c, d], false);
+
+    assign_level0_test_lit(&mut solver, a);
+    assign_level0_test_lit(&mut solver, b);
+    assign_level0_test_lit(&mut solver, c);
+
+    solver.proof_emit_delete(&[a, b], 0).expect("delete 1");
+    solver.proof_emit_delete(&[c, d], 0).expect("delete 2");
+
+    let writer = solver.take_proof_writer().expect("proof writer");
+    let proof_text = String::from_utf8(writer.into_vec().expect("flush")).expect("utf8");
+    assert_eq!(
+        proof_text,
+        "pseudo-Boolean proof version 3.0\n\
+         del spec 1 x1 1 x2 >= 1 ;\n\
+         del spec 1 x3 1 x4 >= 1 ;\n",
+        "no unit statement expected for non-derivation deletions"
+    );
+}

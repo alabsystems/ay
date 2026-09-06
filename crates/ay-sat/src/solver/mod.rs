@@ -58,6 +58,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 mod dump;
+mod dump_cnf;
 pub(crate) mod inproc_engines;
 #[cfg(feature = "jit")]
 #[allow(dead_code)]
@@ -76,6 +77,7 @@ pub(crate) mod tier_state;
 mod types;
 #[allow(dead_code)]
 mod var_data;
+pub use dump_cnf::{DumpCnfReport, DumpCnfVerdict, ExtendModelReport};
 pub use incremental::VarAssignmentKind;
 pub use lookahead::LookaheadStats;
 pub use origin_result::{SolverAssumeResult, SolverSatResult};

@@ -1336,7 +1336,7 @@ fn exact_closed_forall_operators(terms: &CoreTermStore, body: TermId) -> Option<
                 if !crate::executor::quantifier_loop::is_literal_witness_operator(name) {
                     return None;
                 }
-                operators.push(name.clone());
+                operators.push(name.clone().to_string());
                 stack.extend(args.iter().copied());
             }
             TermData::App(..) => return None,

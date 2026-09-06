@@ -209,7 +209,18 @@ impl LraSolver {
         // valid by monotonicity (their antecedent direct bounds / rows still
         // hold at the outer scope). This eliminates the full re-derivation
         // sweep that previously followed every CDCL backtrack.
+        //
+        // Dirty-row pop: every variable whose slot this rewind changed is
+        // stamped and its rows touched, so the next `compute_implied_bounds`
+        // re-derives exactly what the popped scope may have displaced (a
+        // bound derived inside the scope from outer-scope antecedents is
+        // popped here although still valid — its row is now dirty and the
+        // next call restores it). Rows containing no changed variable have
+        // identical inputs and would derive nothing new, so they are not
+        // swept; `tests/dirty_row_sweep.rs` checks this against a full
+        // re-derivation.
         let implied_mark = self.implied_trail_scopes.pop().unwrap_or(0);
+        let mut rewound_vars: SmallVec<[u32; 16]> = SmallVec::new();
         while self.implied_trail.len() > implied_mark {
             let (var, is_upper, old) = self.implied_trail.pop().unwrap();
             let vi = var as usize;
@@ -219,61 +230,54 @@ impl LraSolver {
                 } else {
                     self.implied_bounds[vi].0 = old;
                 }
+                rewound_vars.push(var);
             }
         }
-        // Close the retraction hole: direct-bound overlay merges are not
-        // trailed, so entries for vars whose DIRECT bound this pop restored
-        // may still carry the retracted (tighter) bound. Reset exactly those
-        // entries and stamp their generation so containing rows re-derive.
-        // O(popped bounds), replaces the old O(num_vars) clears of
-        // var_bound_gen / row_computed_gen / implied_tighten_streak.
-        if !changed_vars.is_empty() {
+        // Direct bounds this pop restored: direct-bound overlays are not
+        // trailed, so drop stale direct-overlay slot entries and queue the
+        // incremental re-overlay (`note_direct_bound_widened`); row-derived
+        // entries stay. When most variables changed, mark every row instead
+        // of walking columns (the overlay stays incremental: it is
+        // O(changed), the row sweep is the expensive part).
+        let many_changed = (changed_vars.len() + rewound_vars.len()) * 4 >= self.vars.len();
+        if many_changed {
             self.bound_generation += 1;
             let cur_gen = self.bound_generation;
-            for &var in &changed_vars {
+            for &var in changed_vars.iter().chain(rewound_vars.iter()) {
                 let vi = var as usize;
-                if vi < self.implied_bounds.len() {
-                    self.implied_bounds[vi] = (None, None);
-                }
                 if vi < self.var_bound_gen.len() {
                     self.var_bound_gen[vi] = cur_gen;
                 }
-                // #8857: a direct-bound change legitimately re-enables
-                // tightenings for this var.
                 if vi < self.implied_tighten_streak.len() {
                     self.implied_tighten_streak[vi] = 0;
                 }
             }
+            for &var in &changed_vars {
+                let vi = var as usize;
+                if let Some(slot) = self.implied_bounds.get_mut(vi) {
+                    if slot.0.as_ref().is_some_and(|b| b.row_idx == usize::MAX) {
+                        slot.0 = None;
+                    }
+                    if slot.1.as_ref().is_some_and(|b| b.row_idx == usize::MAX) {
+                        slot.1 = None;
+                    }
+                }
+                self.direct_bounds_changed_vars.push(var);
+            }
+            if !changed_vars.is_empty() {
+                self.direct_bounds_changed_since_implied = true;
+            }
+            for i in 0..self.rows.len() {
+                self.touched_rows.insert(i);
+            }
+        } else {
+            for &var in &changed_vars {
+                self.note_direct_bound_widened(var);
+            }
+            for &var in &rewound_vars {
+                self.stamp_var_for_rederivation(var);
+            }
         }
-        // #uflia-eager-sweep: the eager DPLL(T) combined lanes opt back into
-        // the pre-#inc-implied-trail / pre-#inc-prop-trail pop semantics —
-        // wholesale-clear the propagation memory so the next check re-derives
-        // and re-propagates EVERYTHING against the post-backtrack trail. The
-        // eager UFLIA lane's inline theory-conflict engine (and with it the
-        // hybrid arm's Hash-family sat converts, ~40 T:20 sats in the
-        // QF_UFLIA division) measurably depends on that post-backtrack
-        // re-propagation sweep: the persistence slices collapsed its inline
-        // conflict productivity 5.6x (bisect: f72a06aaa6 flipped the regime,
-        // d10d242273/4c7d3963f6 deepened it; eager fingerprint on
-        // hash_sat_03_11 smt.theory_conflicts 747 -> 132). Incremental
-        // consumers (BMC/IC3 push-pop, the workloads those slices were
-        // measured on) keep the trail-restored fast path — this flag is set
-        // only by the eager combined-theory lanes. The trail scope marks left
-        // behind point into cleared vecs; every subsequent rewind is a
-        // harmless no-op because this block runs on every pop of this solver
-        // instance (the flag is set for the solver's whole lifetime).
-        if self.eager_repropagate_on_pop {
-            self.propagated_atoms.clear();
-            self.propagated_trail.clear();
-            self.implied_trail.clear();
-            self.implied_bounds.clear();
-            self.var_bound_gen.clear();
-            self.row_computed_gen.clear();
-            self.implied_tighten_streak.clear();
-        }
-        // #inc-cib-nodelta: conservative — force one full sweep per pop epoch
-        // (rows whose generations were stamped above re-derive regardless).
-        self.ib_overlay_complete = false;
         if self.warm.enabled {
             // #warm-simplex: REPAIR the infeasible-candidate structures instead
             // of clearing them. Pop never rewrites variable VALUES (only the
@@ -324,8 +328,6 @@ impl LraSolver {
         // tracked-only chain (#inc-guard-chain) until a full verification.
         self.guard_clean_valid = false;
         self.guard_tracked_only = false;
-        self.direct_bounds_changed_since_implied = true;
-        self.direct_bounds_changed_vars.clear();
         self.bcp_implied_dry_streak = 0;
         self.bcp_cascade_dry_streak = 0;
         // #7772 F1: Reset Bland mode on pop. If Bland's rule was activated
@@ -343,34 +345,12 @@ impl LraSolver {
             self.rewind_persistent_unsupported_atoms(mark);
         }
         self.dirty = true;
-        // #8900: Targeted touched-row marking on pop.
-        // Instead of marking ALL rows as touched (O(rows)), only mark rows
-        // containing variables whose bounds changed. This reduces the work
-        // for compute_implied_bounds() on the next check() call from
-        // O(total_rows) to O(affected_rows). Cascading is handled by
-        // compute_implied_bounds()'s own touched_rows seeding at the end.
-        self.touched_rows.clear();
-        if changed_vars.is_empty() {
-            // No bounds changed — no rows to touch.
-        } else if changed_vars.len() * 4 >= self.vars.len() {
-            // Many variables changed — mark all rows.
-            for i in 0..self.rows.len() {
-                self.touched_rows.insert(i);
-            }
-        } else {
-            for &var in &changed_vars {
-                let vi = var as usize;
-                if vi < self.col_index.len() {
-                    for entry in &self.col_index[vi] {
-                        self.touched_rows.insert(entry.row_idx);
-                    }
-                }
-                if let Some(&ri) = self.basic_var_to_row.get(&var) {
-                    self.touched_rows.insert(ri);
-                }
-            }
-        }
-        self.propagate_direct_touched_rows_pending = false;
+        // #8900: rows to re-analyze were seeded above (rows of the variables
+        // whose direct bounds this pop restored or whose derived bounds it
+        // rewound); rows already pending from an outer-scope cascade
+        // continuation are kept — they are generation-skipped when their
+        // inputs did not change.
+        self.propagate_direct_touched_rows_pending = !self.touched_rows.is_empty();
         self.implied_bounds_fresh = false;
         self.lra_basis_region_requests.clear();
         self.lra_basis_region_candidate = None;

@@ -115,6 +115,7 @@ impl LraSolver {
             && !self.direct_bounds_changed_since_implied
             && self.rows.len() == self.rows_len_at_last_implied
         {
+            self.stats.implied_nodelta_skips += 1;
             return ImpliedBoundsResult {
                 newly_bounded: DenseU32Set::default(),
                 converged: true,
@@ -148,77 +149,11 @@ impl LraSolver {
             self.implied_tighten_touched.clear();
         }
 
-        // Overlay direct bounds into implied_bounds. A direct bound always
-        // replaces a missing implied bound. When both exist, keep the tighter
-        // one (direct bounds are always valid; implied bounds may be tighter
-        // from previous fixpoint passes).
-        // Direct bounds use row_idx = usize::MAX as sentinel.
-        //
-        // Incremental skip: when no direct bound has changed since the last
-        // call (direct_bounds_changed_since_implied == false), the overlay
-        // would recompute the same comparisons. Skip the O(num_vars) loop
-        // entirely. This eliminates the dominant per-BCP cost when the theory
-        // callback fires on cascade rows without new bound assertions.
-        if self.direct_bounds_changed_since_implied {
-            self.direct_bounds_changed_since_implied = false;
-            // Incremental overlay (#8782): when direct_bounds_changed_vars tracks
-            // specific changed variables, only overlay those instead of scanning
-            // all vars. On resize or after pop/reset (vec empty + flag true),
-            // fall back to full scan. Reduces O(num_vars) to O(changed_vars)
-            // in the common BCP-cascade case.
-            let use_incremental = !need_resize && !self.direct_bounds_changed_vars.is_empty();
-            if use_incremental {
-                let changed = std::mem::take(&mut self.direct_bounds_changed_vars);
-                // #8003: Bump generation once for the batch of direct bound changes.
-                self.bound_generation += 1;
-                let cur_gen = self.bound_generation;
-                for &var in &changed {
-                    let i = var as usize;
-                    if i >= self.vars.len() {
-                        continue;
-                    }
-                    self.big_bound_seen |= Self::var_has_big_direct_bound(&self.vars[i]);
-                    Self::overlay_direct_bound_for_var(&self.vars[i], &mut self.implied_bounds[i]);
-                    self.register_fixed_term_var(var);
-                    // Stamp variable so rows containing it are re-analyzed.
-                    if i < self.var_bound_gen.len() {
-                        self.var_bound_gen[i] = cur_gen;
-                    }
-                    // #8857: A direct-bound change legitimately enables a new
-                    // round of derived tightenings for this variable.
-                    if i < self.implied_tighten_streak.len() {
-                        self.implied_tighten_streak[i] = 0;
-                    }
-                }
-                self.direct_bounds_changed_vars = changed;
-                self.direct_bounds_changed_vars.clear();
-            } else {
-                self.direct_bounds_changed_vars.clear();
-                // #8857: Full-scan overlay is a lattice rebuild — reset all
-                // Zeno-throttle streaks.
-                self.implied_tighten_streak.fill(0);
-                // #8003: Full scan — bump generation and stamp all vars.
-                self.bound_generation += 1;
-                let cur_gen = self.bound_generation;
-                let mut fixed_vars = std::mem::take(&mut self.ib_fixed_vars_scratch);
-                fixed_vars.clear();
-                fixed_vars.reserve(num_vars);
-                let mut any_big = false;
-                for (i, info) in self.vars.iter().enumerate() {
-                    any_big |= Self::var_has_big_direct_bound(info);
-                    Self::overlay_direct_bound_for_var(info, &mut self.implied_bounds[i]);
-                    fixed_vars.push(i as u32);
-                    if i < self.var_bound_gen.len() {
-                        self.var_bound_gen[i] = cur_gen;
-                    }
-                }
-                self.big_bound_seen |= any_big;
-                for var_idx in fixed_vars.drain(..) {
-                    self.register_fixed_term_var(var_idx);
-                }
-                self.ib_fixed_vars_scratch = fixed_vars;
-            }
-        }
+        // Overlay the current direct bounds into `implied_bounds`,
+        // incrementally when only specific variables changed. The flag says
+        // whether EVERY variable was re-overlaid — the one case in which an
+        // empty touched-row set below still warrants a full sweep.
+        let did_full_overlay = self.overlay_direct_bounds(num_vars, need_resize);
 
         // #certora-bigint-fast: with 2^256-scale direct bounds in play, the
         // exact-Rational accumulation is bignum-dominated even on narrow rows,
@@ -238,14 +173,14 @@ impl LraSolver {
         // #7719 D1: Use std::mem::take instead of clone to avoid O(rows) HashSet
         // clone per call. The function clears and reseeds touched_rows at the end
         // anyway, so taking ownership is equivalent but allocation-free.
-        let iter_rows = if self.touched_rows.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.touched_rows))
-        };
+        let iter_rows = self.take_rows_to_analyze(did_full_overlay);
         // #inc-cib-nodelta: a None here means this call sweeps EVERY row —
         // record that below so provably-empty repeat sweeps can be skipped.
         let was_full_sweep = iter_rows.is_none();
+        self.stats.implied_calls += 1;
+        if was_full_sweep {
+            self.stats.implied_full_sweeps += 1;
+        }
         // Pre-allocate contribution vectors outside both loops to avoid
         // repeated heap allocation. Cleared and reused per row (#4919, P1:129).
         // #8003: Changed from (vi, eq_c, contrib, strict) to (vi, eq_c, strict).
@@ -430,6 +365,7 @@ impl LraSolver {
             for &row_idx in row_indices.iter() {
                 let row = &self.rows[row_idx];
                 let bv = row.basic_var as usize;
+                self.stats.implied_rows_scanned += 1;
                 // #6617: unified row-width limit (was 100 here, 300 in the
                 // old inline path). Z3's bound_analyzer_on_row has no width
                 // cap. Shared constant ensures rows 101-300 are still covered
@@ -481,6 +417,7 @@ impl LraSolver {
                 {
                     continue;
                 }
+                self.stats.implied_rows_analyzed += 1;
                 // #8008: Budget check removed (was #8257).
                 // #4919: Previously skipped rows with no unassigned atoms and
                 // no refinement candidates. This optimization prevented the
@@ -864,15 +801,7 @@ impl LraSolver {
                             let explanation = if skip_eager_explanation || !interesting {
                                 None
                             } else {
-                                let mut contributing_vars = SmallVec::new();
-                                for &(other_vi, ref other_eq_c, _) in &lb_contribs {
-                                    if other_vi == vi {
-                                        continue;
-                                    }
-                                    let used_upper = other_eq_c.is_negative();
-                                    contributing_vars.push((other_vi as u32, used_upper));
-                                }
-                                Some(BoundExplanation { contributing_vars })
+                                self.explanation_from_contribs(&lb_contribs, vi, false)
                             };
                             let ib = ImpliedBound {
                                 value: bound_val,
@@ -903,19 +832,15 @@ impl LraSolver {
                             {
                                 let derived_strict = lb_any_strict;
                                 // #6617: Build eager explanation -- all other variables.
-                                let mut contributing_vars = SmallVec::new();
-                                for &(other_vi, ref other_eq_c, _) in &lb_contribs {
-                                    if other_vi == target_vi {
-                                        continue;
-                                    }
-                                    let used_upper = other_eq_c.is_negative();
-                                    contributing_vars.push((other_vi as u32, used_upper));
-                                }
                                 let ib = ImpliedBound {
                                     value: bound_val,
                                     strict: derived_strict,
                                     row_idx,
-                                    explanation: Some(BoundExplanation { contributing_vars }),
+                                    explanation: self.explanation_from_contribs(
+                                        &lb_contribs,
+                                        target_vi,
+                                        false,
+                                    ),
                                 };
                                 if is_upper {
                                     updates.push((target_vi, None, Some(ib)));
@@ -1233,15 +1158,7 @@ impl LraSolver {
                             let explanation = if ub_skip_eager_explanation || !interesting {
                                 None
                             } else {
-                                let mut contributing_vars = SmallVec::new();
-                                for &(other_vi, ref other_eq_c, _) in &ub_contribs {
-                                    if other_vi == vi {
-                                        continue;
-                                    }
-                                    let used_upper = other_eq_c.is_positive();
-                                    contributing_vars.push((other_vi as u32, used_upper));
-                                }
-                                Some(BoundExplanation { contributing_vars })
+                                self.explanation_from_contribs(&ub_contribs, vi, true)
                             };
                             let ib = ImpliedBound {
                                 value: bound_val,
@@ -1266,19 +1183,15 @@ impl LraSolver {
                             {
                                 let derived_strict = ub_any_strict;
                                 // #6617: Build eager explanation for UB single-unbounded.
-                                let mut contributing_vars = SmallVec::new();
-                                for &(other_vi, ref other_eq_c, _) in &ub_contribs {
-                                    if other_vi == target_vi {
-                                        continue;
-                                    }
-                                    let used_upper = other_eq_c.is_positive();
-                                    contributing_vars.push((other_vi as u32, used_upper));
-                                }
                                 let ib = ImpliedBound {
                                     value: bound_val,
                                     strict: derived_strict,
                                     row_idx,
-                                    explanation: Some(BoundExplanation { contributing_vars }),
+                                    explanation: self.explanation_from_contribs(
+                                        &ub_contribs,
+                                        target_vi,
+                                        true,
+                                    ),
                                 };
                                 if eq_c.is_positive() {
                                     updates.push((target_vi, Some(ib), None));
@@ -1331,15 +1244,17 @@ impl LraSolver {
                         let old = self.implied_bounds[vi].0.replace(new_ib);
                         self.implied_trail.push((vi as u32, false, old));
                         // #8003: Stamp variable generation so rows containing it
-                        // will be re-analyzed on the next iteration — but only
-                        // within the tighten budget: over-budget re-tightenings
-                        // are stored (valid) without re-triggering row analysis.
+                        // are re-analyzed. The in-call cascade frontier only
+                        // takes the variable within the tighten budget;
+                        // over-budget re-tightenings are stored (valid) and
+                        // their rows are reseeded for the NEXT call, which the
+                        // stamp keeps from being generation-skipped there.
+                        self.bound_generation += 1;
+                        if vi < self.var_bound_gen.len() {
+                            self.var_bound_gen[vi] = self.bound_generation;
+                        }
                         if self.implied_tighten_scratch[vi] <= MAX_TIGHTENS_PER_VAR {
                             round_newly_bounded.push(vi as u32);
-                            self.bound_generation += 1;
-                            if vi < self.var_bound_gen.len() {
-                                self.var_bound_gen[vi] = self.bound_generation;
-                            }
                         }
                         any_tighter = true;
                     }
@@ -1368,14 +1283,14 @@ impl LraSolver {
                         // #inc-implied-trail: see the lower-bound twin above.
                         let old = self.implied_bounds[vi].1.replace(new_ib);
                         self.implied_trail.push((vi as u32, true, old));
-                        // #8003: Stamp variable generation (within the tighten
-                        // budget only — see the lower-bound twin above).
+                        // #8003: Stamp variable generation (frontier within the
+                        // tighten budget only — see the lower-bound twin above).
+                        self.bound_generation += 1;
+                        if vi < self.var_bound_gen.len() {
+                            self.var_bound_gen[vi] = self.bound_generation;
+                        }
                         if self.implied_tighten_scratch[vi] <= MAX_TIGHTENS_PER_VAR {
                             round_newly_bounded.push(vi as u32);
-                            self.bound_generation += 1;
-                            if vi < self.var_bound_gen.len() {
-                                self.var_bound_gen[vi] = self.bound_generation;
-                            }
                         }
                         any_tighter = true;
                     }
@@ -1699,7 +1614,7 @@ impl LraSolver {
     /// value (#certora-bigint-fast). Feeds the sticky `big_bound_seen`
     /// heuristic that widens the f64 pre-screen to narrow rows.
     #[inline]
-    fn var_has_big_direct_bound(info: &VarInfo) -> bool {
+    pub(crate) fn var_has_big_direct_bound(info: &VarInfo) -> bool {
         info.lower
             .as_ref()
             .is_some_and(|b| matches!(b.value, Rational::Big(_)))
@@ -1709,7 +1624,7 @@ impl LraSolver {
                 .is_some_and(|b| matches!(b.value, Rational::Big(_)))
     }
 
-    fn overlay_direct_bound_for_var(
+    pub(crate) fn overlay_direct_bound_for_var(
         info: &VarInfo,
         slot: &mut (Option<ImpliedBound>, Option<ImpliedBound>),
     ) {

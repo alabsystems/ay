@@ -1788,7 +1788,11 @@ fn commit_certified_known_optimum(
     // THE WHOLE CHAIN, cheapest-first — same single library definition as the
     // sibling site above and as the competition binary. Routes 1-5 are pure
     // arithmetic and never consult `should_stop`, so this site still certifies
-    // with a fully-consumed deadline; only the three search rungs decline early.
+    // with a fully-consumed deadline; FOUR rungs may decline early — the three
+    // search rungs, which each take a slice of the deadline, plus `certified-bb`,
+    // which takes no slice but consults `should_stop` past the node envelope in
+    // which it has ever certified anything. An interrupt can cost that rung only
+    // bytes it has not emitted, never bytes it has.
     // Each rung internally re-verifies the incumbent is feasible and achieves
     // `optimum`, and returns `None` (never a wrong proof) otherwise.
     let Some((pbp, route)) = ay_pb::proof::certify_opt_lin_any_interruptible(

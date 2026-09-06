@@ -634,7 +634,7 @@ fn test_subst_vars_simplifies_zero_extend_constant() {
     let five_32 = terms.mk_bitvec(BigInt::from(5u8), 32);
     let expected = terms.mk_bitvec(BigInt::from(5u8), 64);
     let zero_extend = terms.mk_app(
-        Symbol::Indexed("zero_extend".to_string(), vec![32]),
+        Symbol::indexed("zero_extend", vec![32]),
         vec![x],
         Sort::bitvec(64),
     );
@@ -664,13 +664,13 @@ fn test_subst_vars_simplifies_deductive_checks_style_bv_index_alias() {
     let zero32 = terms.mk_bitvec(BigInt::from(0u8), 32);
 
     let store_idx = terms.mk_app(
-        Symbol::Indexed("zero_extend".to_string(), vec![32]),
+        Symbol::indexed("zero_extend", vec![32]),
         vec![i32],
         index64_sort.clone(),
     );
     let plus_zero = terms.mk_app(Symbol::named("bvadd"), vec![i32, zero32], index32_sort);
     let select_idx = terms.mk_app(
-        Symbol::Indexed("zero_extend".to_string(), vec![32]),
+        Symbol::indexed("zero_extend", vec![32]),
         vec![plus_zero],
         index64_sort,
     );

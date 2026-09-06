@@ -12,12 +12,23 @@
 //!
 //! Refinement covers only direct-array, equal-index, unequal-value pairs. Hard
 //! traversal, bit, pair, variable, and clause budgets fail closed to `unknown`.
+//!
+//! The audit reads and constrains terms through [`FcAuditLits`], a view in the
+//! FINAL CNF numbering: `BitVec`/`FloatingPoint` terms are their bit-blasted
+//! bits, and a `Bool` term (a Bool-element `select`, or a Bool array index) is
+//! the single atom literal the bit-blaster or the Boolean skeleton assigned
+//! it. This is the same resolution `scalar_elem_lits` uses for the upfront
+//! ROW/FC axioms in `bv_axioms_array.rs`; before it, every Bool-element
+//! select was "owed" term bits the blaster never allocates, so any array with
+//! two Bool selects failed the audit closed to `unknown`.
 
 // #8529: Use deterministic hash maps in all builds.
+use std::collections::BTreeMap;
+
 use ay_bv::BvBits;
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::TermData;
-use ay_core::{Sort, TermId};
+use ay_core::{CnfLit, Sort, TermId, TermStore};
 use ay_sat::Literal as SatLiteral;
 use num_bigint::BigInt;
 
@@ -53,14 +64,85 @@ struct CegarArrayBuild {
     newly_covered: HashSet<(TermId, TermId)>,
 }
 
+/// One audited select with its index and result resolved to final-numbered
+/// literals and to the concrete values those literals take in the SAT model.
+struct FcConcreteSelect {
+    select: TermId,
+    index_lits: BvBits,
+    value_lits: BvBits,
+    index_value: BigInt,
+    value: BigInt,
+}
+
+/// The literal view the FC audit reads values from and constrains, in the
+/// FINAL CNF numbering the SAT solver was loaded with.
+///
+/// `term_bits` and `bv_bool_to_var` carry the bit-blaster's own numbering and
+/// are shifted by `var_offset` (the Tseitin variable count); the Boolean
+/// skeleton's `tseitin_term_to_var` is already final. A `Bool` term resolves to
+/// its single atom literal from the bit-blaster, else from the skeleton — the
+/// two are linked by `bv_encoding`'s atom-linking pass, so either one is the
+/// term's value under the model.
+pub(in crate::executor) struct FcAuditLits<'a> {
+    term_bits: &'a HashMap<TermId, BvBits>,
+    bv_bool_to_var: &'a HashMap<TermId, CnfLit>,
+    tseitin_term_to_var: &'a BTreeMap<TermId, u32>,
+    var_offset: i32,
+}
+
+impl<'a> FcAuditLits<'a> {
+    pub(in crate::executor) fn new(
+        term_bits: &'a HashMap<TermId, BvBits>,
+        bv_bool_to_var: &'a HashMap<TermId, CnfLit>,
+        tseitin_term_to_var: &'a BTreeMap<TermId, u32>,
+        var_offset: i32,
+    ) -> Self {
+        Self {
+            term_bits,
+            bv_bool_to_var,
+            tseitin_term_to_var,
+            var_offset,
+        }
+    }
+
+    fn term_bits(&self) -> &'a HashMap<TermId, BvBits> {
+        self.term_bits
+    }
+
+    /// Final-numbered literals encoding `term`'s value, or `None` when neither
+    /// the bit-blaster nor the Boolean skeleton assigned it any.
+    ///
+    /// A Bool term absent from both maps was never encoded, so the SAT model
+    /// carries no value for it; the caller decides whether that is owed
+    /// (fail closed) or outside the bit-level audit's remit.
+    fn scalar_lits(&self, terms: &TermStore, term: TermId) -> Option<BvBits> {
+        if let Some(bits) = self.term_bits.get(&term) {
+            if bits.is_empty() {
+                return None;
+            }
+            return Some(
+                bits.iter()
+                    .map(|&bit| bv_encoding::offset_cnf_lit(bit, self.var_offset))
+                    .collect(),
+            );
+        }
+        if *terms.sort(term) != Sort::Bool {
+            return None;
+        }
+        if let Some(&lit) = self.bv_bool_to_var.get(&term) {
+            return Some(vec![bv_encoding::offset_cnf_lit(lit, self.var_offset)]);
+        }
+        let var = *self.tseitin_term_to_var.get(&term)?;
+        Some(vec![CnfLit::try_from(var).ok()?])
+    }
+}
+
 mod fc_check;
 
 impl Executor {
     fn append_fc_group_refinement(
         &mut self,
-        group: &[(TermId, TermId, BigInt)],
-        term_bits: &HashMap<TermId, BvBits>,
-        var_offset: i32,
+        group: &[FcConcreteSelect],
         already_covered: &HashSet<(TermId, TermId)>,
         build: &mut CegarArrayBuild,
     ) -> bool {
@@ -72,15 +154,14 @@ impl Executor {
                 {
                     return false;
                 }
-                let (sel_a, idx_a, value_a) = &group[a];
-                let (sel_b, idx_b, value_b) = &group[b];
-                if value_a == value_b || sel_a == sel_b {
+                let (left, right) = (&group[a], &group[b]);
+                if left.value == right.value || left.select == right.select {
                     continue;
                 }
-                let pair = if sel_a < sel_b {
-                    (*sel_a, *sel_b)
+                let pair = if left.select < right.select {
+                    (left.select, right.select)
                 } else {
-                    (*sel_b, *sel_a)
+                    (right.select, left.select)
                 };
                 if already_covered.contains(&pair) {
                     return false;
@@ -88,9 +169,12 @@ impl Executor {
                 if !build.newly_covered.insert(pair) {
                     continue;
                 }
-                let Some((pair_vars, pair_clauses)) =
-                    self.fc_pair_cost_for_terms(term_bits, *idx_a, *idx_b, *sel_a, *sel_b)
-                else {
+                let Some((pair_vars, pair_clauses)) = budget::pair_cost(
+                    &left.index_lits,
+                    &right.index_lits,
+                    &left.value_lits,
+                    &right.value_lits,
+                ) else {
                     return false;
                 };
                 let Some(next_vars) = build.new_vars.checked_add(pair_vars) else {
@@ -108,13 +192,11 @@ impl Executor {
                 {
                     return false;
                 }
-                let clauses = self.generate_fc_axiom_clauses(
-                    term_bits,
-                    var_offset,
-                    *idx_a,
-                    *idx_b,
-                    *sel_a,
-                    *sel_b,
+                let clauses = generate_fc_axiom_clauses(
+                    &left.index_lits,
+                    &right.index_lits,
+                    &left.value_lits,
+                    &right.value_lits,
                     &mut build.next_var,
                 );
                 if clauses.len() != pair_clauses {
@@ -127,12 +209,13 @@ impl Executor {
         true
     }
 
-    /// Does the bit-blaster OWE this term an entry in `term_bits`?
+    /// Does the encoding OWE this term a literal view the audit can read?
     ///
-    /// True exactly for the sorts it can represent as a bit string: `BitVec`,
-    /// `Bool` (a single literal) and `FloatingPoint` (its IEEE encoding). For
-    /// those, a missing entry means the audit cannot read a value it should
-    /// have been able to read — an incomplete audit, which fails closed.
+    /// True exactly for the sorts it can represent as a bit string: `BitVec`
+    /// and `FloatingPoint` (their bit-blasted bits) and `Bool` (the single atom
+    /// literal resolved through [`FcAuditLits::scalar_lits`]). For those, a
+    /// missing view means the audit cannot read a value it should have been
+    /// able to read — an incomplete audit, which fails closed.
     ///
     /// Every other sort — an uninterpreted sort, a datatype, `Int`/`Real`,
     /// `Seq`, `String`, `RegLan`, a nested `Array` — has no bit encoding in
@@ -221,158 +304,179 @@ impl Executor {
         Some(selects)
     }
 
-    fn concrete_bv_value_bounded(
+    /// The value `lits` (final numbering) take in `sat_model`, bounded by the
+    /// audit's per-term and aggregate bit budgets.
+    fn concrete_value_bounded(
         &mut self,
         sat_model: &[bool],
-        bits: &BvBits,
-        var_offset: i32,
+        lits: &[CnfLit],
         inspected_bits: &mut usize,
     ) -> Option<BigInt> {
-        if bits.len() > budget::MAX_SINGLE_WIDTH {
+        if lits.len() > budget::MAX_SINGLE_WIDTH {
             return None;
         }
-        *inspected_bits = inspected_bits.checked_add(bits.len())?;
+        *inspected_bits = inspected_bits.checked_add(lits.len())?;
         if *inspected_bits > budget::MAX_TOTAL_BITS {
             return None;
         }
         let mut value = BigInt::from(0u64);
-        for (i, &bit_lit) in bits.iter().enumerate() {
+        for (i, &lit) in lits.iter().enumerate() {
             if i & 0xff == 0 && self.should_abort_theory_loop() {
                 return None;
             }
-            let offset_lit = if bit_lit > 0 {
-                bit_lit.checked_add(var_offset)?
-            } else {
-                bit_lit.checked_sub(var_offset)?
-            };
-            let sat_var_idx = usize::try_from(offset_lit.unsigned_abs())
-                .ok()?
-                .checked_sub(1)?;
+            let sat_var_idx = usize::try_from(lit.unsigned_abs()).ok()?.checked_sub(1)?;
             let sat_val = *sat_model.get(sat_var_idx)?;
-            let bit_value = if offset_lit > 0 { sat_val } else { !sat_val };
+            let bit_value = if lit > 0 { sat_val } else { !sat_val };
             if bit_value {
                 value |= BigInt::from(1) << i;
             }
         }
         Some(value)
     }
+}
 
-    fn fc_pair_cost_for_terms(
-        &self,
-        term_bits: &HashMap<TermId, BvBits>,
-        idx_a: TermId,
-        idx_b: TermId,
-        sel_a: TermId,
-        sel_b: TermId,
-    ) -> Option<(usize, usize)> {
-        budget::pair_cost(
-            term_bits.get(&idx_a)?,
-            term_bits.get(&idx_b)?,
-            term_bits.get(&sel_a)?,
-            term_bits.get(&sel_b)?,
-        )
+/// Generate FC axiom clauses for a single pair of selects.
+///
+/// Encodes: `(idx_a == idx_b) -> (sel_a == sel_b)` as a bit-level diff-XOR
+/// encoding over literals already in final CNF numbering, producing SAT-level
+/// literals. Fresh diff/eq variables are drawn from `next_var`.
+fn generate_fc_axiom_clauses(
+    idx_a_bits: &[CnfLit],
+    idx_b_bits: &[CnfLit],
+    sel_a_bits: &[CnfLit],
+    sel_b_bits: &[CnfLit],
+    next_var: &mut u32,
+) -> Vec<Vec<SatLiteral>> {
+    let mut clauses: Vec<Vec<SatLiteral>> = Vec::new();
+
+    if idx_a_bits.len() != idx_b_bits.len() || idx_a_bits.is_empty() {
+        return clauses;
+    }
+    if sel_a_bits.len() != sel_b_bits.len() || sel_a_bits.is_empty() {
+        return clauses;
     }
 
-    /// Generate FC axiom clauses for a single pair of selects.
-    ///
-    /// Encodes: `(idx_a == idx_b) -> (sel_a == sel_b)`
-    /// as bit-level diff-XOR encoding, producing SAT-level literals.
-    fn generate_fc_axiom_clauses(
-        &self,
-        term_bits: &HashMap<TermId, BvBits>,
-        var_offset: i32,
-        idx_a: TermId,
-        idx_b: TermId,
-        sel_a: TermId,
-        sel_b: TermId,
-        next_var: &mut u32,
-    ) -> Vec<Vec<SatLiteral>> {
-        let mut clauses: Vec<Vec<SatLiteral>> = Vec::new();
+    let to_sat = |cnf_lit: i32| -> SatLiteral { crate::cnf_lit_to_sat(cnf_lit) };
 
-        let Some(idx_a_bits) = term_bits.get(&idx_a) else {
-            return clauses;
-        };
-        let Some(idx_b_bits) = term_bits.get(&idx_b) else {
-            return clauses;
-        };
-        let Some(sel_a_bits) = term_bits.get(&sel_a) else {
-            return clauses;
-        };
-        let Some(sel_b_bits) = term_bits.get(&sel_b) else {
-            return clauses;
-        };
-
-        if idx_a_bits.len() != idx_b_bits.len() || idx_a_bits.is_empty() {
-            return clauses;
-        }
-        if sel_a_bits.len() != sel_b_bits.len() || sel_a_bits.is_empty() {
-            return clauses;
+    // Create diff variables for index bits: diff_k <-> (idx_a_k XOR idx_b_k)
+    let mut diff_vars: Vec<i32> = Vec::with_capacity(idx_a_bits.len());
+    for (&ob1, &ob2) in idx_a_bits.iter().zip(idx_b_bits.iter()) {
+        // If both bits are the same literal, they're identical - skip
+        if ob1 == ob2 {
+            continue;
         }
 
-        let offset_bit = |bit: i32| -> i32 { bv_encoding::offset_cnf_lit(bit, var_offset) };
-
-        let to_sat = |cnf_lit: i32| -> SatLiteral { crate::cnf_lit_to_sat(cnf_lit) };
-
-        // Create diff variables for index bits: diff_k <-> (idx_a_k XOR idx_b_k)
-        let mut diff_vars: Vec<i32> = Vec::with_capacity(idx_a_bits.len());
-        for (&b1, &b2) in idx_a_bits.iter().zip(idx_b_bits.iter()) {
-            // If both bits are the same literal, they're identical - skip
-            if b1 == b2 {
-                continue;
-            }
-
-            let ob1 = offset_bit(b1);
-            let ob2 = offset_bit(b2);
-            let diff_var = *next_var as i32;
-            *next_var += 1;
-            diff_vars.push(diff_var);
-
-            // diff_var <-> (ob1 XOR ob2)
-            clauses.push(vec![to_sat(-diff_var), to_sat(ob1), to_sat(ob2)]);
-            clauses.push(vec![to_sat(-diff_var), to_sat(-ob1), to_sat(-ob2)]);
-            clauses.push(vec![to_sat(-ob1), to_sat(ob2), to_sat(diff_var)]);
-            clauses.push(vec![to_sat(ob1), to_sat(-ob2), to_sat(diff_var)]);
-        }
-
-        if diff_vars.is_empty() {
-            // Indices are syntactically identical - FC requires values equal.
-            for (&s1, &s2) in sel_a_bits.iter().zip(sel_b_bits.iter()) {
-                if s1 == s2 {
-                    continue;
-                }
-                let os1 = offset_bit(s1);
-                let os2 = offset_bit(s2);
-                clauses.push(vec![to_sat(-os1), to_sat(os2)]);
-                clauses.push(vec![to_sat(os1), to_sat(-os2)]);
-            }
-            return clauses;
-        }
-
-        // eq_idx <-> NOT(OR(diff_vars))
-        let eq_idx = *next_var as i32;
+        let diff_var = *next_var as i32;
         *next_var += 1;
+        diff_vars.push(diff_var);
 
-        // eq_idx -> NOT diff_k
-        for &diff_var in &diff_vars {
-            clauses.push(vec![to_sat(-eq_idx), to_sat(-diff_var)]);
-        }
+        // diff_var <-> (ob1 XOR ob2)
+        clauses.push(vec![to_sat(-diff_var), to_sat(ob1), to_sat(ob2)]);
+        clauses.push(vec![to_sat(-diff_var), to_sat(-ob1), to_sat(-ob2)]);
+        clauses.push(vec![to_sat(-ob1), to_sat(ob2), to_sat(diff_var)]);
+        clauses.push(vec![to_sat(ob1), to_sat(-ob2), to_sat(diff_var)]);
+    }
 
-        // (diff_0 OR ... OR diff_n OR eq_idx)
-        let mut eq_def: Vec<SatLiteral> = diff_vars.iter().map(|&d| to_sat(d)).collect();
-        eq_def.push(to_sat(eq_idx));
-        clauses.push(eq_def);
-
-        // FC: eq_idx -> (sel_a_k == sel_b_k)
-        for (&s1, &s2) in sel_a_bits.iter().zip(sel_b_bits.iter()) {
-            if s1 == s2 {
+    if diff_vars.is_empty() {
+        // Indices are syntactically identical - FC requires values equal.
+        for (&os1, &os2) in sel_a_bits.iter().zip(sel_b_bits.iter()) {
+            if os1 == os2 {
                 continue;
             }
-            let os1 = offset_bit(s1);
-            let os2 = offset_bit(s2);
-            clauses.push(vec![to_sat(-eq_idx), to_sat(-os1), to_sat(os2)]);
-            clauses.push(vec![to_sat(-eq_idx), to_sat(os1), to_sat(-os2)]);
+            clauses.push(vec![to_sat(-os1), to_sat(os2)]);
+            clauses.push(vec![to_sat(os1), to_sat(-os2)]);
         }
+        return clauses;
+    }
 
-        clauses
+    // eq_idx <-> NOT(OR(diff_vars))
+    let eq_idx = *next_var as i32;
+    *next_var += 1;
+
+    // eq_idx -> NOT diff_k
+    for &diff_var in &diff_vars {
+        clauses.push(vec![to_sat(-eq_idx), to_sat(-diff_var)]);
+    }
+
+    // (diff_0 OR ... OR diff_n OR eq_idx)
+    let mut eq_def: Vec<SatLiteral> = diff_vars.iter().map(|&d| to_sat(d)).collect();
+    eq_def.push(to_sat(eq_idx));
+    clauses.push(eq_def);
+
+    // FC: eq_idx -> (sel_a_k == sel_b_k)
+    for (&os1, &os2) in sel_a_bits.iter().zip(sel_b_bits.iter()) {
+        if os1 == os2 {
+            continue;
+        }
+        clauses.push(vec![to_sat(-eq_idx), to_sat(-os1), to_sat(os2)]);
+        clauses.push(vec![to_sat(-eq_idx), to_sat(os1), to_sat(-os2)]);
+    }
+
+    clauses
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{generate_fc_axiom_clauses, FcAuditLits};
+    use ay_core::kani_compat::DetHashMap as HashMap;
+    use ay_core::{Sort, TermStore};
+    use num_bigint::BigInt;
+    use std::collections::BTreeMap;
+
+    /// A Bool-element select has no term bits; its value is the bit-blaster's
+    /// atom (offset into final numbering), else the skeleton's atom (already
+    /// final). A Bool term in neither map has no value to audit.
+    #[test]
+    fn bool_terms_resolve_to_their_single_atom_literal() {
+        let mut terms = TermStore::new();
+        let array_sort = Sort::array(Sort::bitvec(8), Sort::Bool);
+        let array = terms.mk_var("a", array_sort);
+        let index = terms.mk_var("i", Sort::bitvec(8));
+        let blasted = terms.mk_select(array, index);
+        let one = terms.mk_bitvec(BigInt::from(1), 8);
+        let skeleton = terms.mk_select(array, one);
+        let two = terms.mk_bitvec(BigInt::from(2), 8);
+        let unencoded = terms.mk_select(array, two);
+
+        let mut term_bits = HashMap::default();
+        term_bits.insert(index, vec![1, -2, 3, 4, 5, 6, 7, 8]);
+        let mut bv_bool_to_var = HashMap::default();
+        bv_bool_to_var.insert(blasted, -9);
+        let mut tseitin_term_to_var = BTreeMap::new();
+        tseitin_term_to_var.insert(skeleton, 4u32);
+        let var_offset = 10;
+        let lits = FcAuditLits::new(
+            &term_bits,
+            &bv_bool_to_var,
+            &tseitin_term_to_var,
+            var_offset,
+        );
+
+        assert_eq!(
+            lits.scalar_lits(&terms, index),
+            Some(vec![11, -12, 13, 14, 15, 16, 17, 18])
+        );
+        assert_eq!(lits.scalar_lits(&terms, blasted), Some(vec![-19]));
+        assert_eq!(lits.scalar_lits(&terms, skeleton), Some(vec![4]));
+        assert_eq!(lits.scalar_lits(&terms, unencoded), None);
+        assert_eq!(lits.scalar_lits(&terms, array), None);
+    }
+
+    /// A one-bit result pair yields the same shape the BitVec path produces:
+    /// per differing index bit an XOR definition, one eq_idx, and the two
+    /// implication clauses forcing the atoms equal under eq_idx.
+    #[test]
+    fn single_atom_results_get_fc_implications() {
+        let mut next_var = 100;
+        let clauses = generate_fc_axiom_clauses(&[1, 2], &[1, -3], &[7], &[-8], &mut next_var);
+        // One differing index bit: 4 XOR clauses + 1 (eq -> !diff) + 1 (diff | eq)
+        // + 2 value implications.
+        assert_eq!(clauses.len(), 8);
+        assert_eq!(next_var, 102);
+
+        let mut next_var = 100;
+        let identical = generate_fc_axiom_clauses(&[1, 2], &[1, 2], &[7], &[-8], &mut next_var);
+        assert_eq!(identical.len(), 2);
+        assert_eq!(next_var, 100);
     }
 }

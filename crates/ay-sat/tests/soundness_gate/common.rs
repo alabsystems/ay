@@ -326,8 +326,31 @@ fn parse_cadical_status(stdout: &str) -> OracleResult {
     }
 }
 
+/// Strip the historical SATLIB trailer (`%` on its own line, then `0`) that
+/// terminates the clause list in the SATLIB uf*/uuf* archives.
+///
+/// `%` is not valid DIMACS, and CaDiCaL 3.0.0 rejects it outright:
+///     cadical: error: uf200-01.cnf:869: parse error: expected digit or '-'
+/// The oracle then produced NO `s` line, `parse_cadical_status` mapped that to
+/// `Unknown`, and three gates died on `assert_eq!(oracle, Sat/Unsat)` — see
+/// the uf200-01 / uuf250-01 baselines. Sanitising here rather than relaxing
+/// those assertions is deliberate: accepting `Unknown` as a baseline would
+/// silently disable the gates instead of repairing them.
+fn strip_satlib_trailer(cnf: &str) -> String {
+    let mut out = String::with_capacity(cnf.len());
+    for line in cnf.lines() {
+        if line.trim_start().starts_with('%') {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 pub(crate) fn run_cadical_oracle(cnf_dimacs: &str, label: &str) -> OracleResult {
-    let cnf_path = write_temp_cnf(&format!("oracle_{label}"), cnf_dimacs);
+    let sanitized = strip_satlib_trailer(cnf_dimacs);
+    let cnf_path = write_temp_cnf(&format!("oracle_{label}"), &sanitized);
     let output = Command::new(cadical_binary())
         .arg(&cnf_path)
         .output()

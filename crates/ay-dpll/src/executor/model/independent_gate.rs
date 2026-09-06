@@ -9420,7 +9420,7 @@ mod tests {
         let seq_int = Sort::Seq(Box::new(Sort::Int));
         let x = exec.ctx.terms.mk_var("seq-euf-arg-x", seq_int.clone());
         let y = exec.ctx.terms.mk_var("seq-euf-arg-y", seq_int.clone());
-        let f = Symbol::Named("seq_euf_f".to_string());
+        let f = Symbol::named("seq_euf_f");
         let fx = exec.ctx.terms.mk_app(f.clone(), vec![x], seq_int.clone());
         let fy = exec.ctx.terms.mk_app(f, vec![y], seq_int);
         let outputs_differ = exec.ctx.terms.mk_distinct(vec![fx, fy]);
@@ -9468,7 +9468,7 @@ mod tests {
         let len = exec
             .ctx
             .terms
-            .mk_app(Symbol::Named("seq.len".to_string()), vec![x], Sort::Int);
+            .mk_app(Symbol::named("seq.len"), vec![x], Sort::Int);
         let model = synthetic_euf_model(&[(x, "e0")]);
         let view = IndependentModelView::new(&exec, &model);
 

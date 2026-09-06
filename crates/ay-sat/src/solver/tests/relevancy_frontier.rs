@@ -64,19 +64,6 @@ fn random_3sat(num_vars: usize, num_clauses: usize, seed: u64) -> Vec<Vec<Litera
     clauses
 }
 
-/// Keep a test solver out of the PROCESS-GLOBAL ambient-artifact paths.
-///
-/// `maybe_write_fmla_learned_lrat_dry_run_proof_artifact_from_env` fires on
-/// every solve finalization of an ambient-artifact-enabled solver and writes to
-/// whatever path `FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV` names at
-/// that instant — a process-global destination that the conflict-analysis
-/// dry-run tests point at their own tempdir while they run. Nothing here is
-/// about artifacts, so opt out rather than join that race (same reason as
-/// `tests/proof_consumer_lifecycle.rs`).
-fn quiet_ambient_artifacts(solver: &mut Solver) {
-    solver.cold.ambient_artifacts_enabled = false;
-}
-
 /// Solve `clauses`, optionally with the relevancy frontier forced on for EVERY
 /// decision (`hard`), and return the verdict as a comparable string plus the
 /// model when SAT.
@@ -86,7 +73,6 @@ fn solve_with(
     hard: bool,
 ) -> (String, Option<Vec<bool>>) {
     let mut solver = Solver::new(num_vars);
-    quiet_ambient_artifacts(&mut solver);
     if hard {
         solver.set_relevancy_branching(true);
         solver.set_relevancy_hard(true);
@@ -165,7 +151,6 @@ fn incremental_frontier_survives_clause_deletion_and_restarts() {
 fn incremental_frontier_survives_incremental_solves() {
     let num_vars = 24;
     let mut solver = Solver::new(num_vars);
-    quiet_ambient_artifacts(&mut solver);
     solver.set_relevancy_branching(true);
     solver.set_relevancy_hard(true);
     let first = random_3sat(num_vars, 60, 21);
@@ -199,7 +184,6 @@ fn incremental_frontier_survives_incremental_solves() {
 #[test]
 fn empty_frontier_leaves_dont_care_variables_undecided() {
     let mut solver = Solver::new(0);
-    quiet_ambient_artifacts(&mut solver);
     let vars: Vec<Variable> = (0..12).map(|_| solver.new_var()).collect();
     solver.set_relevancy_branching(true);
     solver.set_relevancy_hard(true);
@@ -247,7 +231,6 @@ fn incremental_frontier_survives_arena_compaction_between_sync_and_backtrack() {
     let clauses = random_3sat(num_vars, 870, 32);
 
     let mut solver = Solver::new(num_vars);
-    quiet_ambient_artifacts(&mut solver);
     solver.set_relevancy_branching(true);
     solver.set_relevancy_hard(true);
     for clause in &clauses {

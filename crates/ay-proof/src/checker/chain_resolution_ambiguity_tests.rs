@@ -327,8 +327,8 @@ fn demorgan_equivalence_is_not_a_resolution_pivot() {
     let b = boolvar(&mut terms, "b");
     let na = terms.mk_not(a);
     let nb = terms.mk_not(b);
-    let conjunction = terms.mk_app(Symbol::Named("and".to_string()), [a, b], Sort::Bool);
-    let negated_components = terms.mk_app(Symbol::Named("or".to_string()), [na, nb], Sort::Bool);
+    let conjunction = terms.mk_app(Symbol::named("and"), [a, b], Sort::Bool);
+    let negated_components = terms.mk_app(Symbol::named("or"), [na, nb], Sort::Bool);
     let mut proof = Proof::new();
     let left = proof.add_rule_step(AletheRule::Trust, vec![conjunction], Vec::new(), Vec::new());
     let right = proof.add_rule_step(

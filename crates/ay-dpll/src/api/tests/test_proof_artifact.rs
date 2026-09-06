@@ -689,6 +689,138 @@ fn bundle_export_rechecks_datatype_array_extensionality() {
     );
 }
 
+/// A datatype-element array equality is expanded by the combined DT+array
+/// route after the authored problem has been built.  Its activation clause
+/// must retain strict array authority all the way through native publication
+/// and portable bundle replay; otherwise the generated guarded ROW fact is an
+/// unauthenticated injected assertion.
+#[test]
+fn bundle_export_rechecks_dt_injected_guarded_row_expansion() {
+    #[allow(deprecated)]
+    let mut solver = Solver::new(Logic::All);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-datatype D ((d0) (d1)))
+            (declare-const base (Array Bool D))
+            (declare-const current (Array Bool D))
+            (declare-const binding-choice Bool)
+            (declare-const write-index Bool)
+            (declare-const read-index Bool)
+            "#,
+        )
+        .expect("guarded ROW declarations must parse");
+
+    let symbol = |name: &str| {
+        solver
+            .executor
+            .context()
+            .symbol_info_by_identity(name)
+            .and_then(|info| info.term)
+            .unwrap_or_else(|| panic!("{name} must be declared"))
+    };
+    let base = symbol("base");
+    let current = symbol("current");
+    let binding_choice = symbol("binding-choice");
+    let write_index = symbol("write-index");
+    let read_index = symbol("read-index");
+    let d0 = symbol("d0");
+    let (binding_left, binding_right, wrong_stored_read, wrong_unchanged_read) = {
+        let terms = &mut solver.executor.context_mut().terms;
+        let array_sort = terms.sort(base).clone();
+        let element_sort = terms.sort(d0).clone();
+        let stored = terms.mk_app(
+            Symbol::named("store"),
+            vec![base, write_index, d0],
+            array_sort,
+        );
+        let array_binding = terms.mk_eq(current, stored);
+        // Force the binding by Boolean case split while keeping it nested.
+        // The eager array route has a separate store-flat substitution pass
+        // that rewrites a top-level `current = store(...)` before proof
+        // attribution; the two clauses entail that equality without turning
+        // this W8 canary into a test of that unrelated source-rewrite proof.
+        let not_binding_choice = terms.mk_not(binding_choice);
+        let binding_left = terms.mk_or(vec![not_binding_choice, array_binding]);
+        let binding_right = terms.mk_or(vec![binding_choice, array_binding]);
+        let current_read = terms.mk_app(
+            Symbol::named("select"),
+            vec![current, read_index],
+            element_sort.clone(),
+        );
+        let base_read = terms.mk_app(
+            Symbol::named("select"),
+            vec![base, read_index],
+            element_sort,
+        );
+        let stored_read = terms.mk_eq(current_read, d0);
+        let unchanged_read = terms.mk_eq(current_read, base_read);
+        (
+            binding_left,
+            binding_right,
+            terms.mk_not(stored_read),
+            terms.mk_not(unchanged_read),
+        )
+    };
+    solver.assert_term(solver.wrap_term(binding_left));
+    solver.assert_term(solver.wrap_term(binding_right));
+    solver.assert_term(solver.wrap_term(wrong_stored_read));
+    solver.assert_term(solver.wrap_term(wrong_unchanged_read));
+
+    let verdict = solver.check_sat();
+    assert!(
+        verdict.is_unsat(),
+        "an array equal to a store must obey the corresponding guarded read expansion; \
+         got {verdict:?} / {:?}; injected={:?}; proof={:#?}",
+        solver.unknown_reason(),
+        solver.executor.injected_axiom_theory_kinds,
+        solver.executor.last_proof(),
+    );
+    assert!(
+        solver
+            .executor
+            .injected_axiom_theory_kinds
+            .values()
+            .any(|kind| matches!(kind, TheoryLemmaKind::ArrayGuardedRowExpansion)),
+        "the DT+array emitter must register guarded ROW authority for its injected axiom"
+    );
+
+    let proof = solver
+        .executor
+        .last_proof()
+        .expect("the published UNSAT must retain its proof");
+    let terms = solver.executor.terms();
+    assert!(
+        proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::ArrayGuardedRowExpansion,
+                clause,
+                ..
+            } if ay_proof::recognize_array_guarded_row_expansion(terms, clause)
+        )),
+        "the retained proof must use the registered guarded ROW theory leaf"
+    );
+    let strict = solver
+        .executor
+        .check_proof_strict_with_datatypes(proof)
+        .expect("datatype-aware strict replay must accept the retained proof");
+    assert!(strict.is_complete());
+
+    let bundle = solver
+        .export_last_unsat_bundle()
+        .expect("the strictly checked DT+array proof must export a bundle");
+    assert_eq!(
+        bundle.datatype_declarations,
+        vec![("D".to_string(), vec!["d0".to_string(), "d1".to_string()])],
+        "the portable obligation must retain its datatype declaration"
+    );
+    let checked = re_check_bundle_strict(&bundle)
+        .expect("offline strict replay must accept the injected guarded ROW leaf");
+    assert!(checked.quality.is_complete());
+}
+
 /// Datatype declarations are part of the serialized proof obligation. Without
 /// them an offline checker cannot distinguish a valid constructor-disjointness
 /// lemma from the same syntactic clause over unrelated uninterpreted symbols.

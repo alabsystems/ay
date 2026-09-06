@@ -82,14 +82,17 @@ impl Model {
             };
             let raw_conflict = self.euf_model.as_ref().is_some_and(|euf| {
                 euf.function_tables
-                    .get(name)
+                    .get(name.as_str())
                     .is_some_and(|table| !table.is_empty())
-                    || euf.function_table_terms.contains_key(name)
-                    || euf.function_table_conflicts.contains(name)
+                    || euf.function_table_terms.contains_key(name.as_str())
+                    || euf.function_table_conflicts.contains(name.as_str())
             });
             if !seen.insert(binding.symbol().clone())
                 || !ctx.projection_binding_still_current(&binding)
-                || self.certified_total_ufs.by_symbol.contains_key(name)
+                || self
+                    .certified_total_ufs
+                    .by_symbol
+                    .contains_key(name.as_str())
                 || self.has_formula_neutral_function_default_symbol(binding.symbol())
                 || raw_conflict
                 || !matches!(
@@ -122,7 +125,7 @@ impl Model {
             }
             if let Symbol::Named(name) = entry.symbol() {
                 if let Some(euf) = self.euf_model.as_mut() {
-                    euf.function_tables.remove(name);
+                    euf.function_tables.remove(name.as_str());
                 }
             }
         }
@@ -227,7 +230,10 @@ impl Model {
                 || !ctx.projection_binding_still_current(&binding)
                 || !eval_value_has_exact_sort(&value, binding.result_sort())
                 || self.has_certified_const_interp_symbol(binding.symbol())
-                || self.certified_total_ufs.by_symbol.contains_key(name)
+                || self
+                    .certified_total_ufs
+                    .by_symbol
+                    .contains_key(name.as_str())
                 || !matches!(
                     self.projection_ufs.projected_argument_for_signature(
                         binding.symbol(),
@@ -237,9 +243,9 @@ impl Model {
                     Ok(None)
                 )
                 || self.euf_model.as_ref().is_some_and(|euf| {
-                    euf.function_tables.contains_key(name)
-                        || euf.function_table_terms.contains_key(name)
-                        || euf.function_table_conflicts.contains(name)
+                    euf.function_tables.contains_key(name.as_str())
+                        || euf.function_table_terms.contains_key(name.as_str())
+                        || euf.function_table_conflicts.contains(name.as_str())
                 })
             {
                 return None;

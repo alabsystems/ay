@@ -12,8 +12,11 @@
 use super::*;
 
 mod check;
+mod implied_explain;
 mod propagation;
 mod registration;
+
+pub(crate) use implied_explain::ImpliedReasonBasis;
 
 impl TheorySolver for LraSolver {
     fn register_atom(&mut self, atom: TermId) {
@@ -190,6 +193,37 @@ impl TheorySolver for LraSolver {
             ("lra_reasons_lazy_rejected", self.stats.lazy_rejected_count),
             ("lra_emitted_direct", self.stats.emitted_direct_count),
             ("lra_emitted_implied", self.stats.emitted_implied_count),
+            ("lra_implied_calls", self.stats.implied_calls),
+            ("lra_implied_full_sweeps", self.stats.implied_full_sweeps),
+            (
+                "lra_implied_full_overlays",
+                self.stats.implied_full_overlays,
+            ),
+            ("lra_implied_rows_scanned", self.stats.implied_rows_scanned),
+            (
+                "lra_implied_rows_analyzed",
+                self.stats.implied_rows_analyzed,
+            ),
+            (
+                "lra_implied_nodelta_skips",
+                self.stats.implied_nodelta_skips,
+            ),
+            (
+                "lra_implied_reason_direct",
+                self.stats.implied_reason_direct_count,
+            ),
+            (
+                "lra_implied_reason_chain",
+                self.stats.implied_reason_chain_count,
+            ),
+            (
+                "lra_implied_reason_row",
+                self.stats.implied_reason_row_count,
+            ),
+            (
+                "lra_implied_reason_interval",
+                self.stats.implied_reason_interval_count,
+            ),
             (
                 "lra_emitted_implied_row",
                 self.stats.emitted_implied_row_count,
@@ -963,97 +997,13 @@ impl LraSolver {
         let vi = var as usize;
 
         if is_implied {
-            // #8467: ImpliedBound lazy justification. Reconstruct the reason
-            // from BoundExplanation chain, with single-row and interval fallbacks.
-            // This matches the eager materialization in eagerly_materialize_deferred()
-            // but is called on-demand during conflict analysis (~90% of propagations
-            // never reach this point).
-
-            // Strategy 1: BoundExplanation chain.
-            if let Some(reasons) = self.make_eager_implied_propagation_reasons(vi, need_upper) {
-                if !reasons.is_empty()
-                    && reasons
-                        .iter()
-                        .all(|r| self.asserted.get(&r.term) == Some(&r.value))
-                {
-                    return Some(reasons);
-                }
-            }
-
-            // Strategy 2: Single-row reason collection.
-            if let Some(ib_pair) = self.implied_bounds.get(vi) {
-                let ib = if need_upper {
-                    ib_pair.1.as_ref()
-                } else {
-                    ib_pair.0.as_ref()
-                };
-                if let Some(ib) = ib {
-                    if ib.row_idx != usize::MAX && self.max_row_width <= 50 {
-                        if let Some(reasons) =
-                            self.collect_single_row_reasons(var, need_upper, ib.row_idx)
-                        {
-                            if !reasons.is_empty()
-                                && reasons
-                                    .iter()
-                                    .all(|r| self.asserted.get(&r.term) == Some(&r.value))
-                            {
-                                return Some(reasons);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Strategy 3: Interval-based reasons from atom expression.
-            let atom_term = _lit;
-            if let Some(Some(info)) = self.atom_cache.get(&atom_term) {
-                let is_le = info.is_le;
-                let strict = info.strict;
-                let polarity = (reason_data >> 33) & 1 != 0;
-                let for_upper = if polarity { is_le } else { !is_le };
-                // #8754 soundness fix: Before returning interval-based reasons,
-                // verify the direct-only interval actually IMPLIES the
-                // propagated literal. Without this check, Strategy 3 returns
-                // reasons that are syntactically valid but do not prove the
-                // propagation, because the ImpliedBound propagation was
-                // enqueued against a tighter implied bound (from post-simplex
-                // cascade or cross-negation overlay) while the reasons only
-                // witness the looser direct-bound interval of the atom
-                // expression. The missing-premise shape appeared as unsound
-                // `:rule trust` lemmas in the Alethe proof on LP-family
-                // benchmarks (rand_70_300, tsp_rand).
-                let (lb, ub) = self.compute_expr_interval_direct_only(&info.expr);
-                let implied_true = if polarity {
-                    if is_le {
-                        ub.as_ref()
-                            .is_some_and(|ep| Self::endpoint_implies_le_zero(ep, strict))
-                    } else {
-                        lb.as_ref()
-                            .is_some_and(|ep| Self::endpoint_implies_ge_zero(ep, strict))
-                    }
-                } else if is_le {
-                    lb.as_ref()
-                        .is_some_and(|ep| Self::endpoint_implies_not_le_zero(ep, strict))
-                } else {
-                    ub.as_ref()
-                        .is_some_and(|ep| Self::endpoint_implies_not_ge_zero(ep, strict))
-                };
-                if !implied_true {
-                    // Direct-bound interval does not imply the literal --
-                    // reasons would be unsound. Reject this lazy propagation.
-                    return None;
-                }
-                let reason = self.collect_interval_reasons(&info.expr, for_upper);
-                if !reason.is_empty()
-                    && reason
-                        .iter()
-                        .all(|r| self.asserted.get(&r.term) == Some(&r.value))
-                {
-                    return Some(reason);
-                }
-            }
-
-            return None;
+            // Exact explanation for a lazy ImpliedBound propagation (see
+            // `implied_explain.rs`): the returned literals entail the atom
+            // literal under the CURRENT bounds, or `None`.
+            let polarity = (reason_data >> 33) & 1 != 0;
+            return self
+                .explain_implied_bound_propagation(_lit, var, need_upper, polarity)
+                .map(|(reasons, _)| reasons);
         }
 
         // DirectBound reason reconstruction.

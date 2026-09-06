@@ -58,6 +58,7 @@ impl SolveArgs {
             chc_checked_replay_secs: self.ab_switches.chc_checked_replay,
             xor_allow_large: self.ab_switches.xor_allow_large,
             xor_allow_residual: self.ab_switches.xor_allow_residual,
+            xor_allow_unadmitted: self.ab_switches.xor_allow_unadmitted,
             phase_trace: self.ab_switches.phase_trace,
             debug_cert: self.ab_switches.debug_cert,
             debug_qmg: self.ab_switches.debug_qmg,

@@ -682,7 +682,7 @@ fn validate_qf_expression_inner(
     }
 }
 
-fn validate_qf_operation(op: ChcOp, args: &[ChcSort]) -> ChcResult<ChcSort> {
+pub(crate) fn validate_qf_operation(op: ChcOp, args: &[ChcSort]) -> ChcResult<ChcSort> {
     let arity = |expected: usize| {
         if args.len() == expected {
             Ok(())

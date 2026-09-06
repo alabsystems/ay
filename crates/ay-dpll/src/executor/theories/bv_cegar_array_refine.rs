@@ -4,12 +4,10 @@
 
 //! Bounded re-solve loop for array functional-consistency refinement.
 
-use ay_bv::BvBits;
-use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::TermId;
+use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_sat::{SatResult, Solver as SatSolver};
 
-use super::{CegarArrayCheck, Executor};
+use super::{CegarArrayCheck, Executor, FcAuditLits};
 use crate::executor_types::UnknownReason;
 
 impl Executor {
@@ -20,8 +18,7 @@ impl Executor {
     pub(in crate::executor) fn refine_array_fc_model(
         &mut self,
         mut solve_result: SatResult,
-        term_bits: &HashMap<TermId, BvBits>,
-        var_offset: i32,
+        lits: &FcAuditLits<'_>,
         total_vars: u32,
         solver: &mut SatSolver,
         max_cegar_iterations: u32,
@@ -36,8 +33,7 @@ impl Executor {
                 // been audited. Only a complete, consistent audit may escape.
                 let residual = self.check_array_fc_violations(
                     model,
-                    term_bits,
-                    var_offset,
+                    lits,
                     cegar_next_var as usize,
                     &mut already_covered,
                 );
@@ -54,8 +50,7 @@ impl Executor {
 
             let result = match self.check_array_fc_violations(
                 model,
-                term_bits,
-                var_offset,
+                lits,
                 cegar_next_var as usize,
                 &mut already_covered,
             ) {

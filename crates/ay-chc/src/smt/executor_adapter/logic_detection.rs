@@ -874,7 +874,7 @@ pub(crate) fn collect_uninterpreted_function_declarations_for_problem(
     problem: &ChcProblem,
 ) -> ChcResult<Vec<UninterpretedFunctionDeclaration>> {
     let mut exprs = Vec::new();
-    for clause in problem.clauses() {
+    for clause in problem.source_clauses() {
         if let Some(constraint) = &clause.body.constraint {
             push_bounded_executor_expr_root(&mut exprs, constraint)?;
         }

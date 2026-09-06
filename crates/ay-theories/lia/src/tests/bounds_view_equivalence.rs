@@ -117,10 +117,10 @@ fn build_fixture() -> Fixture {
     // Negation-app constants: (- 4) and (- (- 9)) exercise the recursive
     // constant extraction shared by both implementations.
     let four = terms.mk_int(BigInt::from(4));
-    let neg4 = terms.mk_app(Symbol::Named("-".to_string()), [four], Sort::Int);
+    let neg4 = terms.mk_app(Symbol::named("-"), [four], Sort::Int);
     let nine = terms.mk_int(BigInt::from(9));
-    let neg9 = terms.mk_app(Symbol::Named("-".to_string()), [nine], Sort::Int);
-    let negneg9 = terms.mk_app(Symbol::Named("-".to_string()), [neg9], Sort::Int);
+    let neg9 = terms.mk_app(Symbol::named("-"), [nine], Sort::Int);
+    let negneg9 = terms.mk_app(Symbol::named("-"), [neg9], Sort::Int);
     let weird_consts = [neg4, negneg9];
 
     // Linear expressions: opaque to BOTH implementations (no bound entries),

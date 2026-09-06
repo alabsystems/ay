@@ -15,11 +15,10 @@ fn seq_argument_and_result_cells_use_aligned_source_terms() {
     let mut exec = Executor::new();
     let seq = Sort::Seq(Box::new(Sort::Int));
     let arg = exec.ctx.terms.mk_var("seq-table-arg", seq.clone());
-    let app = exec.ctx.terms.mk_app(
-        Symbol::Named("seq_table_f".to_string()),
-        vec![arg],
-        seq.clone(),
-    );
+    let app = exec
+        .ctx
+        .terms
+        .mk_app(Symbol::named("seq_table_f"), vec![arg], seq.clone());
     let table = vec![(
         vec!["@ay-seq!arg".to_string()],
         "@ay-seq!result".to_string(),
@@ -43,11 +42,10 @@ fn missing_misaligned_or_wrong_source_provenance_fails_closed() {
     let mut exec = Executor::new();
     let seq = Sort::Seq(Box::new(Sort::Int));
     let arg = exec.ctx.terms.mk_var("seq-table-bad-arg", seq.clone());
-    let wrong_app = exec.ctx.terms.mk_app(
-        Symbol::Named("other_seq_table_f".to_string()),
-        vec![arg],
-        seq.clone(),
-    );
+    let wrong_app =
+        exec.ctx
+            .terms
+            .mk_app(Symbol::named("other_seq_table_f"), vec![arg], seq.clone());
     let table = vec![(vec!["opaque".to_string()], "opaque".to_string())];
 
     assert!(exec

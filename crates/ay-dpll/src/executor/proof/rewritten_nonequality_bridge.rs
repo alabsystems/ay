@@ -128,7 +128,9 @@ fn is_nonequality_candidate(terms: &ay_core::TermStore, step: &ProofStep) -> Opt
 /// The head symbol and arity of a term, for the cheap root pre-filter.
 pub(super) fn head_key(terms: &ay_core::TermStore, term: TermId) -> Option<(String, usize)> {
     match terms.get(term) {
-        TermData::App(ay_core::Symbol::Named(name), args) => Some((name.clone(), args.len())),
+        TermData::App(ay_core::Symbol::Named(name), args) => {
+            Some((name.clone().to_string(), args.len()))
+        }
         TermData::Not(_) => Some(("not".to_string(), 1)),
         _ => None,
     }

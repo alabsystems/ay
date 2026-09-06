@@ -1,0 +1,97 @@
+ay options
+
+These are the environment options ay reads at startup. Every one is optional:
+unset, ay uses the default shown in parentheses, and those defaults are exactly
+what a plain `ay solve FILE` does. None of them can make ay publish a wrong
+sat/unsat -- the soundness defaults, the always-on model gate, and the
+fail-closed-to-unknown paths are identical at every setting. They can still
+change whether you get an answer at all, and one of them, AY_DT_CERT=on, can
+turn an `unknown` into a `sat`. Where a command-line flag covers the same
+ground, the flag wins, and it is named with the entry.
+
+Solving -- posture
+
+  AY_COMPETITION (unset)
+    Any non-empty value puts ay in competition posture: no default
+    validation, no proof emission, no proof re-check. Same effect as
+    --rigor fast. The signal wins: a later --rigor standard on the
+    command line does NOT put the batteries back.
+
+  AY_SAT_COMPETITION_PROFILE (unset)
+    Names the SAT-competition profile. Set to `regular` it selects the
+    official main-regular DIMACS route; any non-empty value counts as a
+    competition signal, so it also implies the posture above.
+
+  AY_SAT_PROFILE_ID (unset)
+    The profile identity, reported as `profile_identity` by --stats-json.
+    The exact value `ay-sat-regular-main` also selects the official
+    main-regular DIMACS route. Any non-empty value is a competition signal.
+
+  AY_SAT_TRACK (unset), AY_SAT_AI_CLASS (regular)
+    Declare the SAT-COMP track for DIMACS input. AY_SAT_TRACK=main with
+    AY_SAT_AI_CLASS unset or `regular` picks the official main-regular
+    route. Neither is a competition signal on its own.
+
+  AY_SAT_VARIANT (default)
+    SAT solver variant for DIMACS input: default, aggressive, minimal,
+    probe. Any other value is an error on DIMACS input, not a fallback;
+    on SMT-LIB input it is ignored. --sat-variant supersedes it.
+
+  A fourth competition signal, AY_INTERNAL_SATCOMP_WRAPPER, is set by the
+  SAT-COMP wrapper script rather than by hand. If a run is in competition
+  posture and none of the three above explain it, look for that one.
+
+Solving -- budgets and lanes
+
+  AY_FC_CROSS_BUDGET (200)
+  AY_FC_SAME_BUDGET (10000)
+    Per-array functional-consistency pair budgets for array/BV input,
+    cross-base and same-base. Lowering them sheds eager FC clauses to the
+    lazy CEGAR loop. The whole-problem cap is not an environment option: it
+    starts at 30000 and, left alone, auto-lowers to 2000 once more than 500
+    arrays carry reads. --fc-global-budget pins it and switches that
+    autoscale off; it is a hidden switch, absent from `ay solve --help`.
+
+  AY_DT_LAZY (on)
+    The lazy datatype lane. Exactly `0` turns the lane off; every other
+    value, including the empty string, leaves it on.
+
+  AY_DT_LAZY_AUFLIA (off)
+    Extends that lane to AUFLIA. Any value other than `0` enables it,
+    the empty string included.
+
+  AY_DT_CERT (off)
+    Datatype model certificate; spellings are exact and lower-case. Unset,
+    `0`, or `off`: it never runs. `shadow` (or `log`) runs it and logs its
+    verdict without ever granting sat. `on` (`1`, `grant`) lets a
+    successful certificate grant sat, which is the one setting on this
+    screen that changes a reported verdict: `unknown` becomes `sat`.
+
+Output and sessions
+
+  AY_SESSION_LOG (compact)
+    Verbosity of the `c ay.session.start` and `c ay.session.end` provenance
+    markers on stderr. `off` (`none`, `0`) prints neither; `compact` (`1`)
+    prints one build.stamp plus outcome and timing; `full` (`verbose`)
+    prints every build field, which is the audit form. -q silences the
+    markers too. A competition signal forces `full` -- but naming one of
+    those levels here always wins. An unrecognized value is not an error;
+    it falls back to whatever the run's default would have been, so under
+    a competition signal a typo still yields `full`.
+
+Not listed
+
+  Anything AY_INTERNAL_* is a test or wrapper hook, not a supported option,
+  and may change without notice; so are the per-test fixture variables.
+  AY_DEBUG_* no longer steers the `ay` binary at all -- it installs an
+  explicit debug config even when empty, so debug channels are CLI-owned.
+  Reach for --debug instead. It too is hidden from `ay solve --help`, so
+  run `ay solve --debug` with no value to print the channel list.
+
+Next: on DIMACS input, run `ay solve --stats FILE.cnf` and read
+`c sat.policy_source:` -- it names what chose the variant, printing
+`AY_SAT_VARIANT`, `--sat-variant`, or `default`. That is the only line that
+reports an option by name, and it is DIMACS-only: no --stats line reports the
+AY_DT_*, AY_FC_*, or AY_SESSION_LOG settings. To see those, set one and
+compare two runs; posture shows up as the `c writing ... proof` line appearing
+or not. For --rigor, --sat-variant, and -q, run `ay solve --help`.

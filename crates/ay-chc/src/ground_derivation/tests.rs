@@ -11,7 +11,7 @@
 
 use super::*;
 use crate::clause::{ClauseBody, ClauseHead};
-use crate::{ChcDtConstructor, ChcDtSelector, ChcSort, ChcVar, PredicateId};
+use crate::{ActionId, ChcDtConstructor, ChcDtSelector, ChcSort, ChcVar, PredicateId};
 use std::sync::Arc;
 
 fn var(name: &str) -> ChcExpr {
@@ -24,6 +24,19 @@ fn env(pairs: &[(&str, i128)]) -> FxHashMap<String, SmtValue> {
         map.insert((*name).to_string(), SmtValue::Int(*value));
     }
     map
+}
+
+fn int_uf(name: &str, argument: ChcExpr) -> ChcExpr {
+    ChcExpr::FuncApp(name.to_string(), ChcSort::Int, vec![Arc::new(argument)])
+}
+
+fn install_observation(env: &mut FxHashMap<String, SmtValue>, application: ChcExpr, value: i128) {
+    assert!(
+        crate::smt::executor_adapter::install_observed_uf_application_values(
+            env,
+            &[(application, SmtValue::Int(value))],
+        )
+    );
 }
 
 /// `P(0).  P(x) => P(x + 1).  P(x) /\ x >= 2 => false.`
@@ -97,6 +110,1019 @@ fn ground_derivation_validates_a_real_counterexample() {
 }
 
 #[test]
+fn source_surface_cache_walks_a_repeated_clause_once() {
+    let problem = counting_problem();
+    let mut cache = GroundSourceSurfaceCache::new(&problem);
+    assert_eq!(cache.walked_clause_count(), 0);
+    assert_eq!(cache.charge_step_reuse(1), Ok((2, 0)));
+    let first_work = cache.work_used_for_test();
+    let repeated_work = {
+        let surface = cache.surface(1).expect("cached source surface");
+        surface.replay_work + surface.variables.len() + surface.uf_applications.len()
+    };
+    assert_eq!(cache.walked_clause_count(), 1);
+    assert_eq!(cache.charge_step_reuse(1), Ok((2, 0)));
+    assert_eq!(cache.walked_clause_count(), 1);
+    assert_eq!(cache.work_used_for_test(), first_work + repeated_work);
+}
+
+#[test]
+fn source_surface_cache_budgets_expression_replay_before_rewalking_source() {
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::and(
+        ChcExpr::eq(
+            ChcExpr::add(ChcExpr::int(1), ChcExpr::int(2)),
+            ChcExpr::int(3),
+        ),
+        ChcExpr::eq(
+            ChcExpr::mul(ChcExpr::int(4), ChcExpr::int(5)),
+            ChcExpr::int(20),
+        ),
+    ))));
+    let first_step_work = {
+        let mut measured = GroundSourceSurfaceCache::new(&problem);
+        assert_eq!(measured.charge_step_reuse(0), Ok((0, 0)));
+        let surface = measured
+            .surface(0)
+            .expect("fixture source surface should fit the production envelope");
+        assert!(
+            surface.replay_work > 1,
+            "fixture must carry expression work"
+        );
+        measured.work_used_for_test()
+    };
+    let mut bounded = GroundSourceSurfaceCache::with_work_limit_for_test(&problem, first_step_work);
+    assert_eq!(bounded.charge_step_reuse(0), Ok((0, 0)));
+    assert_eq!(
+        bounded.charge_step_reuse(0),
+        Err(GroundSourceSurfaceError::SourceWorkLimitExceeded)
+    );
+    assert_eq!(
+        bounded.work_used_for_test(),
+        first_step_work,
+        "failed replay reservation must not partially consume the exact budget"
+    );
+    assert_eq!(
+        bounded.walked_clause_count(),
+        1,
+        "budget refusal must happen on cached reuse, not a second source walk"
+    );
+}
+
+#[test]
+fn source_surface_cache_stops_binding_profiles_at_remaining_budget() {
+    let mut constraint = ChcExpr::Bool(true);
+    let mut bindings = FxHashMap::default();
+    for index in 0..64 {
+        let name = format!("x_{index:02}");
+        constraint = ChcExpr::and(constraint, ChcExpr::eq(var(&name), ChcExpr::Int(0)));
+        bindings.insert(name, SmtValue::Int(0));
+    }
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(constraint)));
+    let baseline = {
+        let mut measured = GroundSourceSurfaceCache::new(&problem);
+        assert_eq!(measured.charge_step_reuse(0), Ok((64, 0)));
+        measured.work_used_for_test()
+    };
+    let mut bounded = GroundSourceSurfaceCache::with_work_limit_for_test(&problem, baseline + 1);
+    assert_eq!(bounded.charge_step_reuse(0), Ok((64, 0)));
+
+    assert_eq!(
+        bounded.charge_step_scalar_replay(0, &bindings, &[]),
+        Err(GroundSourceSurfaceError::SourceWorkLimitExceeded)
+    );
+    assert_eq!(
+        bounded.profiled_typecheck_bindings_for_test(),
+        1,
+        "the second binding must be refused before recursively profiling it"
+    );
+    assert_eq!(
+        bounded.work_used_for_test(),
+        baseline,
+        "a refused batch must not partially consume the cache budget"
+    );
+}
+
+#[test]
+fn source_surface_cache_bounds_nested_uf_identity_rendering() {
+    let mut nested = var("x");
+    for index in 0..400 {
+        nested = int_uf(&format!("f{index}"), nested);
+    }
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::eq(
+        nested,
+        ChcExpr::Int(0),
+    ))));
+    assert!(matches!(
+        GroundSourceSurfaceCache::new(&problem).charge_step_reuse(0),
+        Err(GroundSourceSurfaceError::SourceWorkLimitExceeded)
+    ));
+}
+
+#[test]
+fn source_surface_cache_rejects_programmatic_sort_beyond_depth_bound() {
+    let mut deep_sort = ChcSort::Int;
+    for _ in 0..=CHC_GROUND_DERIVATION_MAX_SOURCE_DEPTH {
+        deep_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(deep_sort));
+    }
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::var(
+        ChcVar::new("deep", deep_sort),
+    ))));
+
+    assert_eq!(
+        GroundSourceSurfaceCache::new(&problem).charge_step_reuse(0),
+        Err(GroundSourceSurfaceError::SourceWorkLimitExceeded)
+    );
+}
+
+#[test]
+fn source_surface_cache_rejects_programmatic_value_beyond_depth_bound() {
+    let mut deep_value = SmtValue::Int(0);
+    for _ in 0..=CHC_GROUND_DERIVATION_MAX_VALUE_DEPTH {
+        deep_value = SmtValue::ConstArray(Box::new(deep_value));
+    }
+    let mut env = FxHashMap::default();
+    env.insert("unused".to_string(), deep_value);
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::Bool(
+        true,
+    ))));
+    let derivation = GroundDerivation {
+        steps: vec![GroundDerivationStep {
+            clause_index: 0,
+            env,
+            premises: Vec::new(),
+        }],
+        query_step: 0,
+    };
+
+    assert_eq!(
+        validate_ground_derivation(&problem, &derivation),
+        Err(GroundDerivationError::SourceWorkLimitExceeded)
+    );
+}
+
+#[test]
+fn source_surface_cache_charges_operator_derived_max_bitvector_width() {
+    let mut constraint = ChcExpr::Bool(true);
+    for value in 0..20 {
+        let zero = ChcExpr::Op(
+            crate::ChcOp::Int2Bv(crate::MAX_BITVECTOR_WIDTH),
+            vec![Arc::new(ChcExpr::Int(value))],
+        );
+        let inverted = ChcExpr::Op(crate::ChcOp::BvNot, vec![Arc::new(zero.clone())]);
+        constraint = ChcExpr::and(constraint, ChcExpr::eq(inverted, zero.clone()));
+    }
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(constraint)));
+
+    assert_eq!(
+        GroundSourceSurfaceCache::new(&problem).charge_step_reuse(0),
+        Err(GroundSourceSurfaceError::SourceWorkLimitExceeded),
+        "zero-valued derived bitvectors still reserve width-sized evaluator work"
+    );
+}
+
+#[test]
+fn ground_derivation_rejects_unselected_cross_clause_uf_overload() {
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::Bool(
+        true,
+    ))));
+    let reachable = problem.declare_predicate("Reachable", Vec::new());
+    for argument in [ChcExpr::Int(0), ChcExpr::Bool(false)] {
+        let application = ChcExpr::FuncApp(
+            "conflicting".to_string(),
+            ChcSort::Int,
+            vec![Arc::new(argument)],
+        );
+        problem.add_clause(HornClause::new(
+            ClauseBody::constraint(ChcExpr::eq(application, ChcExpr::Int(0))),
+            ClauseHead::Predicate(reachable, Vec::new()),
+        ));
+    }
+    let derivation = GroundDerivation {
+        steps: vec![GroundDerivationStep {
+            clause_index: 0,
+            env: FxHashMap::default(),
+            premises: Vec::new(),
+        }],
+        query_step: 0,
+    };
+
+    assert_eq!(
+        validate_ground_derivation(&problem, &derivation),
+        Err(GroundDerivationError::InvalidSourceProblem),
+        "unselected live clauses still share one source function namespace"
+    );
+}
+
+fn two_step_ground_link() -> GroundDerivation {
+    GroundDerivation {
+        steps: vec![
+            GroundDerivationStep {
+                clause_index: 0,
+                env: FxHashMap::default(),
+                premises: Vec::new(),
+            },
+            GroundDerivationStep {
+                clause_index: 1,
+                env: FxHashMap::default(),
+                premises: vec![0],
+            },
+        ],
+        query_step: 1,
+    }
+}
+
+fn one_step_ground_query(env: FxHashMap<String, SmtValue>) -> GroundDerivation {
+    GroundDerivation {
+        steps: vec![GroundDerivationStep {
+            clause_index: 0,
+            env,
+            premises: Vec::new(),
+        }],
+        query_step: 0,
+    }
+}
+
+#[test]
+fn ground_derivation_rejects_bool_int_predicate_coercion() {
+    let mut problem = ChcProblem::new();
+    let predicate = problem.declare_predicate("P", vec![ChcSort::Int]);
+    problem.add_clause(HornClause::new(
+        ClauseBody::empty(),
+        ClauseHead::Predicate(predicate, vec![ChcExpr::Bool(true)]),
+    ));
+    problem.add_clause(HornClause::query(ClauseBody::predicates_only(vec![(
+        predicate,
+        vec![ChcExpr::Int(1)],
+    )])));
+
+    assert_eq!(
+        validate_ground_derivation(&problem, &two_step_ground_link()),
+        Err(GroundDerivationError::InvalidSourceProblem),
+        "Bool(true) and Int(1) may compare equal only after a well-typed predicate boundary"
+    );
+}
+
+#[test]
+fn ground_derivation_rejects_cross_sort_value_hidden_in_typed_ite() {
+    let mut problem = ChcProblem::new();
+    let predicate = problem.declare_predicate("P", vec![ChcSort::Int]);
+    let malformed_head = ChcExpr::Op(
+        crate::ChcOp::Ite,
+        vec![
+            Arc::new(ChcExpr::Bool(false)),
+            Arc::new(ChcExpr::Int(0)),
+            Arc::new(ChcExpr::Bool(true)),
+        ],
+    );
+    assert_eq!(malformed_head.sort(), ChcSort::Int);
+    problem.add_clause(HornClause::new(
+        ClauseBody::empty(),
+        ClauseHead::Predicate(predicate, vec![malformed_head]),
+    ));
+    problem.add_clause(HornClause::query(ClauseBody::predicates_only(vec![(
+        predicate,
+        vec![ChcExpr::Int(1)],
+    )])));
+
+    assert_eq!(
+        validate_ground_derivation(&problem, &two_step_ground_link()),
+        Err(GroundDerivationError::InvalidSourceProblem),
+        "ill-typed ITE branches must fail at the source boundary"
+    );
+}
+
+#[test]
+fn ground_derivation_rejects_mixed_bool_int_constraint_equality() {
+    let bool_var = ChcVar::new("b", ChcSort::Bool);
+    let int_var = ChcVar::new("i", ChcSort::Int);
+    let mixed_equality = ChcExpr::Op(
+        crate::ChcOp::Eq,
+        vec![
+            Arc::new(ChcExpr::var(bool_var.clone())),
+            Arc::new(ChcExpr::var(int_var.clone())),
+        ],
+    );
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(mixed_equality)));
+    let mut bindings = FxHashMap::default();
+    bindings.insert(bool_var.name, SmtValue::Bool(true));
+    bindings.insert(int_var.name, SmtValue::Int(1));
+
+    assert_eq!(
+        validate_ground_derivation(&problem, &one_step_ground_query(bindings)),
+        Err(GroundDerivationError::InvalidSourceProblem),
+        "Bool(true) == Int(1) must not satisfy an ill-typed source constraint"
+    );
+}
+
+#[test]
+fn ground_derivation_rejects_background_operator_arity_misuse() {
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::Op(
+        crate::ChcOp::Not,
+        vec![
+            Arc::new(ChcExpr::Var(ChcVar::new("a", ChcSort::Bool))),
+            Arc::new(ChcExpr::Var(ChcVar::new("b", ChcSort::Bool))),
+        ],
+    ))));
+
+    assert_eq!(
+        validate_ground_derivation(&problem, &one_step_ground_query(FxHashMap::default())),
+        Err(GroundDerivationError::InvalidSourceProblem)
+    );
+}
+
+#[test]
+fn ground_derivation_rejects_non_bool_constraint_sort() {
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::Int(1))));
+
+    assert_eq!(
+        validate_ground_derivation(&problem, &one_step_ground_query(FxHashMap::default())),
+        Err(GroundDerivationError::InvalidSourceProblem)
+    );
+}
+
+#[test]
+fn ground_derivation_rejects_undefined_action_id() {
+    let mut problem = ChcProblem::new();
+    problem.add_clause_with_action(
+        HornClause::query(ClauseBody::constraint(ChcExpr::Bool(true))),
+        ActionId::new(7),
+    );
+
+    assert_eq!(
+        validate_ground_derivation(&problem, &one_step_ground_query(FxHashMap::default())),
+        Err(GroundDerivationError::InvalidSourceProblem)
+    );
+}
+
+#[test]
+fn ground_derivation_rejects_undefined_predicate_ids() {
+    let mut problem = ChcProblem::new();
+    let undefined = PredicateId::new(17);
+    problem.add_clause(HornClause::new(
+        ClauseBody::empty(),
+        ClauseHead::Predicate(undefined, Vec::new()),
+    ));
+    problem.add_clause(HornClause::query(ClauseBody::predicates_only(vec![(
+        undefined,
+        Vec::new(),
+    )])));
+
+    assert_eq!(
+        validate_ground_derivation(&problem, &two_step_ground_link()),
+        Err(GroundDerivationError::InvalidSourceProblem)
+    );
+}
+
+#[test]
+fn ground_derivation_rejects_body_and_head_predicate_arity_mismatches() {
+    let mut bad_head = ChcProblem::new();
+    let head_predicate = bad_head.declare_predicate("Head", vec![ChcSort::Int]);
+    bad_head.add_clause(HornClause::new(
+        ClauseBody::empty(),
+        ClauseHead::Predicate(head_predicate, Vec::new()),
+    ));
+    bad_head.add_clause(HornClause::query(ClauseBody::predicates_only(vec![(
+        head_predicate,
+        vec![ChcExpr::Int(0)],
+    )])));
+
+    let mut bad_body = ChcProblem::new();
+    let body_predicate = bad_body.declare_predicate("Body", vec![ChcSort::Int]);
+    bad_body.add_clause(HornClause::new(
+        ClauseBody::empty(),
+        ClauseHead::Predicate(body_predicate, vec![ChcExpr::Int(0)]),
+    ));
+    bad_body.add_clause(HornClause::query(ClauseBody::predicates_only(vec![(
+        body_predicate,
+        Vec::new(),
+    )])));
+
+    for problem in [&bad_head, &bad_body] {
+        assert_eq!(
+            validate_ground_derivation(problem, &two_step_ground_link()),
+            Err(GroundDerivationError::InvalidSourceProblem)
+        );
+    }
+}
+
+#[test]
+fn ground_derivation_rejects_non_bijective_predicate_name_registry() {
+    let mut problem = ChcProblem::new();
+    let first = problem.declare_predicate("Duplicate", Vec::new());
+    let _second = problem.declare_predicate("Duplicate", Vec::new());
+    problem.add_clause(HornClause::new(
+        ClauseBody::empty(),
+        ClauseHead::Predicate(first, Vec::new()),
+    ));
+    problem.add_clause(HornClause::query(ClauseBody::predicates_only(vec![(
+        first,
+        Vec::new(),
+    )])));
+
+    assert_eq!(
+        validate_ground_derivation(&problem, &two_step_ground_link()),
+        Err(GroundDerivationError::InvalidSourceProblem)
+    );
+}
+
+#[test]
+fn source_surface_cache_charges_wide_datatype_lookup_on_every_reuse() {
+    let constructors = (0..256)
+        .map(|index| ChcDtConstructor {
+            name: format!("ctor_{index:03}"),
+            selectors: Vec::new(),
+        })
+        .collect();
+    let datatype_sort = ChcSort::Datatype {
+        name: "Wide".to_string(),
+        constructors: Arc::new(constructors),
+    };
+    let constructor = ChcExpr::FuncApp("ctor_255".to_string(), datatype_sort.clone(), Vec::new());
+    let value = ChcExpr::var(ChcVar::new("value", datatype_sort));
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::eq(
+        value,
+        constructor,
+    ))));
+    let mut value_env = FxHashMap::default();
+    value_env.insert(
+        "value".to_string(),
+        SmtValue::Datatype("ctor_255".to_string(), Vec::new()),
+    );
+    let first_step_work = {
+        let mut measured = GroundSourceSurfaceCache::new(&problem);
+        assert_eq!(measured.charge_step_reuse(0), Ok((1, 0)));
+        assert_eq!(
+            measured.charge_step_scalar_replay(0, &value_env, &[]),
+            Ok(())
+        );
+        measured.work_used_for_test()
+    };
+    let mut bounded = GroundSourceSurfaceCache::with_work_limit_for_test(&problem, first_step_work);
+    assert_eq!(bounded.charge_step_reuse(0), Ok((1, 0)));
+    assert_eq!(
+        bounded.charge_step_scalar_replay(0, &value_env, &[]),
+        Ok(())
+    );
+    assert_eq!(
+        bounded.charge_step_reuse(0),
+        Err(GroundSourceSurfaceError::SourceWorkLimitExceeded),
+        "a reused step must repay its wide datatype lookup cost"
+    );
+}
+
+#[test]
+fn ground_derivation_rejects_wrong_datatype_bindings_before_equality() {
+    let datatype_sort = ChcSort::Datatype {
+        name: "Singleton".to_string(),
+        constructors: Arc::new(vec![ChcDtConstructor {
+            name: "only".to_string(),
+            selectors: Vec::new(),
+        }]),
+    };
+    let x = ChcExpr::var(ChcVar::new("x", datatype_sort.clone()));
+    let y = ChcExpr::var(ChcVar::new("y", datatype_sort));
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::not(
+        ChcExpr::eq(x, y),
+    ))));
+    let mut wrong_env = FxHashMap::default();
+    wrong_env.insert("x".to_string(), SmtValue::Bool(false));
+    wrong_env.insert("y".to_string(), SmtValue::Bool(true));
+    let derivation = GroundDerivation {
+        steps: vec![GroundDerivationStep {
+            clause_index: 0,
+            env: wrong_env,
+            premises: Vec::new(),
+        }],
+        query_step: 0,
+    };
+    assert!(matches!(
+        validate_ground_derivation(&problem, &derivation),
+        Err(GroundDerivationError::VariableBindingSortMismatch { step: 0, .. })
+    ));
+}
+
+#[test]
+fn ground_derivation_rejects_wrong_array_bindings_before_equality() {
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let x = ChcExpr::var(ChcVar::new("x", array_sort.clone()));
+    let y = ChcExpr::var(ChcVar::new("y", array_sort));
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::not(
+        ChcExpr::eq(x, y),
+    ))));
+    let mut wrong_env = FxHashMap::default();
+    wrong_env.insert("x".to_string(), SmtValue::Bool(false));
+    wrong_env.insert("y".to_string(), SmtValue::Bool(true));
+    let derivation = GroundDerivation {
+        steps: vec![GroundDerivationStep {
+            clause_index: 0,
+            env: wrong_env,
+            premises: Vec::new(),
+        }],
+        query_step: 0,
+    };
+    assert!(matches!(
+        validate_ground_derivation(&problem, &derivation),
+        Err(GroundDerivationError::VariableBindingSortMismatch { step: 0, .. })
+    ));
+}
+
+#[test]
+fn ground_derivation_rejects_noncanonical_small_bigint_binding() {
+    let x = var("x");
+    let y = var("y");
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::not(
+        ChcExpr::eq(x, y),
+    ))));
+    let mut wrong_env = FxHashMap::default();
+    wrong_env.insert(
+        "x".to_string(),
+        SmtValue::BigInt(Arc::new(num_bigint::BigInt::from(1))),
+    );
+    wrong_env.insert("y".to_string(), SmtValue::Int(1));
+    let derivation = GroundDerivation {
+        steps: vec![GroundDerivationStep {
+            clause_index: 0,
+            env: wrong_env,
+            premises: Vec::new(),
+        }],
+        query_step: 0,
+    };
+    assert!(matches!(
+        validate_ground_derivation(&problem, &derivation),
+        Err(GroundDerivationError::VariableBindingSortMismatch { step: 0, .. })
+    ));
+}
+
+#[test]
+fn ground_derivation_rejects_noncanonical_real_bindings_before_evaluation() {
+    let real = ChcExpr::var(ChcVar::new("r", ChcSort::Real));
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::eq(
+        real,
+        ChcExpr::Real(0, 1),
+    ))));
+    let malformed = [
+        num_rational::BigRational::new_raw(
+            num_bigint::BigInt::from(2),
+            num_bigint::BigInt::from(2),
+        ),
+        num_rational::BigRational::new_raw(
+            num_bigint::BigInt::from(1),
+            num_bigint::BigInt::from(-2),
+        ),
+        num_rational::BigRational::new_raw(
+            num_bigint::BigInt::from(1),
+            num_bigint::BigInt::from(0),
+        ),
+    ];
+    for value in malformed {
+        assert!(
+            !scalar_value_matches_sort(&SmtValue::Real(value.clone()), &ChcSort::Real),
+            "malformed Real must also be refused as a UF result"
+        );
+        let mut env = FxHashMap::default();
+        env.insert("r".to_string(), SmtValue::Real(value));
+        let derivation = GroundDerivation {
+            steps: vec![GroundDerivationStep {
+                clause_index: 0,
+                env,
+                premises: Vec::new(),
+            }],
+            query_step: 0,
+        };
+        assert!(matches!(
+            validate_ground_derivation(&problem, &derivation),
+            Err(GroundDerivationError::VariableBindingSortMismatch { step: 0, .. })
+        ));
+    }
+}
+
+#[test]
+fn ground_derivation_precharges_aggregate_premise_fanout() {
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let producer_value = ChcExpr::var(ChcVar::new("a", array_sort));
+    let consumer_value = ChcExpr::ConstArray(ChcSort::Int, Arc::new(ChcExpr::Int(0)));
+    let mut problem = ChcProblem::new();
+    let predicate = problem.declare_predicate(
+        "Arrays",
+        vec![ChcSort::Array(
+            Box::new(ChcSort::Int),
+            Box::new(ChcSort::Int),
+        )],
+    );
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(predicate, vec![producer_value]),
+    ));
+    problem.add_clause(HornClause::query(ClauseBody::new(
+        (0..6)
+            .map(|_| (predicate, vec![consumer_value.clone()]))
+            .collect(),
+        Some(ChcExpr::Bool(true)),
+    )));
+    let entries = (0..400)
+        .map(|value| (SmtValue::Int(value), SmtValue::Int(0)))
+        .collect();
+    let mut producer_env = FxHashMap::default();
+    producer_env.insert(
+        "a".to_string(),
+        SmtValue::ArrayMap {
+            default: Box::new(SmtValue::Int(0)),
+            entries,
+        },
+    );
+    let derivation = GroundDerivation {
+        steps: vec![
+            GroundDerivationStep {
+                clause_index: 0,
+                env: producer_env,
+                premises: Vec::new(),
+            },
+            GroundDerivationStep {
+                clause_index: 1,
+                env: FxHashMap::default(),
+                premises: vec![0; 6],
+            },
+        ],
+        query_step: 1,
+    };
+    let mut single_problem = problem.clone();
+    single_problem.clauses_mut()[1].body.predicates.truncate(1);
+    let mut single_derivation = derivation.clone();
+    single_derivation.steps[1].premises.truncate(1);
+    assert_eq!(
+        validate_ground_derivation(&single_problem, &single_derivation),
+        Ok(()),
+        "one aggregate premise comparison must fit the fixed envelope"
+    );
+    assert_eq!(
+        validate_ground_derivation(&problem, &derivation),
+        Err(GroundDerivationError::SourceWorkLimitExceeded),
+        "aggregate comparison work must be multiplied by incoming argument fanout"
+    );
+}
+
+fn many_uf_argument_problem() -> ChcProblem {
+    let mut constraint = ChcExpr::Bool(true);
+    for index in 0..8 {
+        let application = int_uf(&format!("f{index}"), var("x"));
+        constraint = ChcExpr::and(constraint, ChcExpr::eq(application, ChcExpr::Int(index)));
+    }
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(constraint)));
+    problem
+}
+
+#[test]
+fn source_surface_cache_rejects_wide_scalar_uf_amplification() {
+    let problem = many_uf_argument_problem();
+    let base_work = {
+        let mut measured = GroundSourceSurfaceCache::new(&problem);
+        assert_eq!(measured.charge_step_reuse(0), Ok((1, 8)));
+        measured.work_used_for_test()
+    };
+
+    let mut bigint_env = FxHashMap::default();
+    bigint_env.insert(
+        "x".to_string(),
+        SmtValue::int_from_bigint(num_bigint::BigInt::from(1u8) << 2_048usize),
+    );
+    let mut bigint_cache =
+        GroundSourceSurfaceCache::with_work_limit_for_test(&problem, base_work + 128);
+    assert_eq!(bigint_cache.charge_step_reuse(0), Ok((1, 8)));
+    assert_eq!(
+        bigint_cache.charge_step_scalar_replay(0, &bigint_env, &[]),
+        Err(GroundSourceSurfaceError::SourceWorkLimitExceeded)
+    );
+
+    let mut real_env = FxHashMap::default();
+    real_env.insert(
+        "x".to_string(),
+        SmtValue::Real(num_rational::BigRational::new(
+            num_bigint::BigInt::from(1u8) << 2_048usize,
+            num_bigint::BigInt::from(3u8),
+        )),
+    );
+    let mut real_cache =
+        GroundSourceSurfaceCache::with_work_limit_for_test(&problem, base_work + 128);
+    assert_eq!(real_cache.charge_step_reuse(0), Ok((1, 8)));
+    assert_eq!(
+        real_cache.charge_step_scalar_replay(0, &real_env, &[]),
+        Err(GroundSourceSurfaceError::SourceWorkLimitExceeded)
+    );
+}
+
+#[test]
+fn source_surface_cache_counts_repeated_arguments_within_one_wide_uf() {
+    let repeated = Arc::new(var("x"));
+    let application = ChcExpr::FuncApp("wide".to_string(), ChcSort::Int, vec![repeated; 8]);
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::eq(
+        application,
+        ChcExpr::Int(0),
+    ))));
+    let base_work = {
+        let mut measured = GroundSourceSurfaceCache::new(&problem);
+        assert_eq!(measured.charge_step_reuse(0), Ok((1, 1)));
+        assert_eq!(
+            measured
+                .surface(0)
+                .expect("cached wide UF surface")
+                .uf_argument_occurrences,
+            8
+        );
+        measured.work_used_for_test()
+    };
+    let mut env = FxHashMap::default();
+    env.insert(
+        "x".to_string(),
+        SmtValue::int_from_bigint(num_bigint::BigInt::from(1u8) << 2_048usize),
+    );
+    let mut bounded = GroundSourceSurfaceCache::with_work_limit_for_test(&problem, base_work + 128);
+    assert_eq!(bounded.charge_step_reuse(0), Ok((1, 1)));
+    assert_eq!(
+        bounded.charge_step_scalar_replay(0, &env, &[]),
+        Err(GroundSourceSurfaceError::SourceWorkLimitExceeded)
+    );
+}
+
+#[test]
+fn source_surface_cache_rejects_large_aggregate_without_ufs_before_equality() {
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let array = ChcExpr::var(ChcVar::new("a", array_sort));
+    let zero_array = ChcExpr::ConstArray(ChcSort::Int, Arc::new(ChcExpr::Int(0)));
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::eq(
+        array, zero_array,
+    ))));
+    let entries = (0..1_100)
+        .map(|value| (SmtValue::Int(value), SmtValue::Int(value)))
+        .collect();
+    let mut env = FxHashMap::default();
+    env.insert(
+        "a".to_string(),
+        SmtValue::ConstArray(Box::new(SmtValue::ArrayMap {
+            default: Box::new(SmtValue::Int(0)),
+            entries,
+        })),
+    );
+    let mut cache = GroundSourceSurfaceCache::new(&problem);
+    assert_eq!(cache.charge_step_reuse(0), Ok((1, 0)));
+    assert_eq!(
+        cache.charge_step_scalar_replay(0, &env, &[]),
+        Err(GroundSourceSurfaceError::SourceWorkLimitExceeded)
+    );
+}
+
+#[test]
+fn typed_uf_key_unifies_mixed_bitvector_representations() {
+    let application = ChcExpr::FuncApp(
+        "f".to_string(),
+        ChcSort::Int,
+        vec![Arc::new(ChcExpr::var(ChcVar::new("x", ChcSort::BitVec(8))))],
+    );
+    let small = ground_uf_congruence_key(&application, &[SmtValue::BitVec(1, 8)])
+        .expect("small bitvector key");
+    let wide = ground_uf_congruence_key(
+        &application,
+        &[SmtValue::BigBitVec(
+            Arc::new(num_bigint::BigUint::from(257u16)),
+            8,
+        )],
+    )
+    .expect("wide bitvector key");
+    assert_eq!(
+        small, wide,
+        "semantic bitvector keys must be representation-free"
+    );
+    let mut congruence = FxHashMap::default();
+    congruence.insert(small, SmtValue::Int(7));
+    assert!(congruence
+        .get(&wide)
+        .is_some_and(|previous| !smt_values_equal(previous, &SmtValue::Int(8))));
+}
+
+#[test]
+fn ground_derivation_rejects_noncanonical_overwide_bitvector_binding() {
+    let x = ChcExpr::var(ChcVar::new("x", ChcSort::BitVec(8)));
+    let y = ChcExpr::var(ChcVar::new("y", ChcSort::BitVec(8)));
+    let fx = int_uf("f", x.clone());
+    let fy = int_uf("f", y.clone());
+    let mut problem = ChcProblem::new();
+    let p = problem.declare_predicate("P", Vec::new());
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(fx.clone(), ChcExpr::Int(7))),
+        ClauseHead::Predicate(p, Vec::new()),
+    ));
+    problem.add_clause(HornClause::query(ClauseBody::new(
+        vec![(p, Vec::new())],
+        Some(ChcExpr::eq(fy.clone(), ChcExpr::Int(8))),
+    )));
+
+    let mut fact_env = FxHashMap::default();
+    fact_env.insert("x".to_string(), SmtValue::BitVec(1, 8));
+    install_observation(&mut fact_env, fx, 7);
+    let mut query_env = FxHashMap::default();
+    query_env.insert(
+        "y".to_string(),
+        SmtValue::BigBitVec(Arc::new(num_bigint::BigUint::from(257u16)), 8),
+    );
+    install_observation(&mut query_env, fy, 8);
+    let derivation = GroundDerivation {
+        steps: vec![
+            GroundDerivationStep {
+                clause_index: 0,
+                env: fact_env,
+                premises: Vec::new(),
+            },
+            GroundDerivationStep {
+                clause_index: 1,
+                env: query_env,
+                premises: vec![0],
+            },
+        ],
+        query_step: 1,
+    };
+    assert!(matches!(
+        validate_ground_derivation(&problem, &derivation),
+        Err(GroundDerivationError::VariableBindingSortMismatch { step: 1, .. })
+    ));
+}
+
+#[test]
+fn ground_derivation_rejects_step_local_uf_interpretations() {
+    // Both clauses are individually true under their step-local observations,
+    // but one source function cannot map the same concrete argument to both 7
+    // and 8 in a single derivation.
+    let mut problem = ChcProblem::new();
+    let p = problem.declare_predicate("P", vec![ChcSort::Int]);
+    let fx = int_uf("f", var("x"));
+    let fy = int_uf("f", var("y"));
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::and(
+            ChcExpr::eq(var("x"), ChcExpr::int(0)),
+            ChcExpr::eq(fx.clone(), ChcExpr::Int(7)),
+        )),
+        ClauseHead::Predicate(p, vec![var("x")]),
+    ));
+    problem.add_clause(HornClause::query(ClauseBody::new(
+        vec![(p, vec![var("y")])],
+        Some(ChcExpr::and(
+            ChcExpr::eq(var("y"), ChcExpr::int(0)),
+            ChcExpr::eq(fy.clone(), ChcExpr::Int(8)),
+        )),
+    )));
+
+    let mut fact_env = env(&[("x", 0)]);
+    install_observation(&mut fact_env, fx, 7);
+    let mut query_env = env(&[("y", 0)]);
+    install_observation(&mut query_env, fy, 8);
+    let derivation = GroundDerivation {
+        steps: vec![
+            GroundDerivationStep {
+                clause_index: 0,
+                env: fact_env,
+                premises: Vec::new(),
+            },
+            GroundDerivationStep {
+                clause_index: 1,
+                env: query_env,
+                premises: vec![0],
+            },
+        ],
+        query_step: 1,
+    };
+
+    assert!(matches!(
+        validate_ground_derivation(&problem, &derivation),
+        Err(GroundDerivationError::UfCongruenceViolation { step: 1, .. })
+    ));
+}
+
+#[test]
+fn ground_derivation_rejects_same_step_concrete_uf_conflict() {
+    use crate::expr::evaluate::{
+        uf_application_model_key, UF_APPLICATION_MODEL_MARKER_KEY,
+        UF_APPLICATION_MODEL_MARKER_VALUE,
+    };
+
+    let fx = int_uf("f", var("x"));
+    let f_zero = int_uf("f", ChcExpr::int(0));
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::and(
+        ChcExpr::eq(var("x"), ChcExpr::int(0)),
+        ChcExpr::and(
+            ChcExpr::eq(fx.clone(), ChcExpr::Int(7)),
+            ChcExpr::eq(f_zero.clone(), ChcExpr::Int(8)),
+        ),
+    ))));
+
+    let mut hostile = env(&[("x", 0)]);
+    hostile.insert(
+        uf_application_model_key(&fx).expect("UF exact key"),
+        SmtValue::Int(7),
+    );
+    hostile.insert(
+        uf_application_model_key(&f_zero).expect("UF exact key"),
+        SmtValue::Int(8),
+    );
+    hostile.insert(
+        UF_APPLICATION_MODEL_MARKER_KEY.to_string(),
+        SmtValue::Opaque(UF_APPLICATION_MODEL_MARKER_VALUE.to_string()),
+    );
+    let derivation = GroundDerivation {
+        steps: vec![GroundDerivationStep {
+            clause_index: 0,
+            env: hostile,
+            premises: Vec::new(),
+        }],
+        query_step: 0,
+    };
+
+    assert!(matches!(
+        validate_ground_derivation(&problem, &derivation),
+        Err(GroundDerivationError::UfCongruenceViolation { step: 0, .. })
+    ));
+}
+
+#[test]
+fn ground_derivation_accepts_cached_premise_head_fanout() {
+    let mut problem = ChcProblem::new();
+    let p = problem.declare_predicate("P", vec![ChcSort::Int]);
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(var("x"), ChcExpr::int(0))),
+        ClauseHead::Predicate(p, vec![ChcExpr::add(var("x"), ChcExpr::int(1))]),
+    ));
+    problem.add_clause(HornClause::query(ClauseBody::predicates_only(vec![
+        (p, vec![ChcExpr::int(1)]),
+        (p, vec![ChcExpr::int(1)]),
+    ])));
+    let derivation = GroundDerivation {
+        steps: vec![
+            GroundDerivationStep {
+                clause_index: 0,
+                env: env(&[("x", 0)]),
+                premises: Vec::new(),
+            },
+            GroundDerivationStep {
+                clause_index: 1,
+                env: FxHashMap::default(),
+                premises: vec![0, 0],
+            },
+        ],
+        query_step: 1,
+    };
+    assert_eq!(validate_ground_derivation(&problem, &derivation), Ok(()));
+}
+
+#[test]
+fn completion_preserves_only_the_exact_uf_marker_opaque_value() {
+    use crate::expr::evaluate::{
+        UF_APPLICATION_MODEL_MARKER_KEY, UF_APPLICATION_MODEL_MARKER_VALUE,
+    };
+
+    let application = int_uf("f", var("x"));
+    let clause = HornClause::query(ClauseBody::constraint(ChcExpr::eq(
+        application.clone(),
+        ChcExpr::int(7),
+    )));
+    let mut model = env(&[("x", 0)]);
+    install_observation(&mut model, application, 7);
+    model.insert(
+        "ordinary-placeholder".to_string(),
+        SmtValue::Opaque("not-a-value".to_string()),
+    );
+
+    complete::propagate_env_for_clause(&clause, &mut model);
+    assert!(matches!(
+        model.get(UF_APPLICATION_MODEL_MARKER_KEY),
+        Some(SmtValue::Opaque(marker)) if marker == UF_APPLICATION_MODEL_MARKER_VALUE
+    ));
+    assert!(!model.contains_key("ordinary-placeholder"));
+
+    model.insert(
+        UF_APPLICATION_MODEL_MARKER_KEY.to_string(),
+        SmtValue::Opaque("spoofed".to_string()),
+    );
+    complete::propagate_env_for_clause(&clause, &mut model);
+    assert!(!model.contains_key(UF_APPLICATION_MODEL_MARKER_KEY));
+}
+
+#[test]
 fn ground_derivation_rejects_argument_disagreement() {
     // The middle step claims to consume `P(0)` but binds `x = 1`: the body
     // argument no longer matches the premise's head argument.
@@ -140,15 +1166,119 @@ fn ground_derivation_rejects_violated_constraint() {
 }
 
 #[test]
+fn ground_derivation_rejects_array_disequality_from_different_defaults() {
+    // Over Bool indices, `fully_covered_true` and `const_true` are
+    // extensionally equal even though their stored defaults differ. The value
+    // representation does not retain the index sort, so its shared equality
+    // procedure must return Unknown rather than manufacture disequality. A
+    // forged `(distinct a b) => false` step therefore fails closed.
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Bool), Box::new(ChcSort::Bool));
+    let a = ChcVar::new("a", array_sort.clone());
+    let b = ChcVar::new("b", array_sort);
+    let mut problem = ChcProblem::new();
+    problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::ne(
+        ChcExpr::var(a.clone()),
+        ChcExpr::var(b.clone()),
+    ))));
+
+    let mut bindings = FxHashMap::default();
+    bindings.insert(
+        a.name,
+        SmtValue::ArrayMap {
+            default: Box::new(SmtValue::Bool(false)),
+            entries: vec![
+                (SmtValue::Bool(false), SmtValue::Bool(true)),
+                (SmtValue::Bool(true), SmtValue::Bool(true)),
+            ],
+        },
+    );
+    bindings.insert(b.name, SmtValue::ConstArray(Box::new(SmtValue::Bool(true))));
+    let derivation = GroundDerivation {
+        steps: vec![GroundDerivationStep {
+            clause_index: 0,
+            env: bindings,
+            premises: vec![],
+        }],
+        query_step: 0,
+    };
+
+    assert_eq!(
+        validate_ground_derivation(&problem, &derivation),
+        Err(GroundDerivationError::ConstraintNotGround { step: 0 })
+    );
+}
+
+#[test]
+fn ground_derivation_accepts_extensionally_equal_array_arguments() {
+    // Duplicate stores are interpreted with SMT-LIB's last-store-wins
+    // semantics. These two concrete arrays have the same default and the same
+    // observable value at every explicit index, so a premise link between
+    // their different finite representations is valid.
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let defined = ChcVar::new("defined", array_sort.clone());
+    let used = ChcVar::new("used", array_sort.clone());
+    let mut problem = ChcProblem::new();
+    let p = problem.declare_predicate("P", vec![array_sort]);
+    problem.add_clause(HornClause::new(
+        ClauseBody::empty(),
+        ClauseHead::Predicate(p, vec![ChcExpr::var(defined.clone())]),
+    ));
+    problem.add_clause(HornClause::query(ClauseBody::predicates_only(vec![(
+        p,
+        vec![ChcExpr::var(used.clone())],
+    )])));
+
+    let mut definition_env = FxHashMap::default();
+    definition_env.insert(
+        defined.name,
+        SmtValue::ArrayMap {
+            default: Box::new(SmtValue::Int(0)),
+            entries: vec![
+                (SmtValue::Int(3), SmtValue::Int(1)),
+                (SmtValue::Int(3), SmtValue::Int(7)),
+            ],
+        },
+    );
+    let mut use_env = FxHashMap::default();
+    use_env.insert(
+        used.name,
+        SmtValue::ArrayMap {
+            default: Box::new(SmtValue::Int(0)),
+            entries: vec![(SmtValue::Int(3), SmtValue::Int(7))],
+        },
+    );
+    let derivation = GroundDerivation {
+        steps: vec![
+            GroundDerivationStep {
+                clause_index: 0,
+                env: definition_env,
+                premises: vec![],
+            },
+            GroundDerivationStep {
+                clause_index: 1,
+                env: use_env,
+                premises: vec![0],
+            },
+        ],
+        query_step: 1,
+    };
+
+    assert_eq!(validate_ground_derivation(&problem, &derivation), Ok(()));
+}
+
+#[test]
 fn ground_derivation_rejects_unbound_variable() {
-    // `y` is missing from the step environment, so the transition constraint
-    // cannot be decided. Fail closed rather than assume.
+    // `y` is missing from the step environment. Total source bindings are
+    // authenticated before the transition constraint is evaluated.
     let problem = counting_problem();
     let mut derivation = counting_derivation();
     derivation.steps[1].env = env(&[("x", 0)]);
     assert_eq!(
         validate_ground_derivation(&problem, &derivation),
-        Err(GroundDerivationError::ConstraintNotGround { step: 1 })
+        Err(GroundDerivationError::VariableBindingMissing {
+            step: 1,
+            variable: 1,
+        })
     );
 }
 
@@ -163,7 +1293,10 @@ fn ground_derivation_rejects_opaque_placeholder_values() {
         .insert("y".to_string(), SmtValue::Opaque("@x7".to_string()));
     assert_eq!(
         validate_ground_derivation(&problem, &derivation),
-        Err(GroundDerivationError::ConstraintNotGround { step: 1 })
+        Err(GroundDerivationError::VariableBindingSortMismatch {
+            step: 1,
+            variable: 1,
+        })
     );
 }
 
@@ -805,16 +1938,17 @@ fn tester_only_clause() -> (ChcProblem, HornClause) {
     let mut problem = ChcProblem::new();
     let p = problem.declare_predicate("R", vec![ChcSort::Bool]);
     let cell = ChcExpr::Var(ChcVar::new("c", option_int_sort()));
+    let out = ChcExpr::Var(ChcVar::new("out", ChcSort::Bool));
     // out = is-some(c)  =>  R(out)
     let clause = HornClause::new(
-        ClauseBody::constraint(ChcExpr::eq(var("out"), is_some(cell))),
-        ClauseHead::Predicate(p, vec![var("out")]),
+        ClauseBody::constraint(ChcExpr::eq(out.clone(), is_some(cell))),
+        ClauseHead::Predicate(p, vec![out.clone()]),
     );
     problem.add_clause(clause.clone());
     problem.add_clause(HornClause::new(
         ClauseBody::new(
-            vec![(p, vec![var("out")])],
-            Some(ChcExpr::eq(var("out"), ChcExpr::Bool(true))),
+            vec![(p, vec![out.clone()])],
+            Some(ChcExpr::eq(out, ChcExpr::Bool(true))),
         ),
         ClauseHead::False,
     ));
@@ -823,31 +1957,32 @@ fn tester_only_clause() -> (ChcProblem, HornClause) {
 
 /// The same shape with the ITE condition guarded by a SECOND unconstrained
 /// existential. This is the case Part 1 exists for and Part 2 provably cannot
-/// reach: at normalization time `k` is still unbound, so the ITE does not
+/// reach: at normalization time `gate` is still unbound, so the ITE does not
 /// resolve, so the tester's subject is the ITE term rather than `c` and the
 /// tester rule correctly abstains. Only a carried witness completes it.
 fn witness_only_clause() -> (ChcProblem, HornClause) {
     let mut problem = ChcProblem::new();
     let p = problem.declare_predicate("R", vec![ChcSort::Bool]);
     let cell = ChcExpr::Var(ChcVar::new("c", option_int_sort()));
+    let out = ChcExpr::Var(ChcVar::new("out", ChcSort::Bool));
     let none = ChcExpr::FuncApp("none".to_string(), option_int_sort(), vec![]);
     let selected = ChcExpr::Op(
         crate::ChcOp::Ite,
         vec![
-            std::sync::Arc::new(ChcExpr::gt(var("k"), ChcExpr::Int(100))),
+            std::sync::Arc::new(ChcExpr::Var(ChcVar::new("gate", ChcSort::Bool))),
             std::sync::Arc::new(cell),
             std::sync::Arc::new(none),
         ],
     );
     let clause = HornClause::new(
-        ClauseBody::constraint(ChcExpr::eq(var("out"), is_some(selected))),
-        ClauseHead::Predicate(p, vec![var("out")]),
+        ClauseBody::constraint(ChcExpr::eq(out.clone(), is_some(selected))),
+        ClauseHead::Predicate(p, vec![out.clone()]),
     );
     problem.add_clause(clause.clone());
     problem.add_clause(HornClause::new(
         ClauseBody::new(
-            vec![(p, vec![var("out")])],
-            Some(ChcExpr::eq(var("out"), ChcExpr::Bool(true))),
+            vec![(p, vec![out.clone()])],
+            Some(ChcExpr::eq(out, ChcExpr::Bool(true))),
         ),
         ClauseHead::False,
     ));
@@ -855,18 +1990,24 @@ fn witness_only_clause() -> (ChcProblem, HornClause) {
 }
 
 #[test]
-fn carried_witness_completes_what_ground_completion_cannot() {
+fn carried_witness_completes_when_the_bounded_ground_solve_is_unavailable() {
     // THE COMPLETENESS CLAIM. The derivation needs `out = true`, which needs
     // the ITE to select `c` and `c` to be a `some`. Nothing DETERMINES either
-    // `k` or `c`, and the tester rule cannot fire because the ITE is unresolved
-    // while `k` is unbound — so unaided completion defaults `k = 0`, the ITE
-    // selects `none`, and the constraint reads false. The carried witness is
-    // the only thing that closes it.
+    // `gate` or `c`, and the tester rule cannot fire because the ITE is
+    // unresolved while `gate` is unbound. The ordinary bounded witness solve
+    // can rediscover these values when it has time; the opaque fallback below
+    // models the production deadline-exhausted path and isolates the carried
+    // witness behavior. Deterministic completion then defaults `gate = false`,
+    // the ITE selects `none`, and the constraint reads false.
     let (problem, clause) = witness_only_clause();
 
     let mut plain = FxHashMap::default();
     plain.insert("out".to_string(), SmtValue::Bool(true));
-    assert!(complete::complete_env_for_clause(&clause, &mut plain));
+    assert!(complete_after_skipping_witness_solve(
+        &clause,
+        &mut plain,
+        &["gate", "c"]
+    ));
     assert_eq!(
         eval_ground_pub(clause.body.constraint.as_ref().expect("constraint"), &plain),
         Some(SmtValue::Bool(false)),
@@ -876,7 +2017,7 @@ fn carried_witness_completes_what_ground_completion_cannot() {
     let mut carried = FxHashMap::default();
     carried.insert("out".to_string(), SmtValue::Bool(true));
     let mut witness = FxHashMap::default();
-    witness.insert("k".to_string(), SmtValue::Int(200));
+    witness.insert("gate".to_string(), SmtValue::Bool(true));
     witness.insert(
         "c".to_string(),
         SmtValue::Datatype("some".to_string(), vec![SmtValue::Int(4)]),
@@ -1079,6 +2220,7 @@ fn tester_driven_completion_cannot_manufacture_a_witness_for_a_contradiction() {
     let mut problem = ChcProblem::new();
     let p = problem.declare_predicate("R", vec![ChcSort::Bool]);
     let cell = ChcExpr::Var(ChcVar::new("c", option_int_sort()));
+    let out = ChcExpr::Var(ChcVar::new("out", ChcSort::Bool));
     let is_none = ChcExpr::FuncApp(
         "is-none".to_string(),
         ChcSort::Bool,
@@ -1086,11 +2228,11 @@ fn tester_driven_completion_cannot_manufacture_a_witness_for_a_contradiction() {
     );
     let clause = HornClause::new(
         ClauseBody::constraint(ChcExpr::and(is_some(cell), is_none)),
-        ClauseHead::Predicate(p, vec![var("out")]),
+        ClauseHead::Predicate(p, vec![out.clone()]),
     );
     problem.add_clause(clause.clone());
     problem.add_clause(HornClause::new(
-        ClauseBody::new(vec![(p, vec![var("out")])], None),
+        ClauseBody::new(vec![(p, vec![out])], None),
         ClauseHead::False,
     ));
 
@@ -1132,20 +2274,22 @@ fn determined_ite_normalization_exposes_the_tester_subject() {
     // `some`, and with `b = false` must NOT — the ITE then selects `none` and
     // the clause is unsatisfiable for `out = true`.
     let mut problem = ChcProblem::new();
-    let p = problem.declare_predicate("R", vec![ChcSort::Bool]);
+    let p = problem.declare_predicate("R", vec![ChcSort::Bool, ChcSort::Bool]);
     let cell = ChcExpr::Var(ChcVar::new("c", option_int_sort()));
+    let out = ChcExpr::Var(ChcVar::new("out", ChcSort::Bool));
+    let condition = ChcExpr::Var(ChcVar::new("b", ChcSort::Bool));
     let none = ChcExpr::FuncApp("none".to_string(), option_int_sort(), vec![]);
     let selected = ChcExpr::Op(
         crate::ChcOp::Ite,
         vec![
-            std::sync::Arc::new(var("b")),
+            std::sync::Arc::new(condition.clone()),
             std::sync::Arc::new(cell),
             std::sync::Arc::new(none),
         ],
     );
     let clause = HornClause::new(
-        ClauseBody::constraint(ChcExpr::eq(var("out"), is_some(selected))),
-        ClauseHead::Predicate(p, vec![var("out"), var("b")]),
+        ClauseBody::constraint(ChcExpr::eq(out.clone(), is_some(selected))),
+        ClauseHead::Predicate(p, vec![out, condition]),
     );
     problem.add_clause(clause.clone());
 

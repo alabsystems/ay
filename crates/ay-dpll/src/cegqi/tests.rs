@@ -28,7 +28,7 @@ fn test_is_cegqi_candidate_accepts_uf_with_arith_sort() {
 
     // Create: forall x:Int. f(x) = x
     let x_var = terms.mk_var("x", Sort::Int);
-    let f_x = terms.mk_app(Symbol::Named("f".to_string()), vec![x_var], Sort::Int);
+    let f_x = terms.mk_app(Symbol::named("f"), vec![x_var], Sort::Int);
     let body = terms.mk_eq(f_x, x_var);
     let forall = terms.mk_forall(vec![("x".to_string(), Sort::Int)], body);
 
@@ -46,7 +46,7 @@ fn test_is_cegqi_candidate_rejects_pure_uf_bool_sort() {
 
     // Create: forall x:Bool. f(x)
     let x_var = terms.mk_var("x", Sort::Bool);
-    let f_x = terms.mk_app(Symbol::Named("f".to_string()), vec![x_var], Sort::Bool);
+    let f_x = terms.mk_app(Symbol::named("f"), vec![x_var], Sort::Bool);
     let forall = terms.mk_forall(vec![("x".to_string(), Sort::Bool)], f_x);
 
     assert!(
@@ -81,7 +81,7 @@ fn test_is_cegqi_candidate_accepts_mixed_uf_arith() {
     let mut terms = TermStore::new();
 
     let x_var = terms.mk_var("x", Sort::Int);
-    let f_x = terms.mk_app(Symbol::Named("f".to_string()), vec![x_var], Sort::Int);
+    let f_x = terms.mk_app(Symbol::named("f"), vec![x_var], Sort::Int);
     let one = terms.mk_int(1.into());
     let sum = terms.mk_add(vec![f_x, one]);
     let zero = terms.mk_int(0.into());
@@ -100,7 +100,7 @@ fn test_is_cegqi_candidate_rejects_non_arith_seq_binder_7883() {
     let seq_sort = Sort::Uninterpreted("Seq".to_string());
 
     let s_var = terms.mk_var("s", seq_sort.clone());
-    let seq_len_s = terms.mk_app(Symbol::Named("seq_len".to_string()), vec![s_var], Sort::Int);
+    let seq_len_s = terms.mk_app(Symbol::named("seq_len"), vec![s_var], Sort::Int);
     let zero = terms.mk_int(0.into());
     let body = terms.mk_ge(seq_len_s, zero);
     let forall = terms.mk_forall(vec![("s".to_string(), seq_sort)], body);
@@ -118,7 +118,7 @@ fn test_is_cegqi_candidate_rejects_mixed_seq_and_int_binders_7883() {
 
     let s_var = terms.mk_var("s", seq_sort.clone());
     let i_var = terms.mk_var("i", Sort::Int);
-    let seq_len_s = terms.mk_app(Symbol::Named("seq_len".to_string()), vec![s_var], Sort::Int);
+    let seq_len_s = terms.mk_app(Symbol::named("seq_len"), vec![s_var], Sort::Int);
     let body = terms.mk_lt(i_var, seq_len_s);
     let forall = terms.mk_forall(
         vec![("s".to_string(), seq_sort), ("i".to_string(), Sort::Int)],
@@ -136,7 +136,7 @@ fn test_is_cegqi_candidate_rejects_pure_bool_predicate_on_int_var_7883() {
     let mut terms = TermStore::new();
 
     let x_var = terms.mk_var("x", Sort::Int);
-    let pred = terms.mk_app(Symbol::Named("p".to_string()), vec![x_var], Sort::Bool);
+    let pred = terms.mk_app(Symbol::named("p"), vec![x_var], Sort::Bool);
     let forall = terms.mk_forall(vec![("x".to_string(), Sort::Int)], pred);
 
     assert!(
@@ -150,7 +150,7 @@ fn test_is_cegqi_candidate_rejects_guarded_bool_predicate_on_int_var_9227() {
     let mut terms = TermStore::new();
 
     let x_var = terms.mk_var("x", Sort::Int);
-    let pred = terms.mk_app(Symbol::Named("p".to_string()), vec![x_var], Sort::Bool);
+    let pred = terms.mk_app(Symbol::named("p"), vec![x_var], Sort::Bool);
     let zero = terms.mk_int(0.into());
     let len = terms.mk_var("len", Sort::Int);
     let in_lower = terms.mk_le(zero, x_var);

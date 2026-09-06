@@ -169,6 +169,26 @@ pub(super) struct ModDivElimResult {
     pub introduced_unconstrained_div_mod: bool,
 }
 
+impl ModDivElimResult {
+    /// The result this pass produces for a formula containing no `mod`/`div`/`rem`:
+    /// the formula unchanged, no auxiliary constraints, nothing introduced.
+    ///
+    /// #modelim-gate. Callers that run the pass PER ASSERTION build a fresh
+    /// `ModDivElimState` each time, so its memo never spans assertions and a shared
+    /// sub-graph is re-walked and re-cloned once per assertion (`TermData::clone` +
+    /// `String::clone` per node). Guarding the call with `contains_*` and returning
+    /// this instead is semantics-preserving — `rewrite_term` is the identity on a
+    /// term with no div/mod, and `constraints` would be empty — while skipping the
+    /// traversal entirely.
+    pub(in crate::executor) fn identity(formula: TermId) -> Self {
+        Self {
+            constraints: Vec::new(),
+            rewritten: vec![formula],
+            introduced_unconstrained_div_mod: false,
+        }
+    }
+}
+
 pub(super) fn eliminate_int_mod_div_by_constant(
     terms: &mut TermStore,
     formulas: &[TermId],

@@ -49,6 +49,20 @@ fn residual_free_dt_array_bv64_alias_with_consistent_reads_confirms() {
 }
 
 #[test]
+fn residual_free_dt_array_bool_indices_with_consistent_reads_confirms() {
+    let mut ts = TermStore::new();
+    let array = ts.mk_var("a", Sort::array(Sort::Bool, struct_sort()));
+    let false_index = ts.mk_bool(false);
+    let true_index = ts.mk_bool(true);
+    let five = ts.mk_int(int(5));
+    let six = ts.mk_int(int(6));
+    let at_false = field_read_eq(&mut ts, "f", array, false_index, five);
+    let at_true = field_read_eq(&mut ts, "f", array, true_index, six);
+
+    assert_confirmed(&verdict(&ts, &StubModel::new(), &[at_false, at_true]));
+}
+
+#[test]
 fn residual_free_dt_array_alias_only_materializes_and_replays() {
     // Even with no explicit store cells, the residual proof must construct a
     // real array value for the class and replay the alias equality. Both leaves
@@ -113,6 +127,76 @@ fn residual_witness_replay_rejects_malformed_whole_element() {
 }
 
 #[test]
+fn residual_rejects_selector_result_sort_mismatch() {
+    let mut ts = TermStore::new();
+    let datatype = struct_sort();
+    let array = ts.mk_var("a", Sort::array(Sort::Int, datatype.clone()));
+    let index = ts.mk_int(int(0));
+    let selected = app(&mut ts, "select", &[array, index], datatype);
+    let malformed_field = app(&mut ts, "f", &[selected], Sort::Bool);
+    let false_value = ts.mk_bool(false);
+    let assertion = app(&mut ts, "=", &[malformed_field, false_value], Sort::Bool);
+
+    assert_cannot(&verdict(&ts, &StubModel::new(), &[assertion]));
+}
+
+#[test]
+fn residual_rejects_ambiguous_selector_metadata() {
+    let mut ts = TermStore::new();
+    let datatype = Sort::Datatype(DatatypeSort::new(
+        "Ambiguous",
+        vec![
+            DatatypeConstructor::new("left", vec![DatatypeField::new("value", Sort::Int)]),
+            DatatypeConstructor::new("right", vec![DatatypeField::new("value", Sort::Int)]),
+        ],
+    ));
+    let array = ts.mk_var("a", Sort::array(Sort::Int, datatype.clone()));
+    let index = ts.mk_int(int(0));
+    let selected = app(&mut ts, "select", &[array, index], datatype);
+    let ambiguous_field = app(&mut ts, "value", &[selected], Sort::Int);
+    let zero = ts.mk_int(int(0));
+    let assertion = app(&mut ts, "=", &[ambiguous_field, zero], Sort::Bool);
+
+    assert_cannot(&verdict(&ts, &StubModel::new(), &[assertion]));
+}
+
+#[test]
+fn residual_rejects_wrong_shape_bool_indices_before_witness_grouping() {
+    // Three different field values force the three indices to be pairwise
+    // distinct, which is impossible in Bool's two-element carrier. A malformed
+    // model used to launder that contradiction by publishing three distinct
+    // opaque tokens for the Bool leaves; the finite-store replay then treated
+    // those tokens as three keys. Source-sort authentication must refuse the
+    // malformed indices before they acquire witness authority.
+    let mut ts = TermStore::new();
+    let array = ts.mk_var("a", Sort::array(Sort::Bool, struct_sort()));
+    let first_index = ts.mk_var("i0", Sort::Bool);
+    let second_index = ts.mk_var("i1", Sort::Bool);
+    let third_index = ts.mk_var("i2", Sort::Bool);
+    let zero = ts.mk_int(int(0));
+    let one = ts.mk_int(int(1));
+    let two = ts.mk_int(int(2));
+    let first = field_read_eq(&mut ts, "f", array, first_index, zero);
+    let second = field_read_eq(&mut ts, "f", array, second_index, one);
+    let third = field_read_eq(&mut ts, "f", array, third_index, two);
+    let model = StubModel::new()
+        .with(
+            first_index,
+            ModelValue::Uninterpreted("@malformed-bool-0".to_string()),
+        )
+        .with(
+            second_index,
+            ModelValue::Uninterpreted("@malformed-bool-1".to_string()),
+        )
+        .with(
+            third_index,
+            ModelValue::Uninterpreted("@malformed-bool-2".to_string()),
+        );
+
+    assert_cannot(&verdict(&ts, &model, &[first, second, third]));
+}
+
+#[test]
 fn residual_witness_entry_budget_fails_closed() {
     // A satisfiable family just beyond the documented hard entry cap must be
     // rejected wholesale, never truncated to a partial finite-store witness.
@@ -125,6 +209,127 @@ fn residual_witness_entry_budget_fails_closed() {
         assertions.push(field_read_eq(&mut ts, "f", array, index, five));
     }
     assert_cannot(&verdict(&ts, &StubModel::new(), &assertions));
+}
+
+#[test]
+fn residual_rejects_one_node_scalar_payload_beyond_witness_budget() {
+    let mut ts = TermStore::new();
+    let datatype = Sort::Datatype(DatatypeSort::new(
+        "TextCell",
+        vec![DatatypeConstructor::new(
+            "text_cell",
+            vec![DatatypeField::new("payload", Sort::String)],
+        )],
+    ));
+    let array = ts.mk_var("a", Sort::array(Sort::Int, datatype.clone()));
+    let index = ts.mk_int(int(0));
+    let selected = app(&mut ts, "select", &[array, index], datatype);
+    let payload = app(&mut ts, "payload", &[selected], Sort::String);
+    let pinned = ts.mk_var("pinned", Sort::String);
+    let assertion = app(&mut ts, "=", &[payload, pinned], Sort::Bool);
+    let model = StubModel::new().with(
+        pinned,
+        ModelValue::Str("x".repeat(residual::MAX_WITNESS_VALUE_WORK)),
+    );
+
+    assert_cannot(&verdict(&ts, &model, &[assertion]));
+}
+
+#[test]
+fn residual_classifier_depth_budget_fails_closed() {
+    let mut ts = TermStore::new();
+    let array = ts.mk_var("a", Sort::array(Sort::Int, struct_sort()));
+    let index = ts.mk_int(int(0));
+    let five = ts.mk_int(int(5));
+    let mut at_limit = field_read_eq(&mut ts, "f", array, index, five);
+    for _ in 0..residual::MAX_CLASSIFY_DEPTH {
+        at_limit = app(&mut ts, "and", &[at_limit], Sort::Bool);
+    }
+    assert_confirmed(&verdict(&ts, &StubModel::new(), &[at_limit]));
+
+    let over_limit = app(&mut ts, "and", &[at_limit], Sort::Bool);
+    assert_cannot(&verdict(&ts, &StubModel::new(), &[over_limit]));
+}
+
+#[test]
+fn residual_classifier_width_budget_fails_closed_before_argument_snapshot() {
+    let mut ts = TermStore::new();
+    let array = ts.mk_var("a", Sort::array(Sort::Int, struct_sort()));
+    let index = ts.mk_int(int(0));
+    let five = ts.mk_int(int(5));
+    let residual = field_read_eq(&mut ts, "f", array, index, five);
+    let arguments = vec![residual; residual::MAX_CLASSIFY_WORK];
+    let over_limit = app(&mut ts, "and", &arguments, Sort::Bool);
+
+    assert_cannot(&verdict(&ts, &StubModel::new(), &[over_limit]));
+}
+
+#[test]
+fn residual_alias_edge_budget_fails_closed_without_truncation() {
+    let mut ts = TermStore::new();
+    let array_sort = Sort::array(Sort::Int, struct_sort());
+    let left = ts.mk_var("left", array_sort.clone());
+    let right = ts.mk_var("right", array_sort);
+    let alias = app(&mut ts, "=", &[left, right], Sort::Bool);
+
+    let at_limit = vec![alias; residual::MAX_WITNESS_ALIASES];
+    assert_confirmed(&verdict(&ts, &StubModel::new(), &at_limit));
+
+    let over_limit = vec![alias; residual::MAX_WITNESS_ALIASES + 1];
+    assert_cannot(&verdict(&ts, &StubModel::new(), &over_limit));
+}
+
+#[test]
+fn residual_member_budget_fails_closed_without_partial_classes() {
+    let mut ts = TermStore::new();
+    let array_sort = Sort::array(Sort::Int, struct_sort());
+    let index = ts.mk_int(int(0));
+    let five = ts.mk_int(int(5));
+    let mut assertions = Vec::new();
+    for member in 0..=residual::MAX_WITNESS_MEMBERS {
+        let array = ts.mk_var(format!("array_{member}"), array_sort.clone());
+        assertions.push(field_read_eq(&mut ts, "f", array, index, five));
+    }
+
+    assert_confirmed(&verdict(
+        &ts,
+        &StubModel::new(),
+        &assertions[..residual::MAX_WITNESS_MEMBERS],
+    ));
+    assert_cannot(&verdict(&ts, &StubModel::new(), &assertions));
+}
+
+#[test]
+fn residual_occurrence_node_budget_fails_closed() {
+    let mut ts = TermStore::new();
+    let array = ts.mk_var("a", Sort::array(Sort::Int, struct_sort()));
+    let index = ts.mk_int(int(0));
+    let five = ts.mk_int(int(5));
+    let residual = field_read_eq(&mut ts, "f", array, index, five);
+    let mut assertions = vec![residual];
+    let mut model = StubModel::new();
+    for node in 0..=residual::MAX_OCCURRENCE_NODES {
+        let pinned_true = ts.mk_var(format!("pinned_true_{node}"), Sort::Bool);
+        assertions.push(pinned_true);
+        model = model.with(pinned_true, ModelValue::Bool(true));
+    }
+
+    assert_cannot(&verdict(&ts, &model, &assertions));
+}
+
+#[test]
+fn residual_occurrence_pending_width_budget_fails_closed() {
+    let mut ts = TermStore::new();
+    let array = ts.mk_var("a", Sort::array(Sort::Int, struct_sort()));
+    let index = ts.mk_int(int(0));
+    let five = ts.mk_int(int(5));
+    let residual = field_read_eq(&mut ts, "f", array, index, five);
+    let pinned_true = ts.mk_var("pinned_true", Sort::Bool);
+    let arguments = vec![pinned_true; residual::MAX_OCCURRENCE_NODES];
+    let wide_true = app(&mut ts, "and", &arguments, Sort::Bool);
+    let model = StubModel::new().with(pinned_true, ModelValue::Bool(true));
+
+    assert_cannot(&verdict(&ts, &model, &[residual, wide_true]));
 }
 
 #[test]
@@ -317,6 +522,85 @@ fn residual_free_dt_array_pinned_member_not_free() {
         })),
     );
     assert_cannot(&verdict(&ts, &m, &[alias, r1]));
+}
+
+#[test]
+fn residual_conflicting_committed_read_cannot_be_laundered_by_late_pin() {
+    // Scan the residual requirement first, while its concrete-index read is
+    // unpinned. A later assertion then adopts a solver commitment for a
+    // syntactically different read whose symbolic index evaluates to that same
+    // concrete value. Reclassification must observe the value-keyed committed
+    // read, discover that it projects `f = 6` rather than the required `f = 5`,
+    // and fail closed instead of materializing a witness that launders the pin.
+    let mut ts = TermStore::new();
+    let datatype = struct_sort();
+    let array = ts.mk_var("a", Sort::array(Sort::Int, datatype.clone()));
+    let symbolic_index = ts.mk_var("i", Sort::Int);
+    let concrete_index = ts.mk_int(int(0));
+    let five = ts.mk_int(int(5));
+    let six = ts.mk_int(int(6));
+    let zero = ts.mk_int(int(0));
+    let committed_element = app(&mut ts, "mk", &[six, zero], datatype.clone());
+    let committed_read = app(&mut ts, "select", &[array, symbolic_index], datatype);
+    let residual = field_read_eq(&mut ts, "f", array, concrete_index, five);
+    let adopting_assertion = app(
+        &mut ts,
+        "=",
+        &[committed_read, committed_element],
+        Sort::Bool,
+    );
+    let model = ArraySelectStubModel::new()
+        .leaf(symbolic_index, ModelValue::Int(int(0)))
+        .sel(
+            committed_read,
+            ModelValue::Datatype {
+                ctor: "mk".to_string(),
+                args: vec![ModelValue::Int(int(6)), ModelValue::Int(int(0))],
+            },
+        );
+
+    assert_cannot(&verdict(&ts, &model, &[residual, adopting_assertion]));
+}
+
+#[test]
+fn residual_matching_late_committed_read_is_localized_and_confirms() {
+    // Positive control for the conflicting-pin attack above: a syntactically
+    // different read at the same model-evaluated index is admissible when its
+    // committed element agrees with the residual field requirement.
+    let mut ts = TermStore::new();
+    let datatype = struct_sort();
+    let array = ts.mk_var("a", Sort::array(Sort::Int, datatype.clone()));
+    let symbolic_index = ts.mk_var("i", Sort::Int);
+    let concrete_index = ts.mk_int(int(0));
+    let other_index = ts.mk_int(int(1));
+    let five = ts.mk_int(int(5));
+    let seven = ts.mk_int(int(7));
+    let zero = ts.mk_int(int(0));
+    let committed_element = app(&mut ts, "mk", &[five, zero], datatype.clone());
+    let committed_read = app(&mut ts, "select", &[array, symbolic_index], datatype);
+    let residual = field_read_eq(&mut ts, "f", array, concrete_index, five);
+    let unpinned_residual = field_read_eq(&mut ts, "g", array, other_index, seven);
+    let adopting_assertion = app(
+        &mut ts,
+        "=",
+        &[committed_read, committed_element],
+        Sort::Bool,
+    );
+    let model = ArraySelectStubModel::new()
+        .leaf(symbolic_index, ModelValue::Int(int(0)))
+        .sel(
+            committed_read,
+            ModelValue::Datatype {
+                ctor: "mk".to_string(),
+                args: vec![ModelValue::Int(int(5)), ModelValue::Int(int(0))],
+            },
+        );
+
+    assert_confirmed(&verdict(
+        &ts,
+        &model,
+        &[residual, unpinned_residual, adopting_assertion],
+    ));
 }
 
 #[test]

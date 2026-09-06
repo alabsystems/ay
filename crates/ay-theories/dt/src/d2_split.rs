@@ -202,9 +202,15 @@ impl DtSplitOnDemand {
         for raw in self.scanned_len..len {
             let tid = TermId(raw as u32);
             match terms.get(tid) {
-                TermData::App(Symbol::Named(name), _) | TermData::Var(name, _)
-                    if self.ctor_to_dt.contains_key(name) =>
+                // #symbol-intern: `App` now carries a `SymName` while `Var` still
+                // carries a `String`, so the two cannot share an or-pattern binding.
+                // Both arms borrow as `&str` for the identical lookup.
+                TermData::App(Symbol::Named(name), _)
+                    if self.ctor_to_dt.contains_key(name.as_str()) =>
                 {
+                    self.ctor_apps.push(tid);
+                }
+                TermData::Var(name, _) if self.ctor_to_dt.contains_key(name.as_str()) => {
                     self.ctor_apps.push(tid);
                 }
                 _ => {}
@@ -398,7 +404,9 @@ fn collect_relevant(
 ) {
     match terms.get(t) {
         TermData::App(Symbol::Named(name), args) => {
-            if args.len() == 1 && (tester_names.contains(name) || selector_names.contains(name)) {
+            if args.len() == 1
+                && (tester_names.contains(name.as_str()) || selector_names.contains(name.as_str()))
+            {
                 // Legs 1+2: tester / selector argument.
                 note_relevant(terms, args[0], bound, dt_sort_names, relevant, seen);
             } else if (name == "=" || name == "distinct") && args.len() >= 2 {

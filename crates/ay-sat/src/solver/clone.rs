@@ -492,6 +492,9 @@ impl cold::ColdState {
             internal_lrat_enabled: false,
             unsat_certificate_enabled: self.unsat_certificate_enabled,
             ambient_artifacts_enabled: self.ambient_artifacts_enabled,
+            fmla_learned_lrat_dry_run_artifact_path: self
+                .fmla_learned_lrat_dry_run_artifact_path
+                .clone(),
             retain_unsat_certificate: self.retain_unsat_certificate,
             backward_proof_limits: None,
             backward_proof_failure: None,
@@ -501,6 +504,9 @@ impl cold::ColdState {
             fmla_decompose_lrat_preflight_route_enabled: false,
             fmla_decompose_lrat_preflight_route_consumed: true,
             jump_reasons_enabled: self.jump_reasons_enabled,
+            // Clones carry no proof surface; an empty bitset only ever means a
+            // (sound) duplicate restatement if one is ever attached.
+            veripb_stated_root_units: Vec::new(),
             empty_clause_in_proof: false,
             empty_clause_lrat_id: None,
             empty_clause_scope_depth: 0,

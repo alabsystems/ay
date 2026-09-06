@@ -189,22 +189,118 @@ fn test_to_json_all_modes() {
 fn test_stats_config_any() {
     assert!(!StatsConfig {
         human: false,
+        full: false,
         json: false
     }
     .any());
     assert!(StatsConfig {
         human: true,
+        full: false,
         json: false
     }
     .any());
     assert!(StatsConfig {
         human: false,
+        full: false,
         json: true
     }
     .any());
     assert!(StatsConfig {
         human: true,
+        full: false,
         json: true
     }
     .any());
+}
+
+/// Curated output is a strict SELECTION of the full block, never a rewrite of
+/// it. Every key the curated block prints must appear in the full block with
+/// the same spelling — otherwise `--stats-full` has stopped being the superset
+/// the flag promises, and a script that greps a curated key off default `-st`
+/// would be reading a name that exists nowhere else.
+///
+/// The two documented additions are exempt by name, so adding a third one
+/// silently is what this test is really guarding against.
+#[test]
+fn every_curated_key_also_appears_in_the_full_block() {
+    const ADDED_BY_CURATION: [&str; 2] = [":result", ":total-time"];
+
+    // Both branches matter: several full-block rows are conditional, so an
+    // empty run and a populated one can select different key sets.
+    let empty = ay_dpll::Statistics::default();
+
+    let mut populated = ay_dpll::Statistics::default();
+    // Certificate counters live in `extra` and render only when present.
+    populated.set_int("cert.decisions", 1);
+    populated.set_int("cert.proof_steps_recorded", 1);
+    // The full block gates the term rows on this being non-zero.
+    populated.term_bytes = 939;
+    populated.term_count = 6;
+
+    for stats in [&empty, &populated] {
+        let full = stats.to_string();
+        let curated = curated_smt_statistics(stats, "sat", Duration::from_millis(58), false);
+
+        for line in curated.lines() {
+            let Some(key) = line.split_whitespace().next() else {
+                continue;
+            };
+            if !key.starts_with(':') || ADDED_BY_CURATION.contains(&key) {
+                continue;
+            }
+            assert!(
+                full.contains(&format!("{key} ")),
+                "curated key {key} is absent from the full block, so --stats-full is no longer a superset"
+            );
+        }
+    }
+}
+
+/// The verdict and the wall clock are the two things the block never stated,
+/// and `:total-time` is z3's spelling for the latter. `:time` is the solver's
+/// own time and must survive alongside it rather than be replaced by it.
+#[test]
+fn curated_block_states_the_verdict_and_both_clocks() {
+    let stats = ay_dpll::Statistics::default();
+    let curated = curated_smt_statistics(&stats, "unsat", Duration::from_millis(58), false);
+    assert!(curated.contains(":result"), "{curated}");
+    assert!(curated.contains("unsat"), "{curated}");
+    assert!(
+        curated.contains(":total-time                      0.058"),
+        "{curated}"
+    );
+    assert!(curated.contains(":time "), "{curated}");
+}
+
+/// Group labels are a terminal affordance. Redirected `-st` must stay a
+/// comment-free s-expression, because that is what anything parsing it expects.
+#[test]
+fn group_comments_are_terminal_only() {
+    let stats = ay_dpll::Statistics::default();
+    let piped = curated_smt_statistics(&stats, "sat", Duration::ZERO, false);
+    let terminal = curated_smt_statistics(&stats, "sat", Duration::ZERO, true);
+
+    assert!(!piped.contains(';'), "{piped}");
+    assert!(terminal.contains("  ; search\n"), "{terminal}");
+    assert!(terminal.starts_with("(:statistics\n") && terminal.ends_with(')'));
+    // The labels are the only difference: strip them and the two agree.
+    let stripped: String = terminal
+        .lines()
+        .filter(|line| !line.trim_start().starts_with(';'))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_eq!(
+        stripped.trim_end_matches('\n'),
+        piped.trim_end_matches('\n')
+    );
+}
+
+/// A counter that is absent means "this run minted none", which is not the same
+/// claim as a zero. Certificate rows come from `extra` and must stay omitted
+/// rather than be fabricated.
+#[test]
+fn absent_certificate_counters_are_omitted_not_zeroed() {
+    let stats = ay_dpll::Statistics::default();
+    let curated = curated_smt_statistics(&stats, "sat", Duration::ZERO, false);
+    assert!(!curated.contains(":cert.decisions"), "{curated}");
 }

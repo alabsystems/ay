@@ -27,7 +27,8 @@ impl<'decls> Validator<'_, 'decls> {
     fn selector_app(&self, term: TermId, expected_subject: TermId) -> Option<String> {
         if let TermData::App(Symbol::Named(name), args) = self.terms.get(term) {
             if let [subject] = args.as_slice() {
-                return (*subject == expected_subject).then(|| name.clone());
+                return ((*subject == expected_subject).then(|| name.clone()))
+                    .map(|s| s.to_string());
             }
         }
         None

@@ -169,6 +169,28 @@ impl Solver {
         self.cold.unsat_certificate_enabled = enabled;
     }
 
+    /// Set (or clear) the destination for this solver's Fmla learned-LRAT
+    /// dry-run proof artifact.
+    ///
+    /// Defaults to `None`, meaning no artifact is exported. This is explicit
+    /// per-solver configuration on purpose: the artifact destination used to
+    /// be re-read from the process environment at every solve finalization,
+    /// so every solver in a process shared one destination and unrelated
+    /// solves clobbered each other's artifacts. Process-configuration owners
+    /// (the CLI) resolve the environment once and install the result here.
+    pub fn set_fmla_learned_lrat_dry_run_artifact_path(
+        &mut self,
+        path: Option<std::path::PathBuf>,
+    ) {
+        self.cold.fmla_learned_lrat_dry_run_artifact_path = path;
+    }
+
+    /// The configured Fmla learned-LRAT dry-run proof artifact destination.
+    #[must_use]
+    pub fn fmla_learned_lrat_dry_run_artifact_path(&self) -> Option<&std::path::Path> {
+        self.cold.fmla_learned_lrat_dry_run_artifact_path.as_deref()
+    }
+
     /// Disable encoding-dump, Fmla authority/artifact, solver-start JIT hooks,
     /// and startup walk, and do not retain a second copy of emitted backward
     /// LRAT steps in the result.
@@ -181,6 +203,7 @@ impl Solver {
     /// historical artifact and certificate behavior.
     pub(crate) fn set_bounded_in_memory_proof_posture(&mut self) {
         self.cold.ambient_artifacts_enabled = false;
+        self.cold.fmla_learned_lrat_dry_run_artifact_path = None;
         self.cold.retain_unsat_certificate = false;
         // Solver-start native/JIT installation is process-global and may
         // compile or load artifacts selected by the ambient environment.

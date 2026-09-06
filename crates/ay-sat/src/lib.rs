@@ -375,10 +375,11 @@ pub use resolution_validate::{
     ResolutionValidationResource,
 };
 pub use solver::{
-    AssumeResult, BcpLongScanStats, BcpSavedPosStats, DecomposeLratPreflightStats, FactorStats,
-    IndepEnumReport, LookaheadStats, LratMaterializationStats, RephaseAttributionStats,
-    RestartAttributionStats, SatResult, SatUnknownReason, SetSolutionError, Solver,
-    SolverAssumeResult, SolverSatResult, TheoryPropResult, VarAssignmentKind,
+    AssumeResult, BcpLongScanStats, BcpSavedPosStats, DecomposeLratPreflightStats, DumpCnfReport,
+    DumpCnfVerdict, ExtendModelReport, FactorStats, IndepEnumReport, LookaheadStats,
+    LratMaterializationStats, RephaseAttributionStats, RestartAttributionStats, SatResult,
+    SatUnknownReason, SetSolutionError, Solver, SolverAssumeResult, SolverSatResult,
+    TheoryPropResult, VarAssignmentKind,
 };
 pub use symmetry::SymmetryReport;
 pub use technique::SatTechnique;

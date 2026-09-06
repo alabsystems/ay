@@ -493,13 +493,23 @@ def kill_process_group(proc: subprocess.Popen) -> None:
 
 
 def executable_provenance(command: str) -> dict:
+    """Canonical identity (resolved path + size + sha256) of an executable.
+
+    The recorded path is fully resolved, symlinks included, matching the
+    sibling harnesses (chccomp/proof_overhead/wind_tunnel): provenance rows
+    for the same binary must compare equal regardless of the alias it was
+    invoked through (e.g. macOS `/var` -> `/private/var`), and
+    derived_pb_checker_binary() must sibling-derive `ay-pb` next to the real
+    binary rather than next to a symlink.
+    """
     candidate = Path(command)
     if not candidate.is_absolute():
         candidate = candidate.resolve()
     if not candidate.exists():
         found = shutil.which(command)
         if found:
-            candidate = Path(found).resolve()
+            candidate = Path(found)
+    candidate = candidate.resolve()
     try:
         stat = candidate.stat()
         digest = hashlib.sha256()

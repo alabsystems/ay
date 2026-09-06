@@ -313,11 +313,11 @@ impl ColEntry {
 }
 
 mod bound_state;
-pub use bound_state::{Bound, BoundProvenance, VarStatus};
 pub(crate) use bound_state::{
-    BoundExplanation, BoundType, ErrorKey, ExprInterval, ImpliedBound, InfRational,
+    Antecedent, BoundExplanation, BoundType, ErrorKey, ExprInterval, ImpliedBound, InfRational,
     IntervalEndpoint, RowPrecision, TableauRow, VarInfo,
 };
+pub use bound_state::{Bound, BoundProvenance, VarStatus};
 // Re-exported here so existing `use types::LinearExpr` imports continue to work.
 pub use crate::linear_expr::LinearExpr;
 

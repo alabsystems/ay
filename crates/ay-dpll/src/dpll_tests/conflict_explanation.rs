@@ -73,8 +73,8 @@ fn test_lra_conflict_explanation_soundness_gap11() {
     let five = terms.mk_int(5.into());
     let three = terms.mk_int(3.into());
 
-    let ge_5 = terms.mk_app(Symbol::Named(">=".to_string()), vec![x, five], Sort::Bool);
-    let le_3 = terms.mk_app(Symbol::Named("<=".to_string()), vec![x, three], Sort::Bool);
+    let ge_5 = terms.mk_app(Symbol::named(">="), vec![x, five], Sort::Bool);
+    let le_3 = terms.mk_app(Symbol::named("<="), vec![x, three], Sort::Bool);
 
     let mut lra = LraSolver::new(&terms);
 
@@ -140,9 +140,9 @@ fn test_lra_explanation_minimality_gap11() {
     let three = terms.mk_int(3.into());
     let zero = terms.mk_int(0.into());
 
-    let ge_5 = terms.mk_app(Symbol::Named(">=".to_string()), vec![x, five], Sort::Bool);
-    let le_3 = terms.mk_app(Symbol::Named("<=".to_string()), vec![x, three], Sort::Bool);
-    let y_ge_0 = terms.mk_app(Symbol::Named(">=".to_string()), vec![y, zero], Sort::Bool);
+    let ge_5 = terms.mk_app(Symbol::named(">="), vec![x, five], Sort::Bool);
+    let le_3 = terms.mk_app(Symbol::named("<="), vec![x, three], Sort::Bool);
+    let y_ge_0 = terms.mk_app(Symbol::named(">="), vec![y, zero], Sort::Bool);
 
     let mut lra = LraSolver::new(&terms);
 

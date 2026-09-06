@@ -162,11 +162,13 @@ fn collect(
             used_names.insert(sym.name().to_string());
             if let Symbol::Named(name) = &sym {
                 if !args.is_empty() && !is_known_operator(name) {
-                    let entry = info.entry(name.clone()).or_insert_with(|| FnInfo {
-                        arity: args.len(),
-                        all_const: vec![true; args.len()],
-                        consistent: true,
-                    });
+                    let entry = info
+                        .entry(name.clone().to_string())
+                        .or_insert_with(|| FnInfo {
+                            arity: args.len(),
+                            all_const: vec![true; args.len()],
+                            consistent: true,
+                        });
                     if entry.arity != args.len() {
                         entry.consistent = false;
                     } else {
@@ -221,9 +223,9 @@ fn assign(
         }
         TermData::App(sym, args) => {
             if let Symbol::Named(name) = &sym {
-                if let Some(mask) = masks.get(name) {
+                if let Some(mask) = masks.get(name.as_str()) {
                     let tuple: Vec<TermId> = mask.iter().map(|&p| args[p]).collect();
-                    let key = (name.clone(), tuple);
+                    let key = (name.to_string(), tuple);
                     if !names.contains_key(&key) {
                         let fresh = fresh_name(name, counters, used_names, terms);
                         names.insert(key, fresh);
@@ -299,13 +301,13 @@ fn rewrite(
         }
         TermData::App(sym, args) => {
             let reducible_mask = match &sym {
-                Symbol::Named(name) => masks.get(name).map(|m| (name.clone(), m.clone())),
+                Symbol::Named(name) => masks.get(name.as_str()).map(|m| (name.clone(), m.clone())),
                 _ => None,
             };
             if let Some((name, mask)) = reducible_mask {
                 let tuple: Vec<TermId> = mask.iter().map(|&p| args[p]).collect();
                 let new_name = names
-                    .get(&(name, tuple))
+                    .get(&(name.to_string(), tuple))
                     .cloned()
                     .expect("every reducible occurrence is named in pass 3");
                 let mut kept = Vec::new();
@@ -318,7 +320,7 @@ fn rewrite(
                 if kept.is_empty() {
                     terms.mk_var(new_name, ret_sort)
                 } else {
-                    terms.mk_app(Symbol::Named(new_name), kept, ret_sort)
+                    terms.mk_app(Symbol::Named(new_name.into()), kept, ret_sort)
                 }
             } else {
                 let new_args: Vec<TermId> = args

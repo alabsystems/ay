@@ -36,6 +36,36 @@ impl std::fmt::Debug for ChcPdrProofRun {
     }
 }
 
+/// Solver-owned evidence state for an atomic proof/budget report.
+#[derive(Debug)]
+pub(super) enum ChcProofRunEvidence {
+    MetadataOnly(ChcPdrProofRun),
+    Checked(ChcCheckedReplayRun),
+}
+
+impl ChcProofRunEvidence {
+    fn proof_run(&self) -> &ChcPdrProofRun {
+        match self {
+            Self::MetadataOnly(run) => run,
+            Self::Checked(checked) => checked.proof_run(),
+        }
+    }
+
+    fn checked_replay(&self) -> Option<&ChcCheckedReplayRun> {
+        match self {
+            Self::MetadataOnly(_) => None,
+            Self::Checked(checked) => Some(checked),
+        }
+    }
+
+    fn into_proof_run(self) -> ChcPdrProofRun {
+        match self {
+            Self::MetadataOnly(run) => run,
+            Self::Checked(checked) => checked.into_proof_run(),
+        }
+    }
+}
+
 /// Immutable access to a problem-bound CHC proof run.
 ///
 /// Construction stays inside `ay-chc`, so external code cannot bind a result
@@ -267,7 +297,11 @@ impl crate::AdaptivePortfolio {
             budget_report.total_elapsed,
         );
         ChcProofRunWithBudgetReport {
-            proof_run: ChcPdrProofRun::new(self.problem.clone(), result, "portfolio"),
+            evidence: ChcProofRunEvidence::MetadataOnly(ChcPdrProofRun::new(
+                self.problem.clone(),
+                result,
+                "portfolio",
+            )),
             budget_report,
             adaptive_trace,
             stop_reason,
@@ -297,7 +331,7 @@ impl ChcProofRunWithBudgetReport {
         let mut budget_report = crate::BudgetReport::new();
         budget_report.total_elapsed = elapsed;
         Self {
-            proof_run,
+            evidence: ChcProofRunEvidence::MetadataOnly(proof_run),
             budget_report,
             adaptive_trace,
             stop_reason,
@@ -327,14 +361,25 @@ impl ChcProofRunWithBudgetReport {
 
     /// Exact problem-bound result and proof artifacts.
     pub fn proof_run(&self) -> &ChcPdrProofRun {
-        &self.proof_run
+        self.evidence.proof_run()
+    }
+
+    /// Complete checked-replay bundle retained by a successful replay pass.
+    ///
+    /// The returned manifest, summary, and artifact bytes are sealed together
+    /// with [`Self::proof_run`]. `None` means replay was not requested or did
+    /// not complete, regardless of any diagnostic metadata.
+    pub fn checked_replay(&self) -> Option<&ChcCheckedReplayRun> {
+        self.evidence.checked_replay()
     }
 
     /// Whole-run elapsed-time report from the same invocation.
     ///
     /// `entries` is empty because specialized adaptive lanes do not all map to
     /// concrete engine identities. Use [`adaptive_trace`](Self::adaptive_trace)
-    /// for complete production-dispatch attribution.
+    /// for complete production-dispatch attribution. When
+    /// [`with_checked_replay`](Self::with_checked_replay) has been requested,
+    /// `total_elapsed` additionally includes that replay pass.
     pub fn budget_report(&self) -> &crate::BudgetReport {
         &self.budget_report
     }
@@ -359,7 +404,40 @@ impl ChcProofRunWithBudgetReport {
         self.cancellation_requested_at_return
     }
 
-    /// Consume the bundle without discarding any telemetry fields.
+    /// Attempt an independent checked replay without changing the solve
+    /// verdict when replay cannot be completed.
+    ///
+    /// A successful replay upgrades the problem-bound proof metadata to the
+    /// in-process Trust full-verifier admission shape. A timeout, rejected
+    /// obligation, or internal AY panic leaves the original metadata-only run
+    /// intact. Replay wall time is added to the authoritative whole-run elapsed
+    /// time; the solve's stop classification is unchanged.
+    #[must_use]
+    pub fn with_checked_replay(mut self, replay_budget: std::time::Duration) -> Self {
+        if self.checked_replay().is_some() || !self.proof_run().accepted_as_proof() {
+            return self;
+        }
+
+        let started = ay_core::time::Instant::now();
+        let checked = ay_core::catch_ay_panics(
+            std::panic::AssertUnwindSafe(|| self.proof_run().run_checked_replay(replay_budget)),
+            |reason| Err(crate::ChcError::Internal(reason)),
+        );
+        self.budget_report.total_elapsed = self
+            .budget_report
+            .total_elapsed
+            .saturating_add(started.elapsed());
+        if let Ok(checked) = checked {
+            self.evidence = ChcProofRunEvidence::Checked(checked);
+        }
+        self
+    }
+
+    /// Consume the legacy proof-run and telemetry parts.
+    ///
+    /// This intentionally discards any retained checked-replay artifact bundle.
+    /// Persist or inspect [`Self::checked_replay`] before choosing this legacy
+    /// decomposition API.
     pub fn into_parts(
         self,
     ) -> (
@@ -370,7 +448,7 @@ impl ChcProofRunWithBudgetReport {
         bool,
     ) {
         (
-            self.proof_run,
+            self.evidence.into_proof_run(),
             self.budget_report,
             self.adaptive_trace,
             self.stop_reason,

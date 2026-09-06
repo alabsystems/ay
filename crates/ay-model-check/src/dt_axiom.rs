@@ -64,7 +64,7 @@ fn constructor_name(terms: &TermStore, term: TermId, resolve: &DtResolve<'_>) ->
     if let TermData::App(Symbol::Named(name), _) = terms.get(term) {
         if let Some(dt) = sort_dt(terms.sort(term), resolve) {
             if dt.constructors.iter().any(|c| c.name == *name) {
-                return Some(name.clone());
+                return Some(name.to_string());
             }
         }
     }
@@ -658,7 +658,7 @@ mod norm {
             if let Some(dt) = sort_dt(terms.sort(t), resolve) {
                 if let Some(c) = dt.constructors.iter().find(|c| c.name == *name) {
                     if c.fields.len() == args.len() {
-                        return Some((name.clone(), dt.clone(), args.clone()));
+                        return Some((name.clone().to_string(), dt.clone(), args.clone()));
                     }
                 }
             }

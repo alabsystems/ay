@@ -556,6 +556,7 @@ impl LraSolver {
         // (lp_core_solver_base_def.h:285). This feeds compute_implied_bounds with
         // rows where the bound analyzer may now succeed after pivoting.
         self.touched_rows.insert(row_idx);
+        self.mark_row_content_changed(row_idx);
 
         // Reusable scratch buffers for column-index deltas (#8003).
         // substitute_var_with_col_deltas tracks additions/removals during the
@@ -638,6 +639,7 @@ impl LraSolver {
                 };
                 // Track this row as pivot-modified (#4919 Approach D).
                 self.touched_rows.insert(i);
+                self.mark_row_content_changed(i);
 
                 // #8003 TL87: Track whether work-vec substitution was used, so we
                 // can use work_vec positions for O(1) col_index position updates

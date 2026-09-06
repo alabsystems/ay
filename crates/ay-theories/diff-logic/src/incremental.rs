@@ -88,6 +88,16 @@ pub struct IncEdge<W> {
     pub tag: u64,
 }
 
+/// The registered edges between one ordered vertex pair, ids sorted by weight
+/// ascending (see `IncrementalDiffGraph::out_groups`).
+#[derive(Clone, Debug)]
+struct EdgeGroup {
+    /// The opposite endpoint (head in `out_groups`, tail in `inc_groups`).
+    other: usize,
+    /// Edge ids, sorted so that `weight[ids[i]] <= weight[ids[i + 1]]`.
+    ids: Vec<usize>,
+}
+
 /// Result of [`IncrementalDiffGraph::assert_edge`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AssertOutcome {
@@ -111,6 +121,14 @@ pub struct IncrementalDiffGraph<W> {
     /// `inc[v]` = ids of edges entering `v` (active or not); the reverse
     /// adjacency the backward Dijkstra of theory propagation walks.
     inc: Vec<Vec<usize>>,
+    /// `out_groups[v]` = the registered edges leaving `v`, grouped by head
+    /// vertex, each group's ids sorted by weight ascending. The candidate
+    /// index of theory propagation: for a settled pair `(v, u)` the entailed
+    /// atoms are exactly a weight suffix of the `(v → u)` group, found by one
+    /// binary search instead of a scan over every registered edge.
+    out_groups: Vec<Vec<EdgeGroup>>,
+    /// `inc_groups[u]` = the same index keyed by head, grouped by tail.
+    inc_groups: Vec<Vec<EdgeGroup>>,
     active: Vec<bool>,
     /// Activated edge ids, in activation order.
     trail: Vec<usize>,
@@ -155,6 +173,8 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
             edges: Vec::new(),
             out: vec![Vec::new(); n_vars],
             inc: vec![Vec::new(); n_vars],
+            out_groups: vec![Vec::new(); n_vars],
+            inc_groups: vec![Vec::new(); n_vars],
             active: Vec::new(),
             trail: Vec::new(),
             level_marks: Vec::new(),
@@ -185,6 +205,8 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
             self.pot.resize(new_n, W::zero());
             self.out.resize(new_n, Vec::new());
             self.inc.resize(new_n, Vec::new());
+            self.out_groups.resize(new_n, Vec::new());
+            self.inc_groups.resize(new_n, Vec::new());
             self.dist.resize(new_n, None);
             self.settled.resize(new_n, false);
             self.pred.resize(new_n, None);
@@ -214,7 +236,33 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
         self.active.push(false);
         self.out[from].push(id);
         self.inc[to].push(id);
+        Self::index_into_group(&self.edges, &mut self.out_groups[from], to, id);
+        Self::index_into_group(&self.edges, &mut self.inc_groups[to], from, id);
         id
+    }
+
+    /// Insert `id` into the group for `other` (creating it), keeping the
+    /// group's ids sorted by weight.
+    fn index_into_group(
+        edges: &[IncEdge<W>],
+        groups: &mut Vec<EdgeGroup>,
+        other: usize,
+        id: usize,
+    ) {
+        let slot = match groups.iter().position(|g| g.other == other) {
+            Some(i) => i,
+            None => {
+                groups.push(EdgeGroup {
+                    other,
+                    ids: Vec::new(),
+                });
+                groups.len() - 1
+            }
+        };
+        let group = &mut groups[slot];
+        let w = &edges[id].weight;
+        let at = group.ids.partition_point(|&i| edges[i].weight <= *w);
+        group.ids.insert(at, id);
     }
 
     /// The registered edges.
@@ -237,6 +285,16 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
     pub fn edge_is_satisfied(&self, id: usize) -> bool {
         debug_assert!(id < self.edges.len(), "unregistered edge id");
         self.slack(id) >= W::zero()
+    }
+
+    /// Is this registered edge currently ACTIVE (asserted and not retracted)?
+    ///
+    /// Exposed so the DPLL(T) adapter can tell whether an atom is already
+    /// assigned in some polarity before turning an entailment of one of its
+    /// edges into a propagation.
+    pub fn edge_is_active(&self, id: usize) -> bool {
+        debug_assert!(id < self.edges.len(), "unregistered edge id");
+        self.active[id]
     }
 
     /// Open a backtracking level.
@@ -529,6 +587,21 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
     /// Missing an entailment only costs search; claiming a false one would be
     /// unsound, so the test is deliberately one-directional.
     ///
+    /// # Which atoms are tested — the relevant set
+    ///
+    /// A candidate `v → u : d` can only pass the test when `v` is
+    /// backward-settled AND `u` is forward-settled, so only the registered
+    /// edges incident to those two settled sets are enumerated: the
+    /// out-adjacency of the backward set or the in-adjacency of the forward
+    /// set, whichever is smaller. That is Cotton–Maler's relevant-atom set
+    /// (2006, "Fast and Flexible Difference Constraint Propagation for
+    /// DPLL(T)"), and it is what makes the cost proportional to the region
+    /// `e₀` disturbs rather than to the number of registered atoms. The
+    /// previous full scan of every registered edge — `O(|E|)` per assert,
+    /// ~7.5k on super_queen34-1 and far more on the 27k-vertex graph
+    /// instances — was the measured reason propagation had to be switched off
+    /// in the DPLL(T) adapter.
+    ///
     /// `budget` caps how many vertices each Dijkstra settles. Only SETTLED
     /// distances are used — Dijkstra finalizes in nondecreasing order, so a
     /// settled value is exact while a tentative one is merely an upper bound
@@ -548,31 +621,101 @@ impl<W: Weight + Negate> IncrementalDiffGraph<W> {
         self.dijkstra_forward(b, budget);
         self.dijkstra_backward(a, budget);
 
+        // RELEVANT-SET ENUMERATION. A candidate can only pass the test when
+        // its tail is backward-settled AND its head is forward-settled, so walk
+        // the per-pair candidate index of ONE of the two settled sets —
+        // whichever side has fewer groups — instead of every registered edge.
+        // Within a settled pair the entailed atoms are a weight suffix of the
+        // group (the test is `weight >= threshold`), so one binary search per
+        // pair finds them all and inactive-but-unentailed atoms cost nothing.
+        let out_work: usize = self
+            .bwd_touched
+            .iter()
+            .filter(|&&v| self.bwd_done[v])
+            .map(|&v| self.out_groups[v].len())
+            .sum();
+        let inc_work: usize = self
+            .fwd_touched
+            .iter()
+            .filter(|&&u| self.fwd_done[u])
+            .map(|&u| self.inc_groups[u].len())
+            .sum();
+
         let mut out = Vec::new();
-        for f in 0..self.edges.len() {
-            if self.active[f] {
-                continue;
+        if out_work <= inc_work {
+            for i in 0..self.bwd_touched.len() {
+                let v = self.bwd_touched[i];
+                if !self.bwd_done[v] {
+                    continue;
+                }
+                for g in 0..self.out_groups[v].len() {
+                    let u = self.out_groups[v][g].other;
+                    if !self.fwd_done[u] {
+                        continue;
+                    }
+                    let Some(threshold) = self.entailment_threshold(v, u, &s0) else {
+                        continue;
+                    };
+                    let first = self.out_groups[v][g]
+                        .ids
+                        .partition_point(|&f| self.edges[f].weight < threshold);
+                    for k in first..self.out_groups[v][g].ids.len() {
+                        let f = self.out_groups[v][g].ids[k];
+                        if self.active[f] {
+                            continue;
+                        }
+                        let reason = self.entailment_reason(e0, v, u, a, b);
+                        out.push(Entailment { edge_id: f, reason });
+                    }
+                }
             }
-            let (v, u, d) = {
-                let e = &self.edges[f];
-                (e.from, e.to, e.weight.clone())
-            };
-            if !self.bwd_done[v] || !self.fwd_done[u] {
-                continue;
-            }
-            let (Some(bv), Some(fu)) = (self.bwd[v].clone(), self.fwd[u].clone()) else {
-                continue;
-            };
-            let lhs = bv.add(&s0).add(&fu);
-            let rhs = d.add(&self.pot[v]).add(&self.pot[u].negate());
-            if lhs <= rhs {
-                let reason = self.entailment_reason(e0, v, u, a, b);
-                out.push(Entailment { edge_id: f, reason });
+        } else {
+            for i in 0..self.fwd_touched.len() {
+                let u = self.fwd_touched[i];
+                if !self.fwd_done[u] {
+                    continue;
+                }
+                for g in 0..self.inc_groups[u].len() {
+                    let v = self.inc_groups[u][g].other;
+                    if !self.bwd_done[v] {
+                        continue;
+                    }
+                    let Some(threshold) = self.entailment_threshold(v, u, &s0) else {
+                        continue;
+                    };
+                    let first = self.inc_groups[u][g]
+                        .ids
+                        .partition_point(|&f| self.edges[f].weight < threshold);
+                    for k in first..self.inc_groups[u][g].ids.len() {
+                        let f = self.inc_groups[u][g].ids[k];
+                        if self.active[f] {
+                            continue;
+                        }
+                        let reason = self.entailment_reason(e0, v, u, a, b);
+                        out.push(Entailment { edge_id: f, reason });
+                    }
+                }
             }
         }
 
         self.reset_prop_scratch();
         out
+    }
+
+    /// The entailment threshold of [`Self::entailed_after_assert`] for the
+    /// settled pair `(v, u)`: a registered edge `v → u : d` is entailed iff
+    /// `d >= Dr'(v) + s(e₀) + Dr(u) − π(v) + π(u)`.
+    #[inline]
+    fn entailment_threshold(&self, v: usize, u: usize, s0: &W) -> Option<W> {
+        let (Some(bv), Some(fu)) = (&self.bwd[v], &self.fwd[u]) else {
+            return None;
+        };
+        Some(
+            bv.add(s0)
+                .add(fu)
+                .add(&self.pot[v].negate())
+                .add(&self.pot[u]),
+        )
     }
 
     /// Tags of the concrete path `v ⇝ a → b ⇝ u` that justifies an entailment.

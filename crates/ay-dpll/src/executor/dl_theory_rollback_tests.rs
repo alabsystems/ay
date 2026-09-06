@@ -594,3 +594,96 @@ fn model_extraction_after_pop_ignores_retracted_edges() {
     };
     assert!(get(x) < get(y), "the surviving strict constraint was lost");
 }
+
+// ---------------------------------------------------------------------------
+// Theory propagation (part of the DPLL(T) contract since the lane's search
+// strength depends on it): implied atoms are delivered with the asserted
+// literals that justify them, in both polarities, and never for an atom the
+// search has already assigned.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn propagation_is_on_by_default_and_names_its_justifying_path() {
+    let mut fx = Fx::new();
+    let (x, y, z) = (fx.x, fx.y, fx.z);
+    // x − y <= 0 and y − z <= 0 entail x − z <= 5 (registered, unasserted).
+    let a = fx.diff_le(x, y, 0);
+    let b = fx.diff_le(y, z, 0);
+    let implied = fx.diff_le(x, z, 5);
+
+    let mut th = DiffLogicTheory::new(&fx.terms);
+    th.register_atom(a);
+    th.register_atom(b);
+    th.register_atom(implied);
+    th.assert_literal(a, true);
+    th.assert_literal(b, true);
+
+    let props = th.propagate();
+    let hit = props
+        .iter()
+        .find(|p| p.literal.term == implied && p.literal.value)
+        .expect("x − z <= 5 must be propagated TRUE from x − y <= 0, y − z <= 0");
+    let mut reason: Vec<(TermId, bool)> = hit.reason.iter().map(|l| (l.term, l.value)).collect();
+    reason.sort();
+    let mut want = vec![(a, true), (b, true)];
+    want.sort();
+    assert_eq!(
+        reason, want,
+        "the reason must be exactly the path's asserted literals"
+    );
+    assert!(th.propagate().is_empty(), "propagate() drains the buffer");
+}
+
+#[test]
+fn negated_polarity_is_propagated_when_its_edge_is_entailed() {
+    let mut fx = Fx::new();
+    let (x, y, z) = (fx.x, fx.y, fx.z);
+    let a = fx.diff_le(x, y, 0);
+    let b = fx.diff_le(y, z, 0);
+    // z − x <= −5 contradicts the entailed x − z <= 0, so its NEGATION is
+    // implied: the atom must be propagated FALSE.
+    let c = fx.diff_le(z, x, -5);
+
+    let mut th = DiffLogicTheory::new(&fx.terms);
+    th.register_atom(a);
+    th.register_atom(b);
+    th.register_atom(c);
+    th.assert_literal(a, true);
+    th.assert_literal(b, true);
+
+    let props = th.propagate();
+    assert!(
+        props
+            .iter()
+            .any(|p| p.literal.term == c && !p.literal.value),
+        "z − x <= −5 must be propagated FALSE; got {:?}",
+        props
+            .iter()
+            .map(|p| (p.literal.term, p.literal.value))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn an_already_assigned_atom_is_not_propagated_again() {
+    let mut fx = Fx::new();
+    let (x, y, z) = (fx.x, fx.y, fx.z);
+    let a = fx.diff_le(x, y, 0);
+    let b = fx.diff_le(y, z, 0);
+    let implied = fx.diff_le(x, z, 5);
+
+    let mut th = DiffLogicTheory::new(&fx.terms);
+    th.register_atom(a);
+    th.register_atom(b);
+    th.register_atom(implied);
+    // The search assigns the atom itself first; the later asserts must not
+    // re-derive it.
+    th.assert_literal(implied, true);
+    th.assert_literal(a, true);
+    th.assert_literal(b, true);
+    assert!(
+        th.propagate().iter().all(|p| p.literal.term != implied),
+        "an assigned atom must not be re-propagated"
+    );
+    assert!(is_sat(&th.check()));
+}

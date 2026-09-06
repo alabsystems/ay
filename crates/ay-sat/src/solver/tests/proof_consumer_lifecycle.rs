@@ -99,7 +99,6 @@ fn ic3_rejects_internal_lrat_and_exhausted_trace_tombstone() {
 #[test]
 fn public_drat_writer_detach_keeps_conservative_controls() {
     let mut solver = Solver::with_proof(2, Vec::<u8>::new());
-    solver.cold.ambient_artifacts_enabled = false;
     solver.set_sweep_enabled(true);
     assert!(!solver.is_sweep_enabled());
     assert!(solver.inproc_ctrl_pre_proof.is_some());

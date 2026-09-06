@@ -994,7 +994,7 @@ impl TheorySolver for LiaSolver<'_> {
     }
 
     fn collect_statistics(&self) -> Vec<(&'static str, u64)> {
-        vec![
+        let mut stats = vec![
             ("lia_checks", self.check_count),
             ("lia_conflicts", self.conflict_count),
             ("lia_propagations", self.propagation_count),
@@ -1011,7 +1011,12 @@ impl TheorySolver for LiaSolver<'_> {
                 "lia_detect_algebraic_cache_hits",
                 self.detect_algebraic_cache_hits,
             ),
-        ]
+        ];
+        // The inner LRA engine does the simplex/implied-bound work for this
+        // lane; surface its counters (`lra_*`) so LIA-routed families (QF_IDL
+        // scheduling in the default lane) are measurable.
+        stats.extend(TheorySolver::collect_statistics(&self.lra));
+        stats
     }
 }
 

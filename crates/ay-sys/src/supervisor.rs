@@ -22,6 +22,12 @@
 
 use std::process::Command;
 
+mod death_pipe;
+pub use death_pipe::{
+    adopt_inherited_death_pipe, arm_parent_death_signal, configure_child_death_pipe,
+    wait_for_parent_death, DeathPipe, DeathPipeReader, DeathPipeWriter, ParentDeath,
+};
+
 /// Arrange for `command` and all of its descendants to inherit a hard virtual
 /// address-space ceiling.
 ///

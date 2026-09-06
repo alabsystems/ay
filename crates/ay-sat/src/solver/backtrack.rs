@@ -130,7 +130,35 @@ impl Solver {
         let mut write_pos = assigned_limit;
         let mut read_pos = assigned_limit;
 
+        // #backtrack-self-time: software prefetch for the per-variable arrays.
+        //
+        // This loop walks the trail SEQUENTIALLY but indexes six independent
+        // per-variable arrays by the trail literal's VARIABLE, which is a
+        // random index. That is a pointer-chase with a perfectly predictable
+        // address stream, and the hardware prefetcher cannot see it: it only
+        // sees the sequential `trail` walk. The loop profiles at 14-46% of
+        // working self-time (minandmaxor128 13.98%, g2-T97.2.1 18.15%,
+        // bp5_CSO 46.14%) against CaDiCaL's ~1.4-2.2% for the same job.
+        //
+        // Issue the loads for a few iterations ahead. Prefetch has NO semantic
+        // effect whatsoever -- it cannot fault (the index is bounds-checked
+        // before use) and cannot change any value -- so the decision sequence
+        // is bit-identical by construction.
+        const BACKTRACK_PREFETCH_DISTANCE: usize = 6;
         while read_pos < self.trail.len() {
+            if let Some(&ahead) = self.trail.get(read_pos + BACKTRACK_PREFETCH_DISTANCE) {
+                let ai = ahead.variable().index();
+                if let Some(slot) = self.var_data.get(ai) {
+                    ay_prefetch::prefetch_read_l1(std::ptr::from_ref::<VarData>(slot));
+                }
+                if let Some(slot) = self.phase.get(ai) {
+                    ay_prefetch::prefetch_read_l1(std::ptr::from_ref::<i8>(slot));
+                }
+                if let Some(slot) = self.lambda.get(ai) {
+                    ay_prefetch::prefetch_read_l1(std::ptr::from_ref(slot));
+                }
+                ay_prefetch::prefetch_val_l1(&self.vals, ai * 2);
+            }
             let lit = self.trail[read_pos];
             let var = lit.variable();
             let var_level = self.var_data[var.index()].level;
@@ -157,8 +185,29 @@ impl Solver {
                 // If this variable has an MLI clause that is unit at target_level,
                 // reimply it at the lower assertion level instead of unassigning.
                 // Reference: Coutelier et al., Algorithm 3 (SAT 2024).
+                //
+                // COST (#backtrack-self-time). `lambda` is a FOURTH randomly
+                // indexed per-variable array touched once per unassigned
+                // variable, in a loop that profiles at ~14% of working
+                // self-time. The old body both READ it (under `chrono_enabled`)
+                // and unconditionally WROTE `None` back a few lines below --
+                // and the write dirties a cache line even when it stores None
+                // over None, which on this codebase is EVERY time: nothing
+                // anywhere assigns `Some` to a `lambda` entry (`mli_detected`
+                // and `mli_reimplied` are 0 on every instance measured), so the
+                // reimplication branch is currently unreachable.
+                //
+                // One load, reused for both decisions, and a store only when
+                // there is something to clear. Bit-identical: the branch below
+                // sees the same value it would have loaded itself, and the
+                // elided store wrote the value already present.
+                let lambda_entry = if self.chrono_enabled {
+                    self.lambda[var.index()]
+                } else {
+                    None
+                };
                 let reimplied = if self.chrono_enabled {
-                    if let Some(lambda_ref) = self.lambda[var.index()] {
+                    if let Some(lambda_ref) = lambda_entry {
                         // Check if the lambda clause is still active and makes
                         // the literal unit at target_level.
                         if self.arena.is_active(lambda_ref.0 as usize) {
@@ -207,6 +256,8 @@ impl Solver {
                                 if is_clause_reason(lambda_ref.0) {
                                     self.mark_reason_clause(lambda_ref.0 as usize);
                                 }
+                                // Unconditional here: `lambda_entry` was Some to
+                                // reach this arm, so there IS something to clear.
                                 self.lambda[var.index()] = None;
                                 self.stats.mli_reimplied += 1;
                                 // Keep the literal on the trail at write_pos.
@@ -264,8 +315,17 @@ impl Solver {
                     // and the next probe round overwrites parents for every
                     // implied literal it visits. Per-unassign clearing here is
                     // dead release-mode work in the hot loop.
-                    // Clear lambda for unassigned variables.
-                    self.lambda[var.index()] = None;
+                    //
+                    // Clear lambda for unassigned variables -- but only when
+                    // there is something to clear (#backtrack-self-time). The
+                    // `!self.chrono_enabled` leg keeps the old unconditional
+                    // store: `lambda_entry` is forced to `None` in that case
+                    // and carries no information about the array.
+                    if !self.chrono_enabled {
+                        self.lambda[var.index()] = None;
+                    } else if lambda_entry.is_some() {
+                        self.lambda[var.index()] = None;
+                    }
                     // (#8482, #8496) Removed variables can appear on the
                     // trail if a stale learned clause (not yet flushed)
                     // propagated them, or if BVE marked them eliminated

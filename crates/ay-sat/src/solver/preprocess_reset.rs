@@ -277,30 +277,61 @@ impl Solver {
             return jump_level;
         }
 
-        // Find the best variable's trail position (not just index)
-        let mut best_pos: Option<usize> = None;
-
-        for i in start_pos..self.trail.len() {
-            let var = self.trail[i].variable();
-            let is_better = match best_pos {
-                Some(current_best) => self.branch_priority_is_lower(
-                    self.trail[current_best].variable(),
-                    var,
-                    self.active_branch_heuristic,
-                ),
-                None => true,
-            };
-            if is_better {
-                best_pos = Some(i);
+        // Find the best variable's trail position (not just index).
+        //
+        // COST, NOT POLICY (#backtrack-self-time). This loop is O(trail above
+        // jump_level) and runs once per conflict; it profiled at 20-31%
+        // self-time across live `--competition --proof` children versus
+        // CaDiCaL's 1.37%/2.22% for the same job. The scan itself is
+        // irreducible — the argmax is over a metric (VSIDS activity / VMTF
+        // bump order) that every conflict mutates, so nothing can be cached
+        // across calls — but the ORIGINAL inner body was doing far more work
+        // per element than the argmax needs:
+        //
+        //   * `branch_priority_is_lower` re-dispatched on
+        //     `active_branch_heuristic` on EVERY element, inside the loop;
+        //   * it re-loaded `self.trail[current_best]` and re-looked-up the
+        //     incumbent's score on EVERY element, instead of carrying it;
+        //   * the `Option<usize>` incumbent forced a second branch per element.
+        //
+        // The rewrite hoists the heuristic dispatch out of the loop, carries
+        // the incumbent's score in a register, and seeds the incumbent with
+        // the first element so the `None` arm disappears.
+        //
+        // BIT-IDENTICAL BY CONSTRUCTION. `is_better` was
+        // `score(best) < score(var)` — strict, so the EARLIEST element
+        // attaining the maximum wins, and ties keep the lower trail position
+        // (hence the lower level). `best_score < s` is the same expression on
+        // the same values in the same order, including f64 NaN behaviour
+        // (`<` is false against NaN either way, so a NaN activity keeps the
+        // incumbent exactly as before). No score is read that the old loop did
+        // not read, and none is written.
+        let start_lit = self.trail[start_pos];
+        let mut best_pos = start_pos;
+        match self.active_branch_heuristic {
+            BranchHeuristic::Evsids | BranchHeuristic::Chb => {
+                let mut best_score = self.vsids.activity(start_lit.variable());
+                for i in (start_pos + 1)..self.trail.len() {
+                    let score = self.vsids.activity(self.trail[i].variable());
+                    if best_score < score {
+                        best_pos = i;
+                        best_score = score;
+                    }
+                }
+            }
+            BranchHeuristic::Vmtf => {
+                let mut best_order = self.vsids.bump_order(start_lit.variable());
+                for i in (start_pos + 1)..self.trail.len() {
+                    let order = self.vsids.bump_order(self.trail[i].variable());
+                    if best_order < order {
+                        best_pos = i;
+                        best_order = order;
+                    }
+                }
             }
         }
 
-        // Find the level containing the best variable's trail position
-        // CaDiCaL: while (res < level - 1 && control[res + 1].trail <= best_pos) res++;
-        let Some(best_pos) = best_pos else {
-            return jump_level;
-        };
-
+        // Find the level containing the best variable's trail position.
         // CaDiCaL: while (res < level - 1 && control[res + 1].trail <= best_pos) res++;
         // In AY: trail_lim[i] = start of level i+1's assignments
         // So to match control[res+1].trail (start of level res+1), use trail_lim[res]

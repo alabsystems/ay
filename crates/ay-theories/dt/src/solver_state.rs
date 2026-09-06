@@ -164,7 +164,7 @@ impl<'a> DtSolver<'a> {
         match self.terms.get(term_id) {
             TermData::App(Symbol::Named(name), args) => {
                 if let Some(dt_name) = self.get_datatype_for_ctor(name) {
-                    return Some((dt_name.to_string(), name.clone(), args.clone()));
+                    return Some((dt_name.to_string(), name.clone().to_string(), args.clone()));
                 }
                 None
             }

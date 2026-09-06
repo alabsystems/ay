@@ -518,3 +518,92 @@ fn fast_lane_declines_what_it_cannot_represent() {
         "a non-integral constant must be REFUSED, never rounded"
     );
 }
+
+// ---------------------------------------------------------------------------
+// COMPLETENESS of the relevant-set enumeration.
+//
+// `entailed_after_assert` walks only the registered edges incident to the two
+// settled Dijkstra frontiers instead of every registered edge. That is a
+// pruning of CANDIDATES, and a pruning can silently lose propagations without
+// ever failing the soundness gate above. So pin the other direction too: with
+// an unbounded budget, every inactive atom that the brute-force oracle says is
+// entailed by the active set — and was NOT already entailed before the new
+// edge — must be reported. (An entailment that did not need the new edge is
+// out of scope by design: it was reportable when its last justifying edge was
+// asserted.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn relevant_set_enumeration_reports_every_new_entailment() {
+    let mut rng = Rng(0x7A7A_1357_2468_CDCD);
+    let mut new_entailments = 0usize;
+
+    for _case in 0..2500 {
+        let n = 2 + rng.below(6) as usize;
+        let span = 1 + rng.below(3) as i64;
+        let mut g: IncrementalDiffGraph<i64> = IncrementalDiffGraph::new(n);
+        let mut spec: Vec<(usize, usize, i64)> = Vec::new();
+        let pool = 4 + rng.below(9) as usize;
+        let mut ids = Vec::new();
+        for i in 0..pool {
+            let f = rng.below(n as u64) as usize;
+            let t = rng.below(n as u64) as usize;
+            let w = rng.weight(span);
+            ids.push(g.register_edge(f, t, w, i as u64));
+            spec.push((f, t, w));
+        }
+
+        let mut active: Vec<(usize, usize, i64)> = Vec::new();
+        let mut active_ids: Vec<usize> = Vec::new();
+        for (k, &id) in ids.iter().enumerate() {
+            if rng.below(2) == 0 {
+                continue;
+            }
+            let before = active.clone();
+            if let AssertOutcome::Conflict(_) = g.assert_edge(id) {
+                break;
+            }
+            active.push(spec[k]);
+            active_ids.push(id);
+
+            let reported: std::collections::BTreeSet<usize> = g
+                .entailed_after_assert(id, usize::MAX)
+                .into_iter()
+                .map(|e| e.edge_id)
+                .collect();
+
+            for (f, &(v, u, d)) in spec.iter().enumerate() {
+                if active_ids.contains(&f) {
+                    continue;
+                }
+                // Oracle: `u - v <= d` is entailed iff adding its negation
+                // (`v - u <= -d-1` over the integers) makes the set infeasible.
+                let entailed_now = {
+                    let mut probe = active.clone();
+                    probe.push((u, v, -d - 1));
+                    !reference_sat(n, &probe)
+                };
+                let entailed_before = {
+                    let mut probe = before.clone();
+                    probe.push((u, v, -d - 1));
+                    !reference_sat(n, &probe)
+                };
+                if entailed_now && !entailed_before {
+                    new_entailments += 1;
+                    assert!(
+                        reported.contains(&f),
+                        "atom {v}->{u}:{d} became entailed by asserting edge {id} \
+                         (active set {active:?}) but the relevant-set enumeration \
+                         did not report it (reported {reported:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    assert!(
+        new_entailments > 500,
+        "the generator produced only {new_entailments} new entailments; the \
+         completeness check is not exercising anything"
+    );
+}

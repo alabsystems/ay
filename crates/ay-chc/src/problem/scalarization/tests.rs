@@ -245,3 +245,72 @@ fn clause_local_constant_aliases_expose_array_keys_for_cegar_scalarization() {
         ArrayScalarizedArg::Select { index, .. } if *index == ChcExpr::Int(0)
     ));
 }
+
+#[test]
+fn scalarization_validates_pruned_queries_against_the_source_registry() {
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let array = ChcVar::new("a", array_sort.clone());
+    let mut problem = ChcProblem::new();
+    let predicate = problem.declare_predicate("p", vec![array_sort]);
+    let action = problem.declare_action("step");
+
+    problem.add_clause_with_action(
+        HornClause::new(
+            ClauseBody::constraint(ChcExpr::and_all(vec![
+                ChcExpr::eq(
+                    ChcExpr::select(ChcExpr::var(array.clone()), ChcExpr::Int(0)),
+                    ChcExpr::Int(1),
+                ),
+                ChcExpr::eq(
+                    ChcExpr::select(ChcExpr::var(array.clone()), ChcExpr::Int(1)),
+                    ChcExpr::Int(2),
+                ),
+            ])),
+            ClauseHead::Predicate(predicate, vec![ChcExpr::var(array.clone())]),
+        ),
+        action,
+    );
+    problem.add_clause(HornClause::query(ClauseBody::new(
+        vec![(predicate, vec![ChcExpr::var(array.clone())])],
+        Some(ChcExpr::Bool(false)),
+    )));
+    problem.add_clause(HornClause::query(ClauseBody::predicates_only(vec![(
+        predicate,
+        vec![ChcExpr::var(array)],
+    )])));
+
+    problem.validate().expect("source problem should validate");
+    let mut malformed = problem.clone();
+    malformed.pruned_false_queries[0].body.predicates[0]
+        .1
+        .clear();
+    malformed
+        .try_scalarize_const_array_selects_with_map()
+        .expect("malformed source still has a scalarizable live clause");
+    assert!(matches!(
+        malformed.validate(),
+        Err(crate::ChcError::ArityMismatch { .. })
+    ));
+
+    let source_pruned_ids = problem.pruned_false_query_ids();
+    problem
+        .try_scalarize_const_array_selects_with_map()
+        .expect("constant array index should scalarize the predicate");
+
+    assert_eq!(
+        problem.predicates()[0].arg_sorts,
+        vec![ChcSort::Int, ChcSort::Int]
+    );
+    assert_eq!(problem.clause_action(0), Some(action));
+    assert!(problem.pruned_query_source.is_some());
+    problem
+        .validate()
+        .expect("derived clauses and retained source provenance validate in their own registries");
+    assert_eq!(problem.pruned_false_query_ids(), source_pruned_ids);
+    let obligations = problem
+        .query_obligations()
+        .expect("derived active query should remain independently solvable");
+    assert_eq!(obligations.len(), 1);
+    assert_eq!(source_pruned_ids[0].ordinal(), 0);
+    assert_eq!(obligations[0].id().source_query_ordinal(), 1);
+}

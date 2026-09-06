@@ -13,11 +13,11 @@ impl TheorySolver for DtSolver<'_> {
         // Parse tester atoms: is-C(x) → record (term, x, C) for case splitting (#8539).
         if let TermData::App(Symbol::Named(name), args) = self.terms.get(term) {
             if name.starts_with("is-") && args.len() == 1 {
-                if let Some((_dt_name, ctor_name)) = self.tester_map.get(name).cloned() {
+                if let Some((_dt_name, ctor_name)) = self.tester_map.get(name.as_str()).cloned() {
                     let arg = args[0];
                     self.internalized_testers.insert(term, (arg, ctor_name));
                     // Track the argument as a DT-sorted term.
-                    if let Some((dt_name, _)) = self.tester_map.get(name) {
+                    if let Some((dt_name, _)) = self.tester_map.get(name.as_str()) {
                         self.dt_terms.entry(arg).or_insert_with(|| dt_name.clone());
                     }
                 }
@@ -49,7 +49,7 @@ impl TheorySolver for DtSolver<'_> {
         // Check for tester assertions (is-Constructor)
         if let TermData::App(Symbol::Named(name), args) = self.terms.get(term) {
             if name.starts_with("is-") && args.len() == 1 {
-                if let Some((_dt_name, ctor_name)) = self.tester_map.get(name).cloned() {
+                if let Some((_dt_name, ctor_name)) = self.tester_map.get(name.as_str()).cloned() {
                     self.tester_results.insert(args[0], (ctor_name, val, term));
                     self.current_scope.tester_keys.push(args[0]);
                     // Track this tester atom as asserted (#8539).

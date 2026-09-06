@@ -3369,7 +3369,7 @@ impl Executor {
             if model
                 .euf_model
                 .as_ref()
-                .is_some_and(|euf| euf.function_tables.contains_key(name))
+                .is_some_and(|euf| euf.function_tables.contains_key(name.as_str()))
             {
                 return CheckedProjectionOutputCompletion::Conflict;
             }
@@ -3528,7 +3528,7 @@ impl Executor {
             if model
                 .euf_model
                 .as_ref()
-                .is_some_and(|euf| euf.function_tables.contains_key(name))
+                .is_some_and(|euf| euf.function_tables.contains_key(name.as_str()))
             {
                 return CheckedProjectionOutputCompletion::Conflict;
             }

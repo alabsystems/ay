@@ -201,21 +201,175 @@ pub(crate) fn print_feature_report() {
     );
 }
 
-/// Interactive mode banner printed when ay is run on a TTY without arguments.
+/// The screen a bare `ay` opens with on a terminal.
+///
+/// z3 answers a bare invocation with "input file was not specified", which is
+/// true and useless: the person typing it wanted to know what this program is
+/// and what to type next. This screen answers both, and it is the only place
+/// most users will ever be told that the prompt they are looking at IS `z3 -in`.
+///
+/// Every line is load-bearing, and every claim on it is checked somewhere:
+///
+/// - Line 1 doubles as provenance. It carries the version, build increment and
+///   date, which is why the interactive path suppresses `c ay.session.start` —
+///   printing the stamp twice on the one surface where a human can read it was
+///   the old banner's worst habit.
+/// - The `try` line is a REAL transcript. Pasting it prints `sat` and a model
+///   with `x = 42`; a test pins that, so the screen cannot come to lie.
+/// - The logic count comes from [`SUPPORTED_LOGICS`], not from a literal, so it
+///   moves when the list does.
+///
+/// Plain text with styling applied here, through the shared gate, so a
+/// NO_COLOR terminal sees the same words in the same columns.
 pub(crate) fn interactive_banner() -> String {
-    // Show a compact subset of commonly used logics in the banner.
-    let common_logics = [
-        "QF_LIA", "QF_LRA", "QF_BV", "QF_ABV", "QF_UF", "QF_UFLIA", "QF_UFLRA", "QF_FP", "HORN",
-        "ALL",
-    ];
-    let logics_str = common_logics.join(" ");
-    format!(
-        "ay {} -- Rust constraint-solving toolkit\n\
-         Type SMT-LIB 2.6 commands. Ctrl-D to exit.\n\
-         Supported: {}",
-        env!("AY_BUILD_STAMP"),
-        logics_str,
-    )
+    use crate::help_style::{dim, literal};
+
+    let build = crate::build_info::BUILD_INFO;
+    // `2026-09-01T04:21:46Z` -> `2026-09-01`. A time-of-day on a start screen is
+    // noise; the date answers "how old is this binary?" on its own.
+    let date = build.datetime_utc.split('T').next().unwrap_or("");
+    let logics = SUPPORTED_LOGICS.len();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} {} — proof-oriented SMT · SAT · CHC solver\n",
+        literal(&format!("ay {}", build.version)),
+        dim(&format!("(build {} · {date})", build.increment)),
+    ));
+    out.push_str(&format!(
+        "A live SMT-LIB 2.6 session — this prompt is {}, made visible. {} exits.\n\n",
+        literal("z3 -in"),
+        literal("Ctrl-D"),
+    ));
+
+    let row = |label: &str, body: String| format!("  {}  {body}\n", dim(&format!("{label:<5}")));
+    out.push_str(&row(
+        "try",
+        literal("(declare-const x Int) (assert (> x 41)) (check-sat)"),
+    ));
+    out.push_str(&format!(
+        "         {}\n",
+        dim("→ sat, and a model where x = 42")
+    ));
+    out.push_str(&row(
+        "file",
+        format!(
+            "{} {}",
+            literal("ay problem.smt2"),
+            dim("— SMT-LIB2, DIMACS, CHC, WCNF, OPB, LP"),
+        ),
+    ));
+    out.push_str(&row(
+        "z3?",
+        format!(
+            "{} {} {}",
+            dim("your flags are accepted —"),
+            literal("-t: -T: -st -model"),
+            literal("· ay help z3"),
+        ),
+    ));
+    out.push_str(&row(
+        "logic",
+        format!(
+            "{} {} {}",
+            dim("ALL until you pin one:"),
+            literal("(set-logic QF_LIA)"),
+            dim(&format!("— {logics} logics")),
+        ),
+    ));
+    out.push_str(&row(
+        "learn",
+        format!(
+            "{} {} {} {}",
+            literal("ay tutorial"),
+            dim("· in here:"),
+            literal("(help)"),
+            dim("· from a shell: ay -h"),
+        ),
+    ));
+    out
+}
+
+#[cfg(test)]
+mod start_screen_tests {
+    use super::*;
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// The start screen is the one place ay controls its own first impression,
+    /// and an 80-column terminal is still the floor. Measured in CHARACTERS:
+    /// the screen is full of `—` and `·`, and counting their bytes would report
+    /// a fitting line as four columns too wide.
+    #[test]
+    fn every_line_fits_an_eighty_column_terminal() {
+        for (n, line) in strip_ansi(&interactive_banner()).lines().enumerate() {
+            assert!(
+                line.chars().count() <= 79,
+                "start screen line {} is {} columns:\n{line}",
+                n + 1,
+                line.chars().count()
+            );
+        }
+    }
+
+    /// The screen must read identically with color off — same words, same
+    /// columns — because that is what a NO_COLOR user and a redirected pty
+    /// capture both see.
+    #[test]
+    fn the_screen_survives_having_its_color_stripped() {
+        let plain = strip_ansi(&interactive_banner());
+        assert!(plain.contains("proof-oriented SMT"), "{plain}");
+        assert!(plain.contains("z3 -in"), "{plain}");
+        assert!(!plain.contains('\u{1b}'));
+    }
+
+    /// The logic count is interpolated, never typed. A literal would be correct
+    /// exactly until someone adds a logic, and the screen would then be lying
+    /// in the one place a newcomer is most likely to check it.
+    #[test]
+    fn the_logic_count_tracks_the_supported_list() {
+        let banner = strip_ansi(&interactive_banner());
+        assert!(
+            banner.contains(&format!("{} logics", SUPPORTED_LOGICS.len())),
+            "the screen does not state the real logic count ({}):\n{banner}",
+            SUPPORTED_LOGICS.len()
+        );
+    }
+
+    /// Every command the screen names must be one the binary answers to. The
+    /// screen's whole job is telling a newcomer what to type next, and a dead
+    /// pointer there is worse than no pointer.
+    #[test]
+    fn every_command_the_screen_offers_actually_exists() {
+        use clap::CommandFactory;
+        let banner = strip_ansi(&interactive_banner());
+        let root = crate::Cli::command();
+        for offered in ["tutorial", "help"] {
+            assert!(
+                banner.contains(&format!("ay {offered}")),
+                "the screen no longer offers `ay {offered}`"
+            );
+            assert!(
+                root.get_subcommands().any(|s| s.get_name() == offered),
+                "the screen offers `ay {offered}`, which is not a subcommand"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -266,30 +266,30 @@ impl ChcProblem {
     /// Returns true if any transformation was performed.
     pub fn expand_nullary_fail_queries(&mut self, verbose: bool) -> bool {
         // Find query clauses with nullary predicates in body
-        let mut nullary_fail_preds: Vec<PredicateId> = Vec::new();
+        let mut nullary_fail_queries: Vec<(PredicateId, HornClause)> = Vec::new();
 
         for query in self.queries() {
             if query.body.predicates.len() == 1 {
                 let (pred_id, args) = &query.body.predicates[0];
                 if args.is_empty() {
                     // This is a query with a nullary predicate (like `fail => false`)
-                    nullary_fail_preds.push(*pred_id);
+                    nullary_fail_queries.push((*pred_id, query.clone()));
                 }
             }
         }
 
-        if nullary_fail_preds.is_empty() {
+        if nullary_fail_queries.is_empty() {
             return false;
         }
 
         if verbose {
-            let pred_names: Vec<_> = nullary_fail_preds
+            let pred_names: Vec<_> = nullary_fail_queries
                 .iter()
-                .filter_map(|id| self.get_predicate(*id).map(|p| p.name.clone()))
+                .filter_map(|(id, _)| self.get_predicate(*id).map(|p| p.name.clone()))
                 .collect();
             safe_eprintln!(
                 "CHC: expanding {} nullary fail predicates: {:?}",
-                nullary_fail_preds.len(),
+                nullary_fail_queries.len(),
                 pred_names
             );
         }
@@ -297,13 +297,15 @@ impl ChcProblem {
         // For each nullary fail predicate, find clauses that transition to it
         let mut new_queries: Vec<HornClause> = Vec::new();
 
-        for fail_pred in &nullary_fail_preds {
+        for (fail_pred, source_query) in &nullary_fail_queries {
             // Find all clauses `body => fail_pred`
             for clause in &self.clauses {
                 if let ClauseHead::Predicate(head_pred, _) = &clause.head {
                     if head_pred == fail_pred {
                         // Convert `body => fail_pred` to `body => false`
-                        let new_query = HornClause::query(clause.body.clone());
+                        let new_query = HornClause::query(clause.body.clone())
+                            .with_inherited_provenance(clause)
+                            .with_inherited_provenance(source_query);
                         new_queries.push(new_query);
                     }
                 }
@@ -334,7 +336,10 @@ impl ChcProblem {
         // 1. Original queries with nullary predicates (`fail => false`)
         // 2. Clauses that have a nullary fail predicate in their head
         // Keep all other clauses (facts, transitions, and any queries not using nullary predicates)
-        let nullary_set: FxHashSet<PredicateId> = nullary_fail_preds.iter().copied().collect();
+        let nullary_set: FxHashSet<PredicateId> = nullary_fail_queries
+            .iter()
+            .map(|(predicate, _)| *predicate)
+            .collect();
 
         self.clauses.retain(|clause| {
             // Remove `fail => false` queries

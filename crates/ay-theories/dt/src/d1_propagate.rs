@@ -159,7 +159,7 @@ impl DtLazyPropagator {
             return;
         };
         for (pos, sel) in selectors.iter().enumerate() {
-            if let Some(&(prev_cid, prev_pos)) = self.sel_defs.get(sel) {
+            if let Some(&(prev_cid, prev_pos)) = self.sel_defs.get(sel.as_str()) {
                 if prev_cid != cid || prev_pos != pos {
                     tracing::warn!(
                         selector = %sel,
@@ -210,12 +210,12 @@ impl DtLazyPropagator {
             let tid = TermId(raw as u32);
             match terms.get(tid) {
                 TermData::App(Symbol::Named(name), args) => {
-                    if let Some(&cid) = self.ctor_ids.get(name) {
+                    if let Some(&cid) = self.ctor_ids.get(name.as_str()) {
                         self.ctor_apps.push((tid, cid));
                     } else if args.len() == 1 {
-                        if let Some(&cid) = self.tester_names.get(name) {
+                        if let Some(&cid) = self.tester_names.get(name.as_str()) {
                             self.tester_apps.push((tid, args[0], cid));
-                        } else if let Some(&(cid, pos)) = self.sel_defs.get(name) {
+                        } else if let Some(&(cid, pos)) = self.sel_defs.get(name.as_str()) {
                             self.sel_apps.push((tid, args[0], cid, pos));
                         }
                     }
@@ -223,7 +223,7 @@ impl DtLazyPropagator {
                 // Nullary constructors are `Var` terms whose name is a
                 // registered constructor (same convention as the D0 pass).
                 TermData::Var(name, _) => {
-                    if let Some(&cid) = self.ctor_ids.get(name) {
+                    if let Some(&cid) = self.ctor_ids.get(name.as_str()) {
                         self.ctor_apps.push((tid, cid));
                     }
                 }
@@ -681,9 +681,9 @@ mod tests {
         let r = terms.mk_var("r", tower_sort());
         let x = terms.mk_var("x", tower_sort());
         let y = terms.mk_var("y", tower_sort());
-        let stack_ar = terms.mk_app(Symbol::Named("stack".to_string()), [a, r], tower_sort());
-        let is_stack_x = terms.mk_app(Symbol::Named("is-stack".to_string()), [x], Sort::Bool);
-        let is_empty_x = terms.mk_app(Symbol::Named("is-empty".to_string()), [x], Sort::Bool);
+        let stack_ar = terms.mk_app(Symbol::named("stack"), [a, r], tower_sort());
+        let is_stack_x = terms.mk_app(Symbol::named("is-stack"), [x], Sort::Bool);
+        let is_empty_x = terms.mk_app(Symbol::named("is-empty"), [x], Sort::Bool);
         let eq1 = terms.mk_eq(x, y);
         let eq2 = terms.mk_eq(y, stack_ar);
 
@@ -732,15 +732,11 @@ mod tests {
         let a = terms.mk_var("a", enum_sort());
         let r = terms.mk_var("r", tower_sort());
         let x = terms.mk_var("x", tower_sort());
-        let stack_ar = terms.mk_app(Symbol::Named("stack".to_string()), [a, r], tower_sort());
+        let stack_ar = terms.mk_app(Symbol::named("stack"), [a, r], tower_sort());
         // Syntactic: tester directly on the constructor application.
-        let _is_stack_app = terms.mk_app(
-            Symbol::Named("is-stack".to_string()),
-            [stack_ar],
-            Sort::Bool,
-        );
+        let _is_stack_app = terms.mk_app(Symbol::named("is-stack"), [stack_ar], Sort::Bool);
         // Unmerged: tester on x, but x never merged with stack_ar.
-        let _is_stack_x = terms.mk_app(Symbol::Named("is-stack".to_string()), [x], Sort::Bool);
+        let _is_stack_x = terms.mk_app(Symbol::named("is-stack"), [x], Sort::Bool);
 
         let mut euf = EufSolver::new(&terms);
         let _ = euf.check();
@@ -760,8 +756,8 @@ mod tests {
         let a = terms.mk_var("a", enum_sort());
         let r = terms.mk_var("r", tower_sort());
         let x = terms.mk_var("x", tower_sort());
-        let stack_ar = terms.mk_app(Symbol::Named("stack".to_string()), [a, r], tower_sort());
-        let top_x = terms.mk_app(Symbol::Named("top".to_string()), [x], enum_sort());
+        let stack_ar = terms.mk_app(Symbol::named("stack"), [a, r], tower_sort());
+        let top_x = terms.mk_app(Symbol::named("top"), [x], enum_sort());
         let eq = terms.mk_eq(x, stack_ar);
         let eq_atom = terms.mk_eq(top_x, a); // the propagated equality atom
 
@@ -793,7 +789,7 @@ mod tests {
         let x = terms.mk_var("x", tower_sort());
         let empty = terms.mk_var("empty", tower_sort());
         let a = terms.mk_var("a", enum_sort());
-        let top_x = terms.mk_app(Symbol::Named("top".to_string()), [x], enum_sort());
+        let top_x = terms.mk_app(Symbol::named("top"), [x], enum_sort());
         let eq = terms.mk_eq(x, empty);
         let _eq_atom = terms.mk_eq(top_x, a);
 
@@ -822,9 +818,9 @@ mod tests {
         } = fixture();
         let x = terms.mk_var("x", tower_sort());
         let y = terms.mk_var("y", tower_sort());
-        let is_stack_x = terms.mk_app(Symbol::Named("is-stack".to_string()), [x], Sort::Bool);
-        let is_stack_y = terms.mk_app(Symbol::Named("is-stack".to_string()), [y], Sort::Bool);
-        let is_empty_y = terms.mk_app(Symbol::Named("is-empty".to_string()), [y], Sort::Bool);
+        let is_stack_x = terms.mk_app(Symbol::named("is-stack"), [x], Sort::Bool);
+        let is_stack_y = terms.mk_app(Symbol::named("is-stack"), [y], Sort::Bool);
+        let is_empty_y = terms.mk_app(Symbol::named("is-empty"), [y], Sort::Bool);
         let eq = terms.mk_eq(x, y);
 
         let mut euf = EufSolver::new(&terms);
@@ -879,8 +875,8 @@ mod tests {
         let r = terms.mk_var("r", tower_sort());
         let x = terms.mk_var("x", tower_sort());
         let y = terms.mk_var("y", tower_sort());
-        let stack_ar = terms.mk_app(Symbol::Named("stack".to_string()), [a, r], tower_sort());
-        let is_empty_x = terms.mk_app(Symbol::Named("is-empty".to_string()), [x], Sort::Bool);
+        let stack_ar = terms.mk_app(Symbol::named("stack"), [a, r], tower_sort());
+        let is_empty_x = terms.mk_app(Symbol::named("is-empty"), [x], Sort::Bool);
         let eq1 = terms.mk_eq(x, y);
         let eq2 = terms.mk_eq(y, stack_ar);
 
@@ -926,8 +922,8 @@ mod tests {
         let a = terms.mk_var("a", enum_sort());
         let r = terms.mk_var("r", tower_sort());
         let x = terms.mk_var("x", tower_sort());
-        let stack_ar = terms.mk_app(Symbol::Named("stack".to_string()), [a, r], tower_sort());
-        let _is_stack_x = terms.mk_app(Symbol::Named("is-stack".to_string()), [x], Sort::Bool);
+        let stack_ar = terms.mk_app(Symbol::named("stack"), [a, r], tower_sort());
+        let _is_stack_x = terms.mk_app(Symbol::named("is-stack"), [x], Sort::Bool);
         let eq = terms.mk_eq(x, stack_ar);
 
         let mut euf = EufSolver::new(&terms);

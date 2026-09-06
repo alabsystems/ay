@@ -247,11 +247,25 @@ pub(crate) mod trp;
 // Core data model — used in public API signatures (ChcParser::parse -> ChcProblem, etc.)
 pub use clause::HornClause;
 pub use expr::{ChcDtConstructor, ChcDtSelector, ChcExpr, ChcSort, ChcVar};
+pub use ground_derivation::{
+    validate_chc_ground_derivation_artifact, validate_chc_ground_derivation_artifact_v2,
+    ChcGroundDerivationArtifactError, ChcGroundDerivationArtifactErrorReason,
+    ChcValidatedGroundDerivation, CHC_GROUND_DERIVATION_ARTIFACT_MAX_BINDINGS,
+    CHC_GROUND_DERIVATION_ARTIFACT_MAX_BYTES, CHC_GROUND_DERIVATION_ARTIFACT_MAX_CLAUSES,
+    CHC_GROUND_DERIVATION_ARTIFACT_MAX_NESTING_DEPTH,
+    CHC_GROUND_DERIVATION_ARTIFACT_MAX_PREDICATES,
+    CHC_GROUND_DERIVATION_ARTIFACT_MAX_PREMISE_EDGES, CHC_GROUND_DERIVATION_ARTIFACT_MAX_STEPS,
+    CHC_GROUND_DERIVATION_ARTIFACT_MAX_STRING_OR_TOKEN_BYTES,
+    CHC_GROUND_DERIVATION_ARTIFACT_MAX_UF_OBSERVATIONS,
+    CHC_GROUND_DERIVATION_ARTIFACT_MAX_VALUE_NODES, CHC_GROUND_DERIVATION_ARTIFACT_ROLE,
+    CHC_GROUND_DERIVATION_ARTIFACT_SCHEMA, CHC_GROUND_DERIVATION_ARTIFACT_V2_ROLE,
+    CHC_GROUND_DERIVATION_ARTIFACT_V2_SCHEMA, CHC_GROUND_DERIVATION_MAX_SOURCE_WORK,
+};
 // (get-interpolant / compute-interpolant) Craig interpolation command support.
 pub use interpolant_command::{compute_smt_interpolant, InterpolantError, SortResolver};
 pub use predicate::Predicate;
+pub use problem::ChcPrunedQueryObligationId;
 pub use problem::{ChcProblem, ChcQueryObligation, ChcQueryObligationId};
-
 // Core types used by integration tests for problem construction
 pub use adaptive_decision_log::{
     AdaptiveSolveReport, AdaptiveSolveTrace, AdaptiveStrategyObservation, AdaptiveStrategyOutcome,
@@ -264,11 +278,11 @@ pub use proof_metadata::{
     normalized_chc_input, normalized_chc_input_sha256, ChcBmcUnsafeTraceAssignmentCompleteness,
     ChcBmcUnsafeTraceAssignmentCompletenessReason, ChcBmcUnsafeTraceAssignmentCompletenessStatus,
     ChcBmcUnsafeTraceAssignmentContract, ChcCheckedReplayArtifacts,
-    ChcCheckedReplayManifestBinding, ChcCheckedReplayObligation, ChcCheckedReplayRun,
-    ChcCheckedReplaySummary, ChcCheckedReplaySummaryError, ChcObligationStrictCert, ChcPdrProofRun,
-    ChcProofArtifactDigest, ChcProofEvidenceManifest, ChcProofEvidenceOptions,
-    ChcProofEvidenceParseError, ChcProofQueryAdmissionKey, ChcProofQueryCache,
-    ChcProofQueryCacheAdmissionDecision, ChcProofQueryCacheAdmissionPolicy,
+    ChcCheckedReplayManifestBinding, ChcCheckedReplayObligation, ChcCheckedReplayObligationPayload,
+    ChcCheckedReplayRun, ChcCheckedReplaySummary, ChcCheckedReplaySummaryError,
+    ChcObligationStrictCert, ChcPdrProofRun, ChcProofArtifactDigest, ChcProofEvidenceManifest,
+    ChcProofEvidenceOptions, ChcProofEvidenceParseError, ChcProofQueryAdmissionKey,
+    ChcProofQueryCache, ChcProofQueryCacheAdmissionDecision, ChcProofQueryCacheAdmissionPolicy,
     ChcProofQueryCacheAdmissionStatus, ChcProofQueryCacheLookupKey, ChcProofQueryCacheLookupResult,
     ChcProofQueryCacheLookupStatus, ChcProofQueryCacheMetrics, ChcProofRunArtifact,
     ChcProofRunArtifactBundleValidationError, ChcProofRunArtifactBundleValidationErrorReason,
@@ -276,10 +290,11 @@ pub use proof_metadata::{
     ChcProofRunArtifacts, ChcProofRunStopReason, ChcProofRunWithBudgetReport,
     ChcProofSolverIdentity, ChcProofTranscriptConsumerEvidence, ChcProofTranscriptMetadata,
     ChcReplayCheckResult, ChcReplayCheckerIdentity, ChcReplayEvidence, ChcReplayObligationArtifact,
-    ChcTraceAssignmentEvidence, ChcTraceStepEvidence, ChcUnsafeTraceEvidence,
-    CHC_BMC_UNSAFE_TRACE_ASSIGNMENT_COMPLETENESS_SCHEMA,
+    ChcReplayPayloadFormat, ChcTraceAssignmentEvidence, ChcTraceStepEvidence,
+    ChcUnsafeTraceEvidence, CHC_BMC_UNSAFE_TRACE_ASSIGNMENT_COMPLETENESS_SCHEMA,
     CHC_BMC_UNSAFE_TRACE_ASSIGNMENT_CONTRACT_SCHEMA, CHC_CHECKED_REPLAY_MANIFEST_BINDING_SCHEMA,
-    CHC_CHECKED_REPLAY_SUMMARY_SCHEMA, CHC_EVIDENCE_MANIFEST_SCHEMA,
+    CHC_CHECKED_REPLAY_SUMMARY_SCHEMA, CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2,
+    CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3, CHC_EVIDENCE_MANIFEST_SCHEMA,
     CHC_IN_PROCESS_REPLAY_CHECKER_NAME, CHC_PROOF_ARTIFACT_DIGEST_SCHEMA,
     CHC_PROOF_QUERY_ADMISSION_KEY_SCHEMA, CHC_PROOF_QUERY_CACHE_ADMISSION_DECISION_SCHEMA,
     CHC_PROOF_QUERY_CACHE_ADMISSION_POLICY_SCHEMA, CHC_PROOF_QUERY_CACHE_LOOKUP_KEY_SCHEMA,
@@ -544,6 +559,9 @@ pub mod engines {
 
         let raw = PdrSolver::solve_problem(&problem, config.clone());
         let result = validate_pdr_proof_result(&problem, raw, &config);
+        // Refutations do not survive body-`forall` over-approximation.
+        let result =
+            downgrade_unsafe_if_overapproximated(result, problem.has_stripped_body_forall());
         let result = enforce_pdr_proof_return_boundary(result, &config, solve_deadline);
         ChcPdrProofRun::new(problem, result, PDR_PROOF_ENGINE_NAME)
     }
@@ -1084,14 +1102,8 @@ pub mod engines {
     /// }
     /// ```
     pub fn solve_bmc_only(problem: ChcProblem, bmc_config: BmcConfig) -> VerifiedChcResult {
-        // A body-position `forall` was stripped, which WEAKENS the antecedent
-        // (see `ChcProblem::has_stripped_body_forall`). Proofs survive an
-        // over-approximation a fortiori, but a counterexample may have been
-        // fabricated by the weakened guard, so `Unsafe` must not be published.
-        let overapproximated = problem.has_stripped_body_forall();
         let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::default());
-        let result = adaptive.solve_bmc_only(bmc_config);
-        downgrade_unsafe_if_overapproximated(result, overapproximated)
+        adaptive.solve_bmc_only(bmc_config)
     }
 
     /// Map `Unsafe` -> `Unknown` when the problem was over-approximated by

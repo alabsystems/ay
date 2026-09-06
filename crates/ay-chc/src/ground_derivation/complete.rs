@@ -26,7 +26,7 @@
 //! against it. A bad guess makes a constraint evaluate to `false` (rejection)
 //! or leaves it indeterminate (rejection). It can never manufacture a verdict.
 
-use super::{eval_ground, is_concrete};
+use super::{eval_ground, is_concrete, is_exact_uf_model_marker};
 use crate::clause::HornClause;
 use crate::smt::SmtValue;
 use crate::{ChcExpr, ChcOp, ChcSort, ChcVar};
@@ -98,7 +98,7 @@ pub(crate) fn complete_env_for_clause_with_fallback(
     // Drop any binding that is not a genuine concrete value: an `Opaque`
     // placeholder inherited from a transformed model would block propagation
     // AND defeat the validator's groundness check.
-    env.retain(|_, value| is_concrete(value));
+    env.retain(|name, value| is_concrete(value) || is_exact_uf_model_marker(name, value));
 
     let conjuncts: Vec<ChcExpr> = clause
         .body
@@ -1347,7 +1347,7 @@ fn sort_default_bounded(sort: &ChcSort, fuel: usize) -> Option<SmtValue> {
 /// propagation finds them; a sort default would instead silently name a
 /// different derivation.
 pub(crate) fn propagate_env_for_clause(clause: &HornClause, env: &mut FxHashMap<String, SmtValue>) {
-    env.retain(|_, value| is_concrete(value));
+    env.retain(|name, value| is_concrete(value) || is_exact_uf_model_marker(name, value));
     let conjuncts = clause
         .body
         .constraint

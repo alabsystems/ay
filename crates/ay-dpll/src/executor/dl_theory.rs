@@ -36,12 +36,16 @@
 //!   approximation. Boolean-only atoms (`(= p q)` over `Bool`, plain Boolean
 //!   variables, ITE guards) carry no arithmetic content and are ignored; the
 //!   Tseitin encoder constrains them structurally.
-//! * **No theory propagation.** `propagate()` returns `vec![]`. The potential
-//!   vector returned by `IncrementalDiffGraph::model()` is a *feasible
-//!   potential*, NOT a shortest-path distance matrix, so `π(x) − π(y) <= c` is
-//!   necessary but **not sufficient** for entailment — testing it to decide an
-//!   atom is implied would be unsound. Returning no propagations is always
-//!   sound.
+//! * **Theory propagation is exact.** After every consistent assert the
+//!   engine's [`IncrementalDiffGraph::entailed_after_assert`] runs two
+//!   slack-Dijkstras and reports every registered-but-unasserted edge that a
+//!   concrete path of the asserted edges now bounds (Cotton–Maler); the path's
+//!   literals are the propagation's reason. The potential vector returned by
+//!   `IncrementalDiffGraph::model()` is a *feasible potential*, NOT a
+//!   shortest-path distance matrix, so `π(x) − π(y) <= c` is necessary but
+//!   **not sufficient** for entailment — it is never read to decide an atom.
+//!   The Dijkstras are budgeted ([`PROP_BUDGET`]); a cut-short search loses
+//!   propagations but can never produce a wrong one.
 //! * **Conflicts are genuine negative cycles.** `assert_edge` returns the tags
 //!   of the edges forming the cycle; we map them straight back to the
 //!   `TheoryLit`s that activated them. The set is sound (the cycle really is
@@ -126,8 +130,26 @@ pub(crate) struct DiffLogicTheory<'a, W: DlWeight> {
     tag_edge_count: Vec<u32>,
     /// Entailments discovered during `assert_literal`, drained by `propagate`.
     pending_props: Vec<TheoryPropagation>,
-    /// Vertices each propagation Dijkstra may settle. Tunable via
-    /// `AY_RDL_PROP_BUDGET`; 0 disables theory propagation entirely.
+    /// Tag of each entry of `pending_props`, so a propagation that `pop`
+    /// drops before `propagate` delivered it can be unmarked below.
+    pending_tags: Vec<usize>,
+    /// `propagated_level[tag] = Some(depth)` while this theory has propagated
+    /// the tag's literal at scope depth `depth` and that depth is still open.
+    ///
+    /// INVARIANT: a marked literal's edge is entailed by the ACTIVE edges — it
+    /// was found entailed by edges active at `depth`, all asserted at depths
+    /// `<= depth`, and `pop` clears every mark of an unwound depth. Two uses,
+    /// both pure work-saving: (a) asserting a marked literal adds an edge that
+    /// can shorten no distance, so its propagation round is skipped outright —
+    /// on super_queen34-1 that is ~600k of the ~602k rounds; (b) a marked
+    /// literal is not queued a second time.
+    propagated_level: Vec<Option<usize>>,
+    /// Tags marked since the matching `push`, unmarked by `pop`.
+    propagated_trail: Vec<usize>,
+    /// `propagated_trail.len()` captured at each `push`.
+    propagated_marks: Vec<usize>,
+    /// Vertices each propagation Dijkstra may settle ([`PROP_BUDGET`] in
+    /// production; 0 disables theory propagation entirely, tests only).
     prop_budget: usize,
     /// INTEGER difference logic (QF_IDL) rather than the Real lane (QF_RDL).
     ///
@@ -168,7 +190,11 @@ impl<'a, W: DlWeight> DiffLogicTheory<'a, W> {
             tag_lits: Vec::new(),
             tag_edge_count: Vec::new(),
             pending_props: Vec::new(),
-            prop_budget: prop_budget_from_env(),
+            pending_tags: Vec::new(),
+            propagated_level: Vec::new(),
+            propagated_trail: Vec::new(),
+            propagated_marks: Vec::new(),
+            prop_budget: PROP_BUDGET,
             int_mode: false,
             active_edges: Vec::new(),
             active_marks: Vec::new(),
@@ -228,6 +254,7 @@ impl<'a, W: DlWeight> DiffLogicTheory<'a, W> {
         let tag = u64::try_from(self.tag_lits.len()).ok()?;
         self.tag_lits.push(lit);
         self.tag_edge_count.push(0);
+        self.propagated_level.push(None);
         let ids: Vec<usize> = constraints
             .into_iter()
             .map(|c| self.graph.register_edge(c.from, c.to, c.weight, tag))
@@ -419,6 +446,28 @@ impl<'a, W: DlWeight> DiffLogicTheory<'a, W> {
             let Some(&lit) = self.tag_lits.get(idx) else {
                 continue;
             };
+            // An atom the search has already assigned (in either polarity) has
+            // an active edge; propagating it again is wasted work — the DPLL
+            // layer would only skip it — so drop it here. (The opposite
+            // polarity being active while this one is entailed is impossible:
+            // that would be a negative cycle among ACTIVE edges, which
+            // `assert_edge` refuses.)
+            let assigned = match self.atoms.get(&lit.term) {
+                Some(AtomKind::Dl(atom)) => atom
+                    .pos
+                    .iter()
+                    .chain(atom.neg.iter().flatten())
+                    .any(|&id| self.graph.edge_is_active(id)),
+                _ => true,
+            };
+            if assigned {
+                continue;
+            }
+            // Already queued or delivered at a still-open depth: the DPLL
+            // layer has it (or will have it from the same batch).
+            if self.propagated_level.get(idx).copied().flatten().is_some() {
+                continue;
+            }
             let mut seen: HashSet<TheoryLit> = HashSet::default();
             let mut reason_lits: Vec<TheoryLit> = Vec::with_capacity(reason.len());
             let mut usable = true;
@@ -443,6 +492,11 @@ impl<'a, W: DlWeight> DiffLogicTheory<'a, W> {
             if !usable || reason_lits.is_empty() {
                 continue;
             }
+            if let Some(slot) = self.propagated_level.get_mut(idx) {
+                *slot = Some(self.scope_depth);
+                self.propagated_trail.push(idx);
+            }
+            self.pending_tags.push(idx);
             self.pending_props
                 .push(TheoryPropagation::eager(lit, reason_lits));
         }
@@ -579,10 +633,24 @@ impl<W: DlWeight> TheorySolver for DiffLogicTheory<'_, W> {
         };
 
         for id in edges {
+            // An edge whose literal this theory already propagated (at a
+            // still-open depth) is entailed by the active edges: activating
+            // it shortens no shortest path, so it can create no new
+            // entailment and the propagation round is skipped. See
+            // `propagated_level` for the invariant that makes this exact.
+            let implied = self
+                .graph
+                .edges()
+                .get(id)
+                .and_then(|e| usize::try_from(e.tag).ok())
+                .and_then(|idx| self.propagated_level.get(idx).copied().flatten())
+                .is_some();
             match self.graph.assert_edge(id) {
                 AssertOutcome::Consistent => {
                     self.active_edges.push(id);
-                    self.collect_entailments(id);
+                    if !implied {
+                        self.collect_entailments(id);
+                    }
                 }
                 AssertOutcome::Conflict(tags) => {
                     self.record_conflict(&tags);
@@ -624,12 +692,16 @@ impl<W: DlWeight> TheorySolver for DiffLogicTheory<'_, W> {
     /// [`IncrementalDiffGraph::entailed_after_assert`], which computes real
     /// distances and exhibits a concrete justifying path.
     fn propagate(&mut self) -> Vec<TheoryPropagation> {
+        // Delivered: the marks stay (the DPLL layer now owns the literals),
+        // only the undelivered ledger is emptied.
+        self.pending_tags.clear();
         std::mem::take(&mut self.pending_props)
     }
 
     fn push(&mut self) {
         self.graph.push();
         self.active_marks.push(self.active_edges.len());
+        self.propagated_marks.push(self.propagated_trail.len());
         self.scope_depth += 1;
     }
 
@@ -651,6 +723,27 @@ impl<W: DlWeight> TheorySolver for DiffLogicTheory<'_, W> {
         );
         if let Some(mark) = self.active_marks.pop() {
             self.active_edges.truncate(mark);
+        }
+        // Marks made at the unwound depth describe entailments whose reasons
+        // may have just been retracted: clear them. Marks at surviving depths
+        // stay valid (their reasons were asserted no deeper than they were).
+        if let Some(mark) = self.propagated_marks.pop() {
+            while self.propagated_trail.len() > mark {
+                let Some(idx) = self.propagated_trail.pop() else {
+                    break;
+                };
+                if let Some(slot) = self.propagated_level.get_mut(idx) {
+                    *slot = None;
+                }
+            }
+        }
+        // A propagation the DPLL layer never received is dropped below; unmark
+        // it too, whatever its depth, so it is re-derived rather than assumed
+        // delivered. Costs only work, never soundness.
+        for idx in self.pending_tags.drain(..) {
+            if let Some(slot) = self.propagated_level.get_mut(idx) {
+                *slot = None;
+            }
         }
         // Derived state from the popped scope must not leak: a conflict, a split
         // request, or a fail-closed mark raised at a depth we have now unwound
@@ -689,6 +782,12 @@ impl<W: DlWeight> TheorySolver for DiffLogicTheory<'_, W> {
         // no longer assigned, and a surviving split request would fire against a
         // disequality the new search has not asserted.
         self.pending_props.clear();
+        self.pending_tags.clear();
+        self.propagated_level
+            .iter_mut()
+            .for_each(|slot| *slot = None);
+        self.propagated_trail.clear();
+        self.propagated_marks.clear();
         // `atoms` / `var_index` / `tag_lits` are structural caches keyed by term
         // shape, not by the assertion set, and every registered edge is now
         // inactive (constraining nothing), so they are retained.
@@ -704,22 +803,24 @@ fn strip_negations(terms: &TermStore, mut term: TermId, mut value: bool) -> (Ter
     (term, value)
 }
 
-/// Per-Dijkstra vertex budget for theory propagation (`AY_RDL_PROP_BUDGET`).
+/// Per-Dijkstra vertex budget for theory propagation.
 ///
-/// Propagation costs two Dijkstras per assert, so the budget trades search
-/// pruning against theory time. Only SETTLED distances are used, so a smaller
-/// budget loses propagations but can never produce an unsound one. `0` disables
-/// propagation entirely.
-fn prop_budget_from_env() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        // Default OFF. Measured on the QF_RDL corpus, propagation at budget
-        // 256 costs far more than the search it prunes: on tempo-depth-4 it
-        // turned a 13.4s `sat` into a 27s timeout. The machinery is sound;
-        // B25: re-arm by editing this constant for an experiment.
-        0
-    })
-}
+/// Propagation costs two slack-Dijkstras per consistent assert, each settling
+/// at most this many vertices, plus the enumeration of the registered edges
+/// incident to the settled sets (`IncrementalDiffGraph::entailed_after_assert`).
+/// Only SETTLED distances are used, so a smaller budget loses propagations but
+/// can never produce an unsound one. On the small, dense scheduling/queens
+/// instances (35–230 vertices) the budget is never reached and propagation is
+/// exhaustive, like z3's dense difference-logic theory; on the 27k-vertex
+/// graph instances it bounds the per-assert work.
+///
+/// Propagation used to be OFF (budget 0): with the engine scanning every
+/// registered edge after every assert and the Int lane on BigRational
+/// weights, budget 256 turned tempo-depth-4's 13.4 s `sat` into a 27 s
+/// timeout. Both costs are gone (relevant-set enumeration; `IStar`), and the
+/// search-strength gap it left — super_queen34-1 needed 38,690 conflicts where
+/// z3 needs 5 with 3,749 propagations — is what this closes.
+const PROP_BUDGET: usize = 256;
 
 /// Does this Boolean atom carry ARITHMETIC content?
 ///

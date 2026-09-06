@@ -104,7 +104,7 @@ impl Solver {
         match self.terms().get(id) {
             TermData::App(sym, args) => {
                 let name = match sym {
-                    Symbol::Named(n) => n.clone(),
+                    Symbol::Named(n) => n.to_string(),
                     Symbol::Indexed(n, indices) => {
                         format!(
                             "(_ {n} {})",

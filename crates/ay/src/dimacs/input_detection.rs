@@ -132,12 +132,111 @@ const XOR_RESIDUAL_DOMINANCE_DENOMINATOR: usize = 20; // disable when residual >
 /// `--xor-allow-large` for experimentation (inc6, SAT-COMP campaign).
 const XOR_EXTENSION_MAX_CLAUSES: usize = 50_000;
 
+/// Minimum fraction of ADMITTED XOR rows required to take the theory route.
+///
+/// Route-entry incoherence (#xor-route-entry). Two independent decisions used
+/// to disagree with nothing reconciling them:
+///
+///   * `should_enable_xor_extension` (here) commits to the theory route from
+///     DETECTED coverage -- clauses consumed by XOR extraction.
+///   * `XorExtension::new` then admits matrices on PER-COMPONENT limits
+///     (`component_within_limits`: rows <= 2000, cols <= 1000).
+///
+/// Taking the route is not free: `run_xor_dimacs_formula` sets
+/// `preprocess_enabled=false` and calls `disable_extension_inprocessing()`, so
+/// BVE, congruence, sweep, probe, sbva and decompose are all OFF; and the
+/// consumed clauses are DELETED from the CNF (`preprocess.rs`), surviving only
+/// as a full-assignment check with zero propagation power. When almost no rows
+/// get a matrix, that trade buys nothing and the configuration is strictly
+/// worse than plain CDCL.
+///
+/// Measured live at 1500 s on the SAT-COMP 2026 main set: hitag2-7 entered the
+/// route with 10 of 735 rows admitted (1.4%), quad_res_r30_m35 with 2 of 2737
+/// (0.1%), and both time out. The legitimate users of the route sit far above:
+/// the four lightsout `direct` instances and `size_5_5_5_i116_r12` all admit
+/// 100% of their eligible rows. A 25% floor sits in the wide empty gap between
+/// those two populations.
+///
+/// Denominator excludes rows dropped by `MAX_NUM_MATRICES` -- see
+/// `XorExtension::coverage_denominator_rows`.
+///
+/// Kill switch: `--xor-allow-unadmitted` restores the old unconditional
+/// behaviour byte-for-byte (used for the paired A/B that measured this).
+const XOR_MIN_ADMITTED_ROW_NUMERATOR: usize = 1;
+const XOR_MIN_ADMITTED_ROW_DENOMINATOR: usize = 4; // require >= 25% admitted
+
+/// Admitted-row coverage of the XOR system that actually got matrices.
+///
+/// `(admitted, eligible)` read straight off the constructed `XorExtension`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct XorAdmittedRows {
+    pub(crate) admitted: usize,
+    pub(crate) eligible: usize,
+}
+
+impl XorAdmittedRows {
+    pub(crate) fn of(extension: &ay_xor::XorExtension) -> Self {
+        Self {
+            admitted: extension.admitted_rows(),
+            eligible: extension.coverage_denominator_rows(),
+        }
+    }
+
+    /// True when enough of the detected XOR system can actually propagate to
+    /// justify giving up all preprocessing.
+    fn sufficient(self) -> bool {
+        if ay_core::misc_cli_flags().xor_allow_unadmitted {
+            return true;
+        }
+        // An extension with no eligible rows at all has nothing to offer; the
+        // `num_components() > 0` check at the call sites already covers the
+        // normal case, so this is a defensive floor rather than a live branch.
+        if self.eligible == 0 {
+            return self.admitted > 0;
+        }
+        let ok = self
+            .admitted
+            .saturating_mul(XOR_MIN_ADMITTED_ROW_DENOMINATOR)
+            >= self.eligible.saturating_mul(XOR_MIN_ADMITTED_ROW_NUMERATOR);
+        if !ok {
+            // The one line that proves this gate fired. A declined route is
+            // otherwise indistinguishable from an instance that never had XOR
+            // structure, and this campaign has already been misled twice by an
+            // A/B arm that silently did not engage.
+            safe_eprintln!(
+                "c XOR: declining theory route -- only {}/{} detected rows admitted to a matrix (floor {}/{})",
+                self.admitted,
+                self.eligible,
+                XOR_MIN_ADMITTED_ROW_NUMERATOR,
+                XOR_MIN_ADMITTED_ROW_DENOMINATOR
+            );
+        }
+        ok
+    }
+
+    /// Full coverage. Used by the clause-shape unit tests, which exercise the
+    /// other guards and must not be perturbed by this one.
+    #[cfg(test)]
+    pub(crate) const fn full() -> Self {
+        Self {
+            admitted: 1,
+            eligible: 1,
+        }
+    }
+}
+
 fn should_enable_xor_extension(
     clauses: &[Vec<Literal>],
     consumed: usize,
     remaining: usize,
     xor_count: usize,
+    admitted: XorAdmittedRows,
 ) -> bool {
+    // Route-entry coherence gate, checked FIRST: it is the cheapest of the
+    // guards and the only one that consults what the extension actually built.
+    if !admitted.sufficient() {
+        return false;
+    }
     if !ay_xor::should_enable_gauss_elimination(consumed, remaining, xor_count) {
         return false;
     }

@@ -7,6 +7,25 @@
 //! When `AY_DUMP_ENCODING=<file>` is set, dumps all clauses present in the
 //! SAT solver before the first solve call in an annotated DIMACS-like format.
 //!
+//! NOT a formula serialiser — see `solver/dump_cnf.rs` for that. The two are
+//! deliberately separate:
+//!
+//! | | this file (`--dump-encoding`) | `dump_cnf.rs` (`--dump-cnf`) |
+//! |---|---|---|
+//! | when | before preprocessing (`init_solve`) | after the preprocessing fixpoint |
+//! | format | annotated (`e 1 3 -7 0`) — provenance char + clause id | plain DIMACS |
+//! | consumers | humans diffing AY's encoding against another solver's | other SAT solvers |
+//! | clause set | `active_indices()` | `live_indices()` |
+//! | literals | internal | externalized (`i2e`) |
+//!
+//! The last two rows are why this cannot simply be moved later rather than
+//! duplicated. `active_indices()` includes garbage-kept husks — clauses the
+//! solver has logically deleted but whose literal data is retained for
+//! reason-pointer windows — and internal literals diverge from the input
+//! numbering once variable compaction runs. Both are harmless here, because
+//! nothing has been deleted or compacted yet at `init_solve`; both would be
+//! silent corruption in a post-preprocessing formula dump.
+//!
 //! Provenance prefixes:
 //!   `e` = encoding (problem clause)
 //!   `b` = bound axiom

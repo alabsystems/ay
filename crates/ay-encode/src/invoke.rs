@@ -18,7 +18,7 @@
 //! lowering, the model-checker consumer's `ChcTranslator`); this module only configures and runs.
 
 use std::panic::AssertUnwindSafe;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ay_chc::{
     engines, AdaptiveConfig, AdaptiveExecutionMode, AdaptivePortfolio, BudgetPolicy,
@@ -28,6 +28,11 @@ use ay_chc::{
 
 use crate::proof::ProofRun;
 use crate::verdict::AyVerdict;
+
+pub use crate::query_proof_report::{
+    QueryObligationBatchProofReport, QueryObligationBatchVerdict, QueryObligationProofReportRow,
+    CHC_QUERY_BATCH_PROOF_REPORT_SCHEMA, CHC_QUERY_OBLIGATION_SET_SCHEMA,
+};
 
 /// Which CHC engine to drive.
 ///
@@ -419,6 +424,179 @@ pub fn solve_query_obligations_with_cancellation(
             }
         },
     ))
+}
+
+/// Solve every active query independently and retain each authoritative proof report.
+///
+/// Unlike [`solve_query_obligations`], this entry point keeps the exact
+/// [`ChcProofRunWithBudgetReport`] for every successfully invoked row and binds
+/// the complete ordered row set to the normalized aggregate source problem.
+/// The returned aggregate reports Safe only when every surviving query has
+/// definitive proof-accepted Safe evidence, and reports Unsafe when any row
+/// has definitive proof-accepted counterexample evidence.
+///
+/// Construction and row enumeration remain AY-owned: callers cannot supply a
+/// subset, pair a report with a different [`ChcQueryObligationId`], or inject a
+/// transformation between slicing and the authoritative solve. As with
+/// [`solve_query_obligations`], `EncodeConfig::timeout` is per obligation.
+pub fn solve_query_obligations_with_proof_report(
+    problem: &ChcProblem,
+    config: &EncodeConfig,
+) -> crate::Result<QueryObligationBatchProofReport> {
+    solve_query_obligations_with_proof_report_impl(
+        problem,
+        config,
+        None,
+        QueryProofReplay::MetadataOnly,
+    )
+}
+
+/// Solve every active query and independently replay each definitive result.
+///
+/// This is the proof-admission counterpart of
+/// [`solve_query_obligations_with_proof_report`]. Each row is solved exactly
+/// once, then a replay pass receives `replay_budget`. Successful replay can
+/// make the typed in-process batch admissible to the Trust full verifier;
+/// failed or exhausted replay remains explicit metadata-only evidence and can
+/// never change the row verdict.
+///
+/// The solve timeout in [`EncodeConfig`] and `replay_budget` are separate
+/// per-obligation limits. Rows remain sequential, so at most one solver or
+/// replay pass is live at a time.
+pub fn solve_query_obligations_with_checked_proof_report(
+    problem: &ChcProblem,
+    config: &EncodeConfig,
+    replay_budget: Duration,
+) -> crate::Result<QueryObligationBatchProofReport> {
+    solve_query_obligations_with_proof_report_impl(
+        problem,
+        config,
+        None,
+        QueryProofReplay::Checked(replay_budget),
+    )
+}
+
+/// Solve every active query with checked replay under caller-owned cancellation.
+///
+/// This combines the source-bound, proof-admitting report from
+/// [`solve_query_obligations_with_checked_proof_report`] with the cooperative
+/// cancellation behavior of
+/// [`solve_query_obligations_with_proof_report_with_cancellation`]. The parent
+/// token reaches the row currently being solved and is checked again before a
+/// checked-replay pass or any later row is started. Consequently a caller may
+/// arm one batch-wide deadline with [`CancellationToken::cancel_after`]
+/// without losing any source-ordered row identities: work not started after
+/// cancellation is recorded as [`crate::EncodeError::Cancelled`].
+///
+/// `EncodeConfig::timeout` and `replay_budget` remain separate per-obligation
+/// limits. Once a replay pass has started, its own `replay_budget` is the
+/// synchronous bound; a cancellation request is observed at the next batch
+/// stage boundary. A replay that fails, or is not launched because cancellation
+/// was already observed, cannot upgrade a row to Trust-full-verifier-admissible
+/// evidence.
+pub fn solve_query_obligations_with_checked_proof_report_with_cancellation(
+    problem: &ChcProblem,
+    config: &EncodeConfig,
+    replay_budget: Duration,
+    parent: &CancellationToken,
+) -> crate::Result<QueryObligationBatchProofReport> {
+    solve_query_obligations_with_proof_report_impl(
+        problem,
+        config,
+        Some(parent),
+        QueryProofReplay::Checked(replay_budget),
+    )
+}
+
+/// Source-bound multi-query proof reporting under caller-owned cancellation.
+///
+/// A pre-existing or concurrent request reaches the active row. Rows that have
+/// not started when cancellation is observed are retained as
+/// [`crate::EncodeError::Cancelled`] instead of being omitted, so an incomplete
+/// batch can never look like an all-proved conjunction.
+pub fn solve_query_obligations_with_proof_report_with_cancellation(
+    problem: &ChcProblem,
+    config: &EncodeConfig,
+    parent: &CancellationToken,
+) -> crate::Result<QueryObligationBatchProofReport> {
+    solve_query_obligations_with_proof_report_impl(
+        problem,
+        config,
+        Some(parent),
+        QueryProofReplay::MetadataOnly,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum QueryProofReplay {
+    MetadataOnly,
+    Checked(Duration),
+}
+
+fn solve_query_obligations_with_proof_report_impl(
+    problem: &ChcProblem,
+    config: &EncodeConfig,
+    cancellation: Option<&CancellationToken>,
+    replay: QueryProofReplay,
+) -> crate::Result<QueryObligationBatchProofReport> {
+    let started = Instant::now();
+    let source_pruned_false_query_ids = problem.pruned_false_query_ids();
+    let source_has_stripped_body_forall = problem.has_stripped_body_forall();
+    let source_normalized_input = problem.normalized_input();
+
+    let obligations = problem.query_obligations()?;
+    let expected_ids: Vec<_> = obligations
+        .iter()
+        .map(|obligation| obligation.id().clone())
+        .collect();
+
+    // Defensive source/slice binding check before starting any solver. The ID
+    // constructor already computes this digest from the same slice, but an
+    // internal regression here must fail closed rather than produce a batch
+    // whose membership claim and solved input disagree.
+    for obligation in &obligations {
+        let actual = obligation.problem().normalized_input_sha256();
+        if actual != obligation.id().content_sha256() {
+            return Err(crate::EncodeError::Chc(ay_chc::ChcError::Internal(
+                format!(
+                    "query obligation {} digest mismatch: id={}, slice={actual}",
+                    obligation.id().label(),
+                    obligation.id().content_sha256(),
+                ),
+            )));
+        }
+    }
+
+    let rows = obligations
+        .into_iter()
+        .map(|obligation| {
+            let (id, problem) = obligation.into_parts();
+            let outcome = if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                Err(crate::EncodeError::Cancelled)
+            } else {
+                solve_with_proof_report_impl(problem, config, cancellation).map(|report| {
+                    match replay {
+                        QueryProofReplay::Checked(replay_budget)
+                            if !cancellation.is_some_and(CancellationToken::is_cancelled) =>
+                        {
+                            report.with_checked_replay(replay_budget)
+                        }
+                        QueryProofReplay::MetadataOnly | QueryProofReplay::Checked(_) => report,
+                    }
+                })
+            };
+            QueryObligationProofReportRow::new(id, outcome)
+        })
+        .collect();
+
+    QueryObligationBatchProofReport::new(
+        source_normalized_input,
+        &source_pruned_false_query_ids,
+        source_has_stripped_body_forall,
+        &expected_ids,
+        rows,
+        started.elapsed(),
+    )
 }
 
 /// Apply one solver invocation to every already-validated obligation.

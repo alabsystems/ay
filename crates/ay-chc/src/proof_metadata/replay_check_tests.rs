@@ -10,9 +10,11 @@ use super::acyclic_exhaustion_replay_obligations;
 use crate::engine_result::ValidationEvidence;
 use crate::pdr::ChcReplayObligationKind;
 use crate::{
-    engines, AdaptiveConfig, AdaptivePortfolio, BmcConfig, ChcEngineResult, ChcExpr, ChcParser,
-    ChcProblem, ChcSort, ChcVar, InvariantModel, PdrConfig, PredicateInterpretation,
-    VerifiedChcResult,
+    engines, validate_chc_ground_derivation_artifact, AdaptiveConfig, AdaptivePortfolio, BmcConfig,
+    ChcEngineResult, ChcExpr, ChcGroundDerivationArtifactErrorReason, ChcParser, ChcProblem,
+    ChcSort, ChcVar, InvariantModel, PdrConfig, PredicateInterpretation, VerifiedChcResult,
+    VerifiedCounterexample, CHC_GROUND_DERIVATION_ARTIFACT_V2_ROLE,
+    CHC_GROUND_DERIVATION_ARTIFACT_V2_SCHEMA,
 };
 use std::time::Duration;
 
@@ -128,6 +130,9 @@ fn checked_replay_admits_small_safe_pdr_proof_end_to_end() {
     assert_checked_run_invariants(&checked);
 
     strict_bundle::assert_strict_bundle_rows(&checked);
+    checked
+        .recheck_with_fresh_ay(REPLAY_TEST_BUDGET)
+        .expect("retained checked replay must pass a full fresh AY recheck");
 
     // The strict-cert-bearing summary must round-trip through JSON with a
     // stable identity (the strict cert is part of the obligation identity).
@@ -389,6 +394,12 @@ fn checked_replay_validates_unsafe_trace() {
     let result = AdaptivePortfolio::new(problem.clone(), AdaptiveConfig::test_default())
         .solve_bmc_only(BmcConfig::default().with_max_depth(2));
     assert!(result.is_unsafe(), "BMC fixture should produce Unsafe");
+    let VerifiedChcResult::Unsafe(verified) = result else {
+        unreachable!("asserted Unsafe above")
+    };
+    let mut counterexample = verified.into_inner();
+    counterexample.ground_derivation = None;
+    let result = VerifiedChcResult::Unsafe(VerifiedCounterexample::from_validated(counterexample));
     let run = ChcPdrProofRun::new(problem.clone(), result, "bmc");
 
     let checked = run
@@ -396,14 +407,30 @@ fn checked_replay_validates_unsafe_trace() {
         .expect("checked replay should validate the unsafe trace");
     assert_checked_run_invariants(&checked);
     assert_eq!(checked.summary().verdict, "unsafe");
+    assert_eq!(checked.summary().schema, CHC_CHECKED_REPLAY_SUMMARY_SCHEMA);
     assert_eq!(checked.summary().obligations.len(), 1);
     assert_eq!(
         checked.summary().obligations[0].kind,
         ChcReplayObligationKind::TraceValidity
     );
     // A trace-validity (SAT-witness) obligation has no UNSAT proof, so it
-    // carries no strict bundle cert — it stays on the trusted ground-eval path.
+    // carries no strict bundle cert. This fixture deliberately removed the
+    // ground derivation to exercise the legacy fresh-SMT fallback.
     assert!(checked.summary().obligations[0].strict_cert.is_none());
+    let payload = checked
+        .obligation_payloads()
+        .next()
+        .expect("trace validity payload");
+    assert_eq!(payload.obligation(), &checked.summary().obligations[0]);
+    let query_bytes = payload
+        .smt_query_bytes()
+        .expect("single-predicate fallback retains SMT-LIB");
+    assert_eq!(payload.obligation().query.sha256, sha256_hex(query_bytes));
+    assert!(payload.strict_bundle_bytes().is_none());
+    assert!(payload.alethe_bytes().is_none());
+    checked
+        .recheck_with_fresh_ay(REPLAY_TEST_BUDGET)
+        .expect("retained trace validity query must remain SAT on fresh AY state");
 
     // Route B admits SAFE proofs only; a checked unsafe transcript is still
     // rejected there (by result), never by replayability.
@@ -412,6 +439,329 @@ fn checked_replay_validates_unsafe_trace() {
         route_b_native_proof_admission(&json),
         Err("non_safe_result")
     );
+}
+
+#[test]
+fn checked_replay_validates_multi_predicate_unsafe_ground_derivation() {
+    let problem = parse_problem(
+        r#"(set-logic HORN)
+(declare-fun GroundPath0 (Int) Bool)
+(declare-fun GroundPath1 (Int) Bool)
+(assert (GroundPath0 0))
+(assert (forall ((x Int)) (=> (GroundPath0 x) (GroundPath1 (+ x 1)))))
+(assert (forall ((x Int)) (=> (and (GroundPath1 x) (= x 1)) false)))
+(check-sat)
+"#,
+    );
+    let result = AdaptivePortfolio::new(problem.clone(), AdaptiveConfig::test_default())
+        .solve_bmc_only(BmcConfig {
+            max_depth: 2,
+            acyclic_safe: true,
+            prefer_exact_acyclic_first: true,
+            time_budget: Some(Duration::from_secs(20)),
+            enable_k_induction: false,
+            enable_adaptive_stepping: false,
+            ..BmcConfig::default()
+        });
+    let VerifiedChcResult::Unsafe(verified) = &result else {
+        panic!("multi-predicate reachable fixture must produce Unsafe");
+    };
+    assert!(
+        verified.counterexample().has_ground_derivation(),
+        "exact BMC result must retain a deciding ground derivation"
+    );
+    let result_for_reordered_source = result.clone();
+
+    let run = ChcPdrProofRun::new(problem.clone(), result, "bmc");
+    let checked = run
+        .run_checked_replay(REPLAY_TEST_BUDGET)
+        .expect("multi-predicate ground derivation should admit checked replay");
+    assert_checked_run_invariants(&checked);
+    assert_eq!(checked.summary().verdict, "unsafe");
+    assert_eq!(
+        checked.summary().schema,
+        CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2
+    );
+    assert_eq!(checked.summary().obligations.len(), 1);
+    let row = &checked.summary().obligations[0];
+    assert_eq!(row.kind, ChcReplayObligationKind::TraceValidity);
+    assert_eq!(
+        row.payload_format,
+        ChcReplayPayloadFormat::GroundDerivationV1
+    );
+    assert!(row.strict_cert.is_none());
+
+    let payload = checked
+        .obligation_payloads()
+        .next()
+        .expect("ground derivation payload");
+    assert!(payload.smt_query_bytes().is_none());
+    let artifact_bytes = payload
+        .ground_derivation_artifact_bytes()
+        .expect("ground artifact bytes");
+    assert_eq!(row.query.sha256, sha256_hex(artifact_bytes));
+    assert!(payload.strict_bundle_bytes().is_none());
+    assert!(payload.alethe_bytes().is_none());
+    let validated = validate_chc_ground_derivation_artifact(&problem, artifact_bytes)
+        .expect("transported artifact must validate against the exact source problem");
+    assert_eq!(validated.step_count(), 3);
+    checked
+        .recheck_with_fresh_ay(REPLAY_TEST_BUDGET)
+        .expect("fresh source-bound ground replay must remain valid");
+    assert!(checked.manifest().trust_full_verifier_admissible());
+    assert!(checked
+        .proof_run()
+        .metadata()
+        .trust_full_verifier_admissible());
+
+    let report_json: serde_json::Value =
+        serde_json::from_slice(checked.checked_report_bytes()).expect("checked report JSON");
+    let reparsed = ChcCheckedReplaySummary::from_json_value(&report_json)
+        .expect("v2 ground replay report must round-trip");
+    assert_eq!(&reparsed, checked.summary());
+
+    // The finite-UF payload has its own summary schema and artifact role.
+    // Exercise the structural parser independently of solver production so an
+    // older v2 reader cannot silently reinterpret the new row.
+    let mut v3_summary = checked.summary().clone();
+    v3_summary.schema = CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3;
+    v3_summary.obligations[0].payload_format = ChcReplayPayloadFormat::GroundDerivationV2;
+    v3_summary.obligations[0].query.role = CHC_GROUND_DERIVATION_ARTIFACT_V2_ROLE.to_string();
+    let v3_json = v3_summary.to_json_value();
+    assert_eq!(v3_json["schema_version"], 3);
+    assert_eq!(
+        ChcCheckedReplaySummary::from_json_value(&v3_json)
+            .expect("v3 finite-UF row should round-trip structurally"),
+        v3_summary
+    );
+
+    let mut v2_mislabeled_v3 = v3_json;
+    v2_mislabeled_v3["schema"] =
+        serde_json::Value::String(CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2.to_string());
+    v2_mislabeled_v3["schema_version"] = serde_json::Value::from(2);
+    assert!(
+        ChcCheckedReplaySummary::from_json_value(&v2_mislabeled_v3).is_err(),
+        "summary v2 must reject a ground-derivation-v2 row"
+    );
+
+    let run_log: serde_json::Value = serde_json::from_slice(
+        checked
+            .run_log_bytes()
+            .expect("self-contained checked run log"),
+    )
+    .expect("ground run log JSON");
+    assert_eq!(run_log["schema"], "ay.chc-checked-replay-run-log/v2");
+    assert_eq!(run_log["schema_version"], 2);
+    let replay_log: serde_json::Value =
+        serde_json::from_slice(checked.replay_log_bytes()).expect("ground replay log JSON");
+    assert_eq!(replay_log["schema"], "ay.chc-checked-replay-log/v2");
+    assert_eq!(replay_log["schema_version"], 2);
+
+    let parsed_manifest =
+        ChcProofEvidenceManifest::from_json_value(&checked.manifest().to_json_value())
+            .expect_err("serialized data must not recreate AY's opaque in-process authority");
+    assert!(parsed_manifest.reasons().iter().any(|reason| {
+        reason.contains("cannot recover AY's in-process replay seal")
+            || reason.contains("fresh payload validation")
+    }));
+
+    let mut missing_format = report_json.clone();
+    missing_format["obligations"][0]
+        .as_object_mut()
+        .expect("obligation object")
+        .remove("payload_format");
+    assert!(
+        ChcCheckedReplaySummary::from_json_value(&missing_format).is_err(),
+        "v2 must not default a missing ground payload format to SMT"
+    );
+
+    let mut null_identity = report_json.clone();
+    null_identity["obligations"][0]["identity_sha256"] = serde_json::Value::Null;
+    assert!(
+        ChcCheckedReplaySummary::from_json_value(&null_identity).is_err(),
+        "v2 obligation identity must be a concrete lowercase SHA-256"
+    );
+
+    let mut wrong_role = report_json.clone();
+    wrong_role["obligations"][0]["query"]["role"] =
+        serde_json::Value::String("replay-obligation".to_string());
+    assert!(
+        ChcCheckedReplaySummary::from_json_value(&wrong_role).is_err(),
+        "ground bytes under the SMT artifact role must reject"
+    );
+
+    let mut reordered = problem.clone();
+    reordered.clauses_mut().swap(0, 1);
+    assert_eq!(
+        reordered.normalized_input_sha256(),
+        problem.normalized_input_sha256(),
+        "semantic normalized identity deliberately ignores source clause order"
+    );
+    let reordered_run = ChcPdrProofRun::new(reordered, result_for_reordered_source, "bmc");
+    let mut options = ChcProofEvidenceOptions::pdr_strict(&PdrConfig::default());
+    options.proof_mode = "checked-replay:bmc".to_string();
+    let solver = ChcProofSolverIdentity::new("bmc");
+    let obligation_id = format!(
+        "ay-chc:checked-replay:{}",
+        problem.normalized_input_sha256()
+    );
+    let reordered_manifest = reordered_run.evidence_manifest_with_replay_evidence(
+        options,
+        solver,
+        obligation_id,
+        checked
+            .manifest()
+            .replay_evidence()
+            .expect("checked replay evidence")
+            .clone(),
+    );
+    let reorder_reasons =
+        reordered_manifest.checked_replay_summary_rejection_reasons(checked.summary());
+    assert!(
+        reorder_reasons
+            .iter()
+            .any(|reason| reason.contains("source_clause_sequence_sha256")),
+        "reordered positional source must reject: {reorder_reasons:?}"
+    );
+    assert_ne!(
+        reordered_manifest.cache_lookup_key_sha256(),
+        checked.manifest().cache_lookup_key_sha256(),
+        "ground replay cache identity must bind positional source clauses"
+    );
+}
+
+#[test]
+fn supplied_smt_evidence_keeps_legacy_trace_replay_when_ground_is_available() {
+    let problem = parse_problem(
+        r#"(set-logic HORN)
+(declare-fun Inv (Int) Bool)
+(assert (Inv 0))
+(assert (forall ((x Int)) (=> (Inv x) (Inv (+ x 1)))))
+(assert (forall ((x Int)) (=> (and (Inv x) (= x 1)) false)))
+(check-sat)
+"#,
+    );
+    let result = AdaptivePortfolio::new(problem.clone(), AdaptiveConfig::test_default())
+        .solve_bmc_only(BmcConfig::default().with_max_depth(2));
+    let VerifiedChcResult::Unsafe(verified) = &result else {
+        panic!("reachable fixture must produce Unsafe");
+    };
+    assert!(verified.counterexample().has_ground_derivation());
+    let legacy = verified
+        .counterexample()
+        .trace_validity_replay_obligations(&problem)
+        .expect("single-predicate trace fallback")
+        .into_iter()
+        .next()
+        .expect("one trace obligation");
+
+    let run = ChcPdrProofRun::new(problem.clone(), result, "bmc");
+    let mut options = ChcProofEvidenceOptions::pdr_strict(&PdrConfig::default());
+    options.proof_mode = "checked-replay:bmc".to_string();
+    let solver = ChcProofSolverIdentity::new("bmc");
+    let obligation_id = format!(
+        "ay-chc:checked-replay:{}",
+        problem.normalized_input_sha256()
+    );
+    let evidence = ChcReplayEvidence::new(
+        problem.normalized_input_sha256(),
+        options.identity_sha256(),
+        solver.identity_sha256(),
+        obligation_id.clone(),
+        "unsafe",
+        "verified-counterexample",
+    )
+    .with_replay_obligation(ChcReplayObligationArtifact::new(
+        legacy.kind,
+        ChcProofArtifactDigest::from_bytes("replay-obligation", legacy.smtlib.as_bytes()),
+    ));
+
+    let checked = run
+        .run_checked_replay_with_binding(
+            options,
+            solver,
+            obligation_id,
+            Some(evidence),
+            REPLAY_TEST_BUDGET,
+        )
+        .expect("supplied SMT evidence should select the matching fallback");
+    let row = &checked.summary().obligations[0];
+    assert_eq!(row.payload_format, ChcReplayPayloadFormat::SmtlibV1);
+    assert_eq!(row.query.sha256, sha256_hex(legacy.smtlib.as_bytes()));
+    assert!(checked
+        .obligation_payloads()
+        .next()
+        .expect("SMT payload")
+        .smt_query_bytes()
+        .is_some());
+}
+
+#[test]
+fn checked_replay_upgrades_ordinary_uf_ground_evidence_to_v2() {
+    let problem = parse_problem(
+        r#"(set-logic HORN)
+(declare-fun f (Int) Int)
+(declare-fun P (Int) Bool)
+(assert (P (f 0)))
+(assert (forall ((x Int)) (=> (P x) false)))
+(check-sat)
+"#,
+    );
+    let result = AdaptivePortfolio::new(problem.clone(), AdaptiveConfig::test_default())
+        .solve_bmc_only(BmcConfig {
+            max_depth: 2,
+            acyclic_safe: true,
+            prefer_exact_acyclic_first: true,
+            time_budget: Some(Duration::from_secs(20)),
+            enable_k_induction: false,
+            enable_adaptive_stepping: false,
+            ..BmcConfig::default()
+        });
+    let VerifiedChcResult::Unsafe(verified) = &result else {
+        panic!("ordinary-UF fact/query fixture must produce Unsafe");
+    };
+    assert!(verified.counterexample().has_ground_derivation());
+    assert_eq!(
+        verified
+            .counterexample()
+            .ground_derivation_artifact(&problem)
+            .expect_err("artifact v1 must remain UF-free")
+            .reason,
+        ChcGroundDerivationArtifactErrorReason::UnsupportedUninterpretedFunction
+    );
+
+    let checked = ChcPdrProofRun::new(problem.clone(), result, "bmc")
+        .run_checked_replay(REPLAY_TEST_BUDGET)
+        .expect("checked replay should select source-authenticated artifact v2");
+    assert_checked_run_invariants(&checked);
+    assert_eq!(
+        checked.summary().schema,
+        CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3
+    );
+    assert_eq!(checked.summary().obligations.len(), 1);
+    assert_eq!(
+        checked.summary().obligations[0].payload_format,
+        ChcReplayPayloadFormat::GroundDerivationV2
+    );
+    assert_eq!(
+        checked.summary().obligations[0].query.role,
+        CHC_GROUND_DERIVATION_ARTIFACT_V2_ROLE
+    );
+    let artifact_bytes = checked
+        .obligation_payloads()
+        .next()
+        .and_then(|payload| payload.ground_derivation_artifact_bytes())
+        .expect("checked v2 row retains exact artifact bytes");
+    let validated = crate::validate_chc_ground_derivation_artifact_v2(&problem, artifact_bytes)
+        .expect("retained v2 artifact must independently validate");
+    assert_eq!(
+        validated.artifact_schema(),
+        CHC_GROUND_DERIVATION_ARTIFACT_V2_SCHEMA
+    );
+    assert_eq!(validated.uf_observation_count(), 1);
+    checked
+        .recheck_with_fresh_ay(REPLAY_TEST_BUDGET)
+        .expect("fresh replay must dispatch to the v2 validator");
 }
 
 #[test]

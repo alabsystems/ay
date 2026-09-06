@@ -342,7 +342,7 @@ proptest! {
                     LraCmp::Ge => ">=",
                 };
                 let bound_term = terms.mk_int(i64::from(spec.bound).into());
-                terms.mk_app(Symbol::Named(op.to_string()), vec![x, bound_term], Sort::Bool)
+                terms.mk_app(Symbol::named(op), vec![x, bound_term], Sort::Bool)
             })
             .collect::<Vec<_>>();
 
@@ -401,7 +401,7 @@ proptest! {
                     LraCmp::Ge => ">=",
                 };
                 let bound_term = terms.mk_int(i64::from(spec.bound).into());
-                terms.mk_app(Symbol::Named(op.to_string()), vec![x, bound_term], Sort::Bool)
+                terms.mk_app(Symbol::named(op), vec![x, bound_term], Sort::Bool)
             })
             .collect::<Vec<_>>();
 

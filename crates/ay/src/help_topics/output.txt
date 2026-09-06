@@ -1,0 +1,228 @@
+ay output -- the contract between ay and whatever is reading it
+
+  Everything ay prints is split down one line: stdout is for a machine,
+  stderr is for a person. Stdout carries the reply stream and nothing
+  else -- the verdict, a model, the answer to a (get-value) or
+  (get-info), an (error ...) reply -- so a parser can read it whole.
+  Provenance, statistics, warnings and proof announcements all go to
+  stderr, so 2>/dev/null leaves a transcript another SMT tool will accept.
+  Two flags narrow it further: -q drops ay's stderr commentary, and
+  --z3-mode drops it and reshapes what remains into z3's spelling.
+
+  Examples below use a small QF_LIA file, t.smt2, that asserts (> x 3)
+  and (< (+ x y) 10) and ends with (check-sat) (get-model).
+
+THE VERDICT
+
+  One word, on the first line of stdout, before anything else.
+
+  SMT-LIB       sat / unsat / unknown              exit 0
+  DIMACS CNF    s SATISFIABLE / s UNSATISFIABLE    exit 10 / 20
+
+  DIMACS uses the SAT Competition's 10/20 by default, and 0 for both under
+  --z3-mode or --sat-exit-codes z3. On SAT, the v-lines follow. DIMACS and
+  CHC write their own competition grammar to stdout alongside the verdict
+  -- those v-lines, the ay-chc-cert text on a safe CHC query. The split
+  still holds: what lands on stdout is the answer, never the commentary.
+
+  A run that hits its timeout or its memory budget still prints unknown on
+  stdout, but exits 124, not 0.
+
+  An unknown verdict is explained on stderr by a (:reason-unknown ...)
+  line: (:reason-unknown "timeout") after a deadline, (:reason-unknown
+  "memout") after a memory breach. A bare token, as in (:reason-unknown
+  interrupted), is ay's own vocabulary; --z3-mode rewrites it into the
+  quoted z3 spelling.
+
+  A verdict scorer takes the FIRST status line on stdout, and one path
+  depends on that: if the solve process dies on a CRASH signal -- SIGABRT,
+  SIGSEGV and kin, not a harness SIGTERM or SIGKILL, whose status
+  propagates unchanged -- the supervisor prints a fail-closed unknown and
+  exits 0. A run that had already answered keeps its real answer and the
+  extra line is inert; a run that never answered records a clean unknown
+  instead of a crash. The true outcome is still on stderr in the
+  session-end marker.
+
+MODELS
+
+  ay prints a model only when asked -- a (get-model) in the script, or
+  z3's -model or dump_models=true on the command line. It goes to stdout,
+  after the verdict.
+
+    $ ay solve -q t.smt2
+    sat
+    (model
+      (define-fun y () Int 0)
+      (define-fun x () Int 4)
+    )
+
+  --z3-mode drops the leading model keyword, which is z3's spelling:
+
+    sat
+    (
+      (define-fun y () Int 0)
+      (define-fun x () Int 4)
+    )
+
+  Asking for a model that does not exist is an error, not an empty model.
+  A (get-model) after unsat prints, on stdout:
+
+    (error "line 6 column 10: model is not available")
+
+ERRORS
+
+  An error in the input script is an SMT-LIB reply, so it goes to STDOUT
+  in stream order with the verdicts, exactly as z3 does:
+
+    (error "line 2 column 11: unknown constant x")
+    unknown
+
+  An error ay raises outside the script -- it could not read the file at
+  all -- has no place in that reply stream, so it goes to stderr instead,
+  in the same (error "...") shape.
+
+  An unrecognized command is not an error. ay answers z3's "unsupported"
+  on stdout, notes it on stderr as a semicolon comment naming the command
+  and its position, and keeps solving; the exit code stays 0.
+
+  Exit 1 means the run reported an (error ...). It still prints whatever
+  verdict it reached.
+
+STATISTICS
+
+  --stats (--st, and z3's -st and stats=true) prints one (:statistics ...)
+  s-expression to stderr, curated and grouped by what a solve spends
+  itself on. On t.smt2 that is 26 rows in six groups -- abridged here to
+  the first row of each:
+
+    $ ay solve -q --stats t.smt2
+    (:statistics
+      ; answer
+      :result                          sat
+      :total-time                      0.001
+      :time                            0.00
+      ; search
+      :conflicts                       0
+      ; theory
+      :theory-conflicts                0
+      ; proof & certificates
+      :cert.decisions                  1
+      ; models
+      :model-validation-skips          0
+      ; memory & terms
+      :memory                          19.12
+    )
+    (:formula-statistics
+      :commands 7
+      :terms 8
+      :sort.Int 2
+      :theory.arith 3
+    )
+
+  The ; group lines are legal SMT-LIB comments, and they are printed only
+  when stderr is a terminal. Redirect --stats to a file and no ; line
+  lands there. Add -q, as above, and the file holds nothing but the
+  s-expression -- the session markers and proof announcements share that
+  stream otherwise.
+
+  --stats-full REPLACES the curated block with every counter the engines
+  record -- 128 rows on the same t.smt2 -- which is what you want when
+  profiling one subsystem and nothing else. It implies --stats. Every key
+  the curated block SELECTS appears in the full block under the same
+  spelling, so a script grepping a curated key keeps working under
+  --stats-full.
+
+  Two curated keys are additions rather than selections, and so are the
+  only ones absent from the full block:
+
+    :result       names the verdict the numbers belong to
+    :total-time   process wall clock, under z3's spelling for it
+
+  :total-time does not shadow :time, which is the solver's own time and
+  stays in both blocks unchanged.
+
+  --stats-json prints one JSON object, on one line, to stderr, and no
+  s-expression at all. It is a separate namespace, not a transliteration
+  of the s-expression (wrapped here; it is really one line):
+
+    {"ay_build":{"commit":"...","datetime_utc":"...","stamp":"...",
+     "version":"0.23.0"},"conflicts":0,"decisions":0,"mode":"smt", ... ,
+     "propagations":2,"restarts":0,"result":"sat", ... ,"wall_time_ms":1}
+
+  DIMACS and CHC runs keep their own native form for --stats: a
+  c --- AY statistics --- comment block on stderr, carrying ay.mode,
+  ay.result and ay.wall_time_ms among its counters -- at the top of the
+  block on CHC, far down it on DIMACS. CHC prints a short
+  (:chc-statistics ...) block ahead of that. The s-expression is the SMT
+  idiom, so SMT runs emit it alone and no comment block. Other
+  subcommands answer to their own contract, not this page's: ay pb solve
+  --stats, for one, writes its counters as c lines on STDOUT.
+
+  -q does not silence statistics. You asked for them.
+
+PROVENANCE
+
+  Two stderr comment lines say which binary answered and how it ended:
+
+    c ay.session.start build.stamp=0.23.0+build.9206.<commit>@<datetime>
+    c ay.session.end exit.code=0 wall_time_ms=3 build.increment=9206
+
+  The stamp is version+build.increment.commit@datetime -- one token
+  carrying all four, still greppable as build.stamp=. The end marker
+  carries exit.code=N, or exit.signal=N, or exit.error=launch-failed.
+
+  AY_SESSION_LOG sets how much the markers say:
+
+    compact   default: the stamp on start; outcome, wall_time_ms and
+              build.increment on end. Nothing is lost -- every field the
+              compact form drops is recoverable from the stamp it keeps.
+    full      the historical spelling, byte for byte: every build.* field
+              on the start marker, build.increment and build.stamp on the
+              end. The audit form.
+    off       no markers at all.
+
+  1 is accepted for compact, verbose for full, and none or 0 for off. An
+  unrecognized value falls back to compact rather than aborting a solve
+  over a typo in an env var.
+
+  A competition signal in the environment -- AY_COMPETITION,
+  AY_SAT_COMPETITION_PROFILE, AY_SAT_PROFILE_ID, or the internal SAT-COMP
+  wrapper variable -- forces full, because those transcripts are the
+  evidence a claim gets audited against later. An explicit AY_SESSION_LOG
+  still wins over that.
+
+  -q and --z3-mode both suppress the markers outright. --z3-mode does it
+  because z3 writes nothing to stderr on a normal run; the solve is still
+  supervised, only the commentary is gone. On an SMT run either flag alone
+  leaves stderr empty. On DIMACS they silence different sets -- the
+  c --- SAT applied run --- policy preamble is -q's, the c verify-proof:
+  and c proof-status: lines are --z3-mode's -- so pass both there if you
+  want an empty stderr.
+
+GUARANTEED -- WRITE A SCRIPT AGAINST THESE
+
+  - The stream split: stdout carries the reply stream -- verdicts, models,
+    (get-value) / (get-info) / (echo) answers, unsupported, (error ...)
+    replies, and a format's own verdict grammar -- and nothing ay says
+    about itself.
+  - The first status line on stdout is the verdict.
+  - Exit codes: 0 for an SMT verdict, 1 for a run that reported an error,
+    124 for a timeout or a memory breach, 10/20 for DIMACS sat/unsat
+    unless --z3-mode or --sat-exit-codes z3 makes both 0.
+  - The curated statistics key spellings, and their agreement with the
+    full block.
+  - The session-marker field names at a given AY_SESSION_LOG level.
+
+MAY CHANGE -- DO NOT PIN A SCRIPT TO THESE
+
+  - Which counters --stats-full contains, and how many. It is a profiling
+    surface, not a schema.
+  - The --stats-json key set, which varies by mode: a DIMACS run carries a
+    competition_jit object an SMT run does not.
+  - The wording and ordering of stderr commentary: warnings, proof
+    announcements, reason-unknown notes.
+  - The curated selection, which may gain rows.
+
+  So: parse stdout by line, read stderr by key, never by line number.
+
+  Next: ay solve --help -- every flag named here, with its neighbours.

@@ -461,7 +461,7 @@ fn build_6825_formula(terms: &mut TermStore) -> (TermId, TermId, TermId, TermId)
 
     // Atom 0: f(x0) >= 2
     let two = terms.mk_int(2.into());
-    let ge_fx0_2 = terms.mk_app(Symbol::Named(">=".to_string()), vec![f_x0, two], Sort::Bool);
+    let ge_fx0_2 = terms.mk_app(Symbol::named(">="), vec![f_x0, two], Sort::Bool);
 
     // Atom 1: x2 = x0
     let eq_x2_x0 = terms.mk_eq(x2, x0);

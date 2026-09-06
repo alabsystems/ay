@@ -328,7 +328,7 @@ pub(in crate::executor) fn is_api_placeholder(parsed: &FrontendTerm) -> bool {
 fn canonical_head(terms: &TermStore, term: TermId) -> Option<String> {
     match terms.get(term) {
         TermData::Not(_) => Some("not".to_string()),
-        TermData::App(Symbol::Named(name), _) => Some(name.clone()),
+        TermData::App(Symbol::Named(name), _) => Some(name.to_string()),
         _ => None,
     }
 }
@@ -4243,6 +4243,30 @@ impl Executor {
                 kind: EqPlanKind::SeqGroundEvaluate,
             });
         }
+        // Ground ARITHMETIC/BOOLEAN evaluation of a rewritten authored
+        // assertion. Constant propagation substitutes a pinned variable and
+        // then folds the enclosing operation, so the authored side keeps the
+        // symbolic application (`(+ V37 4)`, `(= 0 V23)`) while the leaf the
+        // proof assumed holds the folded literal (`4`, `false`). Neither pure
+        // leg crosses that: `cong` needs matching heads (an application does
+        // not match a constant) and `trans` needs an AUTHORED midpoint, which
+        // the fold destroyed. Compose the two halves instead —
+        //
+        //   authored pins + eq_congruent  |- a = f(g1..gn)   [gi ground]
+        //   strict ground evaluate        |- f(g1..gn) = b
+        //   trans                         |- a = b
+        //
+        // — where every `gi` is reached by the ordinary planner from the
+        // ORIGINAL assertions only, and the second leg is admitted solely
+        // when ay-proof's own strict `evaluate` recognizer independently
+        // closes the fully ground equality in the direction the validator
+        // reads it. A missing pin, unsupported head, out-of-envelope value,
+        // or false fold therefore fails closed to today's trust leaf.
+        if let Some(plan) =
+            self.plan_arith_eq_to_constant(a, b, eq, neg_eq, original_terms, depth, budget)
+        {
+            return Some(plan);
+        }
         // DIRECT datatype selector projection: the goal equality itself is
         // `(= (sel (C ..)) arg_i)` (either orientation) — a registry-gated
         // datatype tautology (`(= B (top (stack B ..)))`, the ground-tower
@@ -4544,10 +4568,10 @@ impl Executor {
                 }
                 for (index, &argument) in head_args.clone().iter().enumerate() {
                     if argument == a && !holders_a.iter().any(|&(t, _, _)| t == side) {
-                        holders_a.push((side, head.clone(), index));
+                        holders_a.push((side, head.clone().to_string(), index));
                     }
                     if argument == b && !holders_b.iter().any(|&(t, _, _)| t == side) {
-                        holders_b.push((side, head.clone(), index));
+                        holders_b.push((side, head.clone().to_string(), index));
                     }
                 }
             }
@@ -4698,7 +4722,7 @@ impl Executor {
                 // `(= target (sel candidate))` in the goal's own orientation,
                 // recognizer-verified (fail-closed on shape or registry).
                 let projected = self.ctx.terms.mk_app(
-                    Symbol::named(sel_name.clone()),
+                    Symbol::named(sel_name.clone().to_string()),
                     [candidate],
                     self.ctx.terms.sort(sel_app).clone(),
                 );
@@ -4874,6 +4898,301 @@ impl Executor {
             eq: ground_eq,
             neg_eq: self.ctx.terms.mk_not_raw(ground_eq),
             kind: EqPlanKind::BvGroundEvaluate,
+        };
+        Some(EqPlan {
+            eq,
+            neg_eq,
+            kind: EqPlanKind::Trans {
+                left: Box::new(congruent),
+                right: Box::new(ground),
+            },
+        })
+    }
+
+    /// Whether `b` is the kind of literal constant the strict `evaluate`
+    /// validator will accept on the RIGHT of an evaluation conclusion.
+    ///
+    /// Deliberately the same three constructors as the validator's own
+    /// `supported_constant`: a BitVec/String constant is a different, separately
+    /// validated fragment and must not be routed here.
+    fn is_arith_evaluate_constant(terms: &TermStore, b: TermId) -> bool {
+        matches!(
+            terms.get(b),
+            TermData::Const(Constant::Bool(_) | Constant::Int(_) | Constant::Rational(_))
+        )
+    }
+
+    /// Whether `eq` is an `evaluate` conclusion the STRICT validator admits.
+    ///
+    /// `recognize_ground_evaluate` alone is not the right question: it accepts
+    /// any closed literal that evaluates to `true`, while the validator is
+    /// deliberately DIRECTIONAL — the right-hand side must already be a literal
+    /// constant and only the left-hand side is evaluated. Ask for both, so a
+    /// plan is never built on a step the checker would then reject.
+    fn arith_ground_evaluate_admissible(&self, eq: TermId) -> bool {
+        let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(eq) else {
+            return false;
+        };
+        if name != "=" || args.len() != 2 {
+            return false;
+        }
+        let rhs = args[1];
+        Self::is_arith_evaluate_constant(&self.ctx.terms, rhs)
+            && ay_proof::recognize_ground_evaluate(&self.ctx.terms, eq)
+    }
+
+    /// Whether the strict ground evaluator closes `x` on its own.
+    ///
+    /// Asked by running the recognizer on `(= x x)`: the evaluator descends
+    /// `x` exactly as it would inside a real conclusion, so this agrees with
+    /// the checker by construction (including its work, depth and value-size
+    /// envelopes) instead of re-implementing a groundness predicate that could
+    /// drift from it. The cheap shape pre-filter keeps the common variable /
+    /// uninterpreted case from interning a term at all.
+    fn term_is_ground_evaluable(&mut self, x: TermId) -> bool {
+        if !matches!(self.ctx.terms.sort(x), Sort::Bool | Sort::Int | Sort::Real) {
+            return false;
+        }
+        match self.ctx.terms.get(x) {
+            TermData::Const(Constant::Bool(_) | Constant::Int(_) | Constant::Rational(_))
+            | TermData::Not(_)
+            | TermData::Ite(_, _, _) => {}
+            TermData::App(Symbol::Named(_), args) if !args.is_empty() => {}
+            _ => return false,
+        }
+        let self_eq = self
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), [x, x], Sort::Bool);
+        ay_proof::recognize_ground_evaluate(&self.ctx.terms, self_eq)
+    }
+
+    /// Ground terms the ORIGINAL assertions offer as a value for `x`.
+    ///
+    /// Only sides of authored binary equalities are considered — the same
+    /// non-laundering rule the definition leg follows. This does NOT decide
+    /// that `x` equals any of them: each candidate is handed to `plan_eq`,
+    /// which must derive `(= x c)` from the originals (typically `symm`, or
+    /// `trans` along an authored definition chain) or the candidate is dropped.
+    fn authored_ground_candidates(&mut self, x: TermId, original_terms: &[TermId]) -> Vec<TermId> {
+        /// Cap the per-argument candidate fan-out. `EQ_PLAN_BUDGET` already
+        /// terminates the search; this only keeps a constant-rich problem from
+        /// spending most of it on one argument position.
+        const MAX_CANDIDATES: usize = 64;
+        let sort = self.ctx.terms.sort(x).clone();
+        let mut sides: Vec<TermId> = Vec::new();
+        for &original in original_terms {
+            let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(original) else {
+                continue;
+            };
+            if name != "=" || args.len() != 2 {
+                continue;
+            }
+            for side in [args[0], args[1]] {
+                if side != x && *self.ctx.terms.sort(side) == sort && !sides.contains(&side) {
+                    sides.push(side);
+                }
+            }
+        }
+        let mut candidates = Vec::new();
+        for side in sides {
+            if candidates.len() >= MAX_CANDIDATES {
+                break;
+            }
+            if self.term_is_ground_evaluable(side) {
+                candidates.push(side);
+            }
+        }
+        candidates
+    }
+
+    /// Resolve `x` to a term the strict ground evaluator closes, together with
+    /// a certified derivation of `(= x ground)`.
+    ///
+    /// Returns `(x, refl)` when `x` is already ground. Otherwise the value has
+    /// to come from the original assertions, either directly (an authored pin,
+    /// possibly through an authored definition chain) or, one level down, by
+    /// grounding `x`'s own arguments.
+    fn plan_ground_form(
+        &mut self,
+        x: TermId,
+        original_terms: &[TermId],
+        depth: u32,
+        budget: &mut u32,
+    ) -> Option<(TermId, EqPlan)> {
+        // Same accounting as `plan_eq`: `EQ_PLAN_BUDGET` is the terminator,
+        // the depth bound only caps native stack use.
+        const MAX_DEPTH: u32 = 512;
+        if depth > MAX_DEPTH || *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        if self.term_is_ground_evaluable(x) {
+            let plan = self.plan_eq(x, x, original_terms, depth, budget)?;
+            return Some((x, plan));
+        }
+        // Per-candidate SLICE of the shared budget. The candidates are a
+        // search, not a chain: a hopeless one can burn an unbounded amount of
+        // planning (two authored definitions naming each other, `x = y` and
+        // `y = x`, let `plan_eq_via_definition` walk back and forth to
+        // `MAX_DEPTH` for every value that will never be reached), and with one
+        // undivided counter the first such candidate starves every later one —
+        // measured on verification-consumer `cc/fmap`, where the whole 200_000 went to a `0`
+        // pin and the `1` pin that actually resolves the variable was never
+        // tried. Every unit consumed is still charged against the shared
+        // counter, so the global bound is unchanged.
+        const CANDIDATE_BUDGET: u32 = 8_192;
+        for candidate in self.authored_ground_candidates(x, original_terms) {
+            if *budget == 0 {
+                return None;
+            }
+            let mut slice = (*budget).min(CANDIDATE_BUDGET);
+            let granted = slice;
+            let attempt = self.plan_eq(x, candidate, original_terms, depth + 1, &mut slice);
+            *budget -= granted - slice;
+            if let Some(plan) = attempt {
+                return Some((candidate, plan));
+            }
+        }
+        // `x` is an application whose ARGUMENTS are pinned: ground them and
+        // rebuild `x`'s own head over the ground arguments.
+        let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(x) else {
+            return None;
+        };
+        if args.is_empty() {
+            return None;
+        }
+        let (name, args) = (name.clone(), args.clone());
+        let sort = self.ctx.terms.sort(x).clone();
+        let (raw_ground, kids) =
+            self.plan_ground_arguments(&name, &args, sort, original_terms, depth, budget)?;
+        if !self.term_is_ground_evaluable(raw_ground) {
+            return None;
+        }
+        let congruent_eq = self
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), [x, raw_ground], Sort::Bool);
+        let mut lemma: Vec<TermId> = kids.iter().map(|kid| kid.neg_eq).collect();
+        lemma.push(congruent_eq);
+        let plan = EqPlan {
+            eq: congruent_eq,
+            neg_eq: self.ctx.terms.mk_not_raw(congruent_eq),
+            kind: EqPlanKind::Cong { lemma, kids },
+        };
+        Some((raw_ground, plan))
+    }
+
+    /// Ground every argument of `name(args)` and re-apply the head to the
+    /// results, returning the raw ground application and the per-position
+    /// congruence premises.
+    ///
+    /// A position whose ground form is the argument itself carries NO premise:
+    /// `eq_congruent` explicitly admits the omission, and emitting a `refl`
+    /// unit for each such position would make two positions share a resolution
+    /// pivot and abandon an otherwise good plan. Returns `None` when nothing
+    /// moved — the caller's direct ground-evaluate leg already covers that.
+    fn plan_ground_arguments(
+        &mut self,
+        name: &str,
+        args: &[TermId],
+        sort: Sort,
+        original_terms: &[TermId],
+        depth: u32,
+        budget: &mut u32,
+    ) -> Option<(TermId, Vec<EqPlan>)> {
+        let mut ground_args: Vec<TermId> = Vec::with_capacity(args.len());
+        let mut kids: Vec<EqPlan> = Vec::new();
+        for &arg in args {
+            let (ground, plan) = self.plan_ground_form(arg, original_terms, depth + 1, budget)?;
+            if ground != arg {
+                kids.push(plan);
+            }
+            ground_args.push(ground);
+        }
+        if kids.is_empty() {
+            return None;
+        }
+        // `mk_app` deliberately preserves the raw application: keeping this
+        // intermediate un-folded is what gives `eq_congruent` a matching
+        // function head on both sides.
+        let raw_ground = self
+            .ctx
+            .terms
+            .mk_app(Symbol::named(name), &ground_args, sort);
+        if !matches!(
+            self.ctx.terms.get(raw_ground),
+            TermData::App(Symbol::Named(interned), raw_args)
+                if interned == name && raw_args.as_slice() == ground_args.as_slice()
+        ) {
+            return None;
+        }
+        Some((raw_ground, kids))
+    }
+
+    /// Plan a certified equality from a symbolic arithmetic/Boolean
+    /// application to the literal constant it folded to. See the call-site
+    /// comment in [`Self::plan_eq`].
+    #[allow(clippy::too_many_arguments)]
+    fn plan_arith_eq_to_constant(
+        &mut self,
+        a: TermId,
+        b: TermId,
+        eq: TermId,
+        neg_eq: TermId,
+        original_terms: &[TermId],
+        depth: u32,
+        budget: &mut u32,
+    ) -> Option<EqPlan> {
+        if !Self::is_arith_evaluate_constant(&self.ctx.terms, b) {
+            return None;
+        }
+        // Already a closed ground theorem: the direct evaluation IS the proof.
+        // Splitting it and adding `trans` would make one premise equal to the
+        // conclusion, which both Alethe and the strict checker reject as
+        // redundant (same reasoning as the concat leg above).
+        if self.arith_ground_evaluate_admissible(eq) {
+            return Some(EqPlan {
+                eq,
+                neg_eq,
+                kind: EqPlanKind::ArithGroundEvaluate,
+            });
+        }
+        let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(a) else {
+            return None;
+        };
+        if args.is_empty() {
+            return None;
+        }
+        let (name, args) = (name.clone(), args.clone());
+        let sort = self.ctx.terms.sort(a).clone();
+        let (raw_ground, kids) =
+            self.plan_ground_arguments(&name, &args, sort, original_terms, depth, budget)?;
+        if raw_ground == a {
+            return None;
+        }
+        let congruent_eq = self
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), [a, raw_ground], Sort::Bool);
+        let mut lemma: Vec<TermId> = kids.iter().map(|kid| kid.neg_eq).collect();
+        lemma.push(congruent_eq);
+        let congruent = EqPlan {
+            eq: congruent_eq,
+            neg_eq: self.ctx.terms.mk_not_raw(congruent_eq),
+            kind: EqPlanKind::Cong { lemma, kids },
+        };
+        let ground_eq = self
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), [raw_ground, b], Sort::Bool);
+        if !self.arith_ground_evaluate_admissible(ground_eq) {
+            return None;
+        }
+        let ground = EqPlan {
+            eq: ground_eq,
+            neg_eq: self.ctx.terms.mk_not_raw(ground_eq),
+            kind: EqPlanKind::ArithGroundEvaluate,
         };
         Some(EqPlan {
             eq,
@@ -5126,12 +5445,9 @@ impl Executor {
                     Vec::new(),
                 ))
             }
-            EqPlanKind::BvGroundEvaluate => Some(proof.add_rule_step(
-                AletheRule::Evaluate,
-                vec![plan.eq],
-                Vec::new(),
-                Vec::new(),
-            )),
+            EqPlanKind::BvGroundEvaluate | EqPlanKind::ArithGroundEvaluate => Some(
+                proof.add_rule_step(AletheRule::Evaluate, vec![plan.eq], Vec::new(), Vec::new()),
+            ),
             EqPlanKind::SeqGroundEvaluate => Some(proof.add_step(ProofStep::TheoryLemma {
                 theory: "seq".to_string(),
                 clause: vec![plan.eq],
@@ -5266,6 +5582,12 @@ enum EqPlanKind {
     /// strict `SeqGroundEval` recognizer. Covers elaboration-folded seq
     /// concats the same way `BvGroundEvaluate` covers folded BV concats.
     SeqGroundEvaluate,
+    /// Closed arithmetic/Boolean evaluation `(= f(g1..gn) c)` accepted by the
+    /// strict `evaluate` recognizer in the validator's own direction (literal
+    /// constant on the right). Covers constant-propagation folds the same way
+    /// `BvGroundEvaluate` covers folded BV concats, and is emitted as the same
+    /// premise-less `evaluate` rule.
+    ArithGroundEvaluate,
     /// Datatype selector projection `(= t (sel C(..t..)))` accepted by the
     /// registry-gated `DatatypeSelectorProject` recognizer at plan time.
     /// Emitted as the corresponding theory lemma; the whole-proof gate
@@ -5293,6 +5615,7 @@ impl EqPlan {
             EqPlanKind::Refl
             | EqPlanKind::BvGroundEvaluate
             | EqPlanKind::SeqGroundEvaluate
+            | EqPlanKind::ArithGroundEvaluate
             | EqPlanKind::DatatypeSelectorProjectEval => {}
             EqPlanKind::SymmOfPlan { inner } => inner.collect_assumed(out),
             EqPlanKind::Assumed => {
@@ -5321,6 +5644,7 @@ impl EqPlan {
         match &self.kind {
             EqPlanKind::BvGroundEvaluate
             | EqPlanKind::SeqGroundEvaluate
+            | EqPlanKind::ArithGroundEvaluate
             | EqPlanKind::DatatypeSelectorProjectEval => true,
             EqPlanKind::SymmOfPlan { inner } => inner.uses_ground_evaluate(),
             EqPlanKind::Cong { kids, .. } => kids.iter().any(Self::uses_ground_evaluate),

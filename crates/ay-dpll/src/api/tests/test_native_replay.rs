@@ -558,7 +558,7 @@ fn native_replay_rejects_reserved_malformed_and_missing_builtin_applications() {
     let TermData::App(symbol, _) = &mut reserved.terms[app_index].data else {
         unreachable!();
     };
-    *symbol = Symbol::Named("__ay_ext_diff!forged_app".to_string());
+    *symbol = Symbol::named("__ay_ext_diff!forged_app");
     assert_native_replay_rejected(&reserved);
 
     let mut wrong_arity = artifact.clone();
@@ -740,11 +740,10 @@ fn native_replay_omits_unused_builtin_colliding_function() {
     // that identity against the declaration's private core, not its surface.
     let zero = solver.int_const(0);
     let one = solver.int_const(1);
-    let builtin_equality_id = solver.terms_mut().mk_app(
-        Symbol::Named("=".to_string()),
-        vec![zero.id(), one.id()],
-        Sort::Bool,
-    );
+    let builtin_equality_id =
+        solver
+            .terms_mut()
+            .mk_app(Symbol::named("="), vec![zero.id(), one.id()], Sort::Bool);
     let builtin_equality = solver.wrap_term(builtin_equality_id);
     solver.try_assert_term(builtin_equality).expect("assert");
     assert!(solver.check_sat().is_unsat());
@@ -781,11 +780,10 @@ fn native_replay_preserves_canonical_core_alongside_colliding_uf() {
 
     // The same artifact now needs both identities. A raw canonical head must
     // bypass the live surface declaration during replay.
-    let builtin_equality_id = solver.terms_mut().mk_app(
-        Symbol::Named("=".to_string()),
-        vec![zero.id(), one.id()],
-        Sort::Bool,
-    );
+    let builtin_equality_id =
+        solver
+            .terms_mut()
+            .mk_app(Symbol::named("="), vec![zero.id(), one.id()], Sort::Bool);
     let builtin_equality = solver.wrap_term(builtin_equality_id);
     solver.try_assert_term(builtin_equality).expect("assert");
     assert!(solver.check_sat().is_unsat());

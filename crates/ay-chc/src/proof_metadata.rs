@@ -79,6 +79,16 @@ pub const CHC_REPLAY_EVIDENCE_SCHEMA: &str = "ay.chc-replay-evidence/v1";
 /// Schema tag used by native CHC certificate replay summaries.
 pub const CHC_CHECKED_REPLAY_SUMMARY_SCHEMA: &str = "ay-chc-certificate-replay/v1";
 
+/// Schema tag for replay summaries that can carry typed ground-derivation
+/// payloads. V1 remains SMT-only so older readers reject, rather than
+/// misinterpret, the new proof representation.
+pub const CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2: &str = "ay-chc-certificate-replay/v2";
+
+/// Schema tag for replay summaries carrying source-authenticated finite-UF
+/// ground-derivation v2 payloads. V2 summary readers accept artifact v1 only;
+/// this new schema binds the new row representation explicitly.
+pub const CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3: &str = "ay-chc-certificate-replay/v3";
+
 /// Schema tag for checked replay checker identity rows.
 pub(crate) const CHC_REPLAY_CHECKER_IDENTITY_SCHEMA: &str = "ay.chc-replay-checker-identity/v1";
 
@@ -392,14 +402,27 @@ impl std::error::Error for ChcProofRunArtifactValidationError {}
 pub struct ChcReplayObligationArtifact {
     /// Replay obligation kind checked by this query.
     pub kind: ChcReplayObligationKind,
-    /// Concrete SMT replay query artifact.
+    /// Representation of the hash-bound replay payload.
+    pub payload_format: ChcReplayPayloadFormat,
+    /// Concrete SMT replay query or ground-derivation artifact.
     pub query: ChcProofArtifactDigest,
 }
 
 impl ChcReplayObligationArtifact {
     /// Build a replay obligation artifact binding.
     pub fn new(kind: ChcReplayObligationKind, query: ChcProofArtifactDigest) -> Self {
-        Self { kind, query }
+        Self {
+            kind,
+            payload_format: ChcReplayPayloadFormat::SmtlibV1,
+            query,
+        }
+    }
+
+    /// Bind the byte-level representation used to check this obligation.
+    #[must_use]
+    pub fn with_payload_format(mut self, payload_format: ChcReplayPayloadFormat) -> Self {
+        self.payload_format = payload_format;
+        self
     }
 
     /// SHA-256 over the stable obligation artifact identity.
@@ -417,6 +440,10 @@ impl ChcReplayObligationArtifact {
                 serde_json::Value::String(self.kind.as_str().to_string()),
             );
             object.insert(
+                "payload_format".to_string(),
+                serde_json::Value::String(self.payload_format.as_str().to_string()),
+            );
+            object.insert(
                 "obligation_identity_sha256".to_string(),
                 serde_json::Value::String(self.identity_sha256()),
             );
@@ -428,6 +455,12 @@ impl ChcReplayObligationArtifact {
         let mut out = String::new();
         out.push_str("ay.chc-replay-obligation-artifact/v1\n");
         out.push_str(&format!("kind={}\n", self.kind.as_str()));
+        if self.payload_format != ChcReplayPayloadFormat::SmtlibV1 {
+            out.push_str(&format!(
+                "payload_format={}\n",
+                self.payload_format.as_str()
+            ));
+        }
         out.push_str(&format!("query={}\n", self.query.identity_sha256()));
         out
     }
@@ -950,7 +983,72 @@ impl ChcReplayCheckResult {
     }
 }
 
-/// One checked CHC replay obligation query.
+/// Byte-level representation retained for one checked CHC replay obligation.
+///
+/// Most obligations are SMT-LIB queries. A verified Unsafe result may instead
+/// carry AY's canonical ground-derivation artifact, which is checked by pure
+/// evaluation against the source CHC problem rather than by another SAT
+/// search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ChcReplayPayloadFormat {
+    /// An SMT-LIB v2 query executed by AY's fresh replay solver.
+    SmtlibV1,
+    /// A canonical source-bound ground derivation checked by AY's deciding
+    /// ground evaluator.
+    GroundDerivationV1,
+    /// A canonical source-bound ground derivation with exact finite ordinary-UF
+    /// observations and derivation-wide congruence validation.
+    GroundDerivationV2,
+}
+
+impl ChcReplayPayloadFormat {
+    /// Stable wire label for this payload representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SmtlibV1 => "smtlib-v1",
+            Self::GroundDerivationV1 => "ground-derivation-v1",
+            Self::GroundDerivationV2 => "ground-derivation-v2",
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "smtlib-v1" => Some(Self::SmtlibV1),
+            "ground-derivation-v1" => Some(Self::GroundDerivationV1),
+            "ground-derivation-v2" => Some(Self::GroundDerivationV2),
+            _ => None,
+        }
+    }
+}
+
+pub(super) fn replay_payload_role(format: ChcReplayPayloadFormat) -> &'static str {
+    match format {
+        ChcReplayPayloadFormat::SmtlibV1 => "replay-obligation",
+        ChcReplayPayloadFormat::GroundDerivationV1 => {
+            crate::ground_derivation::CHC_GROUND_DERIVATION_ARTIFACT_ROLE
+        }
+        ChcReplayPayloadFormat::GroundDerivationV2 => {
+            crate::ground_derivation::CHC_GROUND_DERIVATION_ARTIFACT_V2_ROLE
+        }
+    }
+}
+
+fn is_ground_derivation_payload(format: ChcReplayPayloadFormat) -> bool {
+    matches!(
+        format,
+        ChcReplayPayloadFormat::GroundDerivationV1 | ChcReplayPayloadFormat::GroundDerivationV2
+    )
+}
+
+fn summary_has_ground_derivation(summary: &ChcCheckedReplaySummary) -> bool {
+    summary
+        .obligations
+        .iter()
+        .any(|obligation| is_ground_derivation_payload(obligation.payload_format))
+}
+
+/// One checked CHC replay obligation query or deciding proof artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ChcCheckedReplayObligation {
@@ -959,7 +1057,11 @@ pub struct ChcCheckedReplayObligation {
     /// Obligation kind: `initiation`, `consecution`, `safety`, or
     /// `trace-validity`.
     pub kind: ChcReplayObligationKind,
-    /// Hash-bound replay query.
+    /// Representation of the hash-bound payload.
+    pub payload_format: ChcReplayPayloadFormat,
+    /// Hash-bound replay query or ground-derivation artifact. The artifact role
+    /// is format-specific: ground evidence uses `unsafe-ground-derivation`, so
+    /// an older SMT-only reader rejects it fail-closed.
     pub query: ChcProofArtifactDigest,
     /// Exact checker command used for this obligation.
     pub checker_command: String,
@@ -984,6 +1086,7 @@ impl ChcCheckedReplayObligation {
         Self {
             name: name.into(),
             kind,
+            payload_format: ChcReplayPayloadFormat::SmtlibV1,
             query,
             checker_command: checker_command.into(),
             result,
@@ -1004,6 +1107,21 @@ impl ChcCheckedReplayObligation {
         self
     }
 
+    /// Mark this Unsafe replay row as a source-bound ground derivation.
+    #[must_use]
+    pub(crate) fn with_ground_derivation_payload(mut self) -> Self {
+        self.payload_format = ChcReplayPayloadFormat::GroundDerivationV1;
+        self
+    }
+
+    /// Mark this Unsafe replay row as source-authenticated finite-UF ground
+    /// evidence using artifact v2.
+    #[must_use]
+    pub(crate) fn with_ground_derivation_v2_payload(mut self) -> Self {
+        self.payload_format = ChcReplayPayloadFormat::GroundDerivationV2;
+        self
+    }
+
     /// SHA-256 over the stable obligation identity.
     pub fn identity_sha256(&self) -> String {
         sha256_hex(self.identity_input().as_bytes())
@@ -1014,6 +1132,7 @@ impl ChcCheckedReplayObligation {
         let mut value = serde_json::json!({
             "name": self.name,
             "kind": self.kind.as_str(),
+            "payload_format": self.payload_format.as_str(),
             "query": self.query.to_json_value(),
             "checker_command": self.checker_command,
             "result": self.result.to_json_value(),
@@ -1037,10 +1156,11 @@ impl ChcCheckedReplayObligation {
         };
         let name = string_field(object, "name", &format!("{label}.name"), reasons)?;
         let kind = obligation_kind_field(object, "kind", &format!("{label}.kind"), reasons)?;
+        let payload_format = checked_replay_payload_format_field(object, &label, reasons)?;
         let query = artifact_field(
             object,
             "query",
-            "replay-obligation",
+            replay_payload_role(payload_format),
             &format!("{label}.query"),
             reasons,
         )?;
@@ -1062,6 +1182,7 @@ impl ChcCheckedReplayObligation {
             reasons,
         );
         let mut obligation = Self::new(name, kind, query, checker_command, result);
+        obligation.payload_format = payload_format;
         obligation.strict_cert = strict_cert;
         check_optional_identity_sha256(
             object,
@@ -1078,6 +1199,15 @@ impl ChcCheckedReplayObligation {
         out.push_str("ay.chc-checked-replay-obligation/v1\n");
         out.push_str(&format!("name={}\n", json_string(&self.name)));
         out.push_str(&format!("kind={}\n", self.kind.as_str()));
+        // The default SMT representation predates this field. Omitting it from
+        // that identity preserves old checked-summary identities while a
+        // ground artifact is explicitly and unambiguously type-bound.
+        if self.payload_format != ChcReplayPayloadFormat::SmtlibV1 {
+            out.push_str(&format!(
+                "payload_format={}\n",
+                self.payload_format.as_str()
+            ));
+        }
         out.push_str(&format!("query={}\n", self.query.identity_sha256()));
         out.push_str(&format!(
             "checker_command={}\n",
@@ -1093,6 +1223,30 @@ impl ChcCheckedReplayObligation {
             out.push_str(&cert.identity_input());
         }
         out
+    }
+}
+
+fn checked_replay_payload_format_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    label: &str,
+    reasons: &mut Vec<String>,
+) -> Option<ChcReplayPayloadFormat> {
+    let Some(_) = object.get("payload_format") else {
+        // Summaries emitted before ground-derivation replay used SMT-LIB
+        // exclusively. Keep those packets parseable as the explicit default.
+        return Some(ChcReplayPayloadFormat::SmtlibV1);
+    };
+    let field_label = format!("{label}.payload_format");
+    let value = string_field(object, "payload_format", &field_label, reasons)?;
+    match ChcReplayPayloadFormat::from_label(&value) {
+        Some(format) => Some(format),
+        None => {
+            reasons.push(format!(
+                "{field_label}={} is not a supported checked replay payload format",
+                json_string(&value)
+            ));
+            None
+        }
     }
 }
 
@@ -1137,6 +1291,9 @@ pub struct ChcCheckedReplayManifestBinding {
     pub evidence_manifest_schema: String,
     /// Normalized CHC/PDR problem hash from the manifest.
     pub problem_sha256: String,
+    /// Order-sensitive source-clause hash required by positional ground
+    /// derivation payloads. Absent for legacy SMT-only replay.
+    pub source_clause_sequence_sha256: Option<String>,
     /// Proof/resource option identity from the manifest.
     pub options_sha256: String,
     /// Solver identity hash from the manifest.
@@ -1166,6 +1323,12 @@ pub struct ChcCheckedReplayManifestBinding {
 impl ChcCheckedReplayManifestBinding {
     fn from_manifest(manifest: &ChcProofEvidenceManifest) -> Self {
         let replay_evidence = manifest.replay_evidence.as_ref();
+        let has_ground_derivation = replay_evidence.is_some_and(|evidence| {
+            evidence
+                .replay_obligations
+                .iter()
+                .any(|artifact| is_ground_derivation_payload(artifact.payload_format))
+        });
         let precheck_admission_key_sha256 = manifest
             .checked_replay_summary
             .as_ref()
@@ -1180,6 +1343,9 @@ impl ChcCheckedReplayManifestBinding {
             schema: CHC_CHECKED_REPLAY_MANIFEST_BINDING_SCHEMA,
             evidence_manifest_schema: manifest.schema.to_string(),
             problem_sha256: manifest.problem_sha256.clone(),
+            source_clause_sequence_sha256: has_ground_derivation
+                .then(|| manifest.source_clause_sequence_sha256.clone())
+                .flatten(),
             options_sha256: manifest.options.identity_sha256(),
             solver_identity_sha256: manifest.solver.identity_sha256(),
             obligation_id: manifest.obligation_id.clone(),
@@ -1218,6 +1384,7 @@ impl ChcCheckedReplayManifestBinding {
             "identity_sha256": self.identity_sha256(),
             "evidence_manifest_schema": self.evidence_manifest_schema,
             "problem_sha256": self.problem_sha256,
+            "source_clause_sequence_sha256": self.source_clause_sequence_sha256,
             "options_sha256": self.options_sha256,
             "solver_identity_sha256": self.solver_identity_sha256,
             "obligation_id": self.obligation_id,
@@ -1271,6 +1438,12 @@ impl ChcCheckedReplayManifestBinding {
             "manifest_binding.problem_sha256",
             reasons,
         )?;
+        let source_clause_sequence_sha256 = optional_sha256_field(
+            object,
+            "source_clause_sequence_sha256",
+            "manifest_binding.source_clause_sequence_sha256",
+            reasons,
+        );
         let options_sha256 = sha256_string_field(
             object,
             "options_sha256",
@@ -1342,6 +1515,7 @@ impl ChcCheckedReplayManifestBinding {
             schema: CHC_CHECKED_REPLAY_MANIFEST_BINDING_SCHEMA,
             evidence_manifest_schema,
             problem_sha256,
+            source_clause_sequence_sha256,
             options_sha256,
             solver_identity_sha256,
             obligation_id,
@@ -1374,6 +1548,11 @@ impl ChcCheckedReplayManifestBinding {
             json_string(&self.evidence_manifest_schema)
         ));
         out.push_str(&format!("problem_sha256={}\n", self.problem_sha256));
+        if let Some(source_clause_sequence_sha256) = &self.source_clause_sequence_sha256 {
+            out.push_str(&format!(
+                "source_clause_sequence_sha256={source_clause_sequence_sha256}\n"
+            ));
+        }
         out.push_str(&format!("options_sha256={}\n", self.options_sha256));
         out.push_str(&format!(
             "solver_identity_sha256={}\n",
@@ -1422,7 +1601,7 @@ impl ChcCheckedReplayManifestBinding {
     }
 }
 
-/// Parsed, typed `ay-chc-certificate-replay/v1` summary.
+/// Parsed, typed checked-replay summary (SMT v1, ground v2, or finite-UF v3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ChcCheckedReplaySummary {
@@ -1462,6 +1641,28 @@ pub struct ChcCheckedReplaySummary {
     pub errors: Vec<String>,
 }
 
+/// Non-serializable authority created only by AY's checked replay executor.
+///
+/// A summary naming `ay-chc-replay` is merely data. This seal is the in-memory
+/// fact that the exact summary was produced after AY checked the retained
+/// payloads against this exact source problem.
+#[derive(Debug)]
+pub(crate) struct ChcInProcessReplaySeal {
+    summary_identity_sha256: String,
+    normalized_input_sha256: String,
+    source_clause_sequence_sha256: String,
+}
+
+impl ChcInProcessReplaySeal {
+    pub(crate) fn new(summary: &ChcCheckedReplaySummary, problem: &ChcProblem) -> Self {
+        Self {
+            summary_identity_sha256: summary.identity_sha256(),
+            normalized_input_sha256: normalized_chc_input_sha256(problem),
+            source_clause_sequence_sha256: ordered_chc_clause_sequence_sha256(problem),
+        }
+    }
+}
+
 impl ChcCheckedReplaySummary {
     /// Build and validate a passing checked replay summary for a manifest.
     ///
@@ -1477,8 +1678,19 @@ impl ChcCheckedReplaySummary {
         command: impl Into<String>,
         obligations: Vec<ChcCheckedReplayObligation>,
     ) -> Result<Self, ChcCheckedReplaySummaryError> {
+        let schema = if obligations.iter().any(|obligation| {
+            obligation.payload_format == ChcReplayPayloadFormat::GroundDerivationV2
+        }) {
+            CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3
+        } else if obligations.iter().any(|obligation| {
+            obligation.payload_format == ChcReplayPayloadFormat::GroundDerivationV1
+        }) {
+            CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2
+        } else {
+            CHC_CHECKED_REPLAY_SUMMARY_SCHEMA
+        };
         let summary = Self {
-            schema: CHC_CHECKED_REPLAY_SUMMARY_SCHEMA,
+            schema,
             status: "pass".to_string(),
             surface: "CHC certificates".to_string(),
             ay_commit: manifest.solver.ay_revision.clone(),
@@ -1514,14 +1726,27 @@ impl ChcCheckedReplaySummary {
                 "summary is not an object".to_string(),
             ]));
         };
-        expect_json_string(
+        let parsed_schema = string_field(object, "schema", "schema", &mut reasons);
+        let (schema, schema_version) = match parsed_schema.as_deref() {
+            Some(CHC_CHECKED_REPLAY_SUMMARY_SCHEMA) => (CHC_CHECKED_REPLAY_SUMMARY_SCHEMA, 1),
+            Some(CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2) => (CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2, 2),
+            Some(CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3) => (CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3, 3),
+            Some(other) => {
+                reasons.push(format!(
+                    "schema={} is not a supported checked replay summary schema",
+                    json_string(other)
+                ));
+                (CHC_CHECKED_REPLAY_SUMMARY_SCHEMA, 1)
+            }
+            None => (CHC_CHECKED_REPLAY_SUMMARY_SCHEMA, 1),
+        };
+        expect_json_u64(
             object,
-            "schema",
-            CHC_CHECKED_REPLAY_SUMMARY_SCHEMA,
-            "schema",
+            "schema_version",
+            schema_version,
+            "schema_version",
             &mut reasons,
         );
-        expect_json_u64(object, "schema_version", 1, "schema_version", &mut reasons);
         let status = string_field(object, "status", "status", &mut reasons);
         let surface = string_field(object, "surface", "surface", &mut reasons);
         let ay_commit = optional_string_field(object, "ay_commit", "ay_commit", &mut reasons);
@@ -1568,13 +1793,48 @@ impl ChcCheckedReplaySummary {
         let result =
             ChcReplayCheckResult::from_json_value(object.get("result"), "result", &mut reasons);
         let obligations = obligations_from_json(object.get("obligations"), &mut reasons);
+        if matches!(
+            schema,
+            CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2 | CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3
+        ) {
+            require_v2_checked_replay_obligation_fields(object.get("obligations"), &mut reasons);
+            let expected_ground_format = if schema == CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3 {
+                ChcReplayPayloadFormat::GroundDerivationV2
+            } else {
+                ChcReplayPayloadFormat::GroundDerivationV1
+            };
+            if !obligations
+                .iter()
+                .any(|obligation| obligation.payload_format == expected_ground_format)
+            {
+                reasons.push(format!(
+                    "{} requires a {} payload",
+                    schema,
+                    expected_ground_format.as_str()
+                ));
+            }
+            if obligations.iter().any(|obligation| {
+                is_ground_derivation_payload(obligation.payload_format)
+                    && obligation.payload_format != expected_ground_format
+            }) {
+                reasons.push(format!(
+                    "{} cannot carry a different ground-derivation payload version",
+                    schema
+                ));
+            }
+        } else if obligations
+            .iter()
+            .any(|obligation| obligation.payload_format != ChcReplayPayloadFormat::SmtlibV1)
+        {
+            reasons.push("ay-chc-certificate-replay/v1 supports SMT-LIB payloads only".to_string());
+        }
         let errors = string_vec_field(object, "errors", "errors", &mut reasons);
 
         if !reasons.is_empty() {
             return Err(ChcCheckedReplaySummaryError::new(reasons));
         }
         let summary = Self {
-            schema: CHC_CHECKED_REPLAY_SUMMARY_SCHEMA,
+            schema,
             status: status.expect("status parsed without reasons"),
             surface: surface.expect("surface parsed without reasons"),
             ay_commit,
@@ -1592,13 +1852,31 @@ impl ChcCheckedReplaySummary {
             obligations,
             errors,
         };
-        check_optional_identity_sha256(
-            object,
-            "identity_sha256",
-            "identity_sha256",
-            &summary.identity_sha256(),
-            &mut reasons,
-        );
+        if matches!(
+            schema,
+            CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2 | CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3
+        ) {
+            let expected = summary.identity_sha256();
+            if let Some(actual) =
+                sha256_string_field(object, "identity_sha256", "identity_sha256", &mut reasons)
+            {
+                if actual != expected {
+                    reasons.push(format!(
+                        "identity_sha256={} does not match expected {}",
+                        json_string(&actual),
+                        json_string(&expected)
+                    ));
+                }
+            }
+        } else {
+            check_optional_identity_sha256(
+                object,
+                "identity_sha256",
+                "identity_sha256",
+                &summary.identity_sha256(),
+                &mut reasons,
+            );
+        }
         if !reasons.is_empty() {
             return Err(ChcCheckedReplaySummaryError::new(reasons));
         }
@@ -1620,7 +1898,11 @@ impl ChcCheckedReplaySummary {
             .collect();
         serde_json::json!({
             "schema": self.schema,
-            "schema_version": 1,
+            "schema_version": match self.schema {
+                CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3 => 3,
+                CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2 => 2,
+                _ => 1,
+            },
             "identity_sha256": self.identity_sha256(),
             "status": self.status,
             "surface": self.surface,
@@ -1692,6 +1974,31 @@ impl ChcCheckedReplaySummary {
             out.push_str(&format!("error={}\n", json_string(&error)));
         }
         out
+    }
+}
+
+fn require_v2_checked_replay_obligation_fields(
+    value: Option<&serde_json::Value>,
+    reasons: &mut Vec<String>,
+) {
+    let Some(rows) = value.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for (index, row) in rows.iter().enumerate() {
+        let Some(object) = row.as_object() else {
+            continue;
+        };
+        if !object.contains_key("payload_format") {
+            reasons.push(format!(
+                "obligations[{index}].payload_format is required by ay-chc-certificate-replay/v2"
+            ));
+        }
+        let identity_label = format!("obligations[{index}].identity_sha256");
+        if sha256_string_field(object, "identity_sha256", &identity_label, reasons).is_none() {
+            reasons.push(format!(
+                "{identity_label} is required by ay-chc-certificate-replay/v2"
+            ));
+        }
     }
 }
 
@@ -2602,14 +2909,16 @@ pub enum ChcProofRunStopReason {
 ///
 /// Construction is solver-owned. Callers cannot accidentally pair artifacts
 /// from one solve with timing or stop data collected by another solve. The
-/// budget report's `total_elapsed` and adaptive strategy trace cover the exact
-/// guarded production solve. The budget report's per-engine entries remain
-/// empty because specialized adaptive lanes are represented by the trace
-/// rather than being forced into an inaccurate concrete-engine identity.
+/// budget report's `total_elapsed` covers the guarded production solve plus an
+/// explicitly requested checked-replay pass, if one was attached afterward.
+/// The adaptive strategy trace covers only the solve itself. The budget
+/// report's per-engine entries remain empty because specialized adaptive lanes
+/// are represented by the trace rather than being forced into an inaccurate
+/// concrete-engine identity.
 #[derive(Debug)]
 #[must_use = "proof reports must be inspected; Unknown is non-proof evidence"]
 pub struct ChcProofRunWithBudgetReport {
-    proof_run: ChcPdrProofRun,
+    evidence: proof_run::ChcProofRunEvidence,
     budget_report: crate::BudgetReport,
     adaptive_trace: crate::AdaptiveSolveTrace,
     stop_reason: ChcProofRunStopReason,
@@ -2955,12 +3264,25 @@ impl ChcProofSolverIdentity {
     }
 }
 
+fn ground_source_clause_sequence_sha256(manifest: &ChcProofEvidenceManifest) -> Option<String> {
+    let has_ground_derivation = manifest.replay_evidence.as_ref().is_some_and(|evidence| {
+        evidence
+            .replay_obligations
+            .iter()
+            .any(|artifact| is_ground_derivation_payload(artifact.payload_format))
+    });
+    has_ground_derivation
+        .then(|| manifest.source_clause_sequence_sha256.clone())
+        .flatten()
+}
+
 /// Typed admission key for durable proof-query caches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ChcProofQueryAdmissionKey {
     schema: &'static str,
     problem_sha256: String,
+    source_clause_sequence_sha256: Option<String>,
     options_sha256: String,
     solver_identity_sha256: String,
     transcript_identity_sha256: String,
@@ -2989,6 +3311,7 @@ impl ChcProofQueryAdmissionKey {
         Self {
             schema: CHC_PROOF_QUERY_ADMISSION_KEY_SCHEMA,
             problem_sha256: manifest.problem_sha256.clone(),
+            source_clause_sequence_sha256: ground_source_clause_sequence_sha256(manifest),
             options_sha256: manifest.options.identity_sha256(),
             solver_identity_sha256: manifest.solver.identity_sha256(),
             transcript_identity_sha256: manifest.transcript_metadata.identity_sha256(),
@@ -3062,6 +3385,7 @@ impl ChcProofQueryAdmissionKey {
             "schema_version": 1,
             "sha256": self.sha256(),
             "problem_sha256": self.problem_sha256,
+            "source_clause_sequence_sha256": self.source_clause_sequence_sha256,
             "options_sha256": self.options_sha256,
             "solver_identity_sha256": self.solver_identity_sha256,
             "transcript_identity_sha256": self.transcript_identity_sha256,
@@ -3091,6 +3415,11 @@ impl ChcProofQueryAdmissionKey {
         out.push_str(self.schema);
         out.push('\n');
         out.push_str(&format!("problem_sha256={}\n", self.problem_sha256));
+        if let Some(source_clause_sequence_sha256) = &self.source_clause_sequence_sha256 {
+            out.push_str(&format!(
+                "source_clause_sequence_sha256={source_clause_sequence_sha256}\n"
+            ));
+        }
         out.push_str(&format!("options_sha256={}\n", self.options_sha256));
         out.push_str(&format!(
             "solver_identity_sha256={}\n",
@@ -3182,6 +3511,8 @@ pub struct ChcProofQueryCacheLookupKey {
     pub evidence_manifest_schema: &'static str,
     /// Normalized CHC/PDR problem hash.
     pub problem_sha256: String,
+    /// Order-sensitive source-clause hash for positional ground evidence.
+    pub source_clause_sequence_sha256: Option<String>,
     /// Proof/resource option identity hash.
     pub options_sha256: String,
     /// Solver identity hash.
@@ -3202,6 +3533,7 @@ impl ChcProofQueryCacheLookupKey {
             schema: CHC_PROOF_QUERY_CACHE_LOOKUP_KEY_SCHEMA,
             evidence_manifest_schema: manifest.schema,
             problem_sha256: manifest.problem_sha256.clone(),
+            source_clause_sequence_sha256: ground_source_clause_sequence_sha256(manifest),
             options_sha256: manifest.options.identity_sha256(),
             solver_identity_sha256: manifest.solver.identity_sha256(),
             proof_mode: manifest.options.proof_mode.clone(),
@@ -3224,6 +3556,7 @@ impl ChcProofQueryCacheLookupKey {
             "sha256": self.sha256(),
             "evidence_manifest_schema": self.evidence_manifest_schema,
             "problem_sha256": self.problem_sha256,
+            "source_clause_sequence_sha256": self.source_clause_sequence_sha256,
             "options_sha256": self.options_sha256,
             "solver_identity_sha256": self.solver_identity_sha256,
             "proof_mode": self.proof_mode,
@@ -3242,6 +3575,11 @@ impl ChcProofQueryCacheLookupKey {
             json_string(self.evidence_manifest_schema)
         ));
         out.push_str(&format!("problem_sha256={}\n", self.problem_sha256));
+        if let Some(source_clause_sequence_sha256) = &self.source_clause_sequence_sha256 {
+            out.push_str(&format!(
+                "source_clause_sequence_sha256={source_clause_sequence_sha256}\n"
+            ));
+        }
         out.push_str(&format!("options_sha256={}\n", self.options_sha256));
         out.push_str(&format!(
             "solver_identity_sha256={}\n",
@@ -4169,6 +4507,7 @@ pub struct ChcProofEvidenceManifest {
     schema: &'static str,
     problem_schema: &'static str,
     problem_sha256: String,
+    source_clause_sequence_sha256: Option<String>,
     problem_bytes: u64,
     solver: ChcProofSolverIdentity,
     options: ChcProofEvidenceOptions,
@@ -4204,6 +4543,7 @@ impl ChcProofEvidenceManifest {
         let problem = run.problem();
         let normalized = normalized_chc_input(problem);
         let problem_sha256 = sha256_hex(normalized.as_bytes());
+        let source_clause_sequence_sha256 = Some(ordered_chc_clause_sequence_sha256(problem));
         let problem_bytes = normalized.len() as u64;
         let accepted_as_proof = run.accepted_as_proof();
         let trust_full_verifier_admissible = false;
@@ -4246,6 +4586,7 @@ impl ChcProofEvidenceManifest {
             schema: CHC_EVIDENCE_MANIFEST_SCHEMA,
             problem_schema: NORMALIZED_CHC_INPUT_SCHEMA,
             problem_sha256,
+            source_clause_sequence_sha256,
             problem_bytes,
             solver,
             options,
@@ -4307,20 +4648,137 @@ impl ChcProofEvidenceManifest {
     /// Attach a checked CHC replay summary and admit the manifest only when all
     /// manifest, admission-key, and artifact bindings match.
     pub fn try_with_checked_replay_summary(
-        mut self,
+        self,
         summary: ChcCheckedReplaySummary,
     ) -> Result<Self, ChcCheckedReplaySummaryError> {
-        let reasons = self.checked_replay_summary_rejection_reasons(&summary);
+        let mut reasons = self.checked_replay_summary_rejection_reasons(&summary);
+        if !summary.checker.external {
+            reasons.push(
+                "nonexternal checked replay requires AY's opaque in-process validation seal"
+                    .to_string(),
+            );
+        }
+        if summary_has_ground_derivation(&summary) {
+            reasons.push(
+                "ground-derivation checked replay requires a validated payload capability"
+                    .to_string(),
+            );
+        }
         if !reasons.is_empty() {
             return Err(ChcCheckedReplaySummaryError::new(reasons));
         }
 
+        Ok(self.admit_checked_replay_summary(summary))
+    }
+
+    /// Admit a ground-derivation replay only after the exact payload was
+    /// freshly validated against the consumer's source problem.
+    pub fn try_with_validated_ground_replay_summary(
+        self,
+        summary: ChcCheckedReplaySummary,
+        validated: &crate::ChcValidatedGroundDerivation,
+    ) -> Result<Self, ChcCheckedReplaySummaryError> {
+        let mut reasons = self.checked_replay_summary_rejection_reasons(&summary);
+        let ground_rows = summary
+            .obligations
+            .iter()
+            .filter(|obligation| is_ground_derivation_payload(obligation.payload_format))
+            .collect::<Vec<_>>();
+        if ground_rows.len() != 1 || summary.obligations.len() != 1 {
+            reasons.push(
+                "validated ground replay requires exactly one ground-derivation obligation"
+                    .to_string(),
+            );
+        } else {
+            if ground_rows[0].query.schema != CHC_PROOF_ARTIFACT_DIGEST_SCHEMA {
+                reasons.push(
+                    "validated ground replay artifact descriptor schema mismatch".to_string(),
+                );
+            }
+            let expected_format = match validated.artifact_schema() {
+                crate::CHC_GROUND_DERIVATION_ARTIFACT_SCHEMA => {
+                    ChcReplayPayloadFormat::GroundDerivationV1
+                }
+                crate::CHC_GROUND_DERIVATION_ARTIFACT_V2_SCHEMA => {
+                    ChcReplayPayloadFormat::GroundDerivationV2
+                }
+                _ => ChcReplayPayloadFormat::SmtlibV1,
+            };
+            if ground_rows[0].payload_format != expected_format {
+                reasons.push("validated ground replay payload format/schema mismatch".to_string());
+            }
+            if ground_rows[0].query.role.as_str() != validated.artifact_role() {
+                reasons.push("validated ground replay artifact role mismatch".to_string());
+            }
+            if ground_rows[0].query.sha256 != validated.artifact_sha256() {
+                reasons.push("validated ground replay artifact digest mismatch".to_string());
+            }
+            if ground_rows[0].query.bytes != validated.artifact_bytes() {
+                reasons.push("validated ground replay artifact byte length mismatch".to_string());
+            }
+        }
+        if self.problem_sha256 != validated.normalized_input_sha256()
+            || summary.manifest_binding.problem_sha256 != validated.normalized_input_sha256()
+        {
+            reasons.push("validated ground replay normalized problem mismatch".to_string());
+        }
+        if self.source_clause_sequence_sha256.as_deref()
+            != Some(validated.source_clause_sequence_sha256())
+            || summary
+                .manifest_binding
+                .source_clause_sequence_sha256
+                .as_deref()
+                != Some(validated.source_clause_sequence_sha256())
+        {
+            reasons.push("validated ground replay source clause sequence mismatch".to_string());
+        }
+        if !reasons.is_empty() {
+            return Err(ChcCheckedReplaySummaryError::new(reasons));
+        }
+
+        Ok(self.admit_checked_replay_summary(summary))
+    }
+
+    pub(crate) fn try_with_in_process_checked_replay_summary(
+        self,
+        summary: ChcCheckedReplaySummary,
+        seal: ChcInProcessReplaySeal,
+    ) -> Result<Self, ChcCheckedReplaySummaryError> {
+        let mut reasons = self.checked_replay_summary_rejection_reasons(&summary);
+        if summary.checker.external || summary.checker.name != CHC_IN_PROCESS_REPLAY_CHECKER_NAME {
+            reasons.push("in-process replay seal used with a non-AY checker identity".to_string());
+        }
+        if seal.summary_identity_sha256 != summary.identity_sha256() {
+            reasons.push("in-process replay seal summary identity mismatch".to_string());
+        }
+        if seal.normalized_input_sha256 != self.problem_sha256 {
+            reasons.push("in-process replay seal normalized problem mismatch".to_string());
+        }
+        if summary_has_ground_derivation(&summary)
+            && (self.source_clause_sequence_sha256.as_deref()
+                != Some(seal.source_clause_sequence_sha256.as_str())
+                || summary
+                    .manifest_binding
+                    .source_clause_sequence_sha256
+                    .as_deref()
+                    != Some(seal.source_clause_sequence_sha256.as_str()))
+        {
+            reasons.push("in-process replay seal source clause sequence mismatch".to_string());
+        }
+        if !reasons.is_empty() {
+            return Err(ChcCheckedReplaySummaryError::new(reasons));
+        }
+
+        Ok(self.admit_checked_replay_summary(summary))
+    }
+
+    fn admit_checked_replay_summary(mut self, summary: ChcCheckedReplaySummary) -> Self {
         self.checked_replay_summary = Some(summary);
         self.trust_full_verifier_admissible = true;
         self.replay_evidence_binding_status = "checked-summary-bound".to_string();
         self.non_admission_reasons
             .retain(|reason| !checked_replay_resolves_reason(reason));
-        Ok(self)
+        self
     }
 
     /// Return the fail-closed proof-query admission key.
@@ -4413,6 +4871,7 @@ impl ChcProofEvidenceManifest {
                 "normalized_input_schema": self.problem_schema,
                 "normalized_input_sha256": self.problem_sha256,
                 "pdr_input_sha256": self.problem_sha256,
+                "source_clause_sequence_sha256": self.source_clause_sequence_sha256,
                 "normalized_input_bytes": self.problem_bytes,
             },
             "solver": self.solver.to_json_value(),
@@ -4555,6 +5014,12 @@ impl ChcProofEvidenceManifest {
             "manifest.problem.normalized_input_sha256",
             &mut reasons,
         );
+        let source_clause_sequence_sha256 = optional_sha256_field(
+            problem_object,
+            "source_clause_sequence_sha256",
+            "manifest.problem.source_clause_sequence_sha256",
+            &mut reasons,
+        );
         let problem_bytes = u64_field(
             problem_object,
             "normalized_input_bytes",
@@ -4631,6 +5096,7 @@ impl ChcProofEvidenceManifest {
             schema: CHC_EVIDENCE_MANIFEST_SCHEMA,
             problem_schema: NORMALIZED_CHC_INPUT_SCHEMA,
             problem_sha256: problem_sha256.expect("problem hash parsed without reasons"),
+            source_clause_sequence_sha256,
             problem_bytes: problem_bytes.expect("problem bytes parsed without reasons"),
             solver: solver.expect("solver parsed without reasons"),
             options: options.expect("options parsed without reasons"),
@@ -4711,6 +5177,17 @@ impl ChcProofEvidenceManifest {
             let summary_reasons = self.checked_replay_summary_rejection_reasons(summary);
             for reason in summary_reasons {
                 reasons.push(format!("manifest checked replay summary invalid:{reason}"));
+            }
+            if self.trust_full_verifier_admissible && !summary.checker.external {
+                reasons.push(
+                    "serialized manifest cannot recover AY's in-process replay seal".to_string(),
+                );
+            }
+            if self.trust_full_verifier_admissible && summary_has_ground_derivation(summary) {
+                reasons.push(
+                    "serialized ground replay requires fresh payload validation before admission"
+                        .to_string(),
+                );
             }
         }
         if let Some(admission) = object
@@ -5291,6 +5768,75 @@ pub fn normalized_chc_input_sha256(problem: &ChcProblem) -> String {
     sha256_hex(normalized_chc_input(problem).as_bytes())
 }
 
+/// Return an order-sensitive SHA-256 overlay for source-clause indices.
+///
+/// [`normalized_chc_input`] intentionally sorts clauses and each clause's body
+/// predicate applications because its identity is semantic. Ground derivations
+/// instead name clauses and premises positionally, so their durable artifact
+/// additionally binds this indexed, position-preserving view.
+pub(crate) fn ordered_chc_clause_sequence_sha256(problem: &ChcProblem) -> String {
+    let pred_names = canonical_predicate_names(problem);
+    let mut digest = Sha256::new();
+    digest.update(b"ay.chc-source-clause-sequence/v1\0");
+    digest.update((problem.clauses().len() as u64).to_le_bytes());
+
+    fn update_field(digest: &mut Sha256, value: &str) {
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value.as_bytes());
+    }
+
+    for (clause_index, clause) in problem.clauses().iter().enumerate() {
+        digest.update((clause_index as u64).to_le_bytes());
+        match clause.source_query_ordinal {
+            Some(ordinal) => {
+                digest.update([1]);
+                digest.update((ordinal as u64).to_le_bytes());
+            }
+            None => digest.update([0]),
+        }
+        match clause
+            .action_id
+            .and_then(|action| problem.action_name(action))
+        {
+            Some(action) => {
+                digest.update([1]);
+                update_field(&mut digest, action);
+            }
+            None => digest.update([0]),
+        }
+        digest.update((clause.body.predicates.len() as u64).to_le_bytes());
+        for (predicate, arguments) in &clause.body.predicates {
+            update_field(
+                &mut digest,
+                &normalized_predicate_app(*predicate, arguments, &pred_names),
+            );
+        }
+        let constraint = clause
+            .body
+            .constraint
+            .as_ref()
+            .map(|expression| normalized_expr(expression, &pred_names))
+            .unwrap_or_else(|| "true".to_string());
+        let head = match &clause.head {
+            ClauseHead::False => "false".to_string(),
+            ClauseHead::Predicate(predicate, arguments) => {
+                normalized_predicate_app(*predicate, arguments, &pred_names)
+            }
+        };
+        update_field(&mut digest, &constraint);
+        update_field(&mut digest, &head);
+    }
+
+    let digest = digest.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        hex.push(DIGITS[(byte >> 4) as usize] as char);
+        hex.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    hex
+}
+
 fn unknown_reason_label(reason: VerifiedUnknownReason) -> &'static str {
     reason.code()
 }
@@ -5605,9 +6151,27 @@ fn replay_evidence_binding_status(
         mismatched |= reject_wrong_replay_evidence_role(
             &format!("replay_obligation[{index}]"),
             &artifact.query,
-            "replay-obligation",
+            replay_payload_role(artifact.payload_format),
             non_admission_reasons,
         );
+        if is_ground_derivation_payload(artifact.payload_format)
+            && (result != "unsafe" || artifact.kind != ChcReplayObligationKind::TraceValidity)
+        {
+            mismatched = true;
+            non_admission_reasons.push(format!(
+                "replay_obligation[{index}]_ground_derivation_requires_unsafe_trace_validity"
+            ));
+        }
+    }
+    if evidence.replay_obligations.len() != 1
+        && evidence
+            .replay_obligations
+            .iter()
+            .any(|artifact| is_ground_derivation_payload(artifact.payload_format))
+    {
+        mismatched = true;
+        non_admission_reasons
+            .push("ground_derivation_requires_exactly_one_replay_obligation".to_string());
     }
 
     if mismatched {
@@ -5668,6 +6232,33 @@ fn validate_checked_replay_summary_status(
     summary: &ChcCheckedReplaySummary,
     reasons: &mut Vec<String>,
 ) {
+    let has_ground_v1 = summary
+        .obligations
+        .iter()
+        .any(|obligation| obligation.payload_format == ChcReplayPayloadFormat::GroundDerivationV1);
+    let has_ground_v2 = summary
+        .obligations
+        .iter()
+        .any(|obligation| obligation.payload_format == ChcReplayPayloadFormat::GroundDerivationV2);
+    let expected_schema = if has_ground_v2 {
+        CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V3
+    } else if has_ground_v1 {
+        CHC_CHECKED_REPLAY_SUMMARY_SCHEMA_V2
+    } else {
+        CHC_CHECKED_REPLAY_SUMMARY_SCHEMA
+    };
+    if has_ground_v1 && has_ground_v2 {
+        reasons.push(
+            "summary cannot mix ground-derivation-v1 and ground-derivation-v2 payloads".to_string(),
+        );
+    }
+    if summary.schema != expected_schema {
+        reasons.push(format!(
+            "summary.schema={} does not match payload-required {}",
+            json_string(summary.schema),
+            json_string(expected_schema)
+        ));
+    }
     if summary.status != "pass" {
         reasons.push(format!(
             "summary.status={}, expected 'pass'",
@@ -5738,6 +6329,12 @@ fn validate_checked_replay_manifest_binding(
         "manifest_binding.problem_sha256",
         &summary.manifest_binding.problem_sha256,
         &expected.problem_sha256,
+        reasons,
+    );
+    compare_binding_option(
+        "manifest_binding.source_clause_sequence_sha256",
+        &summary.manifest_binding.source_clause_sequence_sha256,
+        &expected.source_clause_sequence_sha256,
         reasons,
     );
     compare_binding_string(
@@ -5978,10 +6575,35 @@ fn validate_checked_replay_obligations(
         if obligation.checker_command.is_empty() {
             reasons.push(format!("{label}.checker_command is missing"));
         }
+        match (manifest.result.as_str(), obligation.payload_format) {
+            ("safe", ChcReplayPayloadFormat::SmtlibV1)
+            | ("unsafe", ChcReplayPayloadFormat::SmtlibV1)
+            | ("unsafe", ChcReplayPayloadFormat::GroundDerivationV1)
+            | ("unsafe", ChcReplayPayloadFormat::GroundDerivationV2) => {}
+            (result, format) => reasons.push(format!(
+                "{label}.payload_format={} is not valid for {result} CHC replay",
+                json_string(format.as_str())
+            )),
+        }
+        if is_ground_derivation_payload(obligation.payload_format)
+            && obligation.kind != ChcReplayObligationKind::TraceValidity
+        {
+            reasons.push(format!(
+                "{label}.payload_format={} requires trace-validity kind",
+                json_string(obligation.payload_format.as_str())
+            ));
+        }
+        if obligation.kind == ChcReplayObligationKind::TraceValidity
+            && obligation.strict_cert.is_some()
+        {
+            reasons.push(format!(
+                "{label}.strict_cert is not valid for trace-validity replay"
+            ));
+        }
         validate_artifact_digest(
             &format!("{label}.query"),
             &obligation.query,
-            "replay-obligation",
+            replay_payload_role(obligation.payload_format),
             reasons,
         );
         obligation
@@ -6001,6 +6623,29 @@ fn validate_checked_replay_obligations(
             .collect::<Vec<_>>()
             .join(", ");
         reasons.push(format!("missing CHC replay obligation kinds: {}", missing));
+    }
+
+    if summary
+        .obligations
+        .iter()
+        .any(|obligation| is_ground_derivation_payload(obligation.payload_format))
+    {
+        if summary.obligations.len() != 1 {
+            reasons.push(
+                "ground-derivation Unsafe replay requires exactly one replay obligation"
+                    .to_string(),
+            );
+        }
+        if summary
+            .manifest_binding
+            .source_clause_sequence_sha256
+            .is_none()
+        {
+            reasons.push(
+                "ground-derivation replay requires manifest_binding.source_clause_sequence_sha256"
+                    .to_string(),
+            );
+        }
     }
 
     let mut actual_hashes = summary
@@ -6145,6 +6790,7 @@ fn checked_obligation_artifact_identity_hashes(
         .iter()
         .map(|obligation| {
             ChcReplayObligationArtifact::new(obligation.kind, obligation.query.clone())
+                .with_payload_format(obligation.payload_format)
                 .identity_sha256()
         })
         .collect::<Vec<_>>();
@@ -6217,6 +6863,13 @@ fn validate_artifact_digest(
     expected_role: &str,
     reasons: &mut Vec<String>,
 ) {
+    if artifact.schema != CHC_PROOF_ARTIFACT_DIGEST_SCHEMA {
+        reasons.push(format!(
+            "{label}.schema={} does not match expected {}",
+            json_string(artifact.schema),
+            json_string(CHC_PROOF_ARTIFACT_DIGEST_SCHEMA)
+        ));
+    }
     if artifact.role != expected_role {
         reasons.push(format!(
             "{label}.role={} does not match expected {}",
@@ -6763,11 +7416,17 @@ fn replay_obligations_from_json(
         else {
             continue;
         };
-        let Some(query) = artifact_from_json_value(row, "replay-obligation", &label, reasons)
+        let Some(payload_format) = checked_replay_payload_format_field(object, &label, reasons)
         else {
             continue;
         };
-        let obligation = ChcReplayObligationArtifact::new(kind, query);
+        let Some(query) =
+            artifact_from_json_value(row, replay_payload_role(payload_format), &label, reasons)
+        else {
+            continue;
+        };
+        let obligation =
+            ChcReplayObligationArtifact::new(kind, query).with_payload_format(payload_format);
         check_optional_identity_sha256(
             object,
             "obligation_identity_sha256",
@@ -7124,7 +7783,7 @@ fn is_lower_sha256(value: &str) -> bool {
 mod proof_run;
 mod replay_check;
 mod sealed_evidence;
-pub use replay_check::ChcCheckedReplayRun;
+pub use replay_check::{ChcCheckedReplayObligationPayload, ChcCheckedReplayRun};
 
 #[cfg(test)]
 mod tests;

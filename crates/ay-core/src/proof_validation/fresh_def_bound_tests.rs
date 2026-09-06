@@ -208,7 +208,7 @@ fn rejects_a_compound_definiendum() {
     let mut f = fixture();
     let app = f
         .terms
-        .mk_app(crate::Symbol::Named("g".to_string()), vec![f.x], Sort::Int);
+        .mk_app(crate::Symbol::named("g"), vec![f.x], Sort::Int);
     let zero = f.terms.mk_int(BigInt::from(0));
     let atom = f.terms.mk_le(app, zero);
     assert_eq!(
@@ -249,11 +249,9 @@ fn rejects_an_int_symbol_defined_by_a_real_term_satisfied_at_one_half() {
     // `mk_le` debug-asserts matching sorts, so a mixed-sort `<=` can only be
     // built the way a FORGED or deserialized proof would present one: as a raw
     // application. That is exactly the input this guard exists for.
-    let atom = f.terms.mk_app(
-        crate::Symbol::Named("<=".to_string()),
-        vec![f.d, r],
-        Sort::Bool,
-    );
+    let atom = f
+        .terms
+        .mk_app(crate::Symbol::named("<="), vec![f.d, r], Sort::Bool);
     assert_eq!(
         recognize_fresh_def_bound(&f.terms, &[atom], 0, &[f.d]),
         Err(FreshDefBoundShapeError::SortMismatch(Sort::Int, Sort::Real))

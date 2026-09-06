@@ -2112,10 +2112,18 @@ impl Executor {
         // the FC axioms that are actually violated by the current model.
         if config.array_axioms {
             let max_cegar_iterations = ay_core::misc_cli_flags().fc_cegar_iters.unwrap_or(16);
+            // Bool-element selects (and Bool indices) have no term bits; the
+            // audit reads their single atom literal through the same maps the
+            // upfront array axioms use (`scalar_elem_lits`).
+            let fc_audit_lits = super::bv_cegar_array::FcAuditLits::new(
+                &term_bits,
+                &bv_bool_to_var,
+                &tseitin_result.term_to_var,
+                var_offset,
+            );
             solve_result = self.refine_array_fc_model(
                 solve_result,
-                &term_bits,
-                var_offset,
+                &fc_audit_lits,
                 total_vars,
                 &mut solver,
                 max_cegar_iterations,

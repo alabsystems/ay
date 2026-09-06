@@ -388,7 +388,7 @@ fn test_euf_distinct_scaling_200_args() {
         .collect();
 
     // Create raw distinct(...) App term — bypasses mk_distinct's expansion to AND
-    let distinct_term = store.mk_app(Symbol::Named("distinct".to_string()), vars, Sort::Bool);
+    let distinct_term = store.mk_app(Symbol::named("distinct"), vars, Sort::Bool);
 
     let mut euf = EufSolver::new(&store);
     euf.assert_literal(distinct_term, true);
@@ -429,7 +429,7 @@ fn test_euf_distinct_large_with_conflict() {
 
     let eq_0_50 = store.mk_eq(vars[0], vars[50]);
     // Create raw distinct(...) App term — bypasses mk_distinct's expansion to AND
-    let distinct_term = store.mk_app(Symbol::Named("distinct".to_string()), vars, Sort::Bool);
+    let distinct_term = store.mk_app(Symbol::named("distinct"), vars, Sort::Bool);
 
     let mut euf = EufSolver::new(&store);
     euf.assert_literal(distinct_term, true);

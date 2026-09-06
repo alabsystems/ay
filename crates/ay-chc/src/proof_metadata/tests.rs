@@ -2051,6 +2051,50 @@ fn checked_replay_summary_from_json_requires_summary_schema_versions() {
 }
 
 #[test]
+fn checked_replay_v1_defaults_legacy_missing_payload_format_to_smt() {
+    let manifest = safe_manifest_with_replay_evidence("trust:checked:legacy-smt-format", |_| {});
+    let summary = checked_summary_for_manifest(&manifest);
+    let mut json = summary.to_json_value();
+    assert_eq!(json["schema"], CHC_CHECKED_REPLAY_SUMMARY_SCHEMA);
+    for row in json["obligations"].as_array_mut().expect("obligation rows") {
+        row.as_object_mut()
+            .expect("obligation object")
+            .remove("payload_format");
+    }
+
+    let parsed = ChcCheckedReplaySummary::from_json_value(&json)
+        .expect("legacy v1 SMT rows without a format must remain parseable");
+    assert!(parsed
+        .obligations
+        .iter()
+        .all(|row| row.payload_format == ChcReplayPayloadFormat::SmtlibV1));
+    assert_eq!(parsed.identity_sha256(), summary.identity_sha256());
+}
+
+#[test]
+fn public_summary_admission_cannot_forge_ays_in_process_checker() {
+    let manifest = safe_manifest_with_replay_evidence("trust:checked:forged-in-process", |_| {});
+    let mut summary = checked_summary_for_manifest(&manifest);
+    summary.checker = ChcReplayCheckerIdentity::new(
+        CHC_IN_PROCESS_REPLAY_CHECKER_NAME,
+        "forged public claim",
+        false,
+    );
+
+    let error = manifest
+        .try_with_checked_replay_summary(summary)
+        .expect_err("a public name-only in-process checker claim must not grant authority");
+    assert!(
+        error
+            .reasons()
+            .iter()
+            .any(|reason| reason.contains("opaque in-process validation seal")),
+        "unexpected rejection reasons: {:?}",
+        error.reasons()
+    );
+}
+
+#[test]
 fn checked_replay_summary_from_json_requires_checker_identity_schema() {
     let manifest = safe_manifest_with_replay_evidence("trust:checked:checker-schema", |_| {});
     let summary = checked_summary_for_manifest(&manifest);

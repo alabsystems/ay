@@ -9,6 +9,7 @@ use crate::Executor;
 use ay_frontend::parse;
 
 mod qf_abv;
+mod qf_abv_bool_range;
 mod qf_aufbv;
 mod qf_bv;
 mod qf_bv_division;

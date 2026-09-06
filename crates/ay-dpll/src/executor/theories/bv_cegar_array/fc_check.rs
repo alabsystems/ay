@@ -16,12 +16,11 @@ impl Executor {
     pub(in crate::executor) fn check_array_fc_violations(
         &mut self,
         sat_model: &[bool],
-        term_bits: &HashMap<TermId, BvBits>,
-        var_offset: i32,
+        lits: &FcAuditLits<'_>,
         next_var_offset: usize,
         already_covered: &mut HashSet<(TermId, TermId)>,
     ) -> CegarArrayCheck {
-        let Some(select_terms) = self.collect_fc_select_terms(term_bits) else {
+        let Some(select_terms) = self.collect_fc_select_terms(lits.term_bits()) else {
             return CegarArrayCheck::Incomplete;
         };
         if select_terms.is_empty() {
@@ -53,39 +52,35 @@ impl Executor {
             let Some(concrete_selects) = self.collect_concrete_fc_selects(
                 selects,
                 sat_model,
-                term_bits,
-                var_offset,
+                lits,
                 &mut build.inspected_bits,
             ) else {
                 return CegarArrayCheck::Incomplete;
             };
 
             // Group by concrete index value, find violations.
-            let mut by_index: HashMap<BigInt, Vec<(TermId, TermId, BigInt)>> = HashMap::default();
-            for (select, index, idx_val, sel_val) in concrete_selects {
+            let mut by_index: HashMap<BigInt, Vec<FcConcreteSelect>> = HashMap::default();
+            for concrete in concrete_selects {
                 by_index
-                    .entry(idx_val)
+                    .entry(concrete.index_value.clone())
                     .or_default()
-                    .push((select, index, sel_val));
+                    .push(concrete);
             }
 
             for group in by_index.values() {
                 if group.len() < 2 {
                     continue;
                 }
-                let first_val = &group[0].2;
-                let has_violation = group.iter().skip(1).any(|entry| entry.2 != *first_val);
+                let first_value = &group[0].value;
+                let has_violation = group
+                    .iter()
+                    .skip(1)
+                    .any(|entry| entry.value != *first_value);
                 if !has_violation {
                     continue;
                 }
 
-                if !self.append_fc_group_refinement(
-                    group,
-                    term_bits,
-                    var_offset,
-                    already_covered,
-                    &mut build,
-                ) {
+                if !self.append_fc_group_refinement(group, already_covered, &mut build) {
                     return CegarArrayCheck::Incomplete;
                 }
             }
@@ -106,31 +101,36 @@ impl Executor {
         &mut self,
         selects: &[(TermId, TermId)],
         sat_model: &[bool],
-        term_bits: &HashMap<TermId, BvBits>,
-        var_offset: i32,
+        lits: &FcAuditLits<'_>,
         inspected_bits: &mut usize,
-    ) -> Option<Vec<(TermId, TermId, BigInt, BigInt)>> {
+    ) -> Option<Vec<FcConcreteSelect>> {
         let mut concrete_selects = Vec::new();
         for &(select_term, index_term) in selects {
-            // Missing bits are incomplete only for a sort the bit-level audit
-            // owns. Other element sorts are checked by model validation.
-            let Some(idx_bits) = term_bits.get(&index_term) else {
+            // A missing literal view is incomplete only for a sort the
+            // bit-level audit owns. Other element sorts are checked by model
+            // validation.
+            let Some(index_lits) = lits.scalar_lits(&self.ctx.terms, index_term) else {
                 if self.fc_audit_owes_bits(index_term) {
                     return None;
                 }
                 continue;
             };
-            let Some(sel_bits) = term_bits.get(&select_term) else {
+            let Some(value_lits) = lits.scalar_lits(&self.ctx.terms, select_term) else {
                 if self.fc_audit_owes_bits(select_term) {
                     return None;
                 }
                 continue;
             };
-            let idx_value =
-                self.concrete_bv_value_bounded(sat_model, idx_bits, var_offset, inspected_bits)?;
-            let select_value =
-                self.concrete_bv_value_bounded(sat_model, sel_bits, var_offset, inspected_bits)?;
-            concrete_selects.push((select_term, index_term, idx_value, select_value));
+            let index_value =
+                self.concrete_value_bounded(sat_model, &index_lits, inspected_bits)?;
+            let value = self.concrete_value_bounded(sat_model, &value_lits, inspected_bits)?;
+            concrete_selects.push(FcConcreteSelect {
+                select: select_term,
+                index_lits,
+                value_lits,
+                index_value,
+                value,
+            });
         }
         Some(concrete_selects)
     }

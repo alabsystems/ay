@@ -363,6 +363,33 @@ fn breach_hard_memory_ceiling() -> ! {
     unsafe { libc::_exit(exit_code) }
 }
 
+/// Register `handler` to run when the process leaves through `exit(3)`.
+///
+/// The only hook that also covers [`std::process::exit`], which runs no
+/// destructor on any thread: the C runtime calls every registered handler on
+/// the way out, whether the process left through `main`, through an unwinding
+/// panic, or through an explicit exit taken deep inside a watchdog thread. That
+/// makes it the one place a process-wide resource — a staging file that has not
+/// been published yet, say — can be released without enumerating every exit
+/// site in the binary and hoping none is ever added.
+///
+/// It does NOT run for the `_exit` in [`breach_hard_memory_ceiling`], for
+/// `abort`, or for a signal that kills the process outright (`SIGKILL` above
+/// all). Callers must stay correct when it never runs.
+///
+/// `handler` runs on the exiting thread with other threads still live, so it
+/// must not block on a lock another thread may hold.
+///
+/// Returns `false` when the C runtime refuses the registration; its table is
+/// finite (POSIX guarantees only 32 entries).
+pub fn at_process_exit(handler: extern "C" fn()) -> bool {
+    // SAFETY: `atexit` only stores the pointer and calls it with no arguments
+    // during `exit(3)`. `handler` already has the exact `extern "C" fn()` ABI
+    // the C runtime will call, and a function pointer is `'static`, so the
+    // referent cannot dangle before the process ends.
+    unsafe { libc::atexit(handler) == 0 }
+}
+
 /// A `#[global_allocator]` wrapper that maintains [`LIVE_BYTES`], the exact
 /// count of live heap bytes, while delegating every allocation to an inner
 /// allocator `A`.

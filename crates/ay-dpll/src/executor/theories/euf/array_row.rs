@@ -25,7 +25,7 @@ impl Executor {
             }
 
             let (array, sel_index) =
-                if let TermData::App(ref sym, ref args) = self.ctx.terms.get(select_term).clone() {
+                if let TermData::App(sym, args) = self.ctx.terms.get(select_term) {
                     if sym.name() == "select" && args.len() == 2 {
                         (args[0], args[1])
                     } else {
@@ -36,7 +36,7 @@ impl Executor {
                 };
 
             let (base_array, store_index, store_value) =
-                if let TermData::App(ref sym, ref args) = self.ctx.terms.get(array).clone() {
+                if let TermData::App(sym, args) = self.ctx.terms.get(array) {
                     if sym.name() == "store" && args.len() == 3 {
                         (args[0], args[1], args[2])
                     } else {
@@ -68,7 +68,7 @@ impl Executor {
             }
 
             let (array, sel_index) =
-                if let TermData::App(ref sym, ref args) = self.ctx.terms.get(select_term).clone() {
+                if let TermData::App(sym, args) = self.ctx.terms.get(select_term) {
                     if sym.name() == "select" && args.len() == 2 {
                         (args[0], args[1])
                     } else {
@@ -79,7 +79,7 @@ impl Executor {
                 };
 
             let (_base_array, store_index, store_value) =
-                if let TermData::App(ref sym, ref args) = self.ctx.terms.get(array).clone() {
+                if let TermData::App(sym, args) = self.ctx.terms.get(array) {
                     if sym.name() == "store" && args.len() == 3 {
                         (args[0], args[1], args[2])
                     } else {
@@ -482,7 +482,7 @@ impl Executor {
         // Extend parent_stores for store aliases. Definitional aliases are
         // unconditional; store-store equalities are guarded by the equality atom.
         for (&store_term, &(alias, guard)) in &store_aliases {
-            if let TermData::App(ref sym, ref args) = self.ctx.terms.get(store_term).clone() {
+            if let TermData::App(sym, args) = self.ctx.terms.get(store_term) {
                 if sym.name() == "store" && args.len() == 3 {
                     parent_stores
                         .entry(alias)
@@ -503,7 +503,7 @@ impl Executor {
             if !self.term_in_array_scope(term_id) {
                 continue;
             }
-            if let TermData::App(ref sym, ref args) = self.ctx.terms.get(term_id).clone() {
+            if let TermData::App(sym, args) = self.ctx.terms.get(term_id) {
                 if sym.name() == "select" && args.len() == 2 {
                     selects.push((term_id, args[0], args[1]));
                 }

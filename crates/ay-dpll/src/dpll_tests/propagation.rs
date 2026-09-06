@@ -134,9 +134,9 @@ fn test_gap9_lra_propagation_bounds_conflict() {
     let three = terms.mk_int(3.into());
 
     // x >= 5
-    let ge_5 = terms.mk_app(Symbol::Named(">=".to_string()), vec![x, five], Sort::Bool);
+    let ge_5 = terms.mk_app(Symbol::named(">="), vec![x, five], Sort::Bool);
     // x <= 3
-    let le_3 = terms.mk_app(Symbol::Named("<=".to_string()), vec![x, three], Sort::Bool);
+    let le_3 = terms.mk_app(Symbol::named("<="), vec![x, three], Sort::Bool);
 
     // Conjunction
     let formula = terms.mk_and(vec![ge_5, le_3]);
@@ -168,9 +168,9 @@ fn test_gap9_lra_propagation_sat() {
     let ten = terms.mk_int(10.into());
 
     // x >= 0
-    let ge_0 = terms.mk_app(Symbol::Named(">=".to_string()), vec![x, zero], Sort::Bool);
+    let ge_0 = terms.mk_app(Symbol::named(">="), vec![x, zero], Sort::Bool);
     // x <= 10
-    let le_10 = terms.mk_app(Symbol::Named("<=".to_string()), vec![x, ten], Sort::Bool);
+    let le_10 = terms.mk_app(Symbol::named("<="), vec![x, ten], Sort::Bool);
 
     // Conjunction
     let formula = terms.mk_and(vec![ge_0, le_10]);
@@ -201,9 +201,9 @@ fn test_gap9_lra_propagation_strict_bounds() {
     let five = terms.mk_int(5.into());
 
     // x > 5
-    let gt_5 = terms.mk_app(Symbol::Named(">".to_string()), vec![x, five], Sort::Bool);
+    let gt_5 = terms.mk_app(Symbol::named(">"), vec![x, five], Sort::Bool);
     // x < 5
-    let lt_5 = terms.mk_app(Symbol::Named("<".to_string()), vec![x, five], Sort::Bool);
+    let lt_5 = terms.mk_app(Symbol::named("<"), vec![x, five], Sort::Bool);
 
     // Conjunction
     let formula = terms.mk_and(vec![gt_5, lt_5]);
@@ -235,7 +235,7 @@ fn test_gap9_lia_propagation_no_integer_solution() {
     let one = terms.mk_int(1.into());
 
     // 2*x
-    let two_x = terms.mk_app(Symbol::Named("*".to_string()), vec![two, x], Sort::Int);
+    let two_x = terms.mk_app(Symbol::named("*"), vec![two, x], Sort::Int);
     // 2*x = 1
     let eq = terms.mk_eq(two_x, one);
 
@@ -268,9 +268,9 @@ fn test_gap9_lia_propagation_sat() {
     let five = terms.mk_int(5.into());
 
     // x >= 0
-    let ge_0 = terms.mk_app(Symbol::Named(">=".to_string()), vec![x, zero], Sort::Bool);
+    let ge_0 = terms.mk_app(Symbol::named(">="), vec![x, zero], Sort::Bool);
     // x <= 5
-    let le_5 = terms.mk_app(Symbol::Named("<=".to_string()), vec![x, five], Sort::Bool);
+    let le_5 = terms.mk_app(Symbol::named("<="), vec![x, five], Sort::Bool);
 
     // Conjunction
     let formula = terms.mk_and(vec![ge_0, le_5]);

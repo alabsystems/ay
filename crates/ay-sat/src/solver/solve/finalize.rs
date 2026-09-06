@@ -55,11 +55,11 @@ impl Solver {
     /// Detaching the last consumer transitions conservatively to no-proof
     /// state without restoring a stale pre-proof control snapshot.
     pub fn take_proof_writer(&mut self) -> Option<ProofOutput> {
-        self.maybe_write_fmla_learned_lrat_dry_run_proof_artifact_from_env();
+        self.maybe_write_configured_fmla_learned_lrat_dry_run_proof_artifact();
         self.detach_proof_writer()
     }
 
-    /// Detach proof output without consulting ambient artifact-export env vars.
+    /// Detach proof output without exporting the configured dry-run artifact.
     ///
     /// Remaining internal LRAT or clause-trace ownership is preserved exactly
     /// as by [`Self::take_proof_writer`].
@@ -92,9 +92,9 @@ impl Solver {
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
         bytes.push(b'\n');
         // Write atomically: serialize to a unique temp file in the same
-        // directory, then rename into place. The destination is a process-global
-        // path (set via FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV), so
-        // multiple solver finalizations can target it concurrently. A plain
+        // directory, then rename into place. Callers may point several solvers
+        // (for example a portfolio's clones) at one destination, so multiple
+        // finalizations can target the same path concurrently. A plain
         // truncate-then-write lets a concurrent reader observe a zero-length file
         // mid-write (seen as flaky "EOF while parsing a value" artifact reads);
         // rename(2) is atomic within a filesystem, so readers always see a
@@ -113,7 +113,17 @@ impl Solver {
         Ok(Some(path.to_path_buf()))
     }
 
-    pub(super) fn maybe_write_fmla_learned_lrat_dry_run_proof_artifact_from_env(&self) {
+    /// Export the dry-run artifact to this solver's *configured* destination.
+    ///
+    /// The destination is explicit per-solver state
+    /// (`set_fmla_learned_lrat_dry_run_artifact_path`) and defaults to `None`,
+    /// so a solver nobody configured writes nothing. This used to read the
+    /// process-global `AY_SAT_FMLA_LEARNED_LRAT_DRY_RUN_ARTIFACT` variable at
+    /// this instant, which meant *every* solve finalization anywhere in the
+    /// process wrote to whatever single path that variable named — unrelated
+    /// solvers silently overwrote each other's artifacts. The environment is
+    /// now resolved exactly once, by the CLI, and installed per solver.
+    pub(super) fn maybe_write_configured_fmla_learned_lrat_dry_run_proof_artifact(&self) {
         #[cfg(test)]
         FMLA_LEARNED_LRAT_DRY_RUN_ARTIFACT_HOOK_CALLS
             .with(|calls| calls.set(calls.get().saturating_add(1)));
@@ -121,18 +131,16 @@ impl Solver {
         if !self.cold.ambient_artifacts_enabled {
             return;
         }
-        let Ok(path) = std::env::var(
-            crate::fmla_runtime_ledger::FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV,
-        ) else {
+        let Some(path) = self.cold.fmla_learned_lrat_dry_run_artifact_path.as_deref() else {
             return;
         };
-        let path = path.trim();
-        if path.is_empty() {
+        if path.as_os_str().is_empty() {
             return;
         }
         if let Err(err) = self.write_fmla_learned_lrat_dry_run_proof_artifact_json(path) {
             eprintln!(
-                "warning: failed to write Fmla learned-LRAT dry-run artifact to {path}: {err}"
+                "warning: failed to write Fmla learned-LRAT dry-run artifact to {}: {err}",
+                path.display()
             );
         }
     }

@@ -454,11 +454,10 @@ mod tests {
     fn cegqi_ground_instance_writer_records_positive_authorized_support() {
         let mut exec = Executor::new();
         let x = exec.ctx.terms.mk_var("x", Sort::Int);
-        let p_x = exec.ctx.terms.mk_app(
-            Symbol::Named("cegqi_writer_p".to_string()),
-            vec![x],
-            Sort::Bool,
-        );
+        let p_x = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("cegqi_writer_p"), vec![x], Sort::Bool);
         let forall = exec
             .ctx
             .terms
@@ -467,21 +466,19 @@ mod tests {
         exec.ctx.assertions.push(forall);
         exec.install_proof_source_provenance(&[forall]);
         let zero = exec.ctx.terms.mk_int(0.into());
-        let p_zero = exec.ctx.terms.mk_app(
-            Symbol::Named("cegqi_writer_p".to_string()),
-            vec![zero],
-            Sort::Bool,
-        );
+        let p_zero = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("cegqi_writer_p"), vec![zero], Sort::Bool);
         let mut values = HashMap::default();
         values.insert("x".to_string(), zero);
         let proof_steps_before = exec.proof_tracker.num_steps();
 
         let one = exec.ctx.terms.mk_int(1.into());
-        let bogus = exec.ctx.terms.mk_app(
-            Symbol::Named("cegqi_writer_p".to_string()),
-            vec![one],
-            Sort::Bool,
-        );
+        let bogus = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("cegqi_writer_p"), vec![one], Sort::Bool);
         assert!(
             !exec.append_cegqi_ground_instance(forall, &values, bogus),
             "a mismatched claimed instance must not receive authority"
@@ -514,7 +511,7 @@ mod tests {
         let mut terms = ay_core::TermStore::new();
         let x = terms.mk_var("x", Sort::Int);
         let zero = terms.mk_int(0.into());
-        let predicate = terms.mk_app(Symbol::Named("p".to_string()), vec![x], Sort::Bool);
+        let predicate = terms.mk_app(Symbol::named("p"), vec![x], Sort::Bool);
         let x_lt_zero = terms.mk_lt(x, zero);
         let body = terms.mk_or(vec![x_lt_zero, predicate]);
         let forall = terms.mk_forall(vec![("x".to_string(), Sort::Int)], body);
@@ -522,7 +519,7 @@ mod tests {
 
         let a = terms.mk_var("a", Sort::Int);
         let five = terms.mk_int(5.into());
-        let ground_mod = terms.mk_app(Symbol::Named("mod".to_string()), vec![a, five], Sort::Int);
+        let ground_mod = terms.mk_app(Symbol::named("mod"), vec![a, five], Sort::Int);
 
         assert!(
             !unsupported_arith_mentions_ce_var(&terms, &[ground_mod], &[(forall, inst)]),
@@ -544,11 +541,7 @@ mod tests {
             .expect("x counterexample variable");
         let five = terms.mk_int(5.into());
         // SYMBOLIC divisor: the CE var itself divides — the bail must stay.
-        let sym_div = terms.mk_app(
-            Symbol::Named("mod".to_string()),
-            vec![five, ce_x],
-            Sort::Int,
-        );
+        let sym_div = terms.mk_app(Symbol::named("mod"), vec![five, ce_x], Sort::Int);
         let state = [(forall, inst)];
 
         assert!(
@@ -579,7 +572,7 @@ mod tests {
             .get("x")
             .expect("x counterexample variable");
         let two = terms.mk_int(2.into());
-        let const_div = terms.mk_app(Symbol::Named("div".to_string()), vec![ce_x, two], Sort::Int);
+        let const_div = terms.mk_app(Symbol::named("div"), vec![ce_x, two], Sort::Int);
         let state = [(forall, inst)];
         assert!(
             !unsupported_arith_mentions_ce_var(&terms, &[const_div], &state),
@@ -604,11 +597,7 @@ mod tests {
             .ce_variables()
             .get("x")
             .expect("x counterexample variable");
-        let zero_div = terms.mk_app(
-            Symbol::Named("div".to_string()),
-            vec![ce_x, zero],
-            Sort::Int,
-        );
+        let zero_div = terms.mk_app(Symbol::named("div"), vec![ce_x, zero], Sort::Int);
         let state = [(forall, inst)];
         assert!(
             unsupported_arith_mentions_ce_var(&terms, &[zero_div], &state),
@@ -641,7 +630,7 @@ mod tests {
         // separate CE-dependent nonlinear product.
         let a = terms.mk_var("a", Sort::Int);
         let five = terms.mk_int(5.into());
-        let ground_mod = terms.mk_app(Symbol::Named("mod".to_string()), vec![a, five], Sort::Int);
+        let ground_mod = terms.mk_app(Symbol::named("mod"), vec![a, five], Sort::Int);
         let state = [(forall, inst)];
         let roots = [ground_mod, product];
 

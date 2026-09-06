@@ -421,3 +421,84 @@ fn veripb_declared_proof_verifies_under_veripb() {
     veripb::run(&checker, &dir.join("php_6_5.cnf"), &proof, &["--cnf"])
         .assert_verified(&veripb::Expect::UNSAT, "declared-checker-sr-gate");
 }
+
+/// A DELETION-HEAVY instance under the pinned checker.
+///
+/// WHY THIS EXISTS, AND WHY PHP(6,5) IS NOT ENOUGH. Until this test,
+/// `veripb_declared_proof_verifies_under_veripb` above was the ONLY place in
+/// the tree where an AY-emitted DIMACS proof met a real VeriPB — and its
+/// instance is PHP(6,5): 30 vars, 81 clauses, solved through the symmetry
+/// route, producing a ~4 KB proof with ZERO deletion lines. None of the
+/// deletion-emitting machinery (level-0 GC, decompose, congruence, BVE,
+/// vivify, reduce_db, OTFS) runs on it.
+///
+/// That gap is not hypothetical: it is exactly how TWO shipped defects
+/// survived. Both were deletion-stream bugs, and both were invisible in-tree
+/// because AY's other proof tests grade against `ay_drat_check`, which shares
+/// drat-trim's leniencies — `pseudo_unit_skips`, `missed_deletes`,
+/// root-satisfied dropping. A green suite was never evidence that VeriPB
+/// accepts.
+///
+///   * `6aa0bbe61c` — a level-0 unit was stated AFTER its reason clause had
+///     been deleted, so nothing could propagate it.
+///   * `b2875b3b6a` — `del spec` was written for UNIT clauses, which DRAT
+///     ignores outright and VeriPB obeys, killing the root fact.
+///
+/// `eq.atree.braun.10` is the cheapest instance that exercises the surface
+/// PHP misses, and it is not a guess: on a binary predating those two fixes
+/// this instance was REJECTED by the pinned checker, and stripping only the
+/// `del spec` lines from that same rejected proof made it verify. So this test
+/// is known to FAIL on the bug it guards, which is the only property that
+/// makes a regression test worth having.
+///
+/// Cost is negligible — 0.05 s to solve, 0.03 s to check, ~46 deletion lines.
+/// The proof is asserted to actually CONTAIN deletions, because a future
+/// change that stopped emitting them would otherwise turn this test green by
+/// making it vacuous.
+#[test]
+fn veripb_deletion_heavy_proof_verifies_under_veripb() {
+    let Some(checker) = veripb::require_checker("declared-checker-sr-gate") else {
+        return;
+    };
+    let cnf = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benchmarks/sat/eq_atree_braun/eq.atree.braun.10.unsat.cnf");
+    assert!(cnf.is_file(), "missing fixture: {}", cnf.display());
+
+    let (dir, _guard) = scratch();
+    let proof = dir.join("veripb_deletion_heavy.pbp");
+    let output = Command::new(env!("CARGO_BIN_EXE_ay"))
+        .arg("solve")
+        .args([
+            "--proof",
+            proof.to_str().unwrap(),
+            "--proof-format",
+            "veripb",
+            "--proof-checker",
+            "veripb",
+            "--no-verify-proof",
+            "--competition",
+        ])
+        .arg(&cnf)
+        .output()
+        .expect("failed to run ay");
+    let code = output.status.code().expect("ay died on a signal");
+    assert_eq!(
+        code,
+        20,
+        "eq.atree.braun.10 must be UNSAT (exit 20); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The whole point of this fixture. Without deletions it degenerates into a
+    // second, slower PHP test and stops guarding anything.
+    let text = std::fs::read_to_string(&proof).expect("proof is readable");
+    let deletions = text.lines().filter(|l| l.starts_with("del ")).count();
+    assert!(
+        deletions > 0,
+        "fixture no longer exercises the deletion stream: 0 `del` lines in {}",
+        proof.display()
+    );
+
+    veripb::run(&checker, &cnf, &proof, &["--cnf"])
+        .assert_verified(&veripb::Expect::UNSAT, "declared-checker-sr-gate");
+}

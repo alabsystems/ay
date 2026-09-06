@@ -24,6 +24,8 @@ mod allsat_phase1_8777;
 
 #[path = "group_cli/dimacs_sat_exit_codes.rs"]
 mod dimacs_sat_exit_codes;
+#[path = "group_cli/proof_staging_abnormal_exit.rs"]
+mod proof_staging_abnormal_exit;
 #[path = "group_cli/reexec_supervisor_gate.rs"]
 mod reexec_supervisor_gate;
 #[path = "group_cli/uncertifiable_symmetry_refusal.rs"]
@@ -187,6 +189,10 @@ mod stats_schema_contract;
 
 #[path = "group_cli/sigterm_unknown_8674.rs"]
 mod sigterm_unknown_8674;
+
+#[cfg(unix)]
+#[path = "group_cli/supervisor_sigkill_orphan.rs"]
+mod supervisor_sigkill_orphan;
 
 #[path = "group_cli/solution_visualization_8702.rs"]
 mod solution_visualization_8702;

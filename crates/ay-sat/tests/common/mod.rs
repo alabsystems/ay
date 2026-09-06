@@ -158,7 +158,31 @@ pub fn load_optional_benchmark(path: impl AsRef<Path>) -> Option<String> {
         eprintln!("SKIP (loud): benchmark-dependent test: {message}");
         return None;
     }
-    Some(read_benchmark_file(path))
+    Some(strip_satlib_trailer(&read_benchmark_file(path)))
+}
+
+/// Drop the historical SATLIB trailer — a `%` on its own line, then `0` — that
+/// terminates the clause list in the SATLIB `uf*`/`uuf*` archives.
+///
+/// `%` is not valid DIMACS and every consumer here rejects it. CaDiCaL 3.0.0
+/// aborts with `parse error: expected digit or '-'`, producing no `s` line, so
+/// oracle comparisons silently degraded to `Unknown`; `ay_drat_check`'s parser
+/// fails with `bad literal '%'`. Together those killed three soundness gates
+/// (uf200-01, uuf250-01 baselines) that were asserting against a dead oracle.
+///
+/// Stripping at the load boundary — rather than relaxing the gates to accept
+/// `Unknown` — is deliberate: the assertions are the gate, and weakening them
+/// would disable the check instead of repairing it.
+fn strip_satlib_trailer(cnf: &str) -> String {
+    let mut out = String::with_capacity(cnf.len());
+    for line in cnf.lines() {
+        if line.trim_start().starts_with('%') {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Read a benchmark file, decompressing `.xz` files via the `xz` command.

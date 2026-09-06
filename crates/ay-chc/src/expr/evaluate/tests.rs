@@ -287,6 +287,29 @@ fn test_evaluate_expr_eq_array_overwrite_uses_last_store_wins_1753() {
 }
 
 #[test]
+fn test_array_equality_different_defaults_abstains_on_finite_covered_domain() {
+    // These values are extensionally equal when the index sort is Bool: both
+    // map false and true to true. `SmtValue` intentionally carries no index
+    // sort, however, so the equality helper cannot prove that the two entries
+    // cover the whole domain. In particular, the different stored defaults
+    // are not evidence of disequality. The only sound answer is Unknown.
+    let fully_covered_true = SmtValue::ArrayMap {
+        default: Box::new(SmtValue::Bool(false)),
+        entries: vec![
+            (SmtValue::Bool(false), SmtValue::Bool(true)),
+            (SmtValue::Bool(true), SmtValue::Bool(true)),
+        ],
+    };
+    let const_true = SmtValue::ConstArray(Box::new(SmtValue::Bool(true)));
+
+    assert_eq!(
+        smt_values_equal(&fully_covered_true, &const_true),
+        None,
+        "different stored defaults cannot prove array disequality"
+    );
+}
+
+#[test]
 fn test_evaluate_expr_nested_store_select() {
     let model = FxHashMap::default();
     // store(store(const(false), bv0, true), bv1, true)

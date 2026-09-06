@@ -101,7 +101,19 @@ pub(super) fn bve_focused_config() -> SolverConfig {
             backbone: false,
             symmetry: false,
             reorder: true,
-            cce: true,
+            // CCE is DISABLED here deliberately: BVE + CCE together drop
+            // constraints. On minandmaxor128 (officially UNSAT, CaDiCaL proves
+            // it in 231 s) this config reaches a satisfying assignment of the
+            // internal formula in 8.4 s; the finalize gate catches it and
+            // demotes to UNKNOWN, so no wrong answer escapes, but that gate is
+            // the only barrier. Isolation: `bve` alone clean, `bve,bce` clean,
+            // `bve,cce` produces the phantom model — reproduced byte-identically
+            // on sudoku-N30-11, so it is deterministic, not a race. Re-enable
+            // only once covered-clause reconstruction (or CCE's occurrence
+            // handling after BVE elimination) is fixed AND a regression fixture
+            // exists. CCE also measured as converting 0 of 6 instances, so this
+            // costs nothing.
+            cce: false,
         },
         initial_phase: Some(true),
         seed: 5,

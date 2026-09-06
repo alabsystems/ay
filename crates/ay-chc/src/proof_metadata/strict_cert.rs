@@ -34,13 +34,12 @@ enum ChcObligationStrictCertWire {
 /// Strict proof-bundle commitments for one UNSAT replay obligation.
 ///
 /// A v2 row records that AY's producer-independent bundle checker accepted the
-/// exact query-bound bundle with complete quality. It retains the serialized
-/// bundle's digest, not its bytes: the row is an in-process checked commitment,
-/// not standalone/offline evidence. Standalone replay would require a future
-/// evidence-carriage extension. Alethe is an optional presentation digest only;
-/// absence is represented explicitly and never fabricated. Legacy v1
-/// Alethe-required rows remain parseable without changing the surrounding
-/// checked-summary/transcript v1 schemas.
+/// exact query-bound bundle with complete quality. The summary row retains the
+/// serialized bundle's digest; a sealed [`super::ChcCheckedReplayRun`] also
+/// retains the exact bytes and exposes them only paired with this row. Alethe
+/// is an optional presentation digest only; absence is represented explicitly
+/// and never fabricated. Legacy v1 Alethe-required rows remain parseable
+/// without changing the surrounding checked-summary/transcript v1 schemas.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ChcObligationStrictCert {
@@ -70,6 +69,10 @@ impl ChcObligationStrictCert {
             verdict: verdict.into(),
             wire: ChcObligationStrictCertWire::BundleV2,
         }
+    }
+
+    pub(super) fn is_current_bundle_commitment(&self) -> bool {
+        matches!(self.wire, ChcObligationStrictCertWire::BundleV2)
     }
 
     fn new_legacy(

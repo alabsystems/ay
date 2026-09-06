@@ -31,30 +31,50 @@
 //! `soli` logs the incumbent, which both proves the upper bound and installs the
 //! objective-improving row `-Σ c_v x_v >= 1 - optimum`. At a node with variables
 //! fixed to 1 (`F1`) and 0 (`F0`), take non-negative integer row multipliers `Y`
-//! and an objective multiplier `qo`, and form
+//! and an objective multiplier `qo`, and form the single AGGREGATE ROW
 //!
 //! ```text
-//!     Σ_c Y_c · row_c                                  ->  Σ_v A_v x_v >= G
-//!   + qo · (the soli row)                              ->  coefficient A_v - qo·c_v
-//!   + max(0, coef_v) copies of `~x_v >= 0`, free v     (cancels a positive coef)
-//!   + (max(0, coef_v) - coef_v) copies of `x_v >= 0`   (cancels the rest)
-//!   + the same two axioms on the FIXED v               (zeroes them, or leaves
-//!                                                       the sign that normalises
-//!                                                       into a branch literal)
+//!     Σ_c Y_c · row_c  +  qo · (the soli row)   ->   Σ_v coef_v x_v >= G
 //! ```
 //!
-//! Every FREE variable's coefficient cancels exactly, so what survives is
-//! supported only on the branch literals, with NORMALIZED degree
+//! with `coef_v = Σ_c Y_c A[c,v] - qo·c_v` and `G = Σ_c Y_c b_c + qo·(1 - optimum)`.
+//! The MOST that left-hand side can reach under this node's fixings is
+//! `Σ_{v ∈ F1} coef_v + Σ_{v free} max(0, coef_v)`, so
 //!
 //! ```text
-//!     R = G + qo·(1 - optimum) - Σ_{v free} max(0, coef_v) - Σ_{v ∈ F1} coef_v
+//!     R = G - Σ_{v free} max(0, coef_v) - Σ_{v ∈ F1} coef_v  >  0
+//! ```
+//! says exactly that THE NODE'S FIXINGS FALSIFY THE AGGREGATE ROW. That is
+//! precisely the premise reverse unit propagation needs, so the leaf is
+//!
+//! ```text
+//!     pol  <the aggregate row>                        ;
+//!     rup  Σ_{v ∈ F1} ~x_v + Σ_{v ∈ F0} x_v  >= 1     ;
 //! ```
 //!
-//! and one division `; d K` with `K = max(R, largest surviving coefficient)`
-//! rounds every coefficient and the degree to 1: the CLAUSE
-//! `Σ_{v ∈ F1} ~x_v + Σ_{v ∈ F0} x_v >= 1`. Internal nodes are plain resolution
-//! (`pol c1 c0 + s ;`) and the root clause is EMPTY — the contradiction that
-//! justifies `conclusion BOUNDS optimum optimum`.
+//! — negating that clause fixes every branch literal, the aggregate row's slack
+//! goes negative with no propagation needed, and the clause is derived.
+//! Internal nodes are plain resolution (`pol c1 c0 + s ;`) and the root clause
+//! is EMPTY — the contradiction that justifies
+//! `conclusion BOUNDS optimum optimum`.
+//!
+//! # Why there are no literal axioms here
+//!
+//! The route's first form CANCELLED every free coefficient with `max(0, coef_v)`
+//! copies of `~x_v >= 0` and `max(0, coef_v) - coef_v` copies of `x_v >= 0`, so
+//! that a single `d K` could round what survived into the same clause. That is
+//! sound and it is what the Python prototype emitted, but the axioms are
+//! BOOKKEEPING, not evidence: they carry one term per variable with a non-zero
+//! aggregate coefficient, which on the measured instances is thousands of terms
+//! per leaf against a handful of branch literals. `rup` needs the row falsified,
+//! not cancelled, and `R > 0` already says it is — so the axiom block and the
+//! division come out and no leaf is lost.
+//!
+//! The self-check does NOT take that on faith. `cp_replay` models the `rup` rule
+//! itself — normalized slack, weight-versus-slack propagation, conflict on
+//! negative slack, and the transitive reasons of that conflict for the `soli`
+//! taint — so a `rup` line the database does not actually imply is refused by
+//! the route's own guard before the pinned checker ever sees it.
 //!
 //! # Two defects the prototype measured on itself, and how this port avoids them
 //!
@@ -104,7 +124,7 @@ use num_traits::{Signed, ToPrimitive, Zero};
 
 use super::cp_replay::self_check_soli_refutation;
 use super::{evaluate_linear_objective, format_assignment};
-use crate::optimize::lp_bound::lp_dual_raw_diagnosed;
+use crate::optimize::lp_bound::{lp_dual_raw_diagnosed, LpDualDecline};
 use crate::proof::steps::{ConstraintId, ProofStep};
 use crate::proof::veripb::{veripb_input_constraint_count, VeriPbWriter};
 use crate::types::{PbConstraint, PbInstance, PbLit, PbObjective, PbRel, PbTerm};
@@ -164,6 +184,175 @@ const MAX_DEPTH: usize = 512;
 ///   certifies once the root gets its 4096.
 const MAX_ROOT_LP_POLLS: u64 = 4_096;
 const MAX_NODE_LP_POLLS: u64 = 128;
+
+/// The FIRST allowance a node LP below the root is given, before
+/// [`MAX_NODE_LP_POLLS`] is spent on it.
+///
+/// # Why two passes, and why the escalation test is REFUSAL and not tightness
+///
+/// `lp_dual_raw_diagnosed` runs a cheap `f64`-certified tier and then, ONLY IF
+/// that tier's bound did not reach the target, an exact rational simplex. At a
+/// node that closes, the cheap tier usually reaches the target and the exact
+/// tier never runs. At a node that does NOT close — every internal node, which
+/// is half the tree — the exact tier ALWAYS runs, and it is where the polls go.
+/// Its whole product there is a branching hint.
+///
+/// Measured, `dominating_set`-style instance `m100_300_10_20.r` at an unbounded
+/// budget: the tree is 1,443 nodes / 722 leaves and the proof is
+/// BYTE-IDENTICAL (2,540,174 B) at per-node caps of 128, 64, 32 and 16 — while
+/// the poll count falls 102,375 -> 56,295 -> 33,255 -> 21,735. Every one of
+/// those 80,640 extra polls bought nothing at all, and they are the difference
+/// between a certificate and a decline: 32,768 is the global budget.
+///
+/// The opposite instances exist too, which is why a flat small cap is the wrong
+/// answer: at 16, `addm4.r` goes 73 nodes -> 2,808 and declines, `fir04_trarea_ac`
+/// 3 -> 995, and at 32 `f20c10b_008_area_delay` 49 -> 1,512. All three are
+/// conversions this route makes today.
+///
+/// What separates the two populations is not how TIGHT the cheap pass is but
+/// whether it returns a dual point AT ALL. On `m100_300_10_20.r` at 16 polls
+/// every node's LP answers (`guided=0`). On `addm4.r` at 16, `1,433` of `2,808`
+/// nodes get no point (`guided=1433`); on `fir04_trarea_ac`, `511` of `995`; on
+/// `f20c10b_008_area_delay` at 32, `1,435` of `2,734`. So the escalation test is
+/// exactly that refusal — a fact the fast pass REPORTS, with no threshold to
+/// tune and no unit to get wrong.
+///
+/// A refusing node therefore pays `16 + 128` where it used to pay `128`; a node
+/// whose LP answers pays `16` where it used to pay up to `128`.
+///
+/// ONLY A BUDGET REFUSAL BUYS THE SECOND PASS. See
+/// [`refusal_can_change_with_a_bigger_budget`]: escalating a refusal the poll
+/// count cannot change re-solves the identical model to the identical answer,
+/// which on the 17 instances the static LP size cap rejects meant building a
+/// 61,821-row node model TWICE PER NODE for nothing.
+const MAX_NODE_LP_POLLS_FAST: u64 = 16;
+
+/// Deterministic cap on the BLIND-BRANCHING PATH: how many nodes this search
+/// may branch WITHOUT a fresh relaxation of its own to steer them.
+///
+/// # The wall this closes, measured
+///
+/// Before the fallback branch rule existed, one node's refused LP ended the
+/// WHOLE search (`Exhausted` propagates to the root). Removing that is right —
+/// a fact about one node's LP budget says nothing about whether the tree closes
+/// — but it uncovered a cost that had been hidden behind the accident: an
+/// instance whose LP refuses at EVERY node no longer stops at node 1, it walks
+/// to [`MAX_NODES`] or [`MAX_DEPTH`]. Measured back-to-back on this box, the
+/// route's own `ms`, against `8ccb70761`:
+///
+/// ```text
+///   50-250-false-45-90-4-2000opt        75 ms ->  32,726 ms   (436x, 4,097 nodes)
+///   single-obj-f50-DC_side2            307 ms ->  17,354 ms   ( 57x,   513 nodes)
+///   kdessh.cudf.trendy               1,179 ms ->  11,608 ms   (9.8x,   991 nodes)
+///   vertexcover_..._dim_071          3,948 ms -> 240,728 ms   ( 61x,   219 nodes)
+///   single-obj-f17-DCdoubleLoss      8,768 ms -> 630,144 ms   ( 72x,   264 nodes)
+/// ```
+///
+/// None of it is interruptible and none of it produces anything: 17 of those
+/// instances spend `polls=0/32768` across 513-4,097 nodes because the LP was
+/// refused UNREAD by a static size cap, so the one budget that did bound the
+/// route never advanced at all.
+///
+/// # Why a count, and why THIS count
+///
+/// A blind node is exactly a node the relaxation declined to steer, so counting
+/// them charges the path that the poll budget cannot see. It is a COUNT and not
+/// a clock for the reason every other budget here is: the emitted bytes must be
+/// the same on a loaded box as on an idle one.
+///
+/// SIZED FROM THE MEASURED PRODUCT OF THAT PATH, WHICH IS ZERO. Every one of the
+/// seven instances this route certifies walks `guided=0` — not one of them
+/// branches blind even once — so no value of this cap can cost a certificate,
+/// and that is arithmetic rather than hope. Across all 50 `SEARCH-PROOF-GAP`
+/// instances, at every budget probed, blind branching converted NOTHING.
+///
+/// WHY 16 AND NOT SOMETHING ROOMIER.
+///
+/// THERE IS NO GAP. An earlier version of this comment said the corpus's blind
+/// counts are `0, 1, 14, 145, 154, 177, 184, 190, 217, 243, 512, 1135, 3916+`,
+/// that nothing lives between 14 and 145, and therefore that "every cap from 15
+/// to 144 binds on exactly the same instances". That is FALSE, and the
+/// counterexample is in the same corpus (r6 probe `31e8ef02…`, deterministic
+/// counts, re-measured for this merge):
+///
+/// ```text
+///   normalized-ssa7552-159       nodes=271 leaves=82 blind=142 polls=32771/32768
+///   normalized-single-obj-f3-..  nodes=222 leaves=29 blind=178 polls=32771/32768
+/// ```
+///
+/// `142` sits inside the interval declared empty, so caps 15..=141 bind on
+/// `ssa7552-159` and caps 142..=144 do not; `178` is a second value the list
+/// omits. The enumerated list is NOT a complete census of the corpus and must
+/// not be read as one.
+///
+/// WHAT ACTUALLY SIZES THIS CAP is the pair of one-sided facts below, neither of
+/// which needs the list: the cap must be >= 14 to keep `9symml`'s gain, and
+/// among the caps that do, the smallest measured is the cheapest. That is the
+/// whole argument, and it survives the correction. Measured back-to-back on this
+/// box, the route's own `ms`:
+///
+/// ```text
+///                                  BASE      cap 8   cap 16   cap 64  cap 192   r6 (uncapped)
+///   50-250-..-2000opt                75        116      150      364      941      32,726
+///   single-obj-f50-DC_side2         307        317      343      444      828      17,354
+///   kdessh.cudf.trendy            1,179      1,108    1,185    1,768    3,305      11,608
+///   vertexcover_..._dim_071       3,948     13,466   22,923   77,801  226,364     240,728
+/// ```
+///
+/// 16 is the FLOOR of that range rather than 8 because `9symml` branches blind
+/// 14 times on its way from 403 nodes to 1,859, and that gain is one this cap
+/// is meant to keep. What 16 gives up is MORE THAN THE FOUR an earlier version
+/// of this comment named (`ii16d2` at 145 and the three `injcomp_4layers` at
+/// 154-184). Every instance re-measured for this merge trips the cap:
+///
+/// ```text
+///   ssa7552-159 142   ii16d2 145   single-obj-f3 178   vertexcover_..071 217
+///   f20c10b_011 512   single-obj-f50 512   kdessh.cudf.trendy 512
+///   sporttournament18 1,135   50-250-..-2000opt 3,916
+/// ```
+///
+/// NONE of them converts at any budget measured, so the cap costs no
+/// certificate; their extra nodes cost 2.2-3.7x wall, so the trade is a decline
+/// that arrives sooner. Note that 142 and 178 also mean the give-up set is NOT
+/// identical across 16, 64, 128 and 144 — the claim that it was is corrected
+/// above.
+const MAX_BLIND_NODES: u64 = 16;
+
+/// How many nodes the search opens before it will consult the caller's
+/// `should_stop` at all.
+///
+/// # Why this rung may be interrupted, and why not from node 1
+///
+/// This is an UNSCHEDULED rung: it is called outside [`CertRouteBudget`]
+/// precisely so that a CLI whose deadline is already spent — the normal case,
+/// since certification runs after the search — still gets it. Polling
+/// `should_stop` from the first node would hand that caller a decline instead of
+/// the certificate it gets today.
+///
+/// But "not scheduled" was allowed to mean "not stoppable", and a route that
+/// cannot be stopped is one a `--timeout` cannot bound: `single-obj-f17` spent
+/// 10.5 uninterruptible minutes inside a rung whose caller had asked for less.
+///
+/// COUNTS reconcile the two, and it takes TWO of them because this route spends
+/// two things. `m100_300_10_20.r` is the heaviest certificate on both: 1,443
+/// nodes and 21,735 polls; every other conversion is under 400 nodes and under
+/// 12,000 polls. 2,048 and 24,576 clear those with 1.42x and 1.13x headroom —
+/// the same margin [`MAX_TOTAL_LP_POLLS`] carries over ITS heaviest consumer.
+///
+/// A node bound alone would not have been enough, and that is measured rather
+/// than assumed. `knapPI_14_10000_1000_2` declines at 316 nodes and 197 s;
+/// `composed_pebbling_..._height13` at 261 nodes and 183 s. Both are FAR under
+/// any node envelope while spending the whole 32,768-poll budget, because their
+/// cost is per-poll and not per-node — one poll ranges 0.11 ms to 26 ms across
+/// this corpus. A route bounded in two currencies has to be escapable in both.
+///
+/// Every certificate this route produces is therefore emitted before the first
+/// poll of the stop signal, and everything past its certifying envelope is
+/// stoppable. An interrupt can only ever turn a certificate into a decline; it
+/// can never change a byte of one, which is what keeps the emitted proof
+/// load-invariant.
+const MAX_UNINTERRUPTIBLE_NODES: u64 = 2_048;
+const MAX_UNINTERRUPTIBLE_POLLS: u64 = 24_576;
 
 /// Deterministic work cap for ALL node LP solves together. Bounds the route
 /// independently of how many nodes turn out to be cheap, and — because this is
@@ -226,6 +415,29 @@ const LEAF_SCALES: [i128; 11] = [1, 2, 4, 12, 48, 256, 1_024, 4_096, 65_536, 262
 /// Largest common denominator admitted when the EXACT clearing is attempted.
 /// Mirrors `lp_dual_floor::MAX_DUAL_SCALE`.
 const MAX_LEAF_SCALE: i128 = 1 << 20;
+
+/// How many ancestor multiplier vectors the search carries down the tree and
+/// replays at every node BEFORE it pays for an LP.
+///
+/// # Why replaying an ancestor's multipliers is free AND monotone
+///
+/// Fix `Y` and `qo`. `try_leaf`'s degree is
+/// `R = G + qo(1-optimum) - Σ_{v free} max(0, coef_v) - Σ_{v ∈ F1} coef_v`, so
+/// moving one variable OUT of `free` changes exactly one term: to `F1` it
+/// becomes `-coef_v` (a gain of `max(0, -coef_v) >= 0`) and to `F0` it drops
+/// (a gain of `max(0, coef_v) >= 0`). Either way `R` can only GROW as the tree
+/// descends. So a multiplier vector that failed at an ancestor is a valid, and
+/// strictly better, candidate at every descendant — and testing it costs no
+/// LP poll at all, only one pass over the cited rows.
+///
+/// That matters here because POLLS, not nodes, are what actually stop this
+/// route: `MAX_TOTAL_LP_POLLS / MAX_NODE_LP_POLLS = 256`, so a decline exhausts
+/// its budget after ~256 nodes however large `MAX_NODES` is.
+///
+/// SIZED small on purpose. Each entry costs one `try_leaf` per node — a pass
+/// over `num_vars` plus the cited rows — and the entries that pay are the near
+/// ones (a sibling's closing combination) and the root's, not a long history.
+const MAX_DUAL_POOL: usize = 8;
 
 /// What the search concluded. Three outcomes, and the whole point of the type is
 /// that the middle one is NOT the last one.
@@ -292,14 +504,34 @@ struct Stats {
     farkas: u64,
     depth: usize,
     polls: u64,
+    /// Leaves closed by a REPLAYED ancestor multiplier vector, with no LP solve
+    /// of their own. A subset of `leaves`, reported separately because it is the
+    /// number that says whether carrying the pool paid for itself.
+    replays: u64,
+    /// Nodes whose branch variable came from an INHERITED point or from the
+    /// objective, because this node's own LP produced none. Reported because it
+    /// is the number that says how much of the tree was walked without a fresh
+    /// relaxation to steer it.
+    guided: u64,
+    /// Nodes whose fast LP pass refused and which therefore paid for the full
+    /// one as well. See [`MAX_NODE_LP_POLLS_FAST`].
+    escalations: u64,
 }
 
 impl std::fmt::Display for Stats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "nodes={}/{MAX_NODES} leaves={} farkas={} depth={}/{MAX_DEPTH} polls={}/{MAX_TOTAL_LP_POLLS}",
-            self.nodes, self.leaves, self.farkas, self.depth, self.polls
+            "nodes={}/{MAX_NODES} leaves={} replays={} guided={} escalations={} farkas={} \
+             depth={}/{MAX_DEPTH} polls={}/{MAX_TOTAL_LP_POLLS}",
+            self.nodes,
+            self.leaves,
+            self.replays,
+            self.guided,
+            self.escalations,
+            self.farkas,
+            self.depth,
+            self.polls
         )
     }
 }
@@ -435,19 +667,18 @@ impl Model {
 }
 
 /// The exact integer leaf certificate: non-negative row multipliers `ys`, the
-/// objective/`soli` multiplier `qo`, and everything the `pol` line needs.
+/// objective/`soli` multiplier `qo`, and the branch clause they refute.
 struct Leaf {
     /// `(row index, multiplier)`, multipliers strictly positive, rows ascending.
     ys: Vec<(usize, i128)>,
     /// Multiplier on the `soli`-installed row. `0` for a Farkas leaf, which
     /// closes on row infeasibility alone and must not cite the objective.
     qo: i128,
-    /// `x_v >= 0` axiom multiplicities.
-    axiom_pos: Vec<(usize, i128)>,
-    /// `~x_v >= 0` axiom multiplicities.
-    axiom_neg: Vec<(usize, i128)>,
-    /// The divisor that rounds the surviving row to the branch clause.
-    divisor: i128,
+    /// The branch clause, as `(0-based variable, negated)` literals: `~x_v` for
+    /// a variable this node fixed to 1, `x_v` for one it fixed to 0. Recorded
+    /// HERE rather than re-read from the search's `fixed` vector at emission
+    /// time so the clause cannot drift from the `R > 0` test that licensed it.
+    clause: Vec<(usize, bool)>,
     /// The clause's support, as 0-based variable indices.
     support: BTreeSet<usize>,
 }
@@ -458,10 +689,17 @@ struct Leaf {
 /// This is the soundness boundary of the whole route. `ys` and `qo` are
 /// proposals — from a float-guided LP, from a rational dual, from a single row,
 /// it does not matter — and nothing about where they came from is trusted. Every
-/// coefficient of the combination is recomputed here, the axiom multiplicities
-/// are chosen to be the SMALLEST that cancel each free variable (which is also
-/// the choice that maximises `R`, so a slack dual costs tightness and never
-/// correctness), and `R <= 0` returns `None`.
+/// coefficient of the combination is recomputed here, each free variable is
+/// charged the SMALLEST cancellation that covers it (which is also the choice
+/// that maximises `R`, so a slack dual costs tightness and never correctness),
+/// and `R <= 0` returns `None`.
+///
+/// `R` is computed as `G - Σ_{v free} max(0, c_v) - Σ_{v ∈ F1} c_v`, which is
+/// the aggregate row's degree minus the MOST its left-hand side can reach under
+/// this node's fixings. So `R > 0` is not merely the condition under which the
+/// axioms cancel: it is literally the statement that the node's fixings FALSIFY
+/// the aggregate row — which is what makes the branch clause reverse-unit-
+/// propagate from it. See [`Search::emit_leaf`].
 fn try_leaf(
     model: &Model,
     fixed: &[Option<bool>],
@@ -494,47 +732,37 @@ fn try_leaf(
     // (`1 - optimum` per unit of `qo`) and is then charged for every axiom that
     // carries a `-1` into the degree: the `~x_v >= 0` copies.
     let mut degree = aggregate_degree.checked_add(qo.checked_mul(1_i128.checked_sub(optimum)?)?)?;
-    let mut axiom_pos: Vec<(usize, i128)> = Vec::new();
-    let mut axiom_neg: Vec<(usize, i128)> = Vec::new();
+    let mut clause: Vec<(usize, bool)> = Vec::new();
     let mut support = BTreeSet::new();
-    let mut widest = 0_i128;
     for var in 0..model.num_vars {
         let c = coefficient[var];
         match fixed[var] {
-            // FREE: cancel exactly. `W = max(0, c)` copies of `~x_v` and
-            // `W - c` copies of `x_v` sum to `-c`, and `W` is the least
-            // non-negative choice with `W >= c`, so it is also the one that
-            // takes the least out of the degree.
+            // FREE: the most it can contribute is `max(0, c)`, so that is what
+            // the degree is charged. This is the least such charge, hence the
+            // largest surviving `R`.
             None => {
                 if c > 0 {
                     degree = degree.checked_sub(c)?;
-                    axiom_neg.push((var, c));
-                } else if c < 0 {
-                    axiom_pos.push((var, c.checked_neg()?));
                 }
             }
-            // FIXED TO 1: a positive coefficient is cancelled by `~x_v` copies
-            // (charging the degree); a negative one is LEFT, and normalisation
-            // turns it into the branch literal `~x_v` while adding `|c|` back to
-            // the normalized degree. `- c` covers both cases in one term.
+            // FIXED TO 1: it contributes exactly `c`, of either sign, so `- c`
+            // covers both cases in one term. A negative `c` is a coefficient the
+            // fixing is CARRYING, and dropping the fixing would undo the leaf —
+            // so `~x_v` joins the branch clause.
             Some(true) => {
                 degree = degree.checked_sub(c)?;
-                if c > 0 {
-                    axiom_neg.push((var, c));
-                } else if c < 0 {
+                if c < 0 {
                     support.insert(var);
-                    widest = widest.max(c.checked_neg()?);
+                    clause.push((var, true));
                 }
             }
-            // FIXED TO 0: a negative coefficient is cancelled by `x_v` copies
-            // (degree 0, so free); a positive one is LEFT as the branch literal
-            // `x_v`.
+            // FIXED TO 0: it contributes nothing, so the degree is unchanged. A
+            // positive `c` is a contribution the fixing is SUPPRESSING, so
+            // `x_v` joins the branch clause.
             Some(false) => {
                 if c > 0 {
                     support.insert(var);
-                    widest = widest.max(c);
-                } else if c < 0 {
-                    axiom_pos.push((var, c.checked_neg()?));
+                    clause.push((var, false));
                 }
             }
         }
@@ -542,16 +770,10 @@ fn try_leaf(
     if degree <= 0 {
         return None;
     }
-    // `d K` with `K = max(R, widest surviving coefficient)` rounds every
-    // coefficient up to 1 (each is in `1..=K`) and the degree up to 1
-    // (`R` is in `1..=K`): exactly the branch clause.
-    let divisor = degree.max(widest);
     Some(Leaf {
         ys: ys.to_vec(),
         qo,
-        axiom_pos,
-        axiom_neg,
-        divisor,
+        clause,
         support,
     })
 }
@@ -792,6 +1014,24 @@ fn solve_node_lp(
     })
 }
 
+/// Whether re-running [`solve_node_lp`] on the SAME node with a bigger poll
+/// allowance could give a different answer.
+///
+/// [`LpDualDecline::NoDualPoint`] is the only refusal in the whole set that is
+/// about the budget. Every other one — a static size cap that rejected the model
+/// UNREAD, a row already violated by the fixings, an empty free objective, an
+/// overflow — is a fact about this node's model, decided before a single poll is
+/// spent and identical however many are offered. Escalating those re-builds the
+/// node model and re-derives the same refusal, which on the 17 corpus instances
+/// the size cap rejects is a second pass over up to 61,821 rows PER NODE for an
+/// answer already in hand.
+///
+/// Comparing against `label()` rather than a literal keeps the two ends from
+/// drifting: if the decline is ever renamed, this predicate moves with it.
+fn refusal_can_change_with_a_bigger_budget(reason: &str) -> bool {
+    reason == LpDualDecline::NoDualPoint.label()
+}
+
 /// Completes a node's fixings with an LP point and returns the assignment ONLY
 /// if it is a genuine counterexample to the claimed optimum.
 ///
@@ -810,7 +1050,7 @@ fn witness_from_point(
     instance: &PbInstance,
     model: &Model,
     fixed: &[Option<bool>],
-    point: Option<&Vec<(usize, BigRational)>>,
+    point: Option<&[(usize, BigRational)]>,
     optimum: i128,
 ) -> Option<(Vec<bool>, i128)> {
     let mut assignment = vec![false; model.num_vars];
@@ -837,8 +1077,8 @@ fn witness_from_point(
     (value < optimum).then_some((assignment, value))
 }
 
-/// Formats one `pol` line: `Σ operand·multiplier` then an optional `d divisor`.
-fn pol_line(terms: &[(String, i128)], divisor: i128) -> Option<String> {
+/// Formats one `pol` line: `Σ operand·multiplier`.
+fn pol_line(terms: &[(String, i128)]) -> Option<String> {
     let mut expression = String::new();
     for (operand, multiplier) in terms {
         if *multiplier <= 0 {
@@ -858,11 +1098,21 @@ fn pol_line(terms: &[(String, i128)], divisor: i128) -> Option<String> {
     if expression.is_empty() {
         return None;
     }
-    if divisor != 1 {
-        expression.push_str(&format!(" {divisor} d"));
-    }
     expression.push_str(" ;");
     Some(expression)
+}
+
+/// Formats a branch clause as the inline OPB constraint a `rup` line carries:
+/// `1 ~x3 1 x7 >= 1 ;`. An EMPTY clause renders as `>= 1 ;`, the contradiction.
+fn clause_body(clause: &[(usize, bool)]) -> Option<String> {
+    let mut body = String::new();
+    for &(var, negated) in clause {
+        let index = var.checked_add(1)?;
+        let tilde = if negated { "~" } else { "" };
+        body.push_str(&format!("1 {tilde}x{index} "));
+    }
+    body.push_str(">= 1 ;");
+    Some(body)
 }
 
 /// The mutable state one depth-first search carries.
@@ -876,8 +1126,18 @@ struct Search<'a> {
     writer: VeriPbWriter<Vec<u8>>,
     polls: std::cell::Cell<u64>,
     stats: Stats,
+    /// Ancestor multiplier vectors, replayed at every node before the LP runs.
+    /// Slot 0, once filled, is the ROOT's — the strongest global dual this
+    /// search ever sees, because the root is the only solve that gets
+    /// `MAX_ROOT_LP_POLLS`. See [`MAX_DUAL_POOL`].
+    pool: Vec<(Vec<(usize, i128)>, i128)>,
     /// The FIRST reason the node LP gave for refusing, verbatim.
     lp_decline: Option<String>,
+    /// The caller's stop signal, consulted only past
+    /// [`MAX_UNINTERRUPTIBLE_NODES`] so that a starved caller still gets every
+    /// certificate this route makes. It can only ever turn a certificate into a
+    /// decline; it never reaches the emitter, so no proof byte depends on it.
+    should_stop: &'a dyn Fn() -> bool,
 }
 
 /// What one node resolved to.
@@ -889,6 +1149,26 @@ enum NodeResult {
 }
 
 impl Search<'_> {
+    /// Emits one leaf as `pol` (the aggregate row) then `rup` (the branch
+    /// clause), and returns the CLAUSE's id — the one the resolution above it
+    /// cites.
+    ///
+    /// WHY THE LITERAL AXIOMS ARE GONE. They existed only to CANCEL the free
+    /// variables' coefficients so that one division could round what survived
+    /// into the branch clause. `rup` does not need them cancelled; it needs the
+    /// aggregate row FALSIFIED under the negated clause, and [`try_leaf`]'s own
+    /// `R > 0` test is exactly that statement (`R` is the row's degree minus
+    /// the most its left-hand side can reach under this node's fixings). The
+    /// negated clause fixes every variable the leaf's degree was charged for as
+    /// a fixing, and leaves free exactly the ones charged at `max(0, c_v)` —
+    /// so the reachable maximum under the negation is the same `R`-defining
+    /// quantity, the aggregate row's slack goes negative with no propagation
+    /// needed, and the substitution cannot lose a leaf that the axiom block
+    /// would have closed.
+    ///
+    /// The axiom block was also the bulk of the bytes: one term per variable
+    /// with a non-zero aggregate coefficient, against one term per BRANCH
+    /// literal here.
     fn emit_leaf(&mut self, leaf: &Leaf) -> Option<ConstraintId> {
         let mut terms: Vec<(String, i128)> = Vec::new();
         for &(row, multiplier) in &leaf.ys {
@@ -897,17 +1177,39 @@ impl Search<'_> {
         if leaf.qo > 0 {
             terms.push((self.soli.get().to_string(), leaf.qo));
         }
-        for &(var, multiplicity) in &leaf.axiom_pos {
-            terms.push((format!("x{}", var + 1), multiplicity));
-        }
-        for &(var, multiplicity) in &leaf.axiom_neg {
-            terms.push((format!("~x{}", var + 1), multiplicity));
-        }
-        let expression = pol_line(&terms, leaf.divisor)?;
-        self.writer.log_step(ProofStep::Polynomial(expression)).ok()
+        let expression = pol_line(&terms)?;
+        let clause = clause_body(&leaf.clause)?;
+        self.writer
+            .log_step(ProofStep::Polynomial(expression))
+            .ok()?;
+        self.writer.log_step(ProofStep::Rup(clause)).ok()
     }
 
-    fn dfs(&mut self, depth: usize) -> NodeResult {
+    /// Adds a multiplier vector to the replay pool, newest last, root pinned.
+    ///
+    /// FIFO above slot 0 and deduplicated BY CONTENT, so the pool a node sees is
+    /// a function of the tree walked so far and of nothing else — the same
+    /// determinism requirement the branch rule and the poll budgets carry.
+    fn remember(&mut self, ys: &[(usize, i128)], qo: i128) {
+        if ys.is_empty() && qo == 0 {
+            return;
+        }
+        if self
+            .pool
+            .iter()
+            .any(|(pooled, pooled_qo)| *pooled_qo == qo && pooled.as_slice() == ys)
+        {
+            return;
+        }
+        if self.pool.len() >= MAX_DUAL_POOL {
+            // Slot 0 is the root's and is never evicted; the oldest of the rest
+            // goes.
+            self.pool.remove(1.min(self.pool.len() - 1));
+        }
+        self.pool.push((ys.to_vec(), qo));
+    }
+
+    fn dfs(&mut self, depth: usize, inherited: Option<&[(usize, BigRational)]>) -> NodeResult {
         self.stats.nodes = self.stats.nodes.saturating_add(1);
         self.stats.depth = self.stats.depth.max(depth);
         if self.stats.nodes > MAX_NODES {
@@ -918,6 +1220,15 @@ impl Search<'_> {
         }
         if self.polls.get() > MAX_TOTAL_LP_POLLS {
             return NodeResult::Exhausted("lp-poll-budget");
+        }
+        // Past the envelope in which this route has ever certified anything —
+        // in EITHER of the two currencies it spends — the caller may stop it.
+        // See [`MAX_UNINTERRUPTIBLE_NODES`].
+        if (self.stats.nodes > MAX_UNINTERRUPTIBLE_NODES
+            || self.polls.get() > MAX_UNINTERRUPTIBLE_POLLS)
+            && (self.should_stop)()
+        {
+            return NodeResult::Exhausted("interrupted");
         }
 
         // 1. The node's rows are already contradictory through one of them.
@@ -931,8 +1242,25 @@ impl Search<'_> {
         if let Some(leaf) = try_leaf(self.model, &self.fixed, &[], 1, self.optimum) {
             return self.close(&leaf);
         }
+        // 3. REPLAY. An ancestor's multipliers, re-derived against THIS node's
+        //    fixings. Monotone (see `MAX_DUAL_POOL`) and free of polls, so it is
+        //    tried before the LP rather than after it.
+        let model = self.model;
+        let optimum = self.optimum;
+        let fixed = &self.fixed;
+        let replayed = self
+            .pool
+            .iter()
+            .find_map(|(ys, qo)| try_leaf(model, fixed, ys, *qo, optimum));
+        if let Some(leaf) = replayed {
+            self.stats.replays = self.stats.replays.saturating_add(1);
+            return self.close(&leaf);
+        }
 
-        let lp = solve_node_lp(
+        // The root is a full model with no fixings and is solved ONCE, at its own
+        // allowance. Below it the fast pass runs first and only a REFUSAL buys
+        // the full one — see [`MAX_NODE_LP_POLLS_FAST`].
+        let mut lp = solve_node_lp(
             self.model,
             &self.fixed,
             self.optimum,
@@ -940,9 +1268,32 @@ impl Search<'_> {
             if depth == 0 {
                 MAX_ROOT_LP_POLLS
             } else {
-                MAX_NODE_LP_POLLS
+                MAX_NODE_LP_POLLS_FAST
             },
         );
+        // ...and only a refusal a bigger allowance could actually change. Every
+        // other one is decided before the first poll and re-deriving it costs a
+        // second full node-model build for a known answer.
+        if depth > 0
+            && lp
+                .as_ref()
+                .err()
+                .is_some_and(|reason| refusal_can_change_with_a_bigger_budget(reason))
+        {
+            self.stats.escalations = self.stats.escalations.saturating_add(1);
+            let full = solve_node_lp(
+                self.model,
+                &self.fixed,
+                self.optimum,
+                &self.polls,
+                MAX_NODE_LP_POLLS,
+            );
+            // A second refusal keeps the FIRST reason, which is the one the
+            // diagnosis reports and the one that names the model.
+            if full.is_ok() {
+                lp = full;
+            }
+        }
         if let Err(reason) = &lp {
             // Kept for the diagnosis so a decline NAMES the LP's own refusal
             // (`model-too-large(MAX_ROWS=40000,measured=43326)`) instead of
@@ -961,6 +1312,7 @@ impl Search<'_> {
                 //    the rows, which is what makes the single `d K` at the end
                 //    round the degree without disturbing any ratio.
                 if let Some(leaf) = try_leaf(self.model, &self.fixed, &ys, scale, self.optimum) {
+                    self.remember(&ys, scale);
                     return self.close(&leaf);
                 }
                 // 4. The same multipliers with `qo = 0`: a multi-row Farkas
@@ -968,36 +1320,69 @@ impl Search<'_> {
                 //    its bound.
                 if let Some(leaf) = try_leaf(self.model, &self.fixed, &ys, 0, self.optimum) {
                     self.stats.farkas = self.stats.farkas.saturating_add(1);
+                    self.remember(&ys, 0);
                     return self.close(&leaf);
                 }
             }
         }
 
-        // Nothing closed it. Pick a branch variable from the LP point.
-        let branch = lp.as_ref().ok().and_then(|node| branch_variable(node));
-        let Some(variable) = branch else {
-            // No fractional variable to split on. EITHER the point completes to
-            // a genuine counterexample — in which case say so, with the witness
-            // — OR this route simply cannot express this node, which is a fact
-            // about the route and about nothing else.
+        // Nothing closed it here — but by monotonicity the same vector is
+        // stronger at every descendant, so it goes into the pool on the way
+        // down. The LARGEST ladder scale is the one kept: `R` is very nearly
+        // linear in the scale, so the largest is where the floor of each dual
+        // costs the least relative to the numbers it rounds.
+        if let Ok(node) = lp.as_ref() {
+            let widest = node
+                .scales()
+                .filter_map(|scale| node.scaled(scale).map(|ys| (ys, scale)))
+                .filter(|(ys, _)| !ys.is_empty())
+                .max_by_key(|&(_, scale)| scale);
+            if let Some((ys, scale)) = widest {
+                self.remember(&ys, scale);
+            }
+        }
+
+        // Nothing closed it. Pick a branch variable: this node's own point
+        // first, then the nearest ancestor's, then the objective.
+        let own_point = lp.as_ref().ok().and_then(|node| node.point.as_deref());
+        // An integral point that completes to a re-verified feasible assignment
+        // BELOW the claim is the one thing this route says about the instance
+        // rather than about itself, and it must be reported before any fallback
+        // branches past it.
+        if own_point.is_some_and(|point| branch_variable(point, &self.fixed).is_none()) {
             if let Some((witness, value)) = witness_from_point(
                 self.instance,
                 self.model,
                 &self.fixed,
-                lp.as_ref().ok().and_then(|node| node.point.as_ref()),
+                own_point,
                 self.optimum,
             ) {
                 return NodeResult::Refuted(witness, value);
             }
-            return NodeResult::Exhausted(if lp.is_err() {
-                "node-lp-declined"
-            } else {
-                "no-branch-variable"
-            });
+        }
+        let guide: Option<&[(usize, BigRational)]> = own_point.or(inherited);
+        let from_point = guide.and_then(|point| branch_variable(point, &self.fixed));
+        if from_point.is_none() || own_point.is_none() {
+            self.stats.guided = self.stats.guided.saturating_add(1);
+            // THE BLIND PATH IS BOUNDED, AND BY A COUNT. This node has no fresh
+            // relaxation steering it, so the poll budget — the only thing that
+            // bounded this route's cost — did not necessarily move. See
+            // [`MAX_BLIND_NODES`] for the 436x wall that fact opened.
+            if self.stats.guided > MAX_BLIND_NODES {
+                return NodeResult::Exhausted("blind-branch-budget");
+            }
+        }
+        let branch = from_point.or_else(|| fallback_branch_variable(self.model, &self.fixed));
+        let Some(variable) = branch else {
+            // Every variable is fixed and nothing above closed the node. That is
+            // not reachable through `fallback_branch_variable` — an all-fixed
+            // node is closed by `single_row_farkas` or by the objective leaf —
+            // but the route names it rather than assuming it.
+            return NodeResult::Exhausted("no-branch-variable");
         };
 
         self.fixed[variable] = Some(true);
-        let one = self.dfs(depth + 1);
+        let one = self.dfs(depth + 1, guide);
         self.fixed[variable] = None;
         let (one_id, one_support) = match one {
             NodeResult::Clause(id, support) => (id, support),
@@ -1010,7 +1395,7 @@ impl Search<'_> {
         }
 
         self.fixed[variable] = Some(false);
-        let zero = self.dfs(depth + 1);
+        let zero = self.dfs(depth + 1, guide);
         self.fixed[variable] = None;
         let (zero_id, zero_support) = match zero {
             NodeResult::Clause(id, support) => (id, support),
@@ -1043,15 +1428,20 @@ impl Search<'_> {
     }
 }
 
-/// The most fractional free variable, ties broken by the lowest index.
+/// The most fractional STILL-FREE variable of a point, ties broken by the
+/// lowest index.
 ///
 /// Deterministic by construction: the comparison is on exact rationals and the
 /// tie-break is total, so the tree this route walks is the same on every machine.
-fn branch_variable(node: &NodeLp) -> Option<usize> {
+///
+/// `fixed` is consulted because the point may be an INHERITED one — an
+/// ancestor's, carried down by [`Search::dfs`] — in which case some of the
+/// variables it scores have been fixed by the branches taken since.
+fn branch_variable(point: &[(usize, BigRational)], fixed: &[Option<bool>]) -> Option<usize> {
     let half = BigRational::new(BigInt::from(1), BigInt::from(2));
     let mut best: Option<(usize, BigRational)> = None;
-    for (var, value) in node.point.as_ref()? {
-        if value.is_integer() {
+    for (var, value) in point {
+        if fixed[*var].is_some() || value.is_integer() {
             continue;
         }
         let distance = (value - &half).abs();
@@ -1066,7 +1456,51 @@ fn branch_variable(node: &NodeLp) -> Option<usize> {
     best.map(|(var, _)| var)
 }
 
-fn run(instance: &PbInstance, incumbent: &[bool], optimum: i128) -> Run {
+/// The last-resort branch variable: the free variable with the largest absolute
+/// objective coefficient, ties broken by the lowest index.
+///
+/// # Why a search with NO usable point must still branch
+///
+/// The prototype's structure, which this port inherited, ended the WHOLE search
+/// when one node's LP produced no fractional point: `Exhausted` propagates to
+/// the root, so a single refused relaxation at depth 47 threw away a tree that
+/// was two thirds inside its budget (`ii16d2`: 48 nodes, 0 leaves, 10,256 of
+/// 32,768 polls spent). That is a fact about the LP's budget at ONE node, and
+/// nothing about whether the tree closes.
+///
+/// It is also unnecessary, because branching needs no LP at all — only a free
+/// variable — and it TERMINATES: each branch fixes one more variable, and an
+/// all-fixed node always resolves. Either some original row is violated, and
+/// [`single_row_farkas`] closes it; or the assignment is feasible with value
+/// `V`, and `try_leaf(&[], 1, optimum)` has degree `1 + V - optimum`, which is
+/// positive exactly when `V >= optimum` and otherwise means the node completes
+/// to a genuine counterexample that [`witness_from_point`] reports. So the
+/// fallback cannot loop and cannot invent a leaf: `try_leaf` is still the only
+/// thing that emits one.
+///
+/// The objective coefficient is the ranking because it is the only per-variable
+/// signal available without a relaxation, and it is exactly what moves the
+/// degree of the objective leaf: fixing `v` to 1 adds `qo * c_v` to `R`.
+fn fallback_branch_variable(model: &Model, fixed: &[Option<bool>]) -> Option<usize> {
+    let mut best: Option<(usize, i128)> = None;
+    for var in 0..model.num_vars {
+        if fixed[var].is_some() {
+            continue;
+        }
+        let weight = model.objective[var].saturating_abs();
+        if best.is_none_or(|(_, incumbent)| weight > incumbent) {
+            best = Some((var, weight));
+        }
+    }
+    best.map(|(var, _)| var)
+}
+
+fn run(
+    instance: &PbInstance,
+    incumbent: &[bool],
+    optimum: i128,
+    should_stop: &dyn Fn() -> bool,
+) -> Run {
     let Some(model) = build_model(instance) else {
         return Run {
             lp_decline: None,
@@ -1141,9 +1575,11 @@ fn run(instance: &PbInstance, incumbent: &[bool], optimum: i128) -> Run {
         writer,
         polls: std::cell::Cell::new(0),
         stats: Stats::default(),
+        pool: Vec::new(),
         lp_decline: None,
+        should_stop,
     };
-    let root = search.dfs(0);
+    let root = search.dfs(0, None);
     let mut stats = search.stats;
     stats.polls = search.polls.get();
     let lp_decline = search.lp_decline.clone();
@@ -1182,12 +1618,27 @@ fn run(instance: &PbInstance, incumbent: &[bool], optimum: i128) -> Run {
 }
 
 /// Implements the public contract in [`super::certify_opt_lin_certified_bb`].
+///
+/// The uninterruptible entry: a caller with no stop signal at all. Kept because
+/// the probes, the census and every test want the route's own counts, not a
+/// reading of how busy the box was.
 pub(super) fn certify_opt_lin_certified_bb(
     instance: &PbInstance,
     incumbent: &[bool],
     optimum: i128,
 ) -> Option<String> {
-    let Run { outcome, stats, .. } = run(instance, incumbent, optimum);
+    certify_opt_lin_certified_bb_interruptible(instance, incumbent, optimum, &|| false)
+}
+
+/// Implements the public contract in
+/// [`super::certify_opt_lin_certified_bb_interruptible`].
+pub(super) fn certify_opt_lin_certified_bb_interruptible(
+    instance: &PbInstance,
+    incumbent: &[bool],
+    optimum: i128,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<String> {
+    let Run { outcome, stats, .. } = run(instance, incumbent, optimum, should_stop);
     match outcome {
         Outcome::Proof(text) => {
             if ay_core::misc_cli_flags().cert_debug {
@@ -1232,7 +1683,7 @@ pub(super) fn certified_bb_diagnosis(
         outcome,
         stats,
         lp_decline,
-    } = run(instance, incumbent, optimum);
+    } = run(instance, incumbent, optimum, &|| false);
     let lp = lp_decline.map_or_else(String::new, |reason| format!(" lp={reason}"));
     match outcome {
         Outcome::Proof(text) => format!("certified(bytes={}) {stats}{lp}", text.len()),
@@ -1246,9 +1697,12 @@ pub(super) fn certified_bb_diagnosis(
 #[cfg(test)]
 mod tests {
     use super::{
-        certified_bb_diagnosis, certify_opt_lin_certified_bb, single_row_farkas, try_leaf,
-        MAX_DEPTH, MAX_NODES, MAX_NODE_LP_POLLS, MAX_ROOT_LP_POLLS, MAX_TOTAL_LP_POLLS,
+        certified_bb_diagnosis, certify_opt_lin_certified_bb, fallback_branch_variable,
+        single_row_farkas, try_leaf, MAX_BLIND_NODES, MAX_DEPTH, MAX_DUAL_POOL, MAX_NODES,
+        MAX_NODE_LP_POLLS, MAX_NODE_LP_POLLS_FAST, MAX_ROOT_LP_POLLS, MAX_TOTAL_LP_POLLS,
+        MAX_UNINTERRUPTIBLE_NODES, MAX_UNINTERRUPTIBLE_POLLS,
     };
+    use crate::optimize::lp_bound::LpDualDecline;
     use crate::proof::cert::cp_replay::self_check_soli_refutation;
     use crate::types::{PbConstraint, PbInstance, PbLit, PbObjective, PbRel, PbTerm};
 
@@ -1450,6 +1904,155 @@ mod tests {
         ));
     }
 
+    /// THE GUARD ON THE NEW RULE, AND THE ONE TEST THAT DECIDES WHETHER IT IS A
+    /// GUARD AT ALL.
+    ///
+    /// A `rup` line is an ASSUMPTION until something replays it. If the
+    /// self-check accepted anything shaped like a clause, this route would have
+    /// swapped a derivation it checks (`pol`) for one it does not, and the layer
+    /// that reads the emitted bytes cold would have stopped reading them. So
+    /// each mutation below is a `rup` line the database does NOT imply, and each
+    /// must be refused:
+    ///
+    /// 1. a branch literal at the WRONG POLARITY — the negation then fixes the
+    ///    node's variables the other way, which is a different node;
+    /// 2. the EMPTY CLAUSE in place of a real one (which, for a one-literal
+    ///    leaf, is also "drop the branch literal") — the shape that would let a
+    ///    single leaf close the whole tree;
+    /// 3. the OBJECTIVE FLOOR `Σ_v x_v >= optimum`. This is the one that
+    ///    separates "models RUP" from "checks whether the claim is true": it is
+    ///    the very theorem this proof exists to establish, so it is TRUE, and it
+    ///    is not reachable by unit propagation from the database — a
+    ///    truth-checking guard would wave it through and let the certifier skip
+    ///    the entire search.
+    ///
+    /// The `pol` line the leaf rests on is also deleted, on its own, to show the
+    /// `rup` is not self-supporting: without the aggregate row in the database
+    /// there is nothing for propagation to conflict against.
+    #[test]
+    fn the_replay_rejects_a_rup_line_the_database_does_not_imply() {
+        let (instance, incumbent, optimum) = petersen_vertex_cover();
+        let proof = certify_opt_lin_certified_bb(&instance, &incumbent, optimum).expect("emit");
+        let cited: u64 = proof
+            .lines()
+            .find_map(|line| line.strip_prefix("conclusion BOUNDS "))
+            .and_then(|rest| rest.split(" : ").nth(1))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|id| id.parse().ok())
+            .expect("the conclusion hints at a row id");
+        assert!(
+            self_check_soli_refutation(&proof, &instance, &incumbent, optimum, cited),
+            "the untouched bytes must replay"
+        );
+
+        // The route must actually be using the rule under test. A battery that
+        // mutates a line the proof does not contain passes by doing nothing.
+        let rup: Vec<&str> = proof
+            .lines()
+            .filter(|line| line.starts_with("rup "))
+            .collect();
+        assert!(
+            rup.len() > 1,
+            "the leaves are `rup` lines now; got {} in {proof}",
+            rup.len()
+        );
+        // The FIRST leaf, so the mutation lands where the database is smallest
+        // and nothing later can accidentally rescue it.
+        let target = *rup.first().expect("at least one leaf");
+        assert!(
+            target.contains('x'),
+            "the first leaf carries a branch literal: {target}"
+        );
+
+        let mutate = |replacement: &str| proof.replacen(target, replacement, 1);
+
+        // 1. Flip one branch literal's polarity.
+        let flipped = if target.contains(" ~x") {
+            target.replacen(" ~x", " x", 1)
+        } else {
+            target.replacen(" x", " ~x", 1)
+        };
+        assert_ne!(flipped, target, "the mutation must change the bytes");
+        let bytes = mutate(&flipped);
+        assert!(
+            !self_check_soli_refutation(&bytes, &instance, &incumbent, optimum, cited),
+            "a clause over the opposite fixings is a different node: {flipped}"
+        );
+
+        // 2. The empty clause in place of a leaf.
+        let bytes = mutate("rup >= 1 ;");
+        assert_ne!(bytes, proof, "the mutation must change the bytes");
+        assert!(
+            !self_check_soli_refutation(&bytes, &instance, &incumbent, optimum, cited),
+            "one leaf must not be allowed to claim the contradiction"
+        );
+
+        // 3. TRUE, AND NOT RUP. The objective floor is what the whole proof is
+        //    for, so a guard that asked "is this true?" would accept it — and
+        //    accepting it here would let one line replace the search.
+        let floor = format!(
+            "rup {} >= {optimum} ;",
+            (1..=10)
+                .map(|v| format!("1 x{v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let bytes = mutate(&floor);
+        assert_ne!(bytes, proof, "the mutation must change the bytes");
+        assert!(
+            !self_check_soli_refutation(&bytes, &instance, &incumbent, optimum, cited),
+            "the theorem is not a unit-propagation consequence: {floor}"
+        );
+
+        // 4. The `pol` the leaf rests on, deleted. The `rup` survives, and the
+        //    ids shift, so this also shows the replay is not merely counting
+        //    lines.
+        let leaf_index = proof
+            .lines()
+            .position(|line| line == target)
+            .expect("the target leaf");
+        let without_pol: String = proof
+            .lines()
+            .enumerate()
+            .filter(|(index, _)| *index + 1 != leaf_index)
+            .map(|(_, line)| format!("{line}\n"))
+            .collect();
+        assert_ne!(without_pol, proof, "the mutation must change the bytes");
+        assert!(
+            !self_check_soli_refutation(&without_pol, &instance, &incumbent, optimum, cited),
+            "the `rup` is not self-supporting"
+        );
+    }
+
+    /// The leaf substitution must not cost a leaf. Same instance, same search:
+    /// every leaf the old axiom-and-division form could close, `rup` closes, so
+    /// the tree is IDENTICAL — same nodes, same leaves, same depth — and the
+    /// only thing that moved is the bytes.
+    #[test]
+    fn the_rup_leaf_keeps_the_tree_and_drops_the_axiom_block() {
+        let (instance, incumbent, optimum) = petersen_vertex_cover();
+        let proof = certify_opt_lin_certified_bb(&instance, &incumbent, optimum).expect("emit");
+        // Every leaf is exactly one `pol` (the aggregate row) plus one `rup`
+        // (the clause it falsifies); the remaining `pol`s are resolutions.
+        let leaves = proof.lines().filter(|l| l.starts_with("rup ")).count();
+        let diagnosis = certified_bb_diagnosis(&instance, &incumbent, optimum);
+        let reported: usize = diagnosis
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("leaves="))
+            .and_then(|value| value.parse().ok())
+            .expect("the diagnosis reports a leaf count");
+        assert_eq!(leaves, reported, "one `rup` per leaf: {diagnosis}");
+        // The axiom block and its division are what came out. A stray `d` would
+        // mean a leaf still carries one.
+        assert!(
+            !proof.lines().any(|line| line.starts_with("pol ")
+                && line
+                    .split_whitespace()
+                    .any(|token| token == "d" || token.starts_with('~'))),
+            "no leaf may still carry literal axioms or a division: {proof}"
+        );
+    }
+
     /// `try_leaf` IS THE SOUNDNESS BOUNDARY, so its refusal is worth pinning
     /// directly: multipliers that do not clear the refuted budget produce no
     /// leaf, whatever the LP thought of them.
@@ -1521,6 +2124,248 @@ mod tests {
             MAX_DEPTH > 187,
             "the measured injcomp non-closers reach depth 187; the node cap, not the \
              depth cap, must be what stops them"
+        );
+        assert!(
+            MAX_NODE_LP_POLLS_FAST < MAX_NODE_LP_POLLS,
+            "the fast pass must be cheaper than the full one or the escalation is a tax"
+        );
+        assert_eq!(
+            MAX_NODE_LP_POLLS_FAST, 16,
+            "sized from the measured population split: at 16 polls per node \
+             m100_300_10_20.r's LP answers at EVERY node (guided=0) and the proof is \
+             byte-identical to the 128-poll one, while addm4.r, fir04_trarea_ac and \
+             f20c10b_008_area_delay get no point at ~half their nodes and escalate"
+        );
+        assert!(
+            MAX_DUAL_POOL > 0,
+            "a pool of nothing makes `remember` a no-op and every replay impossible"
+        );
+        assert!(
+            MAX_BLIND_NODES < MAX_NODES,
+            "a blind cap at or above the node cap is not a cap: the 436x wall on \
+             50-250-false-45-90-4-2000opt is exactly a blind walk to MAX_NODES"
+        );
+        assert!(
+            MAX_BLIND_NODES >= 14,
+            "9symml branches blind 14 times on its way from 403 nodes to 1,859; below \
+             14 this cap starts costing node throughput instead of only bounding waste"
+        );
+        assert!(
+            MAX_BLIND_NODES < 142,
+            "the smallest measured blind count above 9symml's 14 is ssa7552-159's 142, so \
+             142 is the first cap that stops binding on a measured instance. NOT because \
+             the counts 'jump 14 -> 145 with nothing in between' -- they do not; \
+             ssa7552-159 is 142 and single-obj-f3 is 178, and the enumerated list in the \
+             MAX_BLIND_NODES comment is not a complete census. What holds is one-sided \
+             and is all this needs: among the caps that keep 9symml, the smallest \
+             measured is the cheapest -- cap 64 costs vertexcover_..._dim_071 77.8 s \
+             where cap 16 costs 22.9 s"
+        );
+        assert!(
+            MAX_UNINTERRUPTIBLE_NODES >= 1_443,
+            "1,443 is the largest tree this route has ever certified (m100_300_10_20.r); \
+             below it a starved caller loses a certificate it gets today"
+        );
+        assert!(
+            MAX_UNINTERRUPTIBLE_POLLS >= 21_735,
+            "21,735 is the most polls any certificate this route has produced needed \
+             (m100_300_10_20.r again); below it a starved caller loses that conversion"
+        );
+        assert!(
+            MAX_UNINTERRUPTIBLE_NODES < MAX_NODES && MAX_UNINTERRUPTIBLE_POLLS < MAX_TOTAL_LP_POLLS,
+            "at or above its own budget an escape is not an escape: this rung would be \
+             uninterruptible again, which is the defect a --timeout has to reach"
+        );
+    }
+
+    /// THE ESCALATION TEST IS A BUDGET REFUSAL, AND NOTHING ELSE.
+    ///
+    /// `model-too-large` is decided by a static size cap before the first poll,
+    /// so re-solving with a bigger poll allowance rebuilds the whole node model
+    /// to reach the identical answer. Measured, that second pass ran on up to
+    /// 61,821 rows at every one of 4,097 nodes. If this predicate ever answers
+    /// `true` for a decline the budget cannot move, the waste comes straight
+    /// back.
+    #[test]
+    fn only_a_budget_refusal_buys_the_second_lp_pass() {
+        assert!(super::refusal_can_change_with_a_bigger_budget(
+            &LpDualDecline::NoDualPoint.label()
+        ));
+        for immovable in [
+            LpDualDecline::ModelTooLarge {
+                cap: "MAX_ROWS",
+                limit: 40_000,
+                measured: 61_821,
+            },
+            LpDualDecline::ModelShape,
+            LpDualDecline::RowCount,
+        ] {
+            assert!(
+                !super::refusal_can_change_with_a_bigger_budget(&immovable.label()),
+                "{} is decided before any poll is spent",
+                immovable.label()
+            );
+        }
+        // The refusals `solve_node_lp` raises ITSELF. All ten are listed, and
+        // they split into two groups that an earlier version of this test
+        // conflated under "before the LP is even called" -- which is not true of
+        // the last two.
+        //
+        // RAISED BEFORE THE LP IS CALLED. Properties of the node's own shape;
+        // no amount of poll budget changes any of them.
+        for own in [
+            "all-variables-fixed",
+            "overflow",
+            "row-violated-under-the-fixings",
+            "every-row-discharged",
+            "free-objective-is-empty",
+            "too-many-free-variables",
+        ] {
+            assert!(
+                !super::refusal_can_change_with_a_bigger_budget(own),
+                "{own} is not a budget refusal"
+            );
+        }
+        // RAISED AFTER THE LP RETURNS, and still treated as immovable. These two
+        // are the ones the enumeration used to omit or mis-describe:
+        //
+        //   `row-count`        the solver reported a different number of
+        //                      constraint rows than the model has. That is a
+        //                      SHAPE disagreement, not a convergence one; a
+        //                      bigger budget cannot make the two agree.
+        //   `negative-row-dual` a `>=` row came back with a negative dual, so
+        //                      the readout is not a valid dual point. More polls
+        //                      COULD in principle land on a different vertex, so
+        //                      this one is a DELIBERATE CONSERVATIVE CHOICE
+        //                      rather than an impossibility: re-running is only
+        //                      ever allowed to cost work, never to change a
+        //                      verdict, and declining to re-run is the safe
+        //                      direction. It has no measured cost either --
+        //                      across the 50-instance SEARCH-PROOF-GAP corpus
+        //                      the only labels ever raised below the root are
+        //                      `model-too-large` and `no-dual-point-in-budget`;
+        //                      `negative-row-dual` never fires.
+        for after_lp in ["row-count", "negative-row-dual"] {
+            assert!(
+                !super::refusal_can_change_with_a_bigger_budget(after_lp),
+                "{after_lp} is raised after the LP returns but is still not a budget \
+                 refusal: escalating it re-runs the same solve for the same answer"
+            );
+        }
+    }
+
+    /// AN INTERRUPT COSTS BYTES IT HAS NOT EMITTED, NEVER BYTES IT HAS.
+    ///
+    /// The route is unscheduled on purpose, so the stop signal must not be able
+    /// to change a certificate — only to withhold one. Two halves, both
+    /// asserted: a caller that stops IMMEDIATELY still gets the identical proof
+    /// (because the certifying envelope is below `MAX_UNINTERRUPTIBLE_NODES`),
+    /// and the interruptible entry with a never-stop signal is the plain one.
+    #[test]
+    fn an_always_true_stop_signal_cannot_change_an_emitted_certificate() {
+        let (instance, incumbent, optimum) = petersen_vertex_cover();
+        let plain = certify_opt_lin_certified_bb(&instance, &incumbent, optimum)
+            .expect("Petersen certifies through this route");
+        let stopped = super::certify_opt_lin_certified_bb_interruptible(
+            &instance,
+            &incumbent,
+            optimum,
+            &|| true,
+        )
+        .expect(
+            "a certificate emitted inside the uninterruptible envelope must survive \
+             a caller that is already stopping",
+        );
+        assert_eq!(plain, stopped, "the stop signal changed the emitted bytes");
+        let never = super::certify_opt_lin_certified_bb_interruptible(
+            &instance,
+            &incumbent,
+            optimum,
+            &|| false,
+        );
+        assert_eq!(never.as_deref(), Some(plain.as_str()));
+    }
+
+    /// THE FALLBACK IS A RANKING, AND ITS TIE-BREAK IS TOTAL. Determinism is the
+    /// whole reason this route may use a heuristic at all: the emitted bytes
+    /// must not depend on iteration order, so equal-weight variables must always
+    /// resolve to the lowest index.
+    #[test]
+    fn the_fallback_branch_variable_is_deterministic_and_objective_ranked() {
+        let (instance, _, _) = petersen_vertex_cover();
+        let model = super::build_model(&instance).expect("model");
+        let mut fixed = vec![None; model.num_vars];
+        // Every objective coefficient is 1 here, so the tie-break alone decides.
+        assert_eq!(fallback_branch_variable(&model, &fixed), Some(0));
+        fixed[0] = Some(true);
+        fixed[1] = Some(false);
+        assert_eq!(fallback_branch_variable(&model, &fixed), Some(2));
+        // Weight beats index: a heavier free variable outranks a lighter one
+        // that comes first.
+        let mut weighted = instance.clone();
+        weighted.objective = Some(PbObjective {
+            terms: (1..=10)
+                .map(|v| term(if v == 7 { 5 } else { 1 }, v, false))
+                .collect(),
+        });
+        let heavy = super::build_model(&weighted).expect("model");
+        assert_eq!(
+            fallback_branch_variable(&heavy, &vec![None; heavy.num_vars]),
+            Some(6),
+            "x7 carries 5 and must outrank the ten unit coefficients"
+        );
+        // All fixed: no branch, which is the state the leaf rules own.
+        assert_eq!(
+            fallback_branch_variable(&model, &vec![Some(true); model.num_vars]),
+            None
+        );
+    }
+
+    /// THE PROPERTY THE REPLAY POOL RESTS ON, ASSERTED RATHER THAN ASSUMED.
+    ///
+    /// `R = G + qo(1-optimum) - Sum_{v free} max(0, coef_v) - Sum_{v in F1} coef_v`, so
+    /// moving a variable out of `free` can only ADD to `R`: to `F1` the term
+    /// goes from `-max(0, c)` to `-c` (a gain of `max(0, -c)`), and to `F0` it
+    /// disappears (a gain of `max(0, c)`). If that were false, carrying an
+    /// ancestor's multipliers down the tree would be unsound rather than merely
+    /// unhelpful, because `try_leaf` would be asked to emit a leaf whose degree
+    /// it had not re-derived at THIS node.
+    ///
+    /// Concretely on Petersen, where every vertex has degree 3: the fifteen edge
+    /// rows at multiplier 1 with `qo = 2` give every variable coefficient
+    /// `3 - 2 = 1` and normalized degree `15 + 2(1 - 6) = 5`. At the root all ten
+    /// coefficients are charged and `R = -5`. Fixing six vertices to 0 charges
+    /// only the four that remain free — the fixed ones become branch literals
+    /// instead — so `R = 1` and the SAME vector closes. Nothing about the
+    /// multipliers changed; only which variables the axioms have to cancel.
+    #[test]
+    fn an_ancestors_multipliers_only_get_stronger_as_the_tree_descends() {
+        let (instance, _, optimum) = petersen_vertex_cover();
+        let model = super::build_model(&instance).expect("model");
+        let ys: Vec<(usize, i128)> = (0..15).map(|row| (row, 1_i128)).collect();
+        let root = vec![None; model.num_vars];
+        assert!(
+            try_leaf(&model, &root, &ys, 2, optimum).is_none(),
+            "the whole edge relaxation at the root is LP*, which is below the optimum"
+        );
+        // Five is one short: `R = 5 - 5 = 0`, and `try_leaf` demands STRICTLY
+        // positive. The boundary is asserted so a sign slip cannot pass.
+        let mut five = root.clone();
+        for var in [0usize, 1, 2, 3, 4] {
+            five[var] = Some(false);
+        }
+        assert!(
+            try_leaf(&model, &five, &ys, 2, optimum).is_none(),
+            "R = 0 is not a leaf"
+        );
+        let mut six = five.clone();
+        six[5] = Some(false);
+        let leaf = try_leaf(&model, &six, &ys, 2, optimum)
+            .expect("the SAME multipliers must close once one more variable is fixed");
+        assert_eq!(
+            leaf.support,
+            (0..6).collect(),
+            "the clause is exactly the six branch literals the fixings created"
         );
     }
 }

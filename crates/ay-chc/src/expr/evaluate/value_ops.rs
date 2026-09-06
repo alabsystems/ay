@@ -217,7 +217,11 @@ pub(crate) fn smt_values_equal(a: &SmtValue, b: &SmtValue) -> Option<bool> {
             },
         ) => {
             if !smt_values_equal(d1, d2)? {
-                return Some(false);
+                // Without the array index sort we cannot prove that an
+                // un-overridden index exists. On a finite domain, explicit
+                // entries may cover every index and make differing defaults
+                // unobservable. Abstain instead of fabricating disequality.
+                return None;
             }
             // Compare the observable value at every explicit index from either
             // side, respecting last-store-wins semantics for duplicate writes.
@@ -245,7 +249,10 @@ pub(crate) fn smt_values_equal(a: &SmtValue, b: &SmtValue) -> Option<bool> {
             SmtValue::ConstArray(d),
         ) => {
             if !smt_values_equal(d, d2)? {
-                return Some(false);
+                // As above, a finite index domain may be completely covered by
+                // `entries`, so a different stored default is not by itself a
+                // proof of array disequality.
+                return None;
             }
             // All observable explicit indices must agree with the const default.
             for (k, _) in entries {

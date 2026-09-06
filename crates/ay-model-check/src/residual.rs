@@ -119,20 +119,28 @@ use crate::{is_datatype_tautology_with, EvalOutcome, Evaluator, ModelValue, Mode
 
 mod witness;
 pub(super) use witness::MAX_WITNESS_ENTRIES;
-use witness::{materialize_and_replay, Entry, Slot};
+#[cfg(test)]
+pub(super) use witness::MAX_WITNESS_VALUE_WORK;
+use witness::{account_entry_values, materialize_and_replay, Entry, Slot};
 
 /// Recursion bound for the residual-constraint classifier (top-level Boolean
 /// structure only; residual assertions are shallow in practice).
-const MAX_CLASSIFY_DEPTH: usize = 64;
+pub(super) const MAX_CLASSIFY_DEPTH: usize = 64;
+
+/// Maximum total immediate-argument work admitted by residual classification.
+///
+/// This bounds both traversal and the temporary argument snapshots needed to
+/// recurse without borrowing the term store through a mutable classifier call.
+pub(super) const MAX_CLASSIFY_WORK: usize = 16_384;
 
 /// Maximum alias edges admitted by one residual witness.
-const MAX_WITNESS_ALIASES: usize = 512;
+pub(super) const MAX_WITNESS_ALIASES: usize = 512;
 
 /// Maximum free array leaves completed by one residual witness.
-const MAX_WITNESS_MEMBERS: usize = 256;
+pub(super) const MAX_WITNESS_MEMBERS: usize = 256;
 
 /// Maximum assertion-DAG nodes inspected by the occurrence guard.
-const MAX_OCCURRENCE_NODES: usize = 16_384;
+pub(super) const MAX_OCCURRENCE_NODES: usize = 16_384;
 
 /// Decide whether the unevaluable `residue` is exactly the free-datatype-array
 /// fragment AND jointly satisfiable, so the confirmed partial model provably
@@ -154,6 +162,8 @@ pub(crate) fn free_dt_array_residue_extends(
         aliases: Vec::new(),
         alias_eq_terms: Vec::new(),
         entries: Vec::new(),
+        classify_work: 0,
+        witness_value_work: 0,
     };
     for &a in residue {
         if !cx.classify(a, 0) {
@@ -194,6 +204,9 @@ pub(crate) fn free_dt_array_residue_extends(
     let mut chain_sites: Vec<(TermId, TermId, TermId, String)> = Vec::new();
     let mut other_selector_sites: Vec<TermId> = Vec::new();
     let mut contains_memo: HashMap<TermId, bool> = HashMap::new();
+    if assertions.len() > MAX_OCCURRENCE_NODES {
+        return false;
+    }
     let mut stack: Vec<TermId> = assertions.to_vec();
     let mut seen: HashSet<TermId> = HashSet::new();
     while let Some(t) = stack.pop() {
@@ -205,6 +218,9 @@ pub(crate) fn free_dt_array_residue_extends(
         }
         match terms.get(t) {
             TermData::App(sym, args) => {
+                if !pending_nodes_fit(seen.len(), stack.len(), args.len(), MAX_OCCURRENCE_NODES) {
+                    return false;
+                }
                 let is_select = sym.name() == "select" && args.len() == 2;
                 let blessed_eq = alias_eqs.contains(&t);
                 for (pos, &c) in args.iter().enumerate() {
@@ -230,8 +246,8 @@ pub(crate) fn free_dt_array_residue_extends(
                         false
                     };
                     if contains {
-                        match cx.direct_chain(*arg, name) {
-                            Some((m, i)) => chain_sites.push((t, m, i, name.clone())),
+                        match cx.direct_chain(t, *arg, name) {
+                            Some((m, i)) => chain_sites.push((t, m, i, name.to_string())),
                             None => other_selector_sites.push(t),
                         }
                     }
@@ -242,12 +258,26 @@ pub(crate) fn free_dt_array_residue_extends(
             // fails at the quantifier node itself, adopting no pins), so they
             // cannot constrain the extension; do not descend.
             TermData::Forall(_, _, _) | TermData::Exists(_, _, _) => {}
-            _ => {
-                for c in terms.children(t) {
+            data => {
+                let Some(child_count) = term_child_count(data) else {
+                    return false;
+                };
+                if !pending_nodes_fit(seen.len(), stack.len(), child_count, MAX_OCCURRENCE_NODES) {
+                    return false;
+                }
+                let mut escaped = false;
+                if for_each_term_child(data, |c| {
                     if members.contains(&c) {
-                        return false; // member under a non-App context (ite/not/let)
+                        escaped = true;
                     }
                     stack.push(c);
+                })
+                .is_none()
+                {
+                    return false;
+                }
+                if escaped {
+                    return false; // member under a non-App context (ite/not/let)
                 }
             }
         }
@@ -264,6 +294,20 @@ pub(crate) fn free_dt_array_residue_extends(
             let EvalOutcome::Value(index) = ev.evaluate(idx_term) else {
                 return false; // pinned read at an unkeyable index
             };
+            let Sort::Array(array_sort) = terms.sort(arr) else {
+                return false;
+            };
+            if terms.sort(idx_term) != &array_sort.index_sort
+                || terms.sort(t) != &array_sort.element_sort
+                || ev
+                    .ensure_value_inhabits_sort(&index, &array_sort.index_sort)
+                    .is_err()
+                || ev
+                    .ensure_value_inhabits_sort(&v, &array_sort.element_sort)
+                    .is_err()
+            {
+                return false;
+            }
             if !cx.push_entry(Entry {
                 array: arr,
                 index,
@@ -279,6 +323,17 @@ pub(crate) fn free_dt_array_residue_extends(
             let EvalOutcome::Value(index) = ev.evaluate(idx_term) else {
                 return false; // pinned field read at an unkeyable index
             };
+            let Sort::Array(array_sort) = terms.sort(m) else {
+                return false;
+            };
+            if terms.sort(idx_term) != &array_sort.index_sort
+                || ev
+                    .ensure_value_inhabits_sort(&index, &array_sort.index_sort)
+                    .is_err()
+                || ev.ensure_value_inhabits_sort(&v, terms.sort(t)).is_err()
+            {
+                return false;
+            }
             if !cx.push_entry(Entry {
                 array: m,
                 index,
@@ -303,10 +358,12 @@ pub(crate) fn free_dt_array_residue_extends(
     materialize_and_replay(
         terms,
         model,
+        ev,
         assertions,
         resolve,
         member_roots,
         std::mem::take(&mut cx.entries),
+        cx.witness_value_work,
     )
 }
 
@@ -321,9 +378,22 @@ struct Classifier<'a> {
     aliases: Vec<(TermId, TermId)>,
     alias_eq_terms: Vec<TermId>,
     entries: Vec<Entry>,
+    classify_work: usize,
+    witness_value_work: usize,
 }
 
 impl Classifier<'_> {
+    fn spend_classify_work(&mut self, amount: usize) -> bool {
+        let Some(next) = self.classify_work.checked_add(amount) else {
+            return false;
+        };
+        if next > MAX_CLASSIFY_WORK {
+            return false;
+        }
+        self.classify_work = next;
+        true
+    }
+
     fn push_alias(&mut self, equality: TermId, left: TermId, right: TermId) -> bool {
         if self.aliases.len() >= MAX_WITNESS_ALIASES {
             return false;
@@ -337,6 +407,9 @@ impl Classifier<'_> {
         if self.entries.len() >= MAX_WITNESS_ENTRIES {
             return false;
         }
+        if !account_entry_values(&mut self.witness_value_work, &entry.index, &entry.value) {
+            return false;
+        }
         self.entries.push(entry);
         true
     }
@@ -345,7 +418,17 @@ impl Classifier<'_> {
     /// satisfied by the pinned partial model or recorded as an allowed
     /// free-dt-array constraint); `false` = refuse the whole decision.
     fn classify(&mut self, t: TermId, depth: usize) -> bool {
-        if depth > MAX_CLASSIFY_DEPTH {
+        if depth > MAX_CLASSIFY_DEPTH || !self.spend_classify_work(1) {
+            return false;
+        }
+        let app_header = match self.terms.get(t) {
+            TermData::App(sym, args) => Some((sym.name().to_string(), args.len())),
+            _ => None,
+        };
+        if app_header
+            .as_ref()
+            .is_some_and(|(_, argument_count)| !self.spend_classify_work(*argument_count))
+        {
             return false;
         }
         // A term that meanwhile evaluates `true` needs no residual constraint;
@@ -360,8 +443,11 @@ impl Classifier<'_> {
         if is_datatype_tautology_with(self.terms, t, self.resolve) {
             return true;
         }
-        let (name, args) = match self.terms.get(t) {
-            TermData::App(sym, args) => (sym.name().to_string(), args.clone()),
+        let Some((name, _)) = app_header else {
+            return false;
+        };
+        let args = match self.terms.get(t) {
+            TermData::App(_, args) => args.clone(),
             _ => return false,
         };
         match name.as_str() {
@@ -387,6 +473,7 @@ impl Classifier<'_> {
                         self.aliases.len(),
                         self.alias_eq_terms.len(),
                         self.entries.len(),
+                        self.witness_value_work,
                     );
                     if self.classify(d, depth + 1) {
                         return true;
@@ -394,6 +481,7 @@ impl Classifier<'_> {
                     self.aliases.truncate(snap.0);
                     self.alias_eq_terms.truncate(snap.1);
                     self.entries.truncate(snap.2);
+                    self.witness_value_work = snap.3;
                 }
                 false
             }
@@ -445,14 +533,16 @@ impl Classifier<'_> {
             let EvalOutcome::Value(value) = self.ev.evaluate(ground_side) else {
                 return false;
             };
-            // A whole-element requirement must be a datatype-shaped value
-            // (structured or an opaque element token) — anything else is
-            // ill-typed for a datatype element.
-            if matches!(slot, Slot::Whole)
-                && !matches!(
-                    value,
-                    ModelValue::Datatype { .. } | ModelValue::Uninterpreted(_)
-                )
+            let read_sort = self.terms.sort(read_side);
+            if read_sort != self.terms.sort(ground_side)
+                || self
+                    .ev
+                    .ensure_value_inhabits_sort(&index, self.terms.sort(idx_term))
+                    .is_err()
+                || self
+                    .ev
+                    .ensure_value_inhabits_sort(&value, read_sort)
+                    .is_err()
             {
                 return false;
             }
@@ -488,20 +578,29 @@ impl Classifier<'_> {
         match self.terms.get(t) {
             TermData::App(sym, args) if sym.name() == "select" && args.len() == 2 => {
                 let (a, i) = (args[0], args[1]);
-                self.free_dt_array_var(a)?;
+                let sort = self.free_dt_array_var(a)?;
+                let Sort::Array(array_sort) = sort else {
+                    return None;
+                };
+                if self.terms.sort(i) != &array_sort.index_sort
+                    || self.terms.sort(t) != &array_sort.element_sort
+                {
+                    return None;
+                }
                 Some((a, i, Slot::Whole))
             }
             TermData::App(Symbol::Named(name), args) if args.len() == 1 => {
-                let (a, i) = self.direct_chain(args[0], name)?;
-                Some((a, i, Slot::Field(name.clone())))
+                let (a, i) = self.direct_chain(t, args[0], name)?;
+                Some((a, i, Slot::Field(name.to_string())))
             }
             _ => None,
         }
     }
 
     /// `arg` as the inner read of a DIRECT selector chain `(name (select m i))`
-    /// over a free member array whose element datatype declares field `name`.
-    fn direct_chain(&self, arg: TermId, name: &str) -> Option<(TermId, TermId)> {
+    /// over a free member array whose element datatype declares exactly one
+    /// field `name` with the selector term's result sort.
+    fn direct_chain(&self, selector: TermId, arg: TermId, name: &str) -> Option<(TermId, TermId)> {
         let TermData::App(isym, iargs) = self.terms.get(arg) else {
             return None;
         };
@@ -513,11 +612,20 @@ impl Classifier<'_> {
         let Sort::Array(arr) = &sort else {
             return None;
         };
+        if self.terms.sort(i) != &arr.index_sort || self.terms.sort(arg) != &arr.element_sort {
+            return None;
+        }
         let dt = element_dt(&arr.element_sort, self.resolve)?;
-        dt.constructors
+        let mut fields = dt
+            .constructors
             .iter()
-            .any(|c| c.fields.iter().any(|f| f.name == *name))
-            .then_some((a, i))
+            .flat_map(|constructor| &constructor.fields)
+            .filter(|field| field.name == name);
+        let field = fields.next()?;
+        if fields.next().is_some() || self.terms.sort(selector) != &field.sort {
+            return None;
+        }
+        Some((a, i))
     }
 
     /// Whether `(name arg)` is selector-shaped: `arg` is datatype-sorted and
@@ -542,6 +650,54 @@ fn element_dt(sort: &Sort, resolve: &DtResolve<'_>) -> Option<DatatypeSort> {
     }
 }
 
+/// Visit immediate term children without cloning an application or let vector.
+///
+/// `TermData` is non-exhaustive across the crate boundary. An unknown future
+/// variant returns `None`, so this proof-oriented path fails closed until its
+/// child semantics are reviewed explicitly.
+fn for_each_term_child(data: &TermData, mut visit: impl FnMut(TermId)) -> Option<()> {
+    match data {
+        TermData::Const(_) | TermData::Var(_, _) => {}
+        TermData::App(_, arguments) => {
+            for &argument in arguments {
+                visit(argument);
+            }
+        }
+        TermData::Let(bindings, body) => {
+            for (_, value) in bindings {
+                visit(*value);
+            }
+            visit(*body);
+        }
+        TermData::Not(argument) => visit(*argument),
+        TermData::Ite(condition, then_term, else_term) => {
+            visit(*condition);
+            visit(*then_term);
+            visit(*else_term);
+        }
+        TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => visit(*body),
+        _ => return None,
+    }
+    Some(())
+}
+
+fn term_child_count(data: &TermData) -> Option<usize> {
+    match data {
+        TermData::Const(_) | TermData::Var(_, _) => Some(0),
+        TermData::App(_, arguments) => Some(arguments.len()),
+        TermData::Let(bindings, _) => bindings.len().checked_add(1),
+        TermData::Not(_) | TermData::Forall(_, _, _) | TermData::Exists(_, _, _) => Some(1),
+        TermData::Ite(_, _, _) => Some(3),
+        _ => None,
+    }
+}
+
+fn pending_nodes_fit(seen: usize, pending: usize, additional: usize, maximum: usize) -> bool {
+    seen.checked_add(pending)
+        .and_then(|count| count.checked_add(additional))
+        .is_some_and(|count| count <= maximum)
+}
+
 /// Whether `t`'s subtree mentions a class member (memoized, iterative — no
 /// native-stack recursion; quantifier bodies included, since over-approximating
 /// containment is only ever conservative here).
@@ -551,6 +707,26 @@ fn contains_member(
     members: &HashSet<TermId>,
     memo: &mut HashMap<TermId, bool>,
 ) -> Option<bool> {
+    contains_member_bounded(terms, t, members, memo, MAX_OCCURRENCE_NODES)
+}
+
+/// Bounded implementation of [`contains_member`]. The memoized nodes and
+/// pending post-order frames share one checked budget: a hostile wide term
+/// must not enqueue an unbounded child list before the memo-size guard can
+/// observe it.
+fn contains_member_bounded(
+    terms: &TermStore,
+    t: TermId,
+    members: &HashSet<TermId>,
+    memo: &mut HashMap<TermId, bool>,
+    max_nodes: usize,
+) -> Option<bool> {
+    if let Some(&cached) = memo.get(&t) {
+        return Some(cached);
+    }
+    if memo.len().checked_add(1)? > max_nodes {
+        return None;
+    }
     // Explicit post-order: (node, children_expanded).
     let mut stack: Vec<(TermId, bool)> = vec![(t, false)];
     while let Some((cur, expanded)) = stack.pop() {
@@ -558,31 +734,91 @@ fn contains_member(
             continue;
         }
         if members.contains(&cur) {
-            if memo.len() >= MAX_OCCURRENCE_NODES {
+            if memo.len().checked_add(stack.len())?.checked_add(1)? > max_nodes {
                 return None;
             }
             memo.insert(cur, true);
             continue;
         }
         if expanded {
-            let found = terms
-                .children(cur)
-                .iter()
-                .any(|c| memo.get(c).copied().unwrap_or(false));
-            if memo.len() >= MAX_OCCURRENCE_NODES {
+            let mut found = false;
+            if for_each_term_child(terms.get(cur), |child| {
+                found |= memo.get(&child).copied().unwrap_or(false);
+            })
+            .is_none()
+            {
+                return None;
+            }
+            if memo.len().checked_add(stack.len())?.checked_add(1)? > max_nodes {
                 return None;
             }
             memo.insert(cur, found);
         } else {
-            stack.push((cur, true));
-            for &c in &terms.children(cur) {
-                if !memo.contains_key(&c) {
-                    stack.push((c, false));
-                }
+            let child_count = term_child_count(terms.get(cur))?;
+            let pending_after_expand = memo
+                .len()
+                .checked_add(stack.len())?
+                .checked_add(1)?
+                .checked_add(child_count)?;
+            if pending_after_expand > max_nodes {
+                return None;
             }
+            stack.push((cur, true));
+            for_each_term_child(terms.get(cur), |child| {
+                if !memo.contains_key(&child) {
+                    stack.push((child, false));
+                }
+            })?;
         }
     }
     Some(memo.get(&t).copied().unwrap_or(false))
+}
+
+#[cfg(test)]
+mod contains_member_tests {
+    use super::*;
+
+    #[test]
+    fn pending_post_order_frames_share_the_hard_node_cap() {
+        let mut terms = TermStore::new();
+        let member = terms.mk_var("member", Sort::Bool);
+        let left = terms.mk_var("left", Sort::Bool);
+        let right = terms.mk_var("right", Sort::Bool);
+        let wide = terms.mk_app(Symbol::named("wide"), &[member, left, right], Sort::Bool);
+        let members = HashSet::from([member]);
+
+        let mut at_limit = HashMap::new();
+        assert_eq!(
+            contains_member_bounded(&terms, wide, &members, &mut at_limit, 4),
+            Some(true)
+        );
+
+        let mut over_limit = HashMap::new();
+        assert_eq!(
+            contains_member_bounded(&terms, wide, &members, &mut over_limit, 3),
+            None,
+            "the expanded parent plus three pending children exceed the cap"
+        );
+        assert!(
+            over_limit.is_empty(),
+            "capacity refusal must happen before a partial memo is installed"
+        );
+    }
+
+    #[test]
+    fn existing_memo_entries_consume_the_shared_node_cap() {
+        let mut terms = TermStore::new();
+        let cached = terms.mk_var("cached", Sort::Bool);
+        let member = terms.mk_var("member", Sort::Bool);
+        let members = HashSet::from([member]);
+        let mut memo = HashMap::from([(cached, false)]);
+
+        assert_eq!(
+            contains_member_bounded(&terms, member, &members, &mut memo, 1),
+            None
+        );
+        assert_eq!(memo, HashMap::from([(cached, false)]));
+    }
 }
 
 /// Tiny union-find over `TermId` (path-halving find, union by direct link).

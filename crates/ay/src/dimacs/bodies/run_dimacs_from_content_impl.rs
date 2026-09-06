@@ -145,12 +145,18 @@ fn freeze_xor_extension_variables(solver: &mut SatSolver, extension: &ay_xor::Xo
 }
 
 fn run_xor_dimacs_formula(mut run: XorDimacsRun<'_>) {
+    // `admitted` is the number that decides whether this route is worth its
+    // cost (#xor-route-entry). `detected` alone used to be reported here, and
+    // it read as full coverage on instances where 725 of 735 rows had no
+    // matrix at all.
     safe_eprintln!(
-        "c XOR: detected {} constraints, {} clauses consumed, {} remaining, {} components",
+        "c XOR: detected {} constraints, {} clauses consumed, {} remaining, {} components, {}/{} rows admitted",
         run.xor_stats.xors_detected,
         run.xor_stats.clauses_consumed,
         run.remaining.len(),
-        run.extension.num_components()
+        run.extension.num_components(),
+        run.extension.admitted_rows(),
+        run.extension.coverage_denominator_rows()
     );
     let mut solver = SatSolver::new(run.num_vars);
     solver.set_symmetry_oneshot(true);
@@ -197,6 +203,7 @@ fn try_run_xor_dimacs_formula(
             xor_stats.clauses_consumed,
             remaining.len(),
             xor_stats.xors_detected,
+            XorAdmittedRows::of(&extension),
         )
     {
         return false;

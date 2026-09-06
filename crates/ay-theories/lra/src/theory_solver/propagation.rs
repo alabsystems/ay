@@ -21,11 +21,13 @@ impl LraSolver {
     ///    duplicate-variable canary in replace_clause_checked / vivify during
     ///    the next level-0 GC; release: silent wrong UNSAT).
     ///
-    /// 2. Over-tight implied bound — a lazy ImpliedBound propagation whose
-    ///    reconstructed reason is syntactically valid (all premises asserted, no
-    ///    self-reference) but does NOT actually prove the propagated literal
-    ///    under the direct (asserted) bounds (#8754 shape). Such a propagation
-    ///    forces a literal the reasons cannot defend, leading to false UNSAT.
+    /// 2. Unexplainable implied bound — a lazy ImpliedBound propagation for
+    ///    which no EXACT explanation exists under the current bounds
+    ///    (`explain_implied_bound_propagation`): the bound it was enqueued
+    ///    against went stale (tableau moved, pop-restored antecedent) or its
+    ///    derivation chain cannot be grounded on asserted literals (#8754
+    ///    shape). Such a propagation would force a literal the reasons
+    ///    cannot defend, leading to false UNSAT.
     ///
     /// Validating eagerly (rather than only at conflict-analysis materialization
     /// time, where `explain_propagation` already returns `None` for the same
@@ -49,10 +51,19 @@ impl LraSolver {
         // keep-mask first, then drop.
         let mut keep: Vec<bool> = Vec::with_capacity(propagations.len());
         let mut dropped = 0u64;
+        let mut bases: SmallVec<[ImpliedReasonBasis; 16]> = SmallVec::new();
         for prop in propagations.iter() {
             let valid = if prop.is_lazy() {
                 match prop.reason_data {
-                    Some(rd) => self.lazy_propagation_is_sound(&prop.literal, rd),
+                    Some(rd) => match self.lazy_propagation_is_sound(&prop.literal, rd) {
+                        Some(basis) => {
+                            if let Some(basis) = basis {
+                                bases.push(basis);
+                            }
+                            true
+                        }
+                        None => false,
+                    },
                     // No reason_data and no eager reason: cannot justify.
                     None => false,
                 }
@@ -65,6 +76,9 @@ impl LraSolver {
             if !valid {
                 dropped += 1;
             }
+        }
+        for basis in bases {
+            self.note_implied_reason_basis(basis);
         }
         if dropped > 0 {
             let mut i = 0;
@@ -91,192 +105,60 @@ impl LraSolver {
     ///     (circular / tautological reason), and
     ///   * every reason literal is currently asserted (sound, falsified premise).
     ///
-    /// If any condition fails, the propagation is unsound to place on the trail
-    /// and must be dropped at the source. This mirrors the rejection performed
-    /// at materialization time in `explain_propagation`, but applied eagerly so
-    /// the unsound assignment never reaches the SAT trail in the first place.
-    fn lazy_propagation_is_sound(&self, lit: &TheoryLit, reason_data: u64) -> bool {
+    /// For lazy ImpliedBound propagations (bit62=1, bit63=0) the reconstruction
+    /// is `explain_implied_bound_propagation`, which is EXACT for the present
+    /// state: every strategy it has checks that the literals it returns entail
+    /// the propagated atom under the CURRENT bounds (the producer's row-derived
+    /// bound still decides the atom AND its derivation chain is grounded, or a
+    /// direct-only re-derivation decides it). This filter runs at the end of
+    /// `propagate_impl()`, AFTER `compute_implied_bounds()` refreshed
+    /// `implied_bounds`, so a propagation whose justifying bound went stale
+    /// (tableau moved, antecedent widened by a pop) finds no explanation and is
+    /// dropped, while a genuine row-derived propagation — including one whose
+    /// entailment rests on implied bounds of the atom's original variables
+    /// through equality chains (the sc-* shape) — passes. DirectBound reasons
+    /// come straight from an asserted bound (sound by construction); Interval
+    /// reasons (bit63=1) are eagerly materialized and verified elsewhere.
+    ///
+    /// Returns `Some(basis)` when sound (the basis is the implied-bound
+    /// strategy used, for telemetry; `None` inside for DirectBound reasons),
+    /// or `None` when the propagation must be dropped at the source.
+    fn lazy_propagation_is_sound(
+        &self,
+        lit: &TheoryLit,
+        reason_data: u64,
+    ) -> Option<Option<ImpliedReasonBasis>> {
         let self_term = lit.term;
-        let reason = match self.explain_propagation_inner(self_term, reason_data) {
-            Some(r) => r,
-            None => return false,
+        let is_interval = (reason_data >> 63) & 1 != 0;
+        let is_implied = !is_interval && ((reason_data >> 62) & 1 != 0);
+        let (reason, basis) = if is_implied {
+            let var = (reason_data & 0xFFFF_FFFF) as u32;
+            let need_upper = (reason_data >> 32) & 1 != 0;
+            let polarity = (reason_data >> 33) & 1 != 0;
+            let (reason, basis) =
+                self.explain_implied_bound_propagation(self_term, var, need_upper, polarity)?;
+            (reason, Some(basis))
+        } else {
+            (
+                self.explain_propagation_inner(self_term, reason_data)?,
+                None,
+            )
         };
         if reason.is_empty() {
-            return false;
+            return None;
         }
         // Circular / tautological reason (references the propagated atom).
         if reason.iter().any(|r| r.term == self_term) {
-            return false;
+            return None;
         }
         // Every reason literal must be an asserted (falsified-premise) fact.
         if !reason
             .iter()
             .all(|r| self.asserted.get(&r.term) == Some(&r.value))
         {
-            return false;
+            return None;
         }
-        // Freshness / entailment gate for lazy ImpliedBound propagations.
-        //
-        // An ImpliedBound propagation concludes a derived (row-computed) bound on
-        // the propagated variable. Its reconstructed reason can be syntactically
-        // valid (premises asserted, no self-reference) yet still NOT entail the
-        // propagation once the implied bound that justified it goes STALE: the
-        // tableau may move (simplex pivots, new direct bounds) between the
-        // propagation's enqueue (check() time) and this drain. A stale propagation
-        // forces a literal the current state no longer supports; when conflict
-        // analysis resolves through it the SAT layer learns an over-constrained
-        // clause and can report false UNSAT. On _hhk2008 the stale reason also
-        // becomes circular under SAT-variable aliasing — which is what injected the
-        // duplicate-variable / tautological reason clause into the SAT database.
-        //
-        // Re-verify entailment against the FRESHLY recomputed implied bound on the
-        // propagating variable. This filter runs at the end of propagate_impl(),
-        // AFTER compute_implied_bounds() has refreshed `implied_bounds`, so the
-        // check reflects the present tableau. A genuinely row-derivable
-        // propagation (whose implied bound is current) still passes — preserving
-        // legitimate single-row / cascade implied-bound propagation, exercised by
-        // the propagation_regression tests — while a stale one is dropped.
-        // Dropping a propagation is always sound.
-        //
-        // Scope to ImpliedBound reasons (bit62=1, bit63=0). DirectBound reasons
-        // come straight from an asserted bound (sound by construction); Interval
-        // reasons (bit63=1) are eagerly materialized and verified elsewhere.
-        let is_interval = (reason_data >> 63) & 1 != 0;
-        let is_implied = !is_interval && ((reason_data >> 62) & 1 != 0);
-        if is_implied {
-            let var = (reason_data & 0xFFFF_FFFF) as u32;
-            let need_upper = (reason_data >> 32) & 1 != 0;
-            if !self.implied_bound_still_implies(var, need_upper, lit) {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Whether the propagated literal `lit` is still entailed by the FRESHLY
-    /// recomputed implied bound on `var` (upper if `need_upper`, else lower).
-    ///
-    /// Computes the propagated atom's expression interval using direct bounds for
-    /// every variable, except that for the propagating variable `var` it
-    /// substitutes the current `implied_bounds[var]` overlay (the bound the
-    /// propagation was derived from). If the resulting interval still implies the
-    /// literal, the implied bound is live and the propagation is sound to keep;
-    /// otherwise the bound is stale (or no longer present) and the propagation is
-    /// dropped. This preserves genuine row-derived propagation while rejecting the
-    /// stale, false-UNSAT-inducing propagations seen on _hhk2008.
-    fn implied_bound_still_implies(&self, var: u32, need_upper: bool, lit: &TheoryLit) -> bool {
-        let vi = var as usize;
-        // The fresh implied bound must currently exist.
-        let Some((lower_ib, upper_ib)) = self.implied_bounds.get(vi) else {
-            return false;
-        };
-        let ib = if need_upper {
-            upper_ib.as_ref()
-        } else {
-            lower_ib.as_ref()
-        };
-        let Some(ib) = ib else {
-            return false;
-        };
-        let Some(Some(info)) = self.atom_cache.get(&lit.term) else {
-            return false;
-        };
-        // Compute the atom expression interval, using the fresh implied bound for
-        // `var` and direct bounds for the rest. Mirrors compute_expr_interval's
-        // direction handling (c>0 vs c<0; upper vs lower accumulation).
-        let mut lb = info.expr.constant.clone();
-        let mut ub = info.expr.constant.clone();
-        let mut lb_finite = true;
-        let mut ub_finite = true;
-        let mut lb_strict = false;
-        let mut ub_strict = false;
-        for &(v, ref coeff) in &info.expr.coeffs {
-            let vj = v as usize;
-            if vj >= self.vars.len() {
-                return false;
-            }
-            // Resolve the (lb, ub) endpoints to use for this variable. For the
-            // propagating var, override the relevant side with the fresh implied
-            // bound; for the rest use direct bounds only.
-            let vinfo = &self.vars[vj];
-            let direct_lb = vinfo.lower.as_ref().map(|b| (b.value.clone(), b.strict));
-            let direct_ub = vinfo.upper.as_ref().map(|b| (b.value.clone(), b.strict));
-            let (use_lb, use_ub) = if v == var {
-                let implied = (ib.value.clone(), ib.strict);
-                if need_upper {
-                    (direct_lb, Some(implied))
-                } else {
-                    (Some(implied), direct_ub)
-                }
-            } else {
-                (direct_lb, direct_ub)
-            };
-            if coeff.is_positive() {
-                if ub_finite {
-                    match &use_ub {
-                        Some((bv, strict)) => {
-                            ub.mul_add_assign(coeff, bv);
-                            ub_strict |= *strict;
-                        }
-                        None => ub_finite = false,
-                    }
-                }
-                if lb_finite {
-                    match &use_lb {
-                        Some((bv, strict)) => {
-                            lb.mul_add_assign(coeff, bv);
-                            lb_strict |= *strict;
-                        }
-                        None => lb_finite = false,
-                    }
-                }
-            } else {
-                if ub_finite {
-                    match &use_lb {
-                        Some((bv, strict)) => {
-                            ub.mul_add_assign(coeff, bv);
-                            ub_strict |= *strict;
-                        }
-                        None => ub_finite = false,
-                    }
-                }
-                if lb_finite {
-                    match &use_ub {
-                        Some((bv, strict)) => {
-                            lb.mul_add_assign(coeff, bv);
-                            lb_strict |= *strict;
-                        }
-                        None => lb_finite = false,
-                    }
-                }
-            }
-            if !lb_finite && !ub_finite {
-                break;
-            }
-        }
-        let lb_ep = lb_finite.then(|| IntervalEndpoint::new(lb, lb_strict));
-        let ub_ep = ub_finite.then(|| IntervalEndpoint::new(ub, ub_strict));
-        let is_le = info.is_le;
-        let strict = info.strict;
-        if lit.value {
-            if is_le {
-                ub_ep
-                    .as_ref()
-                    .is_some_and(|ep| Self::endpoint_implies_le_zero(ep, strict))
-            } else {
-                lb_ep
-                    .as_ref()
-                    .is_some_and(|ep| Self::endpoint_implies_ge_zero(ep, strict))
-            }
-        } else if is_le {
-            lb_ep
-                .as_ref()
-                .is_some_and(|ep| Self::endpoint_implies_not_le_zero(ep, strict))
-        } else {
-            ub_ep
-                .as_ref()
-                .is_some_and(|ep| Self::endpoint_implies_not_ge_zero(ep, strict))
-        }
+        Some(basis)
     }
 
     pub(super) fn propagate_impl(&mut self) -> Vec<TheoryPropagation> {
@@ -1447,76 +1329,15 @@ impl LraSolver {
                 Some(reason)
             }
             DeferredReason::ImpliedBound { var, need_upper } => {
-                // #8511: BoundExplanation chain + single-row + interval fallbacks.
-                // collect_reasons_from_explanation() now validates direct bound
-                // asserted status, preventing unsound reason sets.
-                let vi = *var as usize;
-                // Try eager reason collection from BoundExplanation first.
-                if let Some(reasons) = self.make_eager_implied_propagation_reasons(vi, *need_upper)
-                {
-                    if !reasons.is_empty() {
-                        return Some(reasons);
-                    }
-                }
-                // Fallback: single-row reason collection.
-                if let Some(ib_pair) = self.implied_bounds.get(vi) {
-                    let ib = if *need_upper {
-                        ib_pair.1.as_ref()
-                    } else {
-                        ib_pair.0.as_ref()
-                    };
-                    if let Some(ib) = ib {
-                        if ib.row_idx != usize::MAX && self.max_row_width <= 50 {
-                            if let Some(reasons) =
-                                self.collect_single_row_reasons(*var, *need_upper, ib.row_idx)
-                            {
-                                if !reasons.is_empty() {
-                                    return Some(reasons);
-                                }
-                            }
-                        }
-                    }
-                }
-                // Third fallback: interval-based reasons from atom expression.
-                let atom_term = literal.term;
-                if let Some(Some(info)) = self.atom_cache.get(&atom_term) {
-                    // #7853: Use reference instead of cloning LinearExpr.
-                    let is_le = info.is_le;
-                    let strict = info.strict;
-                    let for_upper = if literal.value { is_le } else { !is_le };
-                    // #8754 soundness fix: verify the direct-only interval
-                    // actually IMPLIES the literal before returning reasons
-                    // from collect_interval_reasons. Without this check, when
-                    // the ImpliedBound propagation was enqueued against a
-                    // tighter implied bound (post-simplex cascade or
-                    // cross-negation overlay), the collected direct-bound
-                    // reasons are syntactically valid but do not prove the
-                    // propagation.
-                    let (lb, ub) = self.compute_expr_interval_direct_only(&info.expr);
-                    let implied_true = if literal.value {
-                        if is_le {
-                            ub.as_ref()
-                                .is_some_and(|ep| Self::endpoint_implies_le_zero(ep, strict))
-                        } else {
-                            lb.as_ref()
-                                .is_some_and(|ep| Self::endpoint_implies_ge_zero(ep, strict))
-                        }
-                    } else if is_le {
-                        lb.as_ref()
-                            .is_some_and(|ep| Self::endpoint_implies_not_le_zero(ep, strict))
-                    } else {
-                        ub.as_ref()
-                            .is_some_and(|ep| Self::endpoint_implies_not_ge_zero(ep, strict))
-                    };
-                    if !implied_true {
-                        return None;
-                    }
-                    let reason = self.collect_interval_reasons(&info.expr, for_upper);
-                    if !reason.is_empty() {
-                        return Some(reason);
-                    }
-                }
-                None
+                // Exact explanation under the current bounds (see
+                // `implied_explain.rs`); `None` drops the propagation.
+                self.explain_implied_bound_propagation(
+                    literal.term,
+                    *var,
+                    *need_upper,
+                    literal.value,
+                )
+                .map(|(reasons, _)| reasons)
             }
             DeferredReason::ImpliedRow { .. } => {
                 // #8511 soundness fix: Re-verify interval before collecting reasons.

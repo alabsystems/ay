@@ -13,7 +13,7 @@ fn test_propagate_simple_ground_equality() {
     // Create: (= (f 0) 42)
     let zero = terms.mk_int(BigInt::from(0));
     let fortytwo = terms.mk_int(BigInt::from(42));
-    let f_0 = terms.mk_app(Symbol::Named("f".to_string()), vec![zero], Sort::Int);
+    let f_0 = terms.mk_app(Symbol::named("f"), vec![zero], Sort::Int);
     let eq = terms.mk_eq(f_0, fortytwo);
 
     // Create: (= x (+ (f 0) 1))
@@ -77,8 +77,8 @@ fn test_propagate_cascading_through_fixed_point() {
     let zero = terms.mk_int(BigInt::from(0));
     let one = terms.mk_int(BigInt::from(1));
     let two = terms.mk_int(BigInt::from(2));
-    let succ_0 = terms.mk_app(Symbol::Named("Succ".to_string()), vec![zero], Sort::Int);
-    let succ_1 = terms.mk_app(Symbol::Named("Succ".to_string()), vec![one], Sort::Int);
+    let succ_0 = terms.mk_app(Symbol::named("Succ"), vec![zero], Sort::Int);
+    let succ_1 = terms.mk_app(Symbol::named("Succ"), vec![one], Sort::Int);
     let eq1 = terms.mk_eq(succ_0, one);
     let eq2 = terms.mk_eq(succ_1, two);
 
@@ -88,7 +88,7 @@ fn test_propagate_cascading_through_fixed_point() {
     //   rewrite(Succ(Succ(0))) -> rewrite inner: Succ(0) -> 1
     //   -> rebuild Succ(1) -> hash-consed to succ_1 -> value_map -> 2
     let x = terms.mk_var("x", Sort::Int);
-    let succ_succ_0 = terms.mk_app(Symbol::Named("Succ".to_string()), vec![succ_0], Sort::Int);
+    let succ_succ_0 = terms.mk_app(Symbol::named("Succ"), vec![succ_0], Sort::Int);
     let eq3 = terms.mk_eq(x, succ_succ_0);
 
     let mut assertions = vec![eq1, eq2, eq3];
@@ -182,15 +182,15 @@ fn goal_mode_rewrites_later_definers_with_earlier_ones() {
     let zero = terms.mk_int(BigInt::from(0));
     let one = terms.mk_int(BigInt::from(1));
     let two = terms.mk_int(BigInt::from(2));
-    let f_0 = terms.mk_app(Symbol::Named("f".to_string()), vec![zero], Sort::Int);
-    let f_f_0 = terms.mk_app(Symbol::Named("f".to_string()), vec![f_0], Sort::Int);
+    let f_0 = terms.mk_app(Symbol::named("f"), vec![zero], Sort::Int);
+    let f_f_0 = terms.mk_app(Symbol::named("f"), vec![f_0], Sort::Int);
     let eq1 = terms.mk_eq(f_0, one);
     let eq2 = terms.mk_eq(f_f_0, two);
 
     let mut fs = vec![eq1, eq2];
     let changed = PropagateValues::new().apply_goal(&mut terms, &mut fs);
 
-    let f_1 = terms.mk_app(Symbol::Named("f".to_string()), vec![one], Sort::Int);
+    let f_1 = terms.mk_app(Symbol::named("f"), vec![one], Sort::Int);
     let expected = terms.mk_eq(f_1, two);
     assert!(changed);
     assert_eq!(
@@ -206,14 +206,14 @@ fn goal_mode_harvests_non_ground_equalities() {
     let mut terms = TermStore::new();
     let y = terms.mk_var("y", Sort::Int);
     let three = terms.mk_int(BigInt::from(3));
-    let f_y = terms.mk_app(Symbol::Named("f".to_string()), vec![y], Sort::Int);
+    let f_y = terms.mk_app(Symbol::named("f"), vec![y], Sort::Int);
     let eq = terms.mk_eq(f_y, three);
-    let p_fy = terms.mk_app(Symbol::Named("P".to_string()), vec![f_y], Sort::Bool);
+    let p_fy = terms.mk_app(Symbol::named("P"), vec![f_y], Sort::Bool);
 
     let mut fs = vec![eq, p_fy];
     let changed = PropagateValues::new().apply_goal(&mut terms, &mut fs);
 
-    let p_3 = terms.mk_app(Symbol::Named("P".to_string()), vec![three], Sort::Bool);
+    let p_3 = terms.mk_app(Symbol::named("P"), vec![three], Sort::Bool);
     assert!(changed);
     assert_eq!(fs, vec![eq, p_3], "non-ground (f y) ↦ 3 must be harvested");
 }
@@ -306,7 +306,7 @@ fn test_propagate_preserves_defining_equalities() {
     // Create: (= (f 0) 5) and just that assertion
     let zero = terms.mk_int(BigInt::from(0));
     let five = terms.mk_int(BigInt::from(5));
-    let f_0 = terms.mk_app(Symbol::Named("f".to_string()), vec![zero], Sort::Int);
+    let f_0 = terms.mk_app(Symbol::named("f"), vec![zero], Sort::Int);
     let eq = terms.mk_eq(f_0, five);
 
     let mut assertions = vec![eq];

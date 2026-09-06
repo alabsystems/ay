@@ -4500,8 +4500,26 @@ fn print_smt_stats(
     stats_cfg: stats_output::StatsConfig,
 ) {
     if stats_cfg.human {
+        use std::io::IsTerminal;
         let dpll_stats = executor.statistics();
-        safe_eprintln!("{dpll_stats}");
+        if stats_cfg.full {
+            safe_eprintln!("{dpll_stats}");
+        } else {
+            let result_str = match transcript.public_verdict {
+                Some(PublicVerdict::Sat) => "sat",
+                Some(PublicVerdict::Unsat) => "unsat",
+                Some(PublicVerdict::Unknown) | None => "unknown",
+            };
+            safe_eprintln!(
+                "{}",
+                stats_output::curated_smt_statistics(
+                    &dpll_stats,
+                    result_str,
+                    super::global_elapsed(),
+                    io::stderr().is_terminal(),
+                )
+            );
+        }
         if let Some(formula_stats) = formula_stats {
             safe_eprintln!("{formula_stats}");
         }
@@ -4680,7 +4698,15 @@ fn print_smt_stats(
     }
     insert_unsupported_smt_jit_application_counters(&mut run_stats);
     attach_smt_lra_competition_jit(&mut run_stats);
-    run_stats.emit(stats_cfg);
+    // The `c --- AY statistics ---` block restates a subset of the s-expression
+    // block already printed above, under a second set of key spellings and with
+    // a third copy of the build stamp. The s-expression block is the SMT idiom —
+    // z3 prints one too — so SMT runs emit it alone; DIMACS and PB keep the
+    // comment block as their native form.
+    run_stats.emit(stats_output::StatsConfig {
+        human: false,
+        ..stats_cfg
+    });
 }
 
 #[cfg(test)]
@@ -7804,6 +7830,66 @@ impl IncrementalDepth {
     }
 }
 
+/// What an interactive session shows a HUMAN, as distinct from what it streams.
+///
+/// Split out of the old `is_tty` bool because that one flag was answering three
+/// different questions — print a banner? print a prompt? which prompt? — and the
+/// answers stopped agreeing once a start screen existed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ReplSurface {
+    /// Nothing but the protocol: no banner, no prompt, no hints. What a pipe,
+    /// `-in`, and `--z3-mode` get, byte-identical to every previous release.
+    Raw,
+    /// The pre-redesign surface: a bare `> ` prompt and nothing else.
+    /// `AY_PLAIN_REPL=1`, for expect/pty harnesses that scrape prompts.
+    Plain,
+    /// The start screen, `ay>` / `..>` prompts, and the human affordances.
+    Full,
+}
+
+/// Decide the surface once, from every signal that has a say.
+///
+/// The stdout check is the one that was missing: the gate used to read stdin
+/// alone, so `ay > file` on a terminal wrote the banner INTO the file. Both ends
+/// must be a terminal before ay assumes a human is watching.
+///
+/// An explicit `-in`/`--incremental` means "give me z3's command stream", and it
+/// wins even on a terminal — that is the invocation a pty-driven harness
+/// actually uses, and z3 prints no prompt there either.
+fn repl_surface(stdin_tty: bool, incremental: bool) -> ReplSurface {
+    use std::io::IsTerminal;
+    repl_surface_from(
+        stdin_tty,
+        io::stdout().is_terminal(),
+        incremental,
+        super::Z3_MODE_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+        std::env::var_os("AY_PLAIN_REPL").is_some_and(|v| !v.is_empty() && v != "0"),
+    )
+}
+
+/// The decision table behind [`repl_surface`], with every input handed in.
+///
+/// Pure because this is the one function in the redesign that can corrupt
+/// somebody's data: a `Full` returned for a pipe puts a banner and prompts into
+/// a Why3 or Dafny coprocess's stream, and the driver on the other end is
+/// parsing s-expressions. Every row is pinned by a test rather than reasoned
+/// about at the call site.
+fn repl_surface_from(
+    stdin_tty: bool,
+    stdout_tty: bool,
+    incremental: bool,
+    z3_mode: bool,
+    plain_repl: bool,
+) -> ReplSurface {
+    if !stdin_tty || !stdout_tty || incremental || z3_mode {
+        return ReplSurface::Raw;
+    }
+    if plain_repl {
+        return ReplSurface::Plain;
+    }
+    ReplSurface::Full
+}
+
 pub(super) fn run_interactive(
     stats_cfg: stats_output::StatsConfig,
     proof_config: Option<&ProofConfig>,
@@ -7865,7 +7951,7 @@ pub(super) fn run_interactive(
             let reader = io::BufReader::new(io::Cursor::new(prefix).chain(locked));
             run_interactive_smt_stream(
                 reader,
-                false,
+                ReplSurface::Raw,
                 stats_cfg,
                 proof_config,
                 visualization,
@@ -7951,7 +8037,7 @@ pub(super) fn run_interactive(
     // Line-by-line mode: TTY interactive OR piped incremental (#5360).
     run_interactive_smt_stream(
         stdin.lock(),
-        is_tty,
+        repl_surface(is_tty, incremental),
         stats_cfg,
         proof_config,
         visualization,
@@ -7969,7 +8055,7 @@ pub(super) fn run_interactive(
 /// `is_tty` only controls whether the interactive prompt is printed.
 fn run_interactive_smt_stream(
     mut reader: impl BufRead,
-    is_tty: bool,
+    surface: ReplSurface,
     stats_cfg: stats_output::StatsConfig,
     proof_config: Option<&ProofConfig>,
     visualization: Option<VisualizationFormat>,
@@ -7977,7 +8063,7 @@ fn run_interactive_smt_stream(
     validate: bool,
 ) {
     reject_explicit_proof_verification_for_route("SMT-LIB", "Alethe");
-    if is_tty {
+    if surface == ReplSurface::Full {
         safe_println!("{}", super::features::interactive_banner());
     }
 
@@ -8040,8 +8126,16 @@ fn run_interactive_smt_stream(
 
     loop {
         exit_if_timed_out_with_transcript_context(&transcript);
-        if is_tty {
-            safe_print!("> ");
+        match surface {
+            // `ay>` and `..>` are the same width, so a pasted multi-line command
+            // stays column-aligned instead of stair-stepping. Dim, because the
+            // brightest thing on the screen should be what the user typed.
+            ReplSurface::Full => {
+                let prompt = if depth_scan.depth > 0 { "..>" } else { "ay>" };
+                safe_print!("{} ", super::help_style::dim(prompt));
+            }
+            ReplSurface::Plain => safe_print!("> "),
+            ReplSurface::Raw => {}
         }
         let _ = stdout.flush();
 
@@ -8068,9 +8162,13 @@ fn run_interactive_smt_stream(
         // still open the command cannot be complete, so keep reading without
         // re-lexing the whole (potentially multi-megabyte) buffer. This is the
         // dominant cost on multi-line BMC asserts. See `IncrementalDepth`.
-        if linear_parse && !eof {
+        // The depth is fed for the PARSE gate when `linear_parse` is on, and for
+        // the CONTINUATION PROMPT whenever a human is watching — a session with
+        // `--no-inc-linear-parse` still deserves a `..>` that means something.
+        // Only the gate short-circuits, so the parse behaviour is unchanged.
+        if (linear_parse || surface == ReplSurface::Full) && !eof {
             depth_scan.feed(&line);
-            if depth_scan.depth > 0 {
+            if linear_parse && depth_scan.depth > 0 {
                 continue;
             }
         }
@@ -8894,4 +8992,103 @@ pub(super) fn is_fixedpoint_format(content: &str) -> bool {
     commands
         .iter()
         .any(|cmd| matches!(cmd, Command::Rule(_) | Command::Query(_)))
+}
+
+#[cfg(test)]
+mod repl_surface_tests {
+    use super::{repl_surface_from, ReplSurface};
+
+    /// THE INVARIANT THAT PROTECTS SOMEBODY ELSE'S DATA.
+    ///
+    /// Why3, Dafny and Boogie drive ay as a coprocess over a pipe, parsing
+    /// s-expressions off stdout. A banner or a prompt on that stream is not a
+    /// cosmetic bug — it is a parse error in a tool that is not ay, reported to
+    /// a user who has no idea ay is involved. Every non-terminal shape must be
+    /// Raw, and there is no "unless" worth adding to that sentence.
+    #[test]
+    fn nothing_but_a_two_sided_terminal_ever_gets_a_surface() {
+        for &stdin_tty in &[true, false] {
+            for &stdout_tty in &[true, false] {
+                for &incremental in &[true, false] {
+                    for &z3_mode in &[true, false] {
+                        for &plain in &[true, false] {
+                            let surface = repl_surface_from(
+                                stdin_tty,
+                                stdout_tty,
+                                incremental,
+                                z3_mode,
+                                plain,
+                            );
+                            let human = stdin_tty && stdout_tty && !incremental && !z3_mode;
+                            if !human {
+                                assert_eq!(
+                                    surface,
+                                    ReplSurface::Raw,
+                                    "stdin_tty={stdin_tty} stdout_tty={stdout_tty} \
+                                     incremental={incremental} z3_mode={z3_mode} plain={plain} \
+                                     must be Raw"
+                                );
+                            } else {
+                                assert_ne!(surface, ReplSurface::Raw);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `ay > file` from a terminal. The old gate read stdin alone, so the banner
+    /// went INTO the file — the measured leak this check exists to close.
+    #[test]
+    fn a_redirected_stdout_gets_no_banner_even_from_a_terminal() {
+        assert_eq!(
+            repl_surface_from(true, false, false, false, false),
+            ReplSurface::Raw
+        );
+    }
+
+    /// An explicit `-in` is a request for z3's command stream, and it wins even
+    /// on a terminal — that is the invocation a pty-driven harness uses, and z3
+    /// prints no prompt there either.
+    #[test]
+    fn explicit_incremental_forces_raw_even_on_a_terminal() {
+        assert_eq!(
+            repl_surface_from(true, true, true, false, false),
+            ReplSurface::Raw
+        );
+    }
+
+    /// --z3-mode means "no ay-isms", and a start screen is the largest ay-ism
+    /// there is.
+    #[test]
+    fn z3_mode_forces_raw() {
+        assert_eq!(
+            repl_surface_from(true, true, false, true, false),
+            ReplSurface::Raw
+        );
+    }
+
+    /// The escape hatch: AY_PLAIN_REPL restores the bare `> ` prompt for a
+    /// harness that scrapes it, without silencing the session the way `-q`
+    /// would. It downgrades the surface; it never resurrects one.
+    #[test]
+    fn plain_repl_downgrades_a_human_surface_but_never_creates_one() {
+        assert_eq!(
+            repl_surface_from(true, true, false, false, true),
+            ReplSurface::Plain
+        );
+        assert_eq!(
+            repl_surface_from(false, true, false, false, true),
+            ReplSurface::Raw
+        );
+    }
+
+    #[test]
+    fn a_plain_two_sided_terminal_gets_the_start_screen() {
+        assert_eq!(
+            repl_surface_from(true, true, false, false, false),
+            ReplSurface::Full
+        );
+    }
 }

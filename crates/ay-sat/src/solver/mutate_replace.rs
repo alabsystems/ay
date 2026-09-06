@@ -130,6 +130,12 @@ impl Solver {
                 }
             }
 
+            // Strict-deletion surface (VeriPB): the old clause is deleted a
+            // few lines later in `replace_clause_impl`, and the replacement no
+            // longer contains `assigned_lit`, so this is the last moment at
+            // which the level-0 fact is derivable. State it as a unit.
+            self.proof_emit_level0_unit_for_lost_reason(assigned_lit);
+
             // Invalidate reason marks: clause replacement may clear reasons
             // for variables that shared this clause (#8100).
             self.invalidate_reason_clause_marks();

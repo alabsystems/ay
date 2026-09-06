@@ -362,14 +362,14 @@ fn reduce_selectors_rec(
             let mut folded = None;
             if let (Symbol::Named(name), [only]) = (&sym, rargs.as_slice()) {
                 if let TermData::App(Symbol::Named(ctor), cargs) = terms.get(*only).clone() {
-                    if let Some(sels) = ctor_sels.get(&ctor) {
+                    if let Some(sels) = ctor_sels.get(ctor.as_str()) {
                         if let Some(idx) = sels.iter().position(|s| s == name) {
                             folded = cargs.get(idx).copied();
                         }
                     }
                     if folded.is_none() {
                         if let Some(tested) = name.strip_prefix("is-") {
-                            if ctor_sels.contains_key(tested) && ctor_sels.contains_key(&ctor) {
+                            if ctor_sels.contains_key(tested) && ctor_sels.contains_key(ctor.as_str()) {
                                 folded = Some(if tested == ctor {
                                     terms.true_term()
                                 } else {

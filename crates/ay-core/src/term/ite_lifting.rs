@@ -333,7 +333,7 @@ impl TermStore {
             ">" => self.mk_gt(lhs, rhs),
             ">=" => self.mk_ge(lhs, rhs),
             "distinct" => self.mk_distinct(vec![lhs, rhs]),
-            _ => self.mk_app(Symbol::Named(pred.to_string()), vec![lhs, rhs], Sort::Bool),
+            _ => self.mk_app(Symbol::named(pred), vec![lhs, rhs], Sort::Bool),
         }
     }
 
@@ -352,7 +352,7 @@ impl TermStore {
             ("abs", &[arg]) => self.mk_abs(arg),
             ("to_real", &[arg]) => self.mk_to_real(arg),
             ("to_int", &[arg]) => self.mk_to_int(arg),
-            _ => self.mk_app(Symbol::Named(op.to_string()), args, sort),
+            _ => self.mk_app(Symbol::named(op), args, sort),
         }
     }
 

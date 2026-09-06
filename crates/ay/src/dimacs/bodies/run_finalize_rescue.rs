@@ -71,6 +71,11 @@ fn run_finalize_rescue_body(
         global_elapsed().as_millis()
     );
     let mut solver = create_finalize_rescue_solver(&formula, proof_config)?;
+    // The rescue solver is built here rather than through the shared runner,
+    // so it does not pass through `configure_dimacs_solver`. Install the
+    // dry-run artifact destination explicitly: the solver core no longer
+    // discovers it from the process environment on its own.
+    configure_fmla_learned_lrat_dry_run_artifact(&mut solver);
     solver.set_inprocessing_profile(&finalize_rescue_profile());
     solver.set_symmetry_oneshot(true);
     for clause in formula.clauses {

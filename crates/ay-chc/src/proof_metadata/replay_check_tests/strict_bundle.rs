@@ -26,6 +26,36 @@ pub(super) fn assert_strict_bundle_rows(checked: &ChcCheckedReplayRun) {
         assert_eq!(cert.bundle_sha256.len(), 64);
     }
 
+    let payloads: Vec<_> = checked.obligation_payloads().collect();
+    assert_eq!(payloads.len(), checked.summary().obligations.len());
+    for payload in payloads {
+        let obligation = payload.obligation();
+        let query_bytes = payload
+            .smt_query_bytes()
+            .expect("UNSAT row must retain an SMT-LIB query");
+        assert_eq!(obligation.query.sha256, sha256_hex(query_bytes));
+        assert_eq!(obligation.query.bytes, query_bytes.len() as u64);
+        let bundle_bytes = payload
+            .strict_bundle_bytes()
+            .expect("UNSAT row must retain serialized strict bundle bytes");
+        let cert = obligation
+            .strict_cert
+            .as_ref()
+            .expect("UNSAT row must retain its strict commitment");
+        assert_eq!(cert.bundle_sha256, sha256_hex(bundle_bytes));
+        let bundle: ay_dpll::api::SerializableProofBundle =
+            serde_json::from_slice(bundle_bytes).expect("retained strict bundle JSON");
+        assert_eq!(bundle.schema, cert.proof_bundle_schema);
+        let rechecked = ay_dpll::api::re_check_bundle_strict(&bundle)
+            .expect("retained strict bundle must independently recheck");
+        assert!(rechecked.quality.is_complete());
+        match (cert.alethe_sha256.as_deref(), payload.alethe_bytes()) {
+            (Some(expected), Some(bytes)) => assert_eq!(expected, sha256_hex(bytes)),
+            (None, None) => {}
+            mismatch => panic!("Alethe payload/commitment mismatch: {mismatch:?}"),
+        }
+    }
+
     let replay_log: serde_json::Value = serde_json::from_slice(checked.replay_log_bytes())
         .expect("checked replay log should be JSON");
     for record in replay_log["obligations"]

@@ -1,0 +1,38 @@
+AY is one binary. The solver, the proof checkers, the non-SMT front
+ends, and the help system all live behind the commands below, grouped by
+what you are trying to do. Hand a formula straight to solve; reach for
+the rest when the input is not SMT-LIB, or when you want AY to show its
+work rather than just answer.
+
+Solve — decide, enumerate, count, simplify.
+  solve         Solve an SMT-LIB2, DIMACS CNF, or CHC formula (default)
+  allsat        Enumerate all satisfying assignments of a DIMACS CNF
+  model-count   Exact unweighted MC/PMC counting, competition output
+  simplify      SMT-LIB2 AST simplification
+
+Prove & trust — certificates in, certificates out.
+  check         Verify DRAT/LRAT/DPR/SR proofs and SAT models
+  diagnose      Diagnose a wrong answer: validate, cross-check z3, explain
+
+Formats — native front ends beyond SMT-LIB.
+  maxsat        MaxSAT solving
+  pb            Pseudo-Boolean solving
+  qbf           Quantified Boolean Formula solving
+  lp            Linear and mixed-integer programming (MPS / LP formats)
+  flatzinc      FlatZinc / MiniZinc integration
+
+Learn & meta — the tour and the self-describing surfaces.
+  tutorial      Interactive tutorial
+  commands      This screen: every visible command, grouped
+  options       AY_* environment options, with each one's current value
+  help          Print help for ay or for a named subcommand
+
+About fifteen further commands are hidden from this list: benchmarking,
+corpora, tooling, gates, release, and audit machinery aimed at AY's own
+maintainers. Hidden is not secret. Each still answers to
+ay <name> --help, and the development design notes describes that surface.
+
+Every command has its own screen, with its own flags and arguments:
+
+  ay solve --help        the solver and every option it takes
+  ay <command> --help    any other command listed above

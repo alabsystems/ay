@@ -143,6 +143,7 @@ impl ChcProblem {
     pub(crate) fn rewrite_clause_local_constant_aliases_for_array_scalarization(
         &mut self,
     ) -> usize {
+        self.preserve_pruned_query_source();
         let mut rewritten_aliases = 0usize;
         for clause in &mut self.clauses {
             let Some(constraint) = clause.body.constraint.as_ref() else {
@@ -302,6 +303,7 @@ impl ChcProblem {
         &mut self,
         index_map: FxHashMap<ChcSort, FxHashSet<ConstIndex>>,
     ) -> ArrayScalarizationMap {
+        self.preserve_pruned_query_source();
         let sorted_index_map: FxHashMap<ChcSort, Vec<ConstIndex>> = index_map
             .into_iter()
             .map(|(k, set)| {
@@ -370,7 +372,10 @@ impl ChcProblem {
                 }
                 ClauseHead::False => ClauseHead::False,
             };
-            new_clauses.push(HornClause::new(new_body, new_head));
+            let mut new_clause = HornClause::new(new_body, new_head);
+            new_clause.action_id = clause.action_id;
+            new_clause.source_query_ordinal = clause.source_query_ordinal;
+            new_clauses.push(new_clause);
         }
 
         self.clauses = new_clauses;

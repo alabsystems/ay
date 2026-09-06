@@ -16,7 +16,9 @@ impl ChcProblem {
             predicates: Vec::new(),
             predicate_names: FxHashMap::default(),
             clauses: Vec::new(),
-            pruned_false_queries: 0,
+            pruned_false_queries: Vec::new(),
+            pruned_query_source: None,
+            next_source_query_ordinal: 0,
             fixedpoint_format: false,
             stripped_body_forall: false,
             datatype_defs: FxHashMap::default(),
@@ -81,19 +83,24 @@ impl ChcProblem {
     /// obligation is Unsafe.
     ///
     /// Queries previously removed because their body simplified to `false`
-    /// are already vacuously Safe and have no surviving clause identity, so
-    /// they are not returned.  Such a validated problem returns `Ok([])`.
+    /// are already vacuously Safe and have no solvable slice, so they are not
+    /// returned. Their source-content identities remain available through
+    /// [`Self::pruned_false_query_ids`]. Such a validated problem returns
+    /// `Ok([])`.
     /// Invalid input, including a problem that never had a query, returns its
     /// typed [`ChcError`](crate::ChcError) instead of an ambiguous empty list.
     pub fn query_obligations(&self) -> ChcResult<Vec<ChcQueryObligation>> {
         self.validate()?;
 
         let mut obligations = Vec::new();
+        let mut fallback_query_ordinal = 0usize;
 
         for (query_index, query) in self.clauses.iter().enumerate() {
             if !query.is_query() {
                 continue;
             }
+            let source_query_ordinal = query.source_query_ordinal.unwrap_or(fallback_query_ordinal);
+            fallback_query_ordinal = fallback_query_ordinal.saturating_add(1);
 
             let marker = match query.body.predicates.as_slice() {
                 [(predicate, arguments)] if arguments.is_empty() => Some(*predicate),
@@ -119,6 +126,7 @@ impl ChcProblem {
                         |predicate| predicate.name.clone(),
                     );
                 obligations.push(self.build_query_obligation(
+                    source_query_ordinal,
                     query_index,
                     None,
                     label,
@@ -131,16 +139,18 @@ impl ChcProblem {
                 continue;
             };
             for (definition_index, definition) in definitions {
-                let direct_query = HornClause::query(ClauseBody {
+                let mut direct_query = HornClause::query(ClauseBody {
                     predicates: definition.body.predicates.clone(),
                     constraint: Self::conjoin_optional_constraints(
                         definition.body.constraint.clone(),
                         query.body.constraint.clone(),
                     ),
                 });
+                direct_query.source_query_ordinal = Some(source_query_ordinal);
                 let label =
                     Self::query_obligation_label(self, &direct_query, marker, definition_index);
                 obligations.push(self.build_query_obligation(
+                    source_query_ordinal,
                     query_index,
                     Some(definition_index),
                     label,
@@ -154,15 +164,19 @@ impl ChcProblem {
 
     fn build_query_obligation(
         &self,
+        source_query_ordinal: usize,
         query_clause_index: usize,
         defining_clause_index: Option<usize>,
         label: String,
-        query: HornClause,
+        mut query: HornClause,
     ) -> ChcQueryObligation {
         let constraint_only = query.body.predicates.is_empty();
         let mut problem = self.clone();
         problem.clauses.retain(|clause| !clause.is_query());
-        problem.pruned_false_queries = 0;
+        problem.pruned_false_queries.clear();
+        problem.pruned_query_source = None;
+        query.source_query_ordinal = Some(0);
+        problem.next_source_query_ordinal = 1;
         problem.clauses.push(query);
 
         // Backwards slicing is verdict-preserving: every predicate used by a
@@ -188,6 +202,7 @@ impl ChcProblem {
 
         ChcQueryObligation {
             id: ChcQueryObligationId {
+                source_query_ordinal,
                 query_clause_index,
                 defining_clause_index,
                 label,
@@ -282,13 +297,17 @@ impl ChcProblem {
                             (Some(a), None) | (None, Some(a)) => Some(a),
                             (None, None) => None,
                         };
-                    new_clauses.push(HornClause::new(
-                        ClauseBody {
-                            predicates: def.body.predicates.clone(),
-                            constraint,
-                        },
-                        ClauseHead::False,
-                    ));
+                    new_clauses.push(
+                        HornClause::new(
+                            ClauseBody {
+                                predicates: def.body.predicates.clone(),
+                                constraint,
+                            },
+                            ClauseHead::False,
+                        )
+                        .with_inherited_provenance(def)
+                        .with_inherited_provenance(goal),
+                    );
                 }
             }
             self.clauses = new_clauses;
@@ -352,6 +371,10 @@ impl ChcProblem {
     }
 
     fn simplify_clause_body_constants(&mut self, mut clause: HornClause) -> Option<HornClause> {
+        if clause.is_query() {
+            clause.source_query_ordinal = Some(self.next_source_query_ordinal);
+            self.next_source_query_ordinal = self.next_source_query_ordinal.saturating_add(1);
+        }
         let Some(constraint) = clause.body.constraint.take() else {
             return Some(clause);
         };
@@ -359,7 +382,11 @@ impl ChcProblem {
         let simplified = constraint.simplify_constants();
         if matches!(simplified, ChcExpr::Bool(false)) {
             if clause.is_query() {
-                self.pruned_false_queries += 1;
+                // Retain the original, pre-simplification clause identity.
+                // Distinct source spellings may fold to the same `false` AST,
+                // and proof reporting must not silently identify them.
+                clause.body.constraint = Some(constraint);
+                self.pruned_false_queries.push(clause);
             }
             return None;
         }
@@ -392,11 +419,38 @@ impl ChcProblem {
         for clause in self.clauses.drain(..) {
             clause.iterative_drop();
         }
+        for clause in self.pruned_false_queries.drain(..) {
+            clause.iterative_drop();
+        }
+        if let Some(source) = self.pruned_query_source.take() {
+            if let Ok(source) = Arc::try_unwrap(source) {
+                source.iterative_drop();
+            }
+        }
     }
 
     /// Get all clauses
     pub fn clauses(&self) -> &[HornClause] {
         &self.clauses
+    }
+
+    pub(crate) fn source_clauses(&self) -> impl Iterator<Item = &HornClause> {
+        self.clauses.iter().chain(
+            self.pruned_false_queries
+                .iter()
+                .filter(|_| self.pruned_query_source.is_none()),
+        )
+    }
+
+    /// Freeze the source interpretation of retained pruned queries before an
+    /// in-place transform changes the live problem's declaration registry.
+    pub(super) fn preserve_pruned_query_source(&mut self) {
+        if self.pruned_false_queries.is_empty() || self.pruned_query_source.is_some() {
+            return;
+        }
+        let mut source = self.clone();
+        source.pruned_query_source = None;
+        self.pruned_query_source = Some(Arc::new(source));
     }
 
     /// Get mutable access to all clauses
@@ -425,6 +479,42 @@ impl ChcProblem {
     /// antecedent. Proofs remain valid; counterexamples do not.
     pub fn has_stripped_body_forall(&self) -> bool {
         self.stripped_body_forall
+    }
+
+    /// Number of false-head queries removed because their bodies simplified
+    /// to the Boolean constant `false`.
+    ///
+    /// These queries are vacuously Safe, but proof-reporting consumers still
+    /// need the count to account for every source property instead of silently
+    /// treating a mixed surviving/pruned query set as if it contained only the
+    /// surviving rows.
+    pub fn pruned_false_query_count(&self) -> usize {
+        self.pruned_false_queries.len()
+    }
+
+    /// Ordered source-content identities for false-body queries pruned before
+    /// solving.
+    ///
+    /// The returned vector contains one entry per pruned query, including
+    /// repeated identical clauses. It is separate from [`Self::query_obligations`]
+    /// because these vacuous queries have no solver input.
+    pub fn pruned_false_query_ids(&self) -> Vec<ChcPrunedQueryObligationId> {
+        let mut canonical_problem = self.pruned_query_source.as_deref().unwrap_or(self).clone();
+        canonical_problem.clauses.clear();
+        canonical_problem.pruned_false_queries.clear();
+        canonical_problem.pruned_query_source = None;
+        self.pruned_false_queries
+            .iter()
+            .enumerate()
+            .map(|(fallback_ordinal, clause)| {
+                let ordinal = clause.source_query_ordinal.unwrap_or(fallback_ordinal);
+                ChcPrunedQueryObligationId::from_source_clause(
+                    ordinal,
+                    &mut canonical_problem,
+                    clause,
+                )
+            })
+            .collect()
     }
 
     /// Record that a body-position `forall` was stripped (over-approximation).

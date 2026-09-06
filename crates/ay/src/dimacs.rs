@@ -72,6 +72,7 @@ include!("dimacs/input_runs.rs");
 include!("dimacs/content_run.rs");
 include!("dimacs/sidecars.rs");
 include!("dimacs/parallel.rs");
+include!("dimacs/dump_cnf_route.rs");
 include!("dimacs/solver_runners.rs");
 include!("dimacs/proof_verification.rs");
 include!("dimacs/configure_support.rs");

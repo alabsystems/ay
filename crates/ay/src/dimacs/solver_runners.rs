@@ -45,6 +45,7 @@ fn run_dimacs_solver_with_source_and_research_sidecar_stats(
     separator_cover: Option<&SeparatorCoverSidecarRunStats>,
 ) {
     configure_dimacs_solver(solver, stats_cfg);
+    maybe_run_preprocess_only_route(solver);
     let _fmla_proof_out_env = FmlaCurrentProofOutEnvGuard::set_for_proof(proof_config);
     let result = solver.solve_interruptible(is_timed_out).into_inner();
     finish_dimacs_solve_with_source(
@@ -69,6 +70,7 @@ fn run_dimacs_solver_with_extension(
     separator_cover: Option<&SeparatorCoverSidecarRunStats>,
 ) {
     configure_dimacs_solver(solver, stats_cfg);
+    reject_preprocess_only_route_for_extension();
     let _fmla_proof_out_env = FmlaCurrentProofOutEnvGuard::set_for_proof(proof_config);
     let result = solver
         .solve_interruptible_with_extension(ext, is_timed_out)
@@ -98,6 +100,7 @@ fn run_dimacs_solver_lean4_with_source(
     original_clauses: &[(u64, Vec<i32>)],
 ) {
     configure_dimacs_solver(solver, stats_cfg);
+    maybe_run_preprocess_only_route(solver);
     let result = solver.solve_interruptible(is_timed_out).into_inner();
 
     // On UNSAT, write the Lean4 LRAT kernel-checkable export before

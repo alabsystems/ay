@@ -96,6 +96,31 @@ pub fn certify_opt_lin_certified_bb(
     certified_bb::certify_opt_lin_certified_bb(instance, incumbent, optimum)
 }
 
+/// [`certify_opt_lin_certified_bb`], plus a stop signal the search consults once
+/// it is past the node envelope in which this route has ever certified anything
+/// (`certified_bb::MAX_UNINTERRUPTIBLE_NODES`).
+///
+/// THIS RUNG IS STILL NOT SCHEDULED, and the distinction matters. Its tree is
+/// bounded by COUNTS, so what it emits is the same on an idle box and a loaded
+/// one; the stop signal can only end the search with NO bytes, never with
+/// different ones. What it buys is that a `--timeout` can finally bound the
+/// route: before it existed, an instance whose relaxation refuses at every node
+/// walked to the node cap no matter what the caller had asked for, and one of
+/// them took 10.5 uninterruptible minutes to decline.
+pub fn certify_opt_lin_certified_bb_interruptible(
+    instance: &PbInstance,
+    incumbent: &[bool],
+    optimum: i128,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<String> {
+    certified_bb::certify_opt_lin_certified_bb_interruptible(
+        instance,
+        incumbent,
+        optimum,
+        should_stop,
+    )
+}
+
 /// Reports what [`certify_opt_lin_certified_bb`]'s search concluded, keeping
 /// "this optimum is refuted BY A WITNESS" and "I could not close this tree in
 /// budget" apart in writing. Measurement-only; never called by the certificate
@@ -1617,6 +1642,15 @@ impl OptLinCertRoute {
 /// `floor_routes_still_fire_with_an_already_expired_deadline` is the regression
 /// test.
 ///
+/// UNSCHEDULED IS NOT THE SAME AS UNSTOPPABLE, and `certified_bb` — the one
+/// unscheduled rung that opens a search tree — draws the line. It takes no
+/// slice of `deadline`, so its tree and its bytes stay a function of its own
+/// counts; but past the node envelope in which it has ever certified anything
+/// (`certified_bb::MAX_UNINTERRUPTIBLE_NODES`, sized above the largest tree it
+/// has converted) it DOES consult `should_stop`. A caller with a spent deadline
+/// therefore still gets every certificate it produces, while a `--timeout` can
+/// finally bound what a DECLINE from it costs.
+///
 /// Rungs 6-8 (`lp_dual_floor`, `frustrated_cycle`, `odd_cycle_cover`) are the
 /// ones whose on-family cost is not a formula: they run a simplex, separate
 /// cycles, or solve a packing (LP, respectively matching). All three are
@@ -1714,8 +1748,15 @@ pub fn certify_opt_lin_any_interruptible(
         // block: a CLI whose deadline is already spent when certification starts
         // (the normal case) must still get it, and giving it a wall slice would
         // make its emitted bytes depend on machine load.
+        //
+        // It is nonetheless STOPPABLE, past the node envelope in which it has
+        // ever certified anything. That is not a wall slice and it is not a
+        // schedule: `should_stop` cannot change one byte it emits, only whether
+        // the last of its budget gets spent. Without it this rung was the one
+        // place a `--timeout` did not reach, and it cost 10.5 minutes on
+        // `single-obj-f17-DCdoubleLoss` for a decline.
         .or_else(|| {
-            certify_opt_lin_certified_bb(instance, incumbent, optimum)
+            certify_opt_lin_certified_bb_interruptible(instance, incumbent, optimum, should_stop)
                 .map(|p| (p, OptLinCertRoute::CertifiedBb))
         });
     if floor.is_some() {
@@ -2265,10 +2306,15 @@ mod chain_tests {
     /// THE BUDGET PROPERTY THE SHIPPED CLI DEPENDS ON. The CLI's certificate
     /// stage is entered after the native proof-logging phase has already spent
     /// the caller's deadline, so `should_stop()` is routinely true on the first
-    /// poll. The five floor rungs are pure arithmetic and must fire anyway; only
-    /// the three search rungs are allowed to decline early. If this test ever
-    /// fails, wiring the chain into a starved caller stops buying anything and
-    /// the CLI silently returns to its two-route coverage.
+    /// poll. The floor rungs are pure arithmetic and must fire anyway; FOUR
+    /// rungs may decline early — the three that take a slice of the deadline
+    /// (`BoundsCompact`, `Bounds`, `BoundsPbNative`) plus `CertifiedBb`, which
+    /// takes NO slice but does consult `should_stop` past its certifying
+    /// envelope. (It used to be three; `CertifiedBb` became stoppable so a
+    /// `--timeout` could bound what a DECLINE from it costs. It still cannot
+    /// change a byte it emits.) If this test ever fails, wiring the chain into a
+    /// starved caller stops buying anything and the CLI silently returns to its
+    /// two-route coverage.
     #[test]
     fn floor_routes_still_fire_with_an_already_expired_deadline() {
         let instance = triangle_cover();
@@ -2324,7 +2370,7 @@ mod chain_tests {
             OptLinCertRoute::Bounds,
             OptLinCertRoute::BoundsPbNative,
         ] {
-            let consults_should_stop = match route {
+            let gets_a_deadline_slice = match route {
                 OptLinCertRoute::TrivialZeroFloor
                 | OptLinCertRoute::KnapsackCardinality
                 | OptLinCertRoute::CliqueColoring
@@ -2334,15 +2380,17 @@ mod chain_tests {
                 | OptLinCertRoute::FrustratedCycle
                 | OptLinCertRoute::OddCycleCover
                 | OptLinCertRoute::LayeredPebbling
-                // Bounded by deterministic COUNTS (nodes, depth, LP polls), not
-                // by the caller's clock: it never polls `should_stop`, so it is
-                // NOT a scheduled rung.
+                // Bounded by deterministic COUNTS (nodes, depth, LP polls, and
+                // the blind-branch cap), not by a share of the caller's clock.
+                // It DOES consult `should_stop` past its certifying envelope —
+                // an interrupt costs it bytes it has not emitted, never bytes it
+                // has — but it takes no SLICE, so it must not be counted here.
                 | OptLinCertRoute::CertifiedBb => false,
                 OptLinCertRoute::BoundsCompact
                 | OptLinCertRoute::Bounds
                 | OptLinCertRoute::BoundsPbNative => true,
             };
-            search += u32::from(consults_should_stop);
+            search += u32::from(gets_a_deadline_slice);
         }
         assert_eq!(
             OPT_LIN_SEARCH_ROUTES, search,

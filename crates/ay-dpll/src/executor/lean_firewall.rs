@@ -10668,7 +10668,7 @@ fn render_pred_app(
     match pred {
         Some(p) if p != name => return None,
         Some(_) => {}
-        None => *pred = Some(name.clone()),
+        None => *pred = Some(name.clone().to_string()),
     }
     let arg = render_const_m1(terms, args[0], consts)?;
     Some(format!("(m.2 {arg})"))
@@ -10910,7 +10910,7 @@ end AySoundness.Emitted.Cong_{hash}
 fn render_const_m1(terms: &TermStore, term: TermId, consts: &mut Vec<String>) -> Option<String> {
     let name = match terms.get(term) {
         TermData::Var(n, _) => n.clone(),
-        TermData::App(Symbol::Named(n), args) if args.is_empty() => n.clone(),
+        TermData::App(Symbol::Named(n), args) if args.is_empty() => n.clone().to_string(),
         _ => return None,
     };
     let idx = consts.iter().position(|c| c == &name).unwrap_or_else(|| {
@@ -10940,7 +10940,7 @@ fn render_fn_app(
     match func {
         Some(f) if f != name => return None,
         Some(_) => {}
-        None => *func = Some(name.clone()),
+        None => *func = Some(name.clone().to_string()),
     }
     match arity {
         Some(k) if *k != args.len() => return None,
@@ -11118,7 +11118,7 @@ fn equality_sides(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
 fn render_const(terms: &TermStore, term: TermId, consts: &mut Vec<String>) -> Option<String> {
     let name = match terms.get(term) {
         TermData::Var(n, _) => n.clone(),
-        TermData::App(Symbol::Named(n), args) if args.is_empty() => n.clone(),
+        TermData::App(Symbol::Named(n), args) if args.is_empty() => n.clone().to_string(),
         _ => return None,
     };
     let idx = consts.iter().position(|c| c == &name).unwrap_or_else(|| {
@@ -11326,7 +11326,7 @@ fn shared_and_others(
 
 fn constructor_name(terms: &TermStore, term: TermId) -> Option<String> {
     match terms.get(term) {
-        TermData::App(Symbol::Named(n), _) => Some(n.clone()),
+        TermData::App(Symbol::Named(n), _) => Some(n.to_string()),
         TermData::Var(n, _) => Some(n.clone()),
         _ => None,
     }

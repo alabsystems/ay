@@ -32,7 +32,7 @@ use super::{
     read_authenticated_dimacs_source, sha256_digest, should_enable_xor_extension,
     variant_input_for_dimacs, variant_input_for_dimacs_route, verification_skip_is_acceptable,
     AuthenticatedLeanSnapshot, DenseCliquePhpProofRouteAdmissionResult, DimacsInputSource,
-    DimacsProofPosture, DimacsRouteContext, OfficialMainRoute, StartupPhaseInit,
+    DimacsProofPosture, DimacsRouteContext, OfficialMainRoute, StartupPhaseInit, XorAdmittedRows,
     CLIQUE_N2_K10_CLAUSE_FINGERPRINT, CLIQUE_N2_K10_EXPECTED_CHECKER_AUDIT_STATS,
     DIMACS_MODEL_LINE_LIMIT, DIMACS_TIMEOUT_EXIT_CODE, PHP_FUNCTIONAL_5_4_CLAUSE_FINGERPRINT,
     SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENABLED_KEY,
@@ -315,6 +315,7 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_default_on() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -348,6 +349,7 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_env_kill_switch() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -374,6 +376,7 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_env_gate_truthy() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -399,6 +402,7 @@ fn test_configure_dimacs_solver_scan_pressure_env_gate_default_off() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -422,6 +426,7 @@ fn test_configure_dimacs_solver_scan_pressure_env_gate_truthy() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -442,6 +447,7 @@ fn test_configure_dimacs_solver_learned_1963_identity_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -459,6 +465,7 @@ fn test_configure_dimacs_solver_learned_1963_identity_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -478,6 +485,7 @@ fn test_configure_dimacs_solver_learned_1963_pressure_reduction_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -499,6 +507,7 @@ fn test_configure_dimacs_solver_learned_1963_pressure_reduction_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -522,6 +531,7 @@ fn test_configure_dimacs_solver_learned_1963_pressure_retention_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -543,6 +553,7 @@ fn test_configure_dimacs_solver_learned_1963_pressure_retention_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -566,6 +577,7 @@ fn test_configure_dimacs_solver_used5_fsw_reset_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -583,6 +595,7 @@ fn test_configure_dimacs_solver_used5_fsw_reset_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -602,6 +615,7 @@ fn test_configure_dimacs_solver_fsw_conflict_saved_pos_reset_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -619,6 +633,7 @@ fn test_configure_dimacs_solver_fsw_conflict_saved_pos_reset_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -638,6 +653,7 @@ fn test_configure_dimacs_solver_fsw_gent_skip_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -655,6 +671,7 @@ fn test_configure_dimacs_solver_fsw_gent_skip_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -674,6 +691,7 @@ fn test_configure_dimacs_solver_disable_1963_unit_blocker_refresh_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -691,6 +709,7 @@ fn test_configure_dimacs_solver_disable_1963_unit_blocker_refresh_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -710,6 +729,7 @@ fn test_configure_dimacs_solver_1963_tail_reorder_swap_budget_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -728,6 +748,7 @@ fn test_configure_dimacs_solver_1963_tail_reorder_swap_budget_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -748,6 +769,7 @@ fn test_configure_dimacs_solver_inprocessing_yield_productivity_rescue_env_gate(
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -765,6 +787,7 @@ fn test_configure_dimacs_solver_inprocessing_yield_productivity_rescue_env_gate(
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -786,6 +809,7 @@ fn test_configure_dimacs_solver_lrat_proof_clamp_probe_rescue_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -803,6 +827,7 @@ fn test_configure_dimacs_solver_lrat_proof_clamp_probe_rescue_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -820,6 +845,7 @@ fn test_configure_dimacs_solver_lrat_proof_clamp_probe_rescue_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -841,6 +867,7 @@ fn test_configure_dimacs_solver_bounded_backbone_zero_decompose_backoff_env_gate
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -858,6 +885,7 @@ fn test_configure_dimacs_solver_bounded_backbone_zero_decompose_backoff_env_gate
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -877,6 +905,7 @@ fn test_configure_dimacs_solver_backbone_post_vivify_binary_admission_env_gate()
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -894,6 +923,7 @@ fn test_configure_dimacs_solver_backbone_post_vivify_binary_admission_env_gate()
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -911,6 +941,7 @@ fn test_configure_dimacs_solver_backbone_post_vivify_binary_admission_env_gate()
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -3258,7 +3289,85 @@ fn test_official_route_policy_requires_default_lrat_output() {
 #[test]
 fn test_should_enable_xor_extension_zero() {
     let clauses = make_clauses(0, 0);
-    assert!(!should_enable_xor_extension(&clauses, 0, 0, 0));
+    assert!(!should_enable_xor_extension(
+        &clauses,
+        0,
+        0,
+        0,
+        XorAdmittedRows::full()
+    ));
+}
+
+/// Route-entry coherence (#xor-route-entry).
+///
+/// The clause-shape guards said YES on these numbers; only the admitted-row
+/// figure -- which used to be invisible to this predicate -- can say NO. The
+/// two rejecting cases are the LIVE coverage measured on hitag2-7 (10 of 577
+/// eligible rows) and quad_res_r30_m35 (2 of 2737); the accepting cases are
+/// the live coverage of the four lightsout `direct` instances and
+/// `size_5_5_5_i116_r12`, which admit every eligible row.
+#[test]
+fn test_xor_route_declined_when_almost_no_rows_get_a_matrix() {
+    let clauses = make_clauses_mixed(0, 5, 5);
+    // Sanity: with full admission these exact shape arguments take the route,
+    // so the only thing separating the cases below is admitted-row coverage.
+    assert!(should_enable_xor_extension(
+        &clauses,
+        100,
+        0,
+        10,
+        XorAdmittedRows::full()
+    ));
+
+    for (admitted, eligible) in [(10, 577), (10, 597), (2, 2737), (2, 3216)] {
+        assert!(
+            !should_enable_xor_extension(
+                &clauses,
+                100,
+                0,
+                10,
+                XorAdmittedRows { admitted, eligible }
+            ),
+            "{admitted}/{eligible} admitted rows must NOT enter the theory route: \
+             the route disables ALL preprocessing and deletes the consumed clauses, \
+             so it is strictly worse than plain CDCL at this coverage"
+        );
+    }
+
+    for (admitted, eligible) in [(484, 484), (529, 529), (576, 576), (625, 625), (55, 55)] {
+        assert!(
+            should_enable_xor_extension(
+                &clauses,
+                100,
+                0,
+                10,
+                XorAdmittedRows { admitted, eligible }
+            ),
+            "{admitted}/{eligible} admitted rows is exactly what the route is for"
+        );
+    }
+
+    // The floor itself: 25% admitted passes, one row less does not.
+    assert!(should_enable_xor_extension(
+        &clauses,
+        100,
+        0,
+        10,
+        XorAdmittedRows {
+            admitted: 25,
+            eligible: 100
+        }
+    ));
+    assert!(!should_enable_xor_extension(
+        &clauses,
+        100,
+        0,
+        10,
+        XorAdmittedRows {
+            admitted: 24,
+            eligible: 100
+        }
+    ));
 }
 
 #[test]
@@ -3266,9 +3375,21 @@ fn test_should_enable_xor_extension_requires_density_not_just_detection() {
     // Use mixed clauses so gate-structure check doesn't fire (has large clauses).
     let clauses = make_clauses_mixed(0, 5, 5);
     // A tiny pure-XOR formula still qualifies (low binary fraction).
-    assert!(should_enable_xor_extension(&clauses, 2, 0, 1));
+    assert!(should_enable_xor_extension(
+        &clauses,
+        2,
+        0,
+        1,
+        XorAdmittedRows::full()
+    ));
     // A single accidental XOR in a large formula should stay disabled.
-    assert!(!should_enable_xor_extension(&clauses, 2, 9_998, 1));
+    assert!(!should_enable_xor_extension(
+        &clauses,
+        2,
+        9_998,
+        1,
+        XorAdmittedRows::full()
+    ));
 }
 
 #[test]
@@ -3278,11 +3399,29 @@ fn test_should_enable_xor_extension_pure_xor() {
     // formulas are now treated as gate-structured and XOR is disabled.
     // This is correct: pure ternary formulas are typically gate encodings.
     let clauses = make_clauses(0, 10);
-    assert!(!should_enable_xor_extension(&clauses, 100, 0, 10));
+    assert!(!should_enable_xor_extension(
+        &clauses,
+        100,
+        0,
+        10,
+        XorAdmittedRows::full()
+    ));
     // Mix in large clauses to represent real XOR-heavy formulas.
     let clauses = make_clauses_mixed(0, 8, 2); // 80% ternary + 20% large
-    assert!(should_enable_xor_extension(&clauses, 100, 0, 10));
-    assert!(should_enable_xor_extension(&clauses, 8, 0, 4));
+    assert!(should_enable_xor_extension(
+        &clauses,
+        100,
+        0,
+        10,
+        XorAdmittedRows::full()
+    ));
+    assert!(should_enable_xor_extension(
+        &clauses,
+        8,
+        0,
+        4,
+        XorAdmittedRows::full()
+    ));
 }
 
 #[test]
@@ -3290,10 +3429,34 @@ fn test_should_enable_xor_extension_high_density() {
     // High XOR density (80-90%): enabled when binary fraction is low and
     // formula has clause size diversity (not purely binary+ternary).
     let clauses = make_clauses_mixed(0, 90, 10); // 90% ternary + 10% large
-    assert!(should_enable_xor_extension(&clauses, 1732, 307, 100));
-    assert!(should_enable_xor_extension(&clauses, 4000, 600, 200));
-    assert!(should_enable_xor_extension(&clauses, 7232, 1664, 300));
-    assert!(should_enable_xor_extension(&clauses, 4000, 1000, 200));
+    assert!(should_enable_xor_extension(
+        &clauses,
+        1732,
+        307,
+        100,
+        XorAdmittedRows::full()
+    ));
+    assert!(should_enable_xor_extension(
+        &clauses,
+        4000,
+        600,
+        200,
+        XorAdmittedRows::full()
+    ));
+    assert!(should_enable_xor_extension(
+        &clauses,
+        7232,
+        1664,
+        300,
+        XorAdmittedRows::full()
+    ));
+    assert!(should_enable_xor_extension(
+        &clauses,
+        4000,
+        1000,
+        200,
+        XorAdmittedRows::full()
+    ));
 }
 
 #[test]
@@ -3315,7 +3478,13 @@ fn test_large_formula_disables_xor_extension() {
     assert!(clauses.len() > XOR_EXTENSION_MAX_CLAUSES);
     // High XOR density (consumed ~ half the formula) would normally enable.
     assert!(
-        !should_enable_xor_extension(&clauses, clauses.len() / 2, clauses.len() / 2, 5_000),
+        !should_enable_xor_extension(
+            &clauses,
+            clauses.len() / 2,
+            clauses.len() / 2,
+            5_000,
+            XorAdmittedRows::full()
+        ),
         "large formulas must skip the XOR extension regardless of density"
     );
     // The escape hatch restores GE for experimentation (B41: the carrier
@@ -3325,7 +3494,13 @@ fn test_large_formula_disables_xor_extension() {
         ..ay_core::misc_cli_flags().clone()
     });
     assert!(
-        should_enable_xor_extension(&clauses, clauses.len() / 2, clauses.len() / 2, 5_000),
+        should_enable_xor_extension(
+            &clauses,
+            clauses.len() / 2,
+            clauses.len() / 2,
+            5_000,
+            XorAdmittedRows::full()
+        ),
         "--xor-allow-large must re-enable the XOR extension on large formulas"
     );
 }
@@ -3340,7 +3515,7 @@ fn test_small_dense_xor_still_enabled_under_size_cap() {
     let clauses = make_clauses_mixed(0, 80, 20); // 100 clauses, 80% ternary
     assert!(clauses.len() <= XOR_EXTENSION_MAX_CLAUSES);
     assert!(
-        should_enable_xor_extension(&clauses, 80, 20, 40),
+        should_enable_xor_extension(&clauses, 80, 20, 40, XorAdmittedRows::full()),
         "small dense XOR formulas should still use the XOR extension"
     );
 }
@@ -3362,7 +3537,11 @@ fn test_should_enable_xor_extension_crypto_benchmarks() {
                                                  // production by XOR_EXTENSION_MAX_CLAUSES; this synthetic clauses vec only
                                                  // exercises the fraction/density/residual gates.)
     assert!(should_enable_xor_extension(
-        &clauses, 300_000, 700_000, 5_000
+        &clauses,
+        300_000,
+        700_000,
+        5_000,
+        XorAdmittedRows::full()
     ));
     // 10% consumed / 90% residual and 5% consumed / 95% residual: the XOR path
     // forfeits ALL preprocessing (congruence/sweep/BVE/factor) on the huge CNF
@@ -3370,8 +3549,20 @@ fn test_should_enable_xor_extension_crypto_benchmarks() {
     // The residual-dominance guard (residual > 85%) now keeps these on the
     // pure-SAT + full-preprocessing path. --xor-allow-residual restores the
     // old unconditional enable.
-    assert!(!should_enable_xor_extension(&clauses, 10_000, 90_000, 500));
-    assert!(!should_enable_xor_extension(&clauses, 500, 9_500, 50));
+    assert!(!should_enable_xor_extension(
+        &clauses,
+        10_000,
+        90_000,
+        500,
+        XorAdmittedRows::full()
+    ));
+    assert!(!should_enable_xor_extension(
+        &clauses,
+        500,
+        9_500,
+        50,
+        XorAdmittedRows::full()
+    ));
 }
 
 #[test]
@@ -3394,27 +3585,27 @@ fn test_residual_dominance_disables_xor_extension() {
     let clauses = make_clauses_mixed(325, 460, 215); // 1000 clauses
                                                      // 94% residual -> disabled by the residual-dominance guard.
     assert!(
-        !should_enable_xor_extension(&clauses, 848, 12_560, 207),
+        !should_enable_xor_extension(&clauses, 848, 12_560, 207, XorAdmittedRows::full()),
         "94% CNF residual must disable the XOR extension (31e843c5 class)"
     );
     // Legitimate "XOR ~= whole formula": 15% residual (99718c17) stays on XOR.
     assert!(
-        should_enable_xor_extension(&clauses, 4_672, 833, 207),
+        should_enable_xor_extension(&clauses, 4_672, 833, 207, XorAdmittedRows::full()),
         "15% residual (legitimate XOR-dominant) must stay on the XOR path"
     );
     // Pure-XOR extraction (0 remaining, 77a0d54f) stays on XOR.
     assert!(
-        should_enable_xor_extension(&clauses, 5_505, 0, 207),
+        should_enable_xor_extension(&clauses, 5_505, 0, 207, XorAdmittedRows::full()),
         "0% residual (pure XOR) must stay on the XOR path"
     );
     // Boundary: exactly 85% residual is kept (guard fires only when > 85%).
     assert!(
-        should_enable_xor_extension(&clauses, 1_500, 8_500, 207),
+        should_enable_xor_extension(&clauses, 1_500, 8_500, 207, XorAdmittedRows::full()),
         "exactly 85% residual is kept on the XOR path"
     );
     // Just above 85% residual is disabled.
     assert!(
-        !should_enable_xor_extension(&clauses, 1_499, 8_501, 207),
+        !should_enable_xor_extension(&clauses, 1_499, 8_501, 207, XorAdmittedRows::full()),
         "just over 85% residual disables the XOR extension"
     );
 
@@ -3424,7 +3615,7 @@ fn test_residual_dominance_disables_xor_extension() {
         ..ay_core::misc_cli_flags().clone()
     });
     assert!(
-        should_enable_xor_extension(&clauses, 848, 12_560, 207),
+        should_enable_xor_extension(&clauses, 848, 12_560, 207, XorAdmittedRows::full()),
         "--xor-allow-residual must restore the pre-fix XOR enable"
     );
 }
@@ -3433,8 +3624,20 @@ fn test_residual_dominance_disables_xor_extension() {
 fn test_should_enable_xor_extension_below_density() {
     // Below 5% density: accidental XOR matches, not worth GE overhead.
     let clauses = make_clauses_mixed(0, 50, 50);
-    assert!(!should_enable_xor_extension(&clauses, 100, 9_900, 10));
-    assert!(!should_enable_xor_extension(&clauses, 40, 9_960, 5));
+    assert!(!should_enable_xor_extension(
+        &clauses,
+        100,
+        9_900,
+        10,
+        XorAdmittedRows::full()
+    ));
+    assert!(!should_enable_xor_extension(
+        &clauses,
+        40,
+        9_960,
+        5,
+        XorAdmittedRows::full()
+    ));
 }
 
 #[test]
@@ -3444,11 +3647,11 @@ fn test_sparse_xor_wide_circuit_cnf_disables_xor() {
     // preprocessing available for factor/BVE/model reconstruction.
     let clauses = make_clauses_mixed(2, 8, 90);
     assert!(
-        !should_enable_xor_extension(&clauses, 6, 94, 1),
+        !should_enable_xor_extension(&clauses, 6, 94, 1, XorAdmittedRows::full()),
         "sparse XOR over wide circuit CNF should stay on the pure SAT path"
     );
     assert!(
-        should_enable_xor_extension(&clauses, 20, 80, 5),
+        should_enable_xor_extension(&clauses, 20, 80, 5, XorAdmittedRows::full()),
         "dense XOR recovery should still use the XOR extension"
     );
 }
@@ -3460,7 +3663,7 @@ fn test_should_disable_xor_high_binary_fraction() {
     // eq.atree.braun.8: 688/919 = 74.9% binary, 78.7% XOR density.
     let clauses = make_clauses(688, 231); // 74.9% binary
     assert!(
-        !should_enable_xor_extension(&clauses, 724, 195, 321),
+        !should_enable_xor_extension(&clauses, 724, 195, 321, XorAdmittedRows::full()),
         "XOR should be disabled for gate-structured formulas with high binary fraction"
     );
 }
@@ -3470,7 +3673,7 @@ fn test_should_enable_xor_low_binary_fraction() {
     // Crypto formulas typically have <30% binary clauses and mixed sizes.
     let clauses = make_clauses_mixed(10, 60, 30); // 10% binary + 60% ternary + 30% large
     assert!(
-        should_enable_xor_extension(&clauses, 300, 700, 50),
+        should_enable_xor_extension(&clauses, 300, 700, 50, XorAdmittedRows::full()),
         "XOR should be enabled for crypto formulas with low binary fraction"
     );
 }
@@ -3481,14 +3684,14 @@ fn test_binary_fraction_boundary() {
     // 50% binary + 25% ternary + 25% large = not gate-structured (75% bin+tern < 95%).
     let clauses = make_clauses_mixed(50, 25, 25);
     assert!(
-        should_enable_xor_extension(&clauses, 80, 20, 10),
+        should_enable_xor_extension(&clauses, 80, 20, 10, XorAdmittedRows::full()),
         "XOR should be enabled at 50% binary with mixed sizes"
     );
 
     // 51% binary: should disable via binary-fraction check.
     let clauses = make_clauses_mixed(51, 24, 25);
     assert!(
-        !should_enable_xor_extension(&clauses, 80, 20, 10),
+        !should_enable_xor_extension(&clauses, 80, 20, 10, XorAdmittedRows::full()),
         "XOR should be disabled at 51% binary"
     );
 }
@@ -3499,13 +3702,13 @@ fn test_gate_structure_disables_xor() {
     // eq.atree.braun.7: 43% binary + 56% ternary = 99% gate-structured.
     let clauses = make_clauses(43, 56); // 99% binary+ternary, 1% "other" = 0
     assert!(
-        !should_enable_xor_extension(&clauses, 400, 200, 100),
+        !should_enable_xor_extension(&clauses, 400, 200, 100, XorAdmittedRows::full()),
         "XOR should be disabled for gate-structured formulas (>95% binary+ternary)"
     );
     // Same ratio but with 6% large clauses — no longer gate-structured.
     let clauses = make_clauses_mixed(43, 51, 6); // 94% binary+ternary
     assert!(
-        should_enable_xor_extension(&clauses, 400, 200, 100),
+        should_enable_xor_extension(&clauses, 400, 200, 100, XorAdmittedRows::full()),
         "XOR should be enabled when binary+ternary is below 95%"
     );
 }

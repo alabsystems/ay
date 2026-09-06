@@ -26,21 +26,125 @@ fn rdl_engine_enabled() -> bool {
     *V.get_or_init(|| !ay_core::theory_disable_flags().no_rdl_engine)
 }
 
-/// Opt-in escape hatch to take the lane in a PROOF-PRODUCING session
-/// (`AY_RDL_ENGINE_PROOFS=1`).
+/// What the route may do with an UNSAT verdict from the difference-logic lane.
 ///
-/// Default OFF. The difference-logic theory reports plain
-/// `TheoryResult::Unsat` conflicts with no Farkas annotation, so a proof built
-/// on top of them cannot carry an arithmetic certificate for the theory lemmas.
-/// The verdict would still be sound (the conflict gate re-verifies every
-/// conflict), but the proof ARTIFACT would be weaker than the simplex lane's,
-/// so proof sessions stay on `solve_lra` unless explicitly opted in. Same
-/// posture as `solve_lra_inc_engine`, which also excludes proof sessions from
-/// its new lane.
-fn rdl_engine_proofs_allowed() -> bool {
-    // B23: DL conflicts carry no Farkas annotations; the proofs hatch is
-    // retired and proof sessions stay excluded from the lane.
-    false
+/// The DL theory reports plain `TheoryResult::Unsat` conflicts with no Farkas
+/// annotation, so a proof built on top of them carries no arithmetic
+/// certificate for its theory lemmas. That never made the VERDICT unsound (the
+/// DPLL conflict gate re-verifies every negative cycle), but it means the lane
+/// cannot back an `unsat` with the checked certificate the mandatory-certificate
+/// policy (`configure_public_solve_proof_posture`) requires on every public
+/// solve that is not competition-shed.
+///
+/// The old answer was to keep the lane closed whenever the tracker was armed —
+/// which, since the certificate became mandatory, is EVERY default-mode solve,
+/// so the lane only ever ran under `--rigor fast`. That threw away the lane's
+/// SAT answers too, although a SAT needs no proof at all: it publishes through
+/// the fail-closed model validation gate (`last_model_validated = false` forces
+/// `check_sat` to re-evaluate every ORIGINAL assertion against the model).
+///
+/// So the lane now runs under every posture and only its REFUTATION is
+/// disposed of by this policy:
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DlUnsatDisposition {
+    /// No certificate is demanded (competition shedding: the tracker is off).
+    /// The lane's refutation publishes through the existing B3 raw admission
+    /// lane, byte-identical to the pre-existing `--rigor fast` behaviour.
+    PublishRaw,
+    /// A checked certificate is demanded (tracker armed / `--self-check` /
+    /// `:produce-proofs` / `--proof`). The lane's refutation is DISCARDED and
+    /// the certified simplex lane re-derives the verdict with its Farkas-backed
+    /// proof — exactly the lane that owned the verdict before, so nothing is
+    /// lost relative to the old routing; the DL attempt only costs the time it
+    /// spent. The proof tracker is disarmed for the attempt (its steps could
+    /// never be published) and re-armed before the fallback.
+    Discard,
+}
+
+impl Executor {
+    /// The certificate policy for this solve: whether an UNSAT from the DL lane
+    /// may publish raw or must be re-derived by the certified lane.
+    ///
+    /// `produce_proofs_enabled()` is the recording predicate — the tracker is
+    /// armed, or `:produce-proofs` is set. It is the right question here (not
+    /// `is_producing_proofs()`, the explicit artifact demand): the mandatory
+    /// certificate is keyed to the tracker, and a raw UNSAT may only be
+    /// published when publication itself will not require one.
+    fn dl_unsat_disposition(&self) -> DlUnsatDisposition {
+        if self.produce_proofs_enabled() {
+            DlUnsatDisposition::Discard
+        } else {
+            DlUnsatDisposition::PublishRaw
+        }
+    }
+
+    /// Run one difference-logic attempt with the proof tracker DISARMED and
+    /// the solve deadline NARROWED when its refutation could never be
+    /// published, restoring both afterwards.
+    ///
+    /// Disarming is state-preserving (`ProofTracker::enable`/`disable` flip a
+    /// flag; the ledger is untouched) and is pure cost hygiene: under
+    /// [`DlUnsatDisposition::Discard`] every step the attempt would record is
+    /// thrown away with the attempt, so recording them — and the search-time
+    /// bookkeeping budget they consume — buys nothing. Under
+    /// [`DlUnsatDisposition::PublishRaw`] the tracker is already off.
+    ///
+    /// The deadline cap is the other half of the same fact. A discarded
+    /// attempt can contribute exactly one thing: a SAT answer. On an UNSAT
+    /// instance every second it spends is a second the certified lane — the
+    /// only lane that can publish that verdict — no longer has, so an
+    /// uncapped attempt turns "UNSAT in 8.5 s" into a timeout as soon as the
+    /// DL search is slower than the deadline (measured: FISCHER12-8-ninc,
+    /// unsat 8.5 s before this lane opened, timeout with the attempt uncapped
+    /// once propagation made the attempt slower). Half the remaining budget
+    /// leaves the certified lane at least what it had, and a SAT the DL lane
+    /// cannot find in half the budget it rarely finds in the other half. Only
+    /// `solve_deadline` is narrowed; the certification deadline (the
+    /// publication boundary) is untouched, and `pre_iter_check` /
+    /// `Solver::set_solve_deadline` both read the shared cell, so the cap
+    /// reaches the SAT search. (The old `--rigor fast` lane budgeted nothing,
+    /// and still does: there the DL refutation IS the verdict.)
+    fn run_dl_attempt<F>(
+        &mut self,
+        disposition: DlUnsatDisposition,
+        attempt: F,
+    ) -> Result<SolveResult>
+    where
+        F: FnOnce(&mut Self) -> Result<SolveResult>,
+    {
+        let tracker_was_armed = self.proof_tracker.is_enabled();
+        let saved_deadline = self.solve_deadline.get();
+        if disposition == DlUnsatDisposition::Discard {
+            if tracker_was_armed {
+                self.proof_tracker.disable();
+            }
+            if let Some(deadline) = saved_deadline {
+                let now = ay_core::time::Instant::now();
+                if let Some(remaining) = deadline.checked_duration_since(now) {
+                    self.solve_deadline.set(Some(now + remaining / 2));
+                }
+            }
+        }
+        let result = attempt(self);
+        self.solve_deadline.set(saved_deadline);
+        if tracker_was_armed {
+            self.proof_tracker.enable();
+        }
+        result
+    }
+
+    /// Forget a DL-lane outcome that is not being published, so the trusted
+    /// lane that runs next starts from a clean slate. With the tracker disarmed
+    /// the discarded attempt built no proof artefacts; only the verdict
+    /// bookkeeping needs clearing (including an `Unknown` origin the capped
+    /// attempt may have recorded when its narrowed deadline expired).
+    fn forget_dl_attempt(&mut self) {
+        self.last_result = None;
+        self.last_model = None;
+        self.last_model_validated = false;
+        self.last_unknown_reason = None;
+        self.last_unknown_origin = None;
+    }
 }
 
 /// Restart schedule for the QF_RDL lane: `AY_RDL_RESTART=initial,factor,randfreq`.
@@ -145,24 +249,26 @@ impl Executor {
     /// # Fall-through conditions (each hands the problem to `solve_lra`)
     ///
     /// * `--dpll-no-rdl-engine`;
-    /// * push/pop incremental mode, or a proof-producing session (the DL engine
-    ///   emits no Farkas/proof artifacts);
+    /// * push/pop incremental mode;
     /// * ANY reachable theory atom that is not a pure Real difference-logic
     ///   atom (fail closed — the engine is never fed an approximation);
     /// * an `Unknown` verdict from the DL lane (today only reachable by
-    ///   asserting a *negated* arithmetic equality, which is a disjunction).
+    ///   asserting a *negated* arithmetic equality, which is a disjunction);
+    /// * an `Unsat` verdict from the DL lane when this solve demands a checked
+    ///   certificate ([`DlUnsatDisposition::Discard`]) — the DL engine emits
+    ///   no Farkas/proof artifacts, so the certified simplex lane re-derives
+    ///   the refutation exactly as it did when it owned the whole route.
     ///
     /// # Soundness
     ///
     /// `Sat` clears `last_model_validated`, so `check_sat` re-evaluates every
     /// ORIGINAL assertion against the extracted model and degrades a spurious
     /// model to `Unknown`. `Unsat` rests on the theory's conflicts, each a
-    /// genuine negative cycle re-verified by the DPLL conflict gate.
+    /// genuine negative cycle re-verified by the DPLL conflict gate — and is
+    /// only ever PUBLISHED from this lane when no certificate is demanded
+    /// (the pre-existing `--rigor fast` raw-admission behaviour).
     pub(in crate::executor) fn solve_rdl(&mut self) -> Result<SolveResult> {
-        if !rdl_engine_enabled()
-            || self.incremental_mode
-            || (self.produce_proofs_enabled() && !rdl_engine_proofs_allowed())
-        {
+        if !rdl_engine_enabled() || self.incremental_mode {
             return self.solve_lra();
         }
         if self.should_abort_theory_loop() {
@@ -236,45 +342,48 @@ impl Executor {
     ) -> Result<SolveResult> {
         let solve_interrupt = self.solve_interrupt.clone();
         let solve_deadline = self.solve_deadline.clone();
-        let result = self.with_isolated_incremental_state(Some(lifted), |this| {
-            // Restart schedule. The QF_LRA lane's Z3-style geometric restarts
-            // (100, 1.5) are the default, but they are tunable without a
-            // rebuild because the right schedule differs sharply by answer:
-            // frequent restarts help REFUTATION (they escape bad subtrees),
-            // while MODEL FINDING wants long dives that can complete an
-            // assignment. This division splits that way — the `.base` (unsat)
-            // instances solve in seconds while their structurally identical
-            // `.induction` (sat) siblings do not terminate at all.
-            let (ri, rf, rv) = restart_tuning();
-            this.configure_sat_search_tuning(ri, rf, rv);
-            solve_incremental_split_loop_pipeline!(this,
-                tag: "RDL",
-                persistent_sat_field: persistent_sat,
-                create_theory: DiffLogicTheory::<W>::new(&this.ctx.terms),
-                extract_models: |theory| {
-                    use crate::executor::theories::solve_harness::TheoryModels;
-                    TheoryModels {
-                        lra: Some(theory.extract_model()),
-                        ..TheoryModels::default()
+        let disposition = self.dl_unsat_disposition();
+        let result = self.run_dl_attempt(disposition, |exec| {
+            exec.with_isolated_incremental_state(Some(lifted), |this| {
+                // Restart schedule. The QF_LRA lane's Z3-style geometric restarts
+                // (100, 1.5) are the default, but they are tunable without a
+                // rebuild because the right schedule differs sharply by answer:
+                // frequent restarts help REFUTATION (they escape bad subtrees),
+                // while MODEL FINDING wants long dives that can complete an
+                // assignment. This division splits that way — the `.base` (unsat)
+                // instances solve in seconds while their structurally identical
+                // `.induction` (sat) siblings do not terminate at all.
+                let (ri, rf, rv) = restart_tuning();
+                this.configure_sat_search_tuning(ri, rf, rv);
+                solve_incremental_split_loop_pipeline!(this,
+                    tag: "RDL",
+                    persistent_sat_field: persistent_sat,
+                    create_theory: DiffLogicTheory::<W>::new(&this.ctx.terms),
+                    extract_models: |theory| {
+                        use crate::executor::theories::solve_harness::TheoryModels;
+                        TheoryModels {
+                            lra: Some(theory.extract_model()),
+                            ..TheoryModels::default()
+                        }
+                    },
+                    max_splits: crate::executor::theories::MAX_SPLITS_LRA,
+                    pre_theory_import: |_theory, _lc, _hc, _ds| {
+                        // Difference logic has no learned state to import.
+                    },
+                    post_theory_export: |_theory| {
+                        (vec![], Default::default(), Default::default())
+                    },
+                    // Eager theory-SAT interleaving: the whole point of the lane is
+                    // that an assert costs almost nothing, so check on every BCP.
+                    eager_extension: true,
+                    pre_iter_check: |_s| {
+                        solve_interrupt
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                            || solve_deadline.expired()
                     }
-                },
-                max_splits: crate::executor::theories::MAX_SPLITS_LRA,
-                pre_theory_import: |_theory, _lc, _hc, _ds| {
-                    // Difference logic has no learned state to import.
-                },
-                post_theory_export: |_theory| {
-                    (vec![], Default::default(), Default::default())
-                },
-                // Eager theory-SAT interleaving: the whole point of the lane is
-                // that an assert costs almost nothing, so check on every BCP.
-                eager_extension: true,
-                pre_iter_check: |_s| {
-                    solve_interrupt
-                        .as_ref()
-                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-                        || solve_deadline.expired()
-                }
-            )
+                )
+            })
         });
 
         match result {
@@ -284,7 +393,20 @@ impl Executor {
                 self.last_model_validated = false;
                 Ok(SolveResult::Sat)
             }
-            Ok(SolveResult::Unsat(cert)) => Ok(SolveResult::Unsat(cert)),
+            Ok(SolveResult::Unsat(cert)) if disposition == DlUnsatDisposition::PublishRaw => {
+                Ok(SolveResult::Unsat(cert))
+            }
+            // A refutation this solve cannot publish uncertified: forget it and
+            // let the certified simplex lane re-derive it with a real proof.
+            Ok(SolveResult::Unsat(_)) => {
+                if rdl_engine_debug() {
+                    ay_core::safe_eprintln!(
+                        "[RDL] DL-lane unsat under a certificate demand; re-deriving with solve_lra"
+                    );
+                }
+                self.forget_dl_attempt();
+                self.solve_lra()
+            }
             // Non-definite (or errored): hand the problem to the trusted simplex
             // lane, which owns the verdict. Nothing the DL lane computed is kept.
             other => {
@@ -303,10 +425,7 @@ impl Executor {
                         self.last_unknown_reason
                     );
                 }
-                self.last_result = None;
-                self.last_model = None;
-                self.last_model_validated = false;
-                self.last_unknown_reason = None;
+                self.forget_dl_attempt();
                 self.solve_lra()
             }
         }
@@ -376,14 +495,13 @@ impl Executor {
     /// `last_model_validated`, so `check_sat` re-evaluates every ORIGINAL
     /// assertion against the extracted model and degrades a spurious model to
     /// `Unknown`. `Unsat` rests on the theory's conflicts, each a genuine
-    /// negative cycle re-verified by the DPLL conflict gate. `tighten_int` is an
-    /// equivalence over Int, not a relaxation, so neither verdict can be
-    /// strengthened by it.
+    /// negative cycle re-verified by the DPLL conflict gate — and, exactly as
+    /// in the Real lane, is only PUBLISHED from here when no certificate is
+    /// demanded ([`DlUnsatDisposition`]); otherwise `solve_lia` re-derives it
+    /// with its Farkas-backed proof. `tighten_int` is an equivalence over Int,
+    /// not a relaxation, so neither verdict can be strengthened by it.
     pub(in crate::executor) fn solve_idl(&mut self) -> Result<SolveResult> {
-        if !idl_engine_enabled()
-            || self.incremental_mode
-            || (self.produce_proofs_enabled() && !rdl_engine_proofs_allowed())
-        {
+        if !idl_engine_enabled() || self.incremental_mode {
             return self.solve_lia();
         }
         if self.should_abort_theory_loop() {
@@ -405,53 +523,77 @@ impl Executor {
         if !pure {
             return self.solve_lia();
         }
-        self.solve_idl_with(lifted)
+
+        // WEIGHT-LANE SELECTION, the same test as the Real lane: `IStar` keeps
+        // every slack computation in registers, `RStar` pays a BigRational
+        // allocation each. Measured on queen33-1 (skeptic re-measurement in
+        // the development design notes §3.1): 82% of
+        // the DL lane's worker time on `RStar` is `BigUint::gcd`/`reduce`
+        // inside `assert_edge`'s slack arithmetic, and the same instance
+        // relabelled to the IStar lane runs >= 3.4x more decisions per CPU
+        // second. The test is made on the ORIGINAL constants; `tighten_int`
+        // then only moves an integral constant by at most one, and an atom
+        // whose tightened bound still does not lower exactly makes the theory
+        // report `Unsupported`, which falls back to `solve_lia` — never a
+        // rounded weight.
+        let fast = reachable.iter().all(|&atom| {
+            crate::executor::diff_logic::collect_comparison(&self.ctx.terms, atom)
+                .is_none_or(|a| ay_diff_logic::IStar::fits_fast_lane(&a.c).is_some())
+        });
+        if fast {
+            self.solve_idl_with::<ay_diff_logic::IStar>(lifted)
+        } else {
+            self.solve_idl_with::<ay_diff_logic::RStar>(lifted)
+        }
     }
 
-    fn solve_idl_with(&mut self, lifted: Vec<ay_core::TermId>) -> Result<SolveResult> {
+    fn solve_idl_with<W: ay_diff_logic::DlWeight + 'static>(
+        &mut self,
+        lifted: Vec<ay_core::TermId>,
+    ) -> Result<SolveResult> {
         let solve_interrupt = self.solve_interrupt.clone();
         let solve_deadline = self.solve_deadline.clone();
+        let disposition = self.dl_unsat_disposition();
         let mut model_conversion_failed = false;
-        let result = self.with_isolated_incremental_state(Some(lifted), |this| {
-            let (ri, rf, rv) = restart_tuning();
-            this.configure_sat_search_tuning(ri, rf, rv);
-            solve_incremental_split_loop_pipeline!(this,
-                tag: "IDL",
-                persistent_sat_field: persistent_sat,
-                create_theory: DiffLogicTheory::<ay_diff_logic::RStar>::new_int(&this.ctx.terms),
-                extract_models: |theory| {
-                    use crate::executor::theories::solve_harness::TheoryModels;
-                    let lra = theory.extract_model();
-                    match lra_model_to_lia(&lra) {
-                        Some(lia) => TheoryModels { lia: Some(lia), ..TheoryModels::default() },
-                        None => {
-                            model_conversion_failed = true;
-                            TheoryModels::default()
+        let result = self.run_dl_attempt(disposition, |exec| {
+            exec.with_isolated_incremental_state(Some(lifted), |this| {
+                let (ri, rf, rv) = restart_tuning();
+                this.configure_sat_search_tuning(ri, rf, rv);
+                solve_incremental_split_loop_pipeline!(this,
+                    tag: "IDL",
+                    persistent_sat_field: persistent_sat,
+                    create_theory: DiffLogicTheory::<W>::new_int(&this.ctx.terms),
+                    extract_models: |theory| {
+                        use crate::executor::theories::solve_harness::TheoryModels;
+                        let lra = theory.extract_model();
+                        match lra_model_to_lia(&lra) {
+                            Some(lia) => TheoryModels { lia: Some(lia), ..TheoryModels::default() },
+                            None => {
+                                model_conversion_failed = true;
+                                TheoryModels::default()
+                            }
                         }
+                    },
+                    max_splits: crate::executor::theories::MAX_SPLITS_LRA,
+                    pre_theory_import: |_theory, _lc, _hc, _ds| {},
+                    post_theory_export: |_theory| {
+                        (vec![], Default::default(), Default::default())
+                    },
+                    eager_extension: true,
+                    pre_iter_check: |_s| {
+                        solve_interrupt
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                            || solve_deadline.expired()
                     }
-                },
-                max_splits: crate::executor::theories::MAX_SPLITS_LRA,
-                pre_theory_import: |_theory, _lc, _hc, _ds| {},
-                post_theory_export: |_theory| {
-                    (vec![], Default::default(), Default::default())
-                },
-                eager_extension: true,
-                pre_iter_check: |_s| {
-                    solve_interrupt
-                        .as_ref()
-                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-                        || solve_deadline.expired()
-                }
-            )
+                )
+            })
         });
 
         // A failed integral conversion means the tightening invariant did not
         // hold; refuse the verdict and let the trusted lane own it.
         if model_conversion_failed {
-            self.last_result = None;
-            self.last_model = None;
-            self.last_model_validated = false;
-            self.last_unknown_reason = None;
+            self.forget_dl_attempt();
             return self.solve_lia();
         }
 
@@ -460,7 +602,15 @@ impl Executor {
                 self.last_model_validated = false;
                 Ok(SolveResult::Sat)
             }
-            Ok(SolveResult::Unsat(cert)) => Ok(SolveResult::Unsat(cert)),
+            Ok(SolveResult::Unsat(cert)) if disposition == DlUnsatDisposition::PublishRaw => {
+                Ok(SolveResult::Unsat(cert))
+            }
+            // A refutation this solve cannot publish uncertified: forget it and
+            // let the certified LIA lane re-derive it with a real proof.
+            Ok(SolveResult::Unsat(_)) => {
+                self.forget_dl_attempt();
+                self.solve_lia()
+            }
             other => {
                 if self.solve_deadline.expired()
                     || self
@@ -470,12 +620,301 @@ impl Executor {
                 {
                     return other;
                 }
-                self.last_result = None;
-                self.last_model = None;
-                self.last_model_validated = false;
-                self.last_unknown_reason = None;
+                self.forget_dl_attempt();
                 self.solve_lia()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    //! The certificate policy of the difference-logic lanes, end to end
+    //! through the public `check-sat` path (`execute_all` arms the proof
+    //! tracker exactly as the CLI does).
+    //!
+    //! The lane is identified by the ABSENCE of the LIA theory's `lia_checks`
+    //! statistic: the simplex lane exports it on every solve, the DL lane never
+    //! does. That is the same signal the 2026-09-05 diagnosis used.
+
+    use super::{DlUnsatDisposition, Executor};
+    use crate::executor::unsat_cert::CommandUnsatAdmission;
+    use crate::executor_types::SolveResult;
+    use ay_frontend::parse;
+
+    fn verdict(exec: &mut Executor, script: &str) -> String {
+        let cmds = parse(script).expect("parse");
+        exec.execute_all(&cmds)
+            .expect("execute")
+            .into_iter()
+            .rfind(|o| matches!(o.trim(), "sat" | "unsat" | "unknown"))
+            .expect("a check-sat verdict")
+            .trim()
+            .to_string()
+    }
+
+    fn lia_lane_ran(exec: &Executor) -> bool {
+        exec.statistics().get_int("lia_checks").is_some()
+    }
+
+    /// Disjunctive, so the `:ay-diff-logic` conjunctive pre-check cannot take
+    /// it; every atom is a pure Int difference atom, so `solve_idl` does.
+    const IDL_SAT: &str = "(set-logic QF_IDL)
+         (declare-fun x () Int)
+         (declare-fun y () Int)
+         (declare-fun z () Int)
+         (assert (or (<= (- x y) (- 3)) (>= (- x y) 3)))
+         (assert (< (- y z) 2))
+         (assert (<= (- z x) 5))
+         (check-sat)";
+
+    /// `x = y` forced by two bounds, then a disjunction of strict orderings
+    /// that both contradict it — every disjunct closes a negative cycle.
+    const IDL_UNSAT: &str = "(set-logic QF_IDL)
+         (declare-fun x () Int)
+         (declare-fun y () Int)
+         (assert (or (< (- x y) 0) (< (- y x) 0)))
+         (assert (<= (- x y) 0))
+         (assert (>= (- x y) 0))
+         (check-sat)";
+
+    const RDL_SAT: &str = "(set-logic QF_RDL)
+         (declare-fun x () Real)
+         (declare-fun y () Real)
+         (declare-fun z () Real)
+         (assert (or (<= (- x y) (- 3)) (>= (- x y) 3)))
+         (assert (< (- y z) 2))
+         (assert (<= (- z x) 5))
+         (check-sat)";
+
+    const RDL_UNSAT: &str = "(set-logic QF_RDL)
+         (declare-fun x () Real)
+         (declare-fun y () Real)
+         (assert (or (< (- x y) 0) (< (- y x) 0)))
+         (assert (<= (- x y) 0))
+         (assert (>= (- x y) 0))
+         (check-sat)";
+
+    /// Default posture (tracker armed on every public solve): a SAT from the
+    /// DL lane publishes through model validation — no simplex lane runs.
+    #[test]
+    fn idl_sat_under_the_default_certificate_posture_is_decided_by_the_dl_lane() {
+        let mut exec = Executor::new();
+        assert_eq!(verdict(&mut exec, IDL_SAT), "sat");
+        assert!(
+            !lia_lane_ran(&exec),
+            "the DL lane must decide a SAT instance itself"
+        );
+        assert!(
+            exec.last_model_validated,
+            "DL-lane models go through the validation gate"
+        );
+    }
+
+    #[test]
+    fn rdl_sat_under_the_default_certificate_posture_is_decided_by_the_dl_lane() {
+        let mut exec = Executor::new();
+        assert_eq!(verdict(&mut exec, RDL_SAT), "sat");
+        assert!(!lia_lane_ran(&exec));
+        assert!(exec.last_model_validated);
+    }
+
+    /// Default posture: the DL lane's refutation is discarded and the
+    /// certified LIA lane re-derives it — the published UNSAT carries a proof
+    /// and is NOT a raw admission.
+    #[test]
+    fn idl_unsat_under_the_default_certificate_posture_is_rederived_by_the_certified_lane() {
+        let mut exec = Executor::new();
+        assert_eq!(verdict(&mut exec, IDL_UNSAT), "unsat");
+        assert!(
+            lia_lane_ran(&exec),
+            "a certificate demand must hand UNSAT to solve_lia"
+        );
+        assert_certified_admission(&exec);
+    }
+
+    #[test]
+    fn rdl_unsat_under_the_default_certificate_posture_is_rederived_by_the_certified_lane() {
+        let mut exec = Executor::new();
+        assert_eq!(verdict(&mut exec, RDL_UNSAT), "unsat");
+        assert_certified_admission(&exec);
+    }
+
+    /// The published UNSAT was admitted by a CHECKED certification lane.
+    ///
+    /// `admit_command_solve_result` consumes the minted one-shot certificate
+    /// and records its admission kind, so the admission class is the
+    /// observable that survives publication (the same one
+    /// `competition_mode_tests` relies on): `Some` proves a certification lane
+    /// admitted the verdict, and it must not be the raw competition
+    /// carve-out. `last_proof()` is deliberately not used: it exposes the
+    /// proof only when proof OUTPUT was requested, which a bare executor does
+    /// not do.
+    fn assert_certified_admission(exec: &Executor) {
+        assert!(
+            exec.last_command_unsat_admission.is_some(),
+            "a published UNSAT records its admission class"
+        );
+        assert_ne!(
+            exec.last_command_unsat_admission,
+            Some(CommandUnsatAdmission::CompetitionRaw)
+        );
+    }
+
+    /// Competition shedding (the pre-existing `--rigor fast` route): the DL
+    /// lane's refutation publishes raw, exactly as before this change.
+    #[test]
+    fn idl_unsat_under_competition_shedding_publishes_raw_from_the_dl_lane() {
+        let mut exec = Executor::new();
+        exec.set_competition_mode(true);
+        assert_eq!(verdict(&mut exec, IDL_UNSAT), "unsat");
+        assert!(
+            !lia_lane_ran(&exec),
+            "shedding keeps the whole route on the DL lane"
+        );
+        assert_eq!(
+            exec.last_command_unsat_admission,
+            Some(CommandUnsatAdmission::CompetitionRaw)
+        );
+    }
+
+    #[test]
+    fn idl_sat_under_competition_shedding_is_decided_by_the_dl_lane() {
+        let mut exec = Executor::new();
+        exec.set_competition_mode(true);
+        assert_eq!(verdict(&mut exec, IDL_SAT), "sat");
+        assert!(!lia_lane_ran(&exec));
+    }
+
+    /// An explicit proof demand under competition mode re-arms the tracker
+    /// (precedence over shedding), so the UNSAT is again re-derived certified.
+    #[test]
+    fn idl_unsat_with_an_explicit_proof_demand_is_rederived_even_in_competition_mode() {
+        let mut exec = Executor::new();
+        exec.set_competition_mode(true);
+        exec.set_produce_proofs(true);
+        assert_eq!(verdict(&mut exec, IDL_UNSAT), "unsat");
+        assert!(lia_lane_ran(&exec));
+        assert!(exec.last_proof().is_some());
+    }
+
+    /// A constant beyond the i128 fast lane sends the Int lane to exact
+    /// rationals; the verdict is unaffected.
+    #[test]
+    fn idl_huge_constants_take_the_exact_lane_and_still_decide() {
+        let mut exec = Executor::new();
+        let script = "(set-logic QF_IDL)
+             (declare-fun x () Int)
+             (declare-fun y () Int)
+             (assert (or (<= (- x y) (- 1180591620717411303424))
+                         (>= (- x y) 1180591620717411303424)))
+             (assert (<= (- x y) 5))
+             (check-sat)";
+        assert_eq!(verdict(&mut exec, script), "sat");
+        assert!(!lia_lane_ran(&exec));
+    }
+
+    /// The disposition follows the recording predicate: off the public path
+    /// the tracker is off (raw), a public solve arms it (discard), and a
+    /// competition-shed public solve leaves it off (raw).
+    #[test]
+    fn disposition_tracks_the_certificate_demand() {
+        let mut exec = Executor::new();
+        assert_eq!(exec.dl_unsat_disposition(), DlUnsatDisposition::PublishRaw);
+        exec.begin_public_solve(false);
+        assert_eq!(exec.dl_unsat_disposition(), DlUnsatDisposition::Discard);
+
+        let mut shed = Executor::new();
+        shed.set_competition_mode(true);
+        shed.begin_public_solve(false);
+        assert_eq!(shed.dl_unsat_disposition(), DlUnsatDisposition::PublishRaw);
+    }
+
+    /// The attempt runs untracked ONLY when its refutation is to be discarded,
+    /// and the tracker comes back exactly as it was.
+    #[test]
+    fn run_dl_attempt_disarms_only_under_discard_and_restores_the_tracker() {
+        let mut exec = Executor::new();
+        exec.proof_tracker.enable();
+        let r = exec.run_dl_attempt(DlUnsatDisposition::Discard, |e| {
+            assert!(
+                !e.proof_tracker.is_enabled(),
+                "discarded attempt must run untracked"
+            );
+            Ok(SolveResult::Unknown)
+        });
+        assert!(r.is_ok());
+        assert!(
+            exec.proof_tracker.is_enabled(),
+            "tracker must be re-armed afterwards"
+        );
+
+        exec.proof_tracker.disable();
+        let r = exec.run_dl_attempt(DlUnsatDisposition::PublishRaw, |e| {
+            assert!(!e.proof_tracker.is_enabled());
+            Ok(SolveResult::Unknown)
+        });
+        assert!(r.is_ok());
+        assert!(
+            !exec.proof_tracker.is_enabled(),
+            "a disarmed tracker stays disarmed"
+        );
+    }
+
+    /// A discarded attempt runs against HALF the remaining budget and the
+    /// original deadline comes back afterwards; a raw-publishing attempt keeps
+    /// the whole budget; no deadline stays no deadline.
+    #[test]
+    fn run_dl_attempt_caps_only_a_discarded_attempt_at_half_the_remaining_budget() {
+        use ay_core::time::Instant;
+        use std::time::Duration;
+        let mut exec = Executor::new();
+        let deadline = Instant::now() + Duration::from_secs(600);
+        exec.solve_deadline.set(Some(deadline));
+
+        let seen = exec
+            .run_dl_attempt(DlUnsatDisposition::Discard, |e| {
+                Ok(e.solve_deadline.get().map_or(SolveResult::Unknown, |d| {
+                    // Between a quarter and just under the full budget: the
+                    // cap is half of what remained at entry.
+                    let left = d.saturating_duration_since(Instant::now());
+                    assert!(
+                        left > Duration::from_secs(150) && left < Duration::from_secs(301),
+                        "capped deadline leaves {left:?}, expected ~300 s"
+                    );
+                    SolveResult::Sat
+                }))
+            })
+            .expect("attempt");
+        assert_eq!(seen, SolveResult::Sat, "the attempt saw a deadline");
+        assert_eq!(
+            exec.solve_deadline.get(),
+            Some(deadline),
+            "the original deadline is restored"
+        );
+
+        let seen = exec
+            .run_dl_attempt(DlUnsatDisposition::PublishRaw, |e| {
+                assert_eq!(
+                    e.solve_deadline.get(),
+                    Some(deadline),
+                    "raw attempt keeps its budget"
+                );
+                Ok(SolveResult::Unknown)
+            })
+            .expect("attempt");
+        assert_eq!(seen, SolveResult::Unknown);
+
+        exec.solve_deadline.set(None);
+        exec.run_dl_attempt(DlUnsatDisposition::Discard, |e| {
+            assert_eq!(
+                e.solve_deadline.get(),
+                None,
+                "no deadline stays no deadline"
+            );
+            Ok(SolveResult::Unknown)
+        })
+        .expect("attempt");
+        assert_eq!(exec.solve_deadline.get(), None);
     }
 }

@@ -576,7 +576,7 @@ impl Executor {
                     // This is an uninterpreted function application. Key by
                     // (name, arity): `f/2` and `f/3` are distinct symbols (#4661).
                     uf_apps
-                        .entry((name.clone(), args.len()))
+                        .entry((name.clone().to_string(), args.len()))
                         .or_default()
                         .push((term, args.clone()));
                 }
@@ -607,7 +607,7 @@ impl Executor {
                 if !is_builtin && !args.is_empty() {
                     // Key by (name, arity) — distinct arities are distinct symbols.
                     uf_apps
-                        .entry((name.clone(), args.len()))
+                        .entry((name.clone().to_string(), args.len()))
                         .or_default()
                         .push((term, args.clone()));
                 }
@@ -657,22 +657,22 @@ mod tests {
         // Same symbol name "*" applied at arity 2 (twice) AND arity 3 (twice).
         // Two applications per arity so each (name, arity) bucket has >= 2 apps
         // and the congruence loop's arity `debug_assert!` is actually reached.
-        let star2_ab =
-            exec.ctx
-                .terms
-                .mk_app(Symbol::Named("*".to_string()), vec![a, b], bv8.clone());
-        let star2_ca =
-            exec.ctx
-                .terms
-                .mk_app(Symbol::Named("*".to_string()), vec![c, a], bv8.clone());
-        let star3_abc =
-            exec.ctx
-                .terms
-                .mk_app(Symbol::Named("*".to_string()), vec![a, b, c], bv8.clone());
-        let star3_cba =
-            exec.ctx
-                .terms
-                .mk_app(Symbol::Named("*".to_string()), vec![c, b, a], bv8.clone());
+        let star2_ab = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("*"), vec![a, b], bv8.clone());
+        let star2_ca = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("*"), vec![c, a], bv8.clone());
+        let star3_abc = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("*"), vec![a, b, c], bv8.clone());
+        let star3_cba = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("*"), vec![c, b, a], bv8.clone());
 
         exec.ctx.assertions.push(star2_ab);
         exec.ctx.assertions.push(star2_ca);

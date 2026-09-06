@@ -133,6 +133,31 @@ pub struct XorExtension {
     /// Debug counter: backtrack calls.
     #[cfg(debug_assertions)]
     debug_backtrack_calls: std::cell::Cell<u64>,
+    /// Rows (XOR constraints) that actually got a Gaussian matrix.
+    ///
+    /// Route-entry coherence (#xor-route-entry): the DIMACS layer decides
+    /// whether to take the theory route from DETECTED coverage, while this
+    /// constructor admits matrices on PER-COMPONENT limits. Nothing used to
+    /// reconcile the two, so an instance could enter the route -- which sets
+    /// `preprocess_enabled=false` and calls `disable_extension_inprocessing()`
+    /// -- with a handful of its rows actually propagating. Measured live:
+    /// hitag2-7 entered with 10/735 rows admitted, quad_res_r30_m35 with
+    /// 2/2737. Consumed clauses are removed from the CNF and survive only via
+    /// a full-assignment check with zero propagation power, so that
+    /// configuration is strictly worse than plain CDCL. Exposed via
+    /// `admitted_rows()` so the route-entry predicate can refuse it.
+    admitted_rows: usize,
+    /// Denominator for admitted-row coverage: every detected row EXCEPT those
+    /// dropped purely because `MAX_NUM_MATRICES` was already reached.
+    ///
+    /// Rows dropped by the matrix budget are excluded deliberately. A formula
+    /// whose XOR system splits into many well-formed components is exactly the
+    /// case GE is for; charging it for components it could have solved but for
+    /// an arbitrary cap of 5 would evict legitimate instances
+    /// (`size_5_5_5_i116_r12`). Rows dropped by `component_within_limits`
+    /// (too wide / too tall for a matrix) DO count against coverage: those
+    /// rows are unreachable by GE no matter what the budget is.
+    coverage_denominator_rows: usize,
 }
 
 impl XorExtension {
@@ -156,12 +181,16 @@ impl XorExtension {
         //    already sorted by split_components)
         // Reference: cryptominisat/src/matrixfinder.cpp:235-286
         let mut accepted = 0usize;
+        let mut admitted_rows = 0usize;
+        let mut total_rows = 0usize;
+        let mut matrix_budget_dropped_rows = 0usize;
         for comp in xor_components {
             // Use pre-computed stats from split_components to avoid
             // redundant row/col counting.
             let num_rows = comp.stats.rows;
             let num_cols = comp.stats.cols;
             let comp_constraints = comp.constraints;
+            total_rows += num_rows;
 
             // Skip components outside size bounds
             if !component_within_limits(num_rows, num_cols) {
@@ -172,9 +201,11 @@ impl XorExtension {
             // Limit total number of matrices
             if accepted >= MAX_NUM_MATRICES {
                 row_offset += num_rows;
+                matrix_budget_dropped_rows += num_rows;
                 continue;
             }
             accepted += 1;
+            admitted_rows += num_rows;
 
             let comp_idx = components.len();
             let mut solver = GaussianSolver::new(&comp_constraints);
@@ -235,7 +266,24 @@ impl XorExtension {
             debug_propagate_calls: std::cell::Cell::new(0),
             #[cfg(debug_assertions)]
             debug_backtrack_calls: std::cell::Cell::new(0),
+            admitted_rows,
+            coverage_denominator_rows: total_rows.saturating_sub(matrix_budget_dropped_rows),
         }
+    }
+
+    /// Rows (XOR constraints) that actually got a Gaussian matrix.
+    ///
+    /// Pair with [`XorExtension::coverage_denominator_rows`] to get the
+    /// fraction of the detected XOR system the theory route can really
+    /// propagate over. See the field docs for why the two numbers exist.
+    pub fn admitted_rows(&self) -> usize {
+        self.admitted_rows
+    }
+
+    /// Rows that COULD have been admitted: every detected row except those
+    /// dropped purely because the `MAX_NUM_MATRICES` budget was exhausted.
+    pub fn coverage_denominator_rows(&self) -> usize {
+        self.coverage_denominator_rows
     }
 
     /// Get the number of XOR constraints.

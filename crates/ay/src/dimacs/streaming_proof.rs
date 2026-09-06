@@ -110,6 +110,7 @@ fn try_run_xor_proof_route(
                 xor_stats.clauses_consumed,
                 remaining.len(),
                 xor_stats.xors_detected,
+                XorAdmittedRows::of(ext),
             )
     });
     if !use_xor {
@@ -119,11 +120,13 @@ fn try_run_xor_proof_route(
     let features = SatFeatures::extract(formula.num_vars, &formula.clauses);
     let mut ext = xor_ext.expect("use_xor implies Some");
     safe_eprintln!(
-        "c XOR: detected {} constraints, {} clauses consumed, {} remaining, {} components (proof mode)",
+        "c XOR: detected {} constraints, {} clauses consumed, {} remaining, {} components, {}/{} rows admitted (proof mode)",
         xor_stats.xors_detected,
         xor_stats.clauses_consumed,
         remaining.len(),
-        ext.num_components()
+        ext.num_components(),
+        ext.admitted_rows(),
+        ext.coverage_denominator_rows()
     );
     let output = match create_configured_dimacs_proof_file(proof)
         .and_then(|file| solver_proof_output_writer(file, proof))

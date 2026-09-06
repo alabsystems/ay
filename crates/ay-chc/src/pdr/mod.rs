@@ -35,7 +35,7 @@ pub(crate) mod implication_cache;
 mod init_analysis;
 mod interpolation_failure;
 mod invariant_parser;
-pub(crate) use invariant_parser::validate_qf_expression;
+pub(crate) use invariant_parser::{validate_qf_expression, validate_qf_operation};
 mod lemma_cluster;
 mod lemma_sanitize;
 pub(crate) mod model;

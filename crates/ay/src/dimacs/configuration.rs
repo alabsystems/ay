@@ -4,6 +4,31 @@
 
 fn configure_dimacs_solver(solver: &mut SatSolver, _stats_cfg: stats_output::StatsConfig) {
     configure_dimacs_solver_body(solver);
+    configure_fmla_learned_lrat_dry_run_artifact(solver);
+}
+
+/// Resolve `AY_SAT_FMLA_LEARNED_LRAT_DRY_RUN_ARTIFACT` for solver configuration.
+///
+/// This is the ONLY place the variable is turned into solver state. The solver
+/// core no longer consults the environment when it finalizes a solve: a
+/// process-global read there gave every solver in the process one shared
+/// artifact destination, so unrelated solves overwrote each other's artifacts.
+fn fmla_learned_lrat_dry_run_artifact_path_from_env() -> Option<PathBuf> {
+    let raw = std::env::var(
+        ay_sat::fmla_runtime_ledger::FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV,
+    )
+    .ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+/// Install the process-configured dry-run artifact destination on `solver`.
+fn configure_fmla_learned_lrat_dry_run_artifact(solver: &mut SatSolver) {
+    let path = fmla_learned_lrat_dry_run_artifact_path_from_env();
+    solver.set_fmla_learned_lrat_dry_run_artifact_path(path);
 }
 
 // Serialize the process-global FMLA proof-out env override: the mutation and its

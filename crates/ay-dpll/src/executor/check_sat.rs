@@ -4856,7 +4856,12 @@ impl Executor {
             }
             LogicCategory::Ufdtlra => self.solve_dt_auflra(),
             LogicCategory::Ufdtlira | LogicCategory::Aufdtlira => self.solve_dt_auflira(),
-            LogicCategory::Ufdtnia | LogicCategory::Ufdtnra | LogicCategory::Ufdtnira => {
+            // DT + non-linear INTEGER arithmetic composes over the existing
+            // UF+NIA route, lazy DT lane first. See `solve_dt_uf_nia`.
+            LogicCategory::Ufdtnia => self.solve_dt_uf_nia(),
+            // NRA/NIRA keep the sound `unknown`: there is no `solve_uf_nra`
+            // sibling to compose with.
+            LogicCategory::Ufdtnra | LogicCategory::Ufdtnira => {
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 Ok(SolveResult::Unknown)
             }

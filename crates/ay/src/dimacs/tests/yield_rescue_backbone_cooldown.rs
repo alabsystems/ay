@@ -16,6 +16,7 @@ fn test_configure_dimacs_solver_yield_rescue_backbone_cooldown_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -33,6 +34,7 @@ fn test_configure_dimacs_solver_yield_rescue_backbone_cooldown_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );
@@ -50,6 +52,7 @@ fn test_configure_dimacs_solver_yield_rescue_backbone_cooldown_env_gate() {
         &mut solver,
         stats_output::StatsConfig {
             human: false,
+            full: false,
             json: false,
         },
     );

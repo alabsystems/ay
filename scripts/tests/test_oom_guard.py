@@ -195,8 +195,13 @@ class PlanSolverResourcesTest(unittest.TestCase):
         self.assertEqual(value, og.CgroupMemory(6144, 2048))
 
     def test_effective_core_count_honors_affinity_and_cgroup(self):
+        # `create=True`: macOS's os module has no sched_getaffinity at all.
+        # physical_core_count() guards its call with (AttributeError, OSError),
+        # so injecting the attribute here exercises the affinity-honoring
+        # branch on every platform.
         with mock.patch.object(og, "_host_physical_core_count", return_value=16), \
-             mock.patch.object(og.os, "sched_getaffinity", return_value=set(range(4))), \
+             mock.patch.object(og.os, "sched_getaffinity",
+                               return_value=set(range(4)), create=True), \
              mock.patch.object(og, "cgroup_core_limit", return_value=2):
             self.assertEqual(og.physical_core_count(), 2)
 
@@ -459,12 +464,19 @@ class PlanSolverResourcesTest(unittest.TestCase):
             self.assertTrue(og._harness_lease_owner_is_alive(record))
 
     def test_count_active_rustc_returns_count(self):
+        # Contract (count_active_rustc docstring): hosts without a procfs
+        # (macOS) use an equivalent bounded `ps` scan so the concurrent-build
+        # refusal keeps protecting sweeps on every supported platform instead
+        # of crashing.
+        count = og.count_active_rustc()
+        self.assertIsInstance(count, int)
+        self.assertGreaterEqual(count, 0)
         if not Path("/proc").is_dir():
-            with self.assertRaisesRegex(RuntimeError, "cannot inspect build processes"):
-                og.count_active_rustc()
-            return
-        self.assertIsInstance(og.count_active_rustc(), int)
-        self.assertGreaterEqual(og.count_active_rustc(), 0)
+            with mock.patch.object(
+                og, "_count_active_rustc_ps", return_value=3
+            ) as fallback:
+                self.assertEqual(og.count_active_rustc(), 3)
+            fallback.assert_called_once_with(None)
 
     def test_warn_concurrent_build_preserves_process_scan_failure(self):
         with mock.patch.object(
@@ -904,7 +916,14 @@ class RssWatchdogTest(unittest.TestCase):
 
         def capture_spawn(*args, **kwargs):
             proc = real_popen(*args, **kwargs)
-            spawned.append(proc)
+            # Record only session leaders: guarded_popen owns exactly one
+            # (start_new_session=True). On procfs-less hosts (macOS) the
+            # identity checks and RSS polls shell out to `ps` through this
+            # same patched subprocess module at watchdog-poll cadence;
+            # counting those helper spawns would make this reap assertion
+            # both platform- and timing-dependent.
+            if kwargs.get("start_new_session"):
+                spawned.append(proc)
             return proc
 
         def fail_resume(pgid, signum):
@@ -1099,14 +1118,44 @@ class RssWatchdogTest(unittest.TestCase):
             og._RSS_SNAPSHOT_READY = False
             before = og._RSS_SNAPSHOT_SCAN_COUNT
 
+        # Synthesize a one-process /proc so the Linux snapshot path (the code
+        # that implements the shared-scan contract) runs on procfs-less hosts
+        # (macOS) too, and so the observed value is exact rather than whatever
+        # a loaded benchmark host happens to be doing.
+        pgid = os.getpgid(0)
+        page_kb = os.sysconf("SC_PAGE_SIZE") // 1024
+        resident_pages = (7 * 1024) // page_kb
+        expected_mb = resident_pages * page_kb // 1024
+        real_exists = os.path.exists
+        real_listdir = os.listdir
+        real_open = open
+
+        def fake_exists(path):
+            return True if path == "/proc/self/stat" else real_exists(path)
+
+        def fake_listdir(path):
+            return ["4242"] if path == "/proc" else real_listdir(path)
+
+        def fake_open(path, *args, **kwargs):
+            if path == "/proc/4242/stat":
+                return io.StringIO(f"4242 (fake-solver) S 1 {pgid} 0 0 0\n")
+            if path == "/proc/4242/statm":
+                return io.StringIO(
+                    f"{2 * resident_pages} {resident_pages} 0 0 0 0 0\n"
+                )
+            return real_open(path, *args, **kwargs)
+
         def inspect():
             try:
                 barrier.wait(timeout=5)
-                results.append(og.process_group_rss_mb(os.getpgid(0)))
+                results.append(og.process_group_rss_mb(pgid))
             except Exception as error:
                 errors.append(error)
 
-        with mock.patch.object(og, "_RSS_SNAPSHOT_TTL_S", 60.0):
+        with mock.patch.object(og, "_RSS_SNAPSHOT_TTL_S", 60.0), \
+             mock.patch.object(og.os.path, "exists", new=fake_exists), \
+             mock.patch.object(og.os, "listdir", new=fake_listdir), \
+             mock.patch.object(og, "open", new=fake_open, create=True):
             threads = [threading.Thread(target=inspect) for _ in range(workers)]
             for thread in threads:
                 thread.start()
@@ -1114,8 +1163,11 @@ class RssWatchdogTest(unittest.TestCase):
                 thread.join(timeout=10)
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
-        self.assertEqual(len(results), workers)
-        self.assertTrue(all(result is not None for result in results))
+        self.assertEqual(
+            results,
+            [expected_mb] * workers,
+            "every waiter must observe the one shared snapshot's value",
+        )
         self.assertEqual(
             og._RSS_SNAPSHOT_SCAN_COUNT - before,
             1,
@@ -1132,6 +1184,12 @@ class RssWatchdogTest(unittest.TestCase):
             og._RSS_SNAPSHOT = None
             og._RSS_SNAPSHOT_READY = False
             before = og._RSS_SNAPSHOT_SCAN_COUNT
+        real_exists = os.path.exists
+
+        def fake_exists(path):
+            # Force the Linux snapshot path (the code under test) on
+            # procfs-less hosts (macOS) too.
+            return True if path == "/proc/self/stat" else real_exists(path)
 
         def slow_empty_proc(_path):
             time.sleep(0.1)
@@ -1140,15 +1198,25 @@ class RssWatchdogTest(unittest.TestCase):
         def inspect(index):
             try:
                 barrier.wait(timeout=5)
-                # Stagger arrivals across several TTLs while the first thread
-                # holds the scan lock. Freshness must be measured after that
-                # wait, not from each thread's stale pre-lock timestamp.
+                # Stagger arrivals while the first thread holds the scan lock:
+                # every waiter must reuse that in-flight scan's result. The
+                # guarded regression decided staleness before acquiring the
+                # lock, which turned one slow scan into one rescan per waiter
+                # (and would fail the scan-count assertion below ~16-fold).
                 time.sleep(index * 0.004)
                 results.append(og.process_group_rss_mb(os.getpgid(0)))
             except Exception as error:
                 errors.append(error)
 
-        with mock.patch.object(og.os, "listdir", side_effect=slow_empty_proc):
+        # The TTL is pinned far above any scheduling delay: on a loaded host a
+        # waiter can be descheduled past the real 0.02s TTL after the scan
+        # completes, which would make a second scan legitimate and the
+        # scan-count assertion flaky. The pre-lock-staleness regression is
+        # TTL-independent (the buggy decision happens while the snapshot is
+        # still unpublished), so pinning loses no coverage.
+        with mock.patch.object(og, "_RSS_SNAPSHOT_TTL_S", 60.0), \
+             mock.patch.object(og.os.path, "exists", new=fake_exists), \
+             mock.patch.object(og.os, "listdir", side_effect=slow_empty_proc):
             threads = [
                 threading.Thread(target=inspect, args=(index,))
                 for index in range(workers)
@@ -1159,6 +1227,8 @@ class RssWatchdogTest(unittest.TestCase):
                 thread.join(timeout=10)
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
+        # None (measurement failure) for every waiter — never 0, and never a
+        # per-waiter retry.
         self.assertEqual(results, [None] * workers)
         self.assertEqual(og._RSS_SNAPSHOT_SCAN_COUNT - before, 1)
 

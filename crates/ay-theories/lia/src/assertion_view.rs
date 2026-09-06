@@ -271,6 +271,24 @@ pub(crate) struct AssertionViewCache {
     /// byte-identical to when the stamp was taken. Kept monotone across
     /// `clear` so a cleared-and-refilled cache can never alias an old stamp.
     epoch: u64,
+    /// Epoch that advances ONLY when `positive_equalities` changes.
+    ///
+    /// #poseq-epoch. The general `epoch` bumps on EVERY asserted literal
+    /// (`on_assert`) and on the disequality-only `bump_epoch`
+    /// (#certora-diseq-epoch). Memos that read nothing but `positive_equalities`
+    /// were therefore invalidated thousands of times per solve by changes they
+    /// do not depend on: the algebraic-detect memo in `nelson_oppen.rs` measured
+    /// a **10% hit rate (201 hits / 2000 calls)** on a QF_UFDTNIA instance, with
+    /// `view_epoch` the ONLY stamp field that moved (5259 -> 5261) while
+    /// `shared_eq_revision`, `bound_revision`, `var_index_epoch` and
+    /// `propagated_pairs_len` were all identical. `detect_algebraic_full` was
+    /// the single largest cost in that run and produced ZERO Nelson-Oppen rounds.
+    ///
+    /// Conservative by construction: it bumps on every path that can change
+    /// `positive_equalities` (build/rebuild, reset, a growing `on_assert`, and
+    /// every `on_pop`), and only skips the disequality-only bump. A spurious
+    /// miss is safe; a stale hit is not.
+    pos_eq_epoch: u64,
 }
 
 impl AssertionViewCache {
@@ -284,12 +302,19 @@ impl AssertionViewCache {
         self.epoch
     }
 
+    /// See `pos_eq_epoch`: advances only when `positive_equalities` changes.
+    pub(crate) fn pos_eq_epoch(&self) -> u64 {
+        self.pos_eq_epoch
+    }
+
     /// Reset everything (solver `reset` / `clear_assertions`).
     pub(crate) fn clear(&mut self) {
         // Preserve epoch monotonicity across the reset (see `epoch` doc).
         let epoch = self.epoch;
+        let pos_eq_epoch = self.pos_eq_epoch;
         *self = Self::default();
         self.epoch = epoch + 1;
+        self.pos_eq_epoch = pos_eq_epoch + 1;
     }
 
     /// Bump the view-content epoch WITHOUT rebuilding (#certora-diseq-epoch).
@@ -318,6 +343,7 @@ impl AssertionViewCache {
         // Rebuilding from the same `asserted` produces identical content, but
         // bump anyway: a spurious memo miss is safe, a stale hit is not.
         self.epoch += 1;
+        self.pos_eq_epoch += 1;
         self.view = AssertionView::build(terms, asserted);
         self.eq_counts.clear();
         for &literal in &self.view.positive_equalities {
@@ -334,6 +360,7 @@ impl AssertionViewCache {
         self.view
             .classify_and_record(terms, term, value, Some(&mut self.bounds_undo));
         if self.view.positive_equalities.len() > pos_eq_before {
+            self.pos_eq_epoch += 1;
             let count = self.eq_counts.entry(term).or_insert(0);
             *count += 1;
             if *count == 1 {
@@ -374,6 +401,7 @@ impl AssertionViewCache {
         // Truncation below changes view content (even a no-op truncation is
         // only a spurious memo miss; see `epoch` doc).
         self.epoch += 1;
+        self.pos_eq_epoch += 1;
         while self.view.positive_equalities.len() > mark.pos_eq {
             let literal = self
                 .view

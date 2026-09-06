@@ -105,7 +105,12 @@ impl LiaSolver<'_> {
     /// propagated-pairs length cover every input the detection reads.
     fn algebraic_detect_stamp(&self) -> AlgebraicDetectStamp {
         AlgebraicDetectStamp {
-            view_epoch: self.assertion_view_cache.epoch(),
+            // #poseq-epoch: this memo reads only `positive_equalities`, so it is
+            // stamped on the epoch that tracks exactly that -- not the general
+            // view epoch, which bumps on every asserted literal and on the
+            // disequality-only `bump_epoch`. Measured 10% hit rate (201/2000)
+            // before this change, with `view_epoch` the only stamp field moving.
+            view_epoch: self.assertion_view_cache.pos_eq_epoch(),
             shared_eq_revision: self.shared_eq_revision,
             bound_revision: self.lra.bound_revision(),
             var_index_epoch: self.var_index_epoch,

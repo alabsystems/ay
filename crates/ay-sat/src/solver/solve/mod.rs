@@ -243,7 +243,7 @@ impl Solver {
     /// Solve the formula
     pub fn solve(&mut self) -> SolverSatResult {
         let result = self.solve_raw();
-        self.maybe_write_fmla_learned_lrat_dry_run_proof_artifact_from_env();
+        self.maybe_write_configured_fmla_learned_lrat_dry_run_proof_artifact();
         SolverSatResult::from_solver_result(result)
     }
 
@@ -306,15 +306,16 @@ impl Solver {
         F: Fn() -> bool,
     {
         let result = self.solve_interruptible_raw(should_stop);
-        self.maybe_write_fmla_learned_lrat_dry_run_proof_artifact_from_env();
+        self.maybe_write_configured_fmla_learned_lrat_dry_run_proof_artifact();
         SolverSatResult::from_solver_result(result)
     }
 
-    /// Interruptible solve without ambient environment-driven artifact export.
+    /// Interruptible solve without the configured dry-run artifact export.
     ///
     /// The bounded in-memory ResolutionDag producer uses this crate-internal
-    /// entry point so an unrelated process environment variable cannot add
-    /// unmetered serialization or filesystem I/O to its resource envelope.
+    /// entry point so a dry-run artifact destination configured on the solver
+    /// cannot add unmetered serialization or filesystem I/O to its resource
+    /// envelope.
     pub(crate) fn solve_interruptible_without_artifact<F>(
         &mut self,
         should_stop: F,
@@ -385,7 +386,7 @@ impl Solver {
     /// When scope selectors are empty, falls back to normal solving.
     pub fn solve_with_phase_hints(&mut self, phase_hints: &dyn Extension) -> SolverSatResult {
         let result = self.solve_with_phase_hints_raw(phase_hints);
-        self.maybe_write_fmla_learned_lrat_dry_run_proof_artifact_from_env();
+        self.maybe_write_configured_fmla_learned_lrat_dry_run_proof_artifact();
         SolverSatResult::from_solver_result(result)
     }
 
@@ -440,7 +441,7 @@ impl Solver {
     /// and runs initial propagation. Returns `Some(result)` if the formula
     /// is trivially solved during initialization (empty formula, unit
     /// propagation conflict), `None` if the CDCL loop should proceed.
-    fn init_solve(&mut self) -> Option<SatResult> {
+    pub(in crate::solver) fn init_solve(&mut self) -> Option<SatResult> {
         // Record wall-clock start time for progress and observer reporting (#8155).
         if self.cold.progress_enabled || self.has_observer() {
             self.cold.solve_start_time = Some(ay_core::time::Instant::now());

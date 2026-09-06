@@ -8,6 +8,7 @@ use num_rational::BigRational;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 /// A term identifier (index into the term store)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -132,25 +133,144 @@ impl Hash for TermData {
     }
 }
 
+/// Interned symbol name: a refcounted `str` that behaves like a `String` at
+/// every use site.
+///
+/// #symbol-intern. `TermData::App` holds a `Symbol`, and term-graph traversals
+/// clone `TermData` pervasively, so a `String` payload made every clone a heap
+/// allocation plus memcpy. Profiling a QF_UFDTLIA memout put `String::clone`
+/// under `TermData::clone` at the top of the allocation profile. `Arc<str>`
+/// makes the clone a refcount bump.
+///
+/// The `Deref<Target = str>` plus the `PartialEq<str>`/`PartialEq<&str>` impls
+/// below exist so the ~2100 existing sites that pattern-match the variant and
+/// then compare (`name == "select"`) or call `&str` methods keep compiling
+/// unchanged. Only construction from an owned `String` differs, and that goes
+/// through `Symbol::named`/`indexed` for all but a handful of call sites.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SymName(Arc<str>);
+
+impl SymName {
+    /// Wrap an owned or borrowed name.
+    pub fn new(name: impl AsRef<str>) -> Self {
+        Self(Arc::from(name.as_ref()))
+    }
+    /// Borrow as `&str`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for SymName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+impl AsRef<str> for SymName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+impl std::borrow::Borrow<str> for SymName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+impl PartialEq<str> for SymName {
+    fn eq(&self, other: &str) -> bool {
+        &*self.0 == other
+    }
+}
+impl PartialEq<&str> for SymName {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+impl PartialEq<String> for SymName {
+    fn eq(&self, other: &String) -> bool {
+        &*self.0 == other.as_str()
+    }
+}
+impl PartialEq<SymName> for str {
+    fn eq(&self, other: &SymName) -> bool {
+        self == &*other.0
+    }
+}
+impl PartialEq<SymName> for &str {
+    fn eq(&self, other: &SymName) -> bool {
+        *self == &*other.0
+    }
+}
+impl From<String> for SymName {
+    fn from(s: String) -> Self {
+        Self(Arc::from(s))
+    }
+}
+impl From<&str> for SymName {
+    fn from(s: &str) -> Self {
+        Self(Arc::from(s))
+    }
+}
+impl Serialize for SymName {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.0)
+    }
+}
+impl<'de> Deserialize<'de> for SymName {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        Ok(Self(Arc::from(String::deserialize(de)?)))
+    }
+}
+/// Capacity of the underlying buffer, for the term-store memory accounting that
+/// used to call `String::capacity`. An `Arc<str>` is exactly its length.
+impl SymName {
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.0.len()
+    }
+}
+impl PartialEq<SymName> for String {
+    fn eq(&self, other: &SymName) -> bool {
+        self.as_str() == &*other.0
+    }
+}
+
+impl fmt::Display for SymName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Function/predicate symbol
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Symbol {
     /// Named function (user-defined or built-in)
-    Named(String),
+    ///
+    /// #symbol-intern: the payload is `Arc<str>`, not `String`, so cloning a
+    /// `Symbol` — and therefore cloning the `TermData::App` that holds it — is a
+    /// refcount bump rather than a heap allocation plus memcpy. Term-graph
+    /// traversals clone `TermData` pervasively (28 `terms.get(x).clone()` sites in
+    /// the EUF theory alone), and profiling a QF_UFDTLIA memout put
+    /// `String::clone` under `TermData::clone` at the top of the allocation
+    /// profile. The public API is unchanged: `named`/`indexed` still take
+    /// `impl Into<String>` and `name()` still returns `&str`.
+    Named(SymName),
     /// Indexed function like (_ extract 7 4)
-    Indexed(String, Vec<u32>),
+    Indexed(SymName, Vec<u32>),
 }
 
 impl Symbol {
     /// Create a named symbol
     pub fn named(name: impl Into<String>) -> Self {
-        Self::Named(name.into())
+        Self::Named(SymName::new(name.into()))
     }
 
     /// Create an indexed symbol
     pub fn indexed(name: impl Into<String>, indices: Vec<u32>) -> Self {
-        Self::Indexed(name.into(), indices)
+        Self::Indexed(SymName::new(name.into()), indices)
     }
 
     /// Get the name of the symbol

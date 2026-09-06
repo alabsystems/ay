@@ -173,7 +173,7 @@ proptest! {
                 };
                 let bound_term = terms.mk_int(i64::from(spec.bound).into());
                 terms.mk_app(
-                    Symbol::Named(op.to_string()),
+                    Symbol::named(op),
                     vec![lhs, bound_term],
                     Sort::Bool,
                 )

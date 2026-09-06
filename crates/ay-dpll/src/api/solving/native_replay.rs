@@ -165,7 +165,7 @@ impl Solver {
         let mut needed_functions: HashSet<String> = HashSet::default();
         for &term in &replay_terms {
             if let TermData::App(Symbol::Named(name), _) = self.terms().get(term) {
-                needed_functions.insert(name.clone());
+                needed_functions.insert(name.clone().to_string());
             }
             // Higher-order array wrappers encode the referenced declaration in
             // their symbol token rather than as a child term.
@@ -2627,7 +2627,7 @@ impl NativeReplayIdentityRemap {
                 TermData::Var(mapped, *id)
             }
             TermData::App(Symbol::Named(name), args) => TermData::App(
-                Symbol::Named(self.remap_application_name(name)?),
+                Symbol::Named(self.remap_application_name(name)?.into()),
                 args.clone(),
             ),
             // Binder spellings are not declaration identities. Replay gives
@@ -4003,9 +4003,9 @@ fn rebuild_builtin_application(
         .map(|(name, _)| ay_frontend::Term::Symbol(name.clone()))
         .collect();
     let parsed = match symbol {
-        Symbol::Named(name) => ay_frontend::Term::App(name.clone(), parsed_args),
+        Symbol::Named(name) => ay_frontend::Term::App(name.clone().to_string(), parsed_args),
         Symbol::Indexed(name, indices) => ay_frontend::Term::IndexedApp(
-            name.clone(),
+            name.clone().to_string(),
             indices
                 .iter()
                 .map(|index| ay_frontend::Index::Numeral(index.to_string()))
@@ -5392,9 +5392,9 @@ fn constant_from_json(value: &Value) -> Result<Constant, SolverError> {
 fn symbol_from_json(value: &Value) -> Result<Symbol, SolverError> {
     let object = json_object(value, "symbol")?;
     match required_string(object, "kind")?.as_str() {
-        "named" => Ok(Symbol::Named(required_string(object, "name")?)),
+        "named" => Ok(Symbol::Named(required_string(object, "name")?.into())),
         "indexed" => Ok(Symbol::Indexed(
-            required_string(object, "name")?,
+            required_string(object, "name")?.into(),
             required_array(object, "indices")?
                 .iter()
                 .map(required_u32_value)

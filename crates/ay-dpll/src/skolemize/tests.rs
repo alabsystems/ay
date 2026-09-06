@@ -1017,7 +1017,7 @@ fn test_finite_domain_extended_budget_gated_on_bool_uf() {
     let three_hundred = terms.mk_int(BigInt::from(300));
     let lo = terms.mk_le(zero, x);
     let hi = terms.mk_le(x, three_hundred);
-    let p_of_x = terms.mk_app(Symbol::Named("P".to_string()), vec![x], Sort::Bool);
+    let p_of_x = terms.mk_app(Symbol::named("P"), vec![x], Sort::Bool);
     let body = terms.mk_and(vec![lo, hi, p_of_x]);
     let exists = terms.mk_exists(vec![("x".to_string(), Sort::Int)], body);
     assert!(
@@ -1050,7 +1050,7 @@ fn test_finite_domain_extended_budget_cap_and_i64_extremes() {
     let wide = terms.mk_int(BigInt::from(600));
     let lo = terms.mk_le(zero, x);
     let hi = terms.mk_le(x, wide);
-    let p_of_x = terms.mk_app(Symbol::Named("P".to_string()), vec![x], Sort::Bool);
+    let p_of_x = terms.mk_app(Symbol::named("P"), vec![x], Sort::Bool);
     let body = terms.mk_and(vec![lo, hi, p_of_x]);
     let exists = terms.mk_exists(vec![("x".to_string(), Sort::Int)], body);
     assert!(
@@ -1065,7 +1065,7 @@ fn test_finite_domain_extended_budget_cap_and_i64_extremes() {
     let max = terms.mk_int(BigInt::from(i64::MAX));
     let lo_y = terms.mk_le(min, y);
     let hi_y = terms.mk_le(y, max);
-    let p_of_y = terms.mk_app(Symbol::Named("P".to_string()), vec![y], Sort::Bool);
+    let p_of_y = terms.mk_app(Symbol::named("P"), vec![y], Sort::Bool);
     let body_y = terms.mk_and(vec![lo_y, hi_y, p_of_y]);
     let exists_y = terms.mk_exists(vec![("y".to_string(), Sort::Int)], body_y);
     assert!(
@@ -1086,7 +1086,7 @@ fn test_finite_domain_bounded_bv_forall_bvult_literal() {
     let i = terms.mk_var("i", bv64.clone());
     let two = terms.mk_bitvec(BigInt::from(2), 64);
     let guard = terms.mk_bvult(i, two);
-    let body_app = terms.mk_app(Symbol::Named("P".to_string()), vec![i], Sort::Bool);
+    let body_app = terms.mk_app(Symbol::named("P"), vec![i], Sort::Bool);
     let implies = terms.mk_implies(guard, body_app);
     let forall = terms.mk_forall(vec![("i".to_string(), bv64)], implies);
 
@@ -1113,7 +1113,7 @@ fn test_finite_domain_bounded_bv_forall_symbolic_bound_rejected() {
     let i = terms.mk_var("i", bv64.clone());
     let n = terms.mk_var("n", bv64.clone());
     let guard = terms.mk_bvult(i, n);
-    let body_app = terms.mk_app(Symbol::Named("P".to_string()), vec![i], Sort::Bool);
+    let body_app = terms.mk_app(Symbol::named("P"), vec![i], Sort::Bool);
     let implies = terms.mk_implies(guard, body_app);
     let forall = terms.mk_forall(vec![("i".to_string(), bv64)], implies);
 
@@ -1131,7 +1131,7 @@ fn test_finite_domain_bounded_bv_forall_wide_range_rejected() {
     let i = terms.mk_var("i", bv64.clone());
     let wide = terms.mk_bitvec(BigInt::from(100_000), 64);
     let guard = terms.mk_bvult(i, wide);
-    let body_app = terms.mk_app(Symbol::Named("P".to_string()), vec![i], Sort::Bool);
+    let body_app = terms.mk_app(Symbol::named("P"), vec![i], Sort::Bool);
     let implies = terms.mk_implies(guard, body_app);
     let forall = terms.mk_forall(vec![("i".to_string(), bv64)], implies);
 
@@ -1153,7 +1153,7 @@ fn test_finite_domain_bounded_bv_forall_empty_range_vacuous_true() {
     let g_lo = terms.mk_bvult(five, i);
     let g_hi = terms.mk_bvult(i, two);
     let guard = terms.mk_and(vec![g_lo, g_hi]);
-    let body_app = terms.mk_app(Symbol::Named("P".to_string()), vec![i], Sort::Bool);
+    let body_app = terms.mk_app(Symbol::named("P"), vec![i], Sort::Bool);
     let implies = terms.mk_implies(guard, body_app);
     let forall = terms.mk_forall(vec![("i".to_string(), bv64)], implies);
 

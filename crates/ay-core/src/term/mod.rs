@@ -1322,7 +1322,7 @@ impl TermStore {
     fn compute_app_hash_named(&self, name: &str, args: &[TermId]) -> u64 {
         let mut state = foldhash::fast::FixedState::default().build_hasher();
         std::mem::discriminant(&TermData::App(Symbol::named(""), vec![])).hash(&mut state);
-        std::mem::discriminant(&Symbol::Named(String::new())).hash(&mut state);
+        std::mem::discriminant(&Symbol::named("")).hash(&mut state);
         name.hash(&mut state);
         args.hash(&mut state);
         state.finish()

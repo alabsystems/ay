@@ -11549,6 +11549,20 @@ impl BmcSolver {
             }
             on_path.remove(&entry_idx);
             let clause_index = entry.incoming_clause?;
+            let source_clause = self.problem.clauses().get(clause_index)?;
+            // `entry.instances` also carries canonical predicate-state keys
+            // (`__p{predicate}_a{argument}`) used by the legacy witness and
+            // counterexample views. They are not variables of the selected
+            // source clause and therefore must not cross the canonical ground
+            // evidence boundary. Project only here, leaving the richer witness
+            // intact for its other consumers.
+            let mut source_env = FxHashMap::default();
+            for variable in source_clause.vars() {
+                source_env.insert(
+                    variable.name.clone(),
+                    entry.instances.get(&variable.name)?.clone(),
+                );
+            }
             let mut premises = Vec::with_capacity(entry.premises.len());
             for premise in &entry.premises {
                 premises.push(*mapped.get(premise)?);
@@ -11556,7 +11570,7 @@ impl BmcSolver {
             mapped.insert(entry_idx, steps.len());
             steps.push(GroundDerivationStep {
                 clause_index,
-                env: entry.instances.clone(),
+                env: source_env,
                 premises,
             });
         }

@@ -6795,17 +6795,17 @@ impl Executor {
             let Symbol::Named(name) = binding.symbol() else {
                 return None;
             };
-            let arg_sorts = table_arg_sorts.get(name)?.clone();
+            let arg_sorts = table_arg_sorts.get(name.as_str())?.clone();
             let arity = arg_sorts.len();
             if arity == 0 || binding.parameter_sorts() != arg_sorts {
                 return None;
             }
-            let codomain = result_sort(*table_syms.get(name)?);
+            let codomain = result_sort(*table_syms.get(name.as_str())?);
             if binding.result_sort() != &codomain {
                 return None;
             }
-            let rows = tables.get(name)?;
-            let default = defaults.get(name)?;
+            let rows = tables.get(name.as_str())?;
+            let default = defaults.get(name.as_str())?;
             let mut sorted_rows: Vec<(&TableCertKey, &TableCertVal)> = rows.iter().collect();
             sorted_rows.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -6822,7 +6822,7 @@ impl Executor {
             }
 
             replacements.push((
-                name.clone(),
+                name.clone().to_string(),
                 arg_sorts,
                 codomain,
                 semantic_rows,
@@ -6875,7 +6875,7 @@ impl Executor {
             let Symbol::Named(name) = binding.symbol() else {
                 return None;
             };
-            let &(arity, codomain) = table_syms.get(name)?;
+            let &(arity, codomain) = table_syms.get(name.as_str())?;
             if arity == 0
                 || binding.parameter_sorts().len() != arity
                 || binding
@@ -6885,8 +6885,8 @@ impl Executor {
             {
                 return None;
             }
-            let rows = tables.get(name)?;
-            let default = defaults.get(name)?;
+            let rows = tables.get(name.as_str())?;
+            let default = defaults.get(name.as_str())?;
             let mut sorted_rows: Vec<&(Vec<num_bigint::BigInt>, TableCertVal)> =
                 rows.iter().collect();
             sorted_rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -6912,7 +6912,7 @@ impl Executor {
                 return None;
             }
             completed.install_certified_total_uf(
-                name.clone(),
+                name.clone().to_string(),
                 vec![Sort::Int; arity],
                 result_sort,
                 semantic_rows,
@@ -7012,17 +7012,18 @@ impl Executor {
             {
                 return None;
             }
-            let codomain = result_sort(*table_syms.get(name)?);
+            let codomain = result_sort(*table_syms.get(name.as_str())?);
             if binding.result_sort() != &codomain {
                 return None;
             }
-            let table = tables.get(name)?;
+            let table = tables.get(name.as_str())?;
             let mut sorted_rows: Vec<(&String, &TableCertVal)> = table.iter().collect();
             sorted_rows.sort_by(|a, b| a.0.cmp(b.0));
             let mut rows = Vec::with_capacity(sorted_rows.len());
             let mut rendered_arguments = Vec::with_capacity(sorted_rows.len());
             for (key, value) in sorted_rows {
-                let Some(&representative) = table_key_reps.get(&(name.clone(), key.clone())) else {
+                let Some(&representative) = table_key_reps.get(&(name.to_string(), key.clone()))
+                else {
                     trace_decline("missing-row-representative");
                     return None;
                 };
@@ -7058,12 +7059,12 @@ impl Executor {
                 rendered_arguments.push(vec![rendered]);
             }
             replacements.push((
-                name.clone(),
+                name.clone().to_string(),
                 binding.parameter_sorts().to_vec(),
                 codomain,
                 rows,
                 rendered_arguments,
-                semantic_value(defaults.get(name)?),
+                semantic_value(defaults.get(name.as_str())?),
             ));
         }
 
@@ -12114,7 +12115,7 @@ impl Executor {
                                     }
                                 }
                                 None => {
-                                    heads.insert(name.clone(), (sort, args.len()));
+                                    heads.insert(name.clone().to_string(), (sort, args.len()));
                                 }
                             }
                         } else if const_interp_rebuild_folds_name(name)

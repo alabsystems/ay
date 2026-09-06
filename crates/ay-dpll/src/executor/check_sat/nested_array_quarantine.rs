@@ -9,10 +9,33 @@ use super::*;
 impl Executor {
     /// Fail closed on an UNSAT result for an active nested-array problem.
     ///
-    /// The QF_ALIA/AUFLIA combination has a confirmed false-UNSAT reproducer
-    /// over `(Array Int (Array Int Int))`. SAT remains available through model
-    /// validation; only an UNSAT lacking one of the checked authorities below
-    /// is quarantined.
+    /// SAT remains available through model validation; only an UNSAT lacking
+    /// one of the checked authorities below is quarantined.
+    ///
+    /// ORIGIN (`53e9ac3c07`): a confirmed false `unsat` over
+    /// `(Array Int (Array Int Int))` in the QF_ALIA/AUFLIA combination,
+    /// `repros/cs_stateful-1.i_2.MINIMIZED.smt2`. That reproducer's SOURCE
+    /// defect -- a vacuously true `all()` over a GC-compacted, zero-length
+    /// pending-theory-conflict slice -- was root-caused and fixed at
+    /// `f978212a6f` + `7272612d89`, and the repro now fails closed to timeout
+    /// WITHOUT reaching this gate (Round 20 of
+    /// the development design notes;
+    /// re-measured 2026-09-06 on current main: `interrupted`/`timeout`, no
+    /// degrade warning). This is therefore no longer a workaround for one bug.
+    /// It is the ENFORCEMENT POINT of the authority ladder below -- what lets a
+    /// nested-array UNSAT publish on checked evidence rather than on trust.
+    ///
+    /// Do NOT answer a withheld verdict by widening the gate. Every narrowing
+    /// that shipped bought its verdicts with an independently checked
+    /// authority: the ho-seq unfold marker (`7479b26878`), the entailed-residue
+    /// rescue (`6d687da43`) and the exact finite Bool/BV theorem
+    /// (`233ab32da2`). Bypassing the gate outright was measured once, on the
+    /// 41-instance CHC/Solidity shard that produced 337 quarantine events, and
+    /// converted ZERO files
+    /// (the development design notes).
+    /// The class this still withholds is the one whose refutation reconstructs
+    /// to a bare `(step t0 (cl) :rule trust)`, which `--self-check` rejects --
+    /// see the quantified pin in `executor_tests::array_soundness`.
     ///
     /// `hard` is the caller-authored hard-assertion snapshot only when the
     /// verdict rests on those assertions alone. Assumption and optimization

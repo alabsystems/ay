@@ -245,7 +245,7 @@ proptest! {
                     };
                     let bound_term = terms.mk_int(i64::from(*bound).into());
                     terms.mk_app(
-                        Symbol::Named(op.to_string()),
+                        Symbol::named(op),
                         vec![int_vars[*var_idx as usize], bound_term],
                         Sort::Bool,
                     )

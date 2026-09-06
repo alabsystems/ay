@@ -266,8 +266,21 @@ impl LraSolver {
         self.propagated_atoms = saved_propagated_atoms;
         self.propagation_dirty_vars = saved_propagation_dirty_vars;
         self.implied_bounds = saved_implied_bounds;
-        self.touched_rows = saved_touched_rows;
+        // The probe's tentative bounds and derived slots are rolled back,
+        // but its pivots are not: the rows they rewrote hold new equations
+        // (same solution set, different single-row derivations) and must be
+        // re-analyzed. Keep them touched on top of the restored set instead
+        // of dropping the marks with the rest of the probe state; the
+        // dirty-row sweep relies on the touched set being the complete
+        // record of changed rows.
+        let probe_touched = std::mem::replace(&mut self.touched_rows, saved_touched_rows);
         self.propagate_direct_touched_rows_pending = saved_propagate_direct_touched_rows_pending;
+        if !probe_touched.is_empty() {
+            for &row_idx in probe_touched.iter() {
+                self.touched_rows.insert(row_idx);
+            }
+            self.propagate_direct_touched_rows_pending = true;
+        }
         self.implied_bounds_fresh = saved_implied_bounds_fresh;
         self.pending_diseq_splits = saved_pending_diseq_splits;
         self.pending_expr_splits = saved_pending_expr_splits;

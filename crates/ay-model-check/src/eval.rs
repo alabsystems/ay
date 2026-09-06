@@ -1309,8 +1309,15 @@ impl<'a> Evaluator<'a> {
     /// element sort, and datatype values store only a constructor name. Exact
     /// equality therefore has to authenticate the complete nested shape against
     /// the declared term sort before comparing payloads. Identical malformed
-    /// values are not evidence of equality at an unrelated sort.
-    fn ensure_value_inhabits_sort(&self, value: &ModelValue, sort: &Sort) -> Result<(), String> {
+    /// values are not evidence of equality at an unrelated sort. Residual
+    /// witness construction shares this exact validator so its finite-store
+    /// keys, elements, and synthesized defaults cannot bypass typed equality's
+    /// model boundary.
+    pub(crate) fn ensure_value_inhabits_sort(
+        &self,
+        value: &ModelValue,
+        sort: &Sort,
+    ) -> Result<(), String> {
         let mut work = 0usize;
         self.ensure_value_inhabits_sort_bounded(value, sort, 0, &mut work)
     }

@@ -75,6 +75,36 @@ pub(crate) struct LraStats {
     /// Count of `ImpliedRow` propagations emitted from the drain.
     pub(crate) emitted_implied_row_count: u64,
 
+    // ----- compute_implied_bounds sweep telemetry -----
+    /// `compute_implied_bounds` calls that reached the row analysis.
+    pub(crate) implied_calls: u64,
+    /// ... of which swept EVERY row (no touched-row set).
+    pub(crate) implied_full_sweeps: u64,
+    /// Calls that overlaid every variable's direct bounds (O(num_vars)).
+    pub(crate) implied_full_overlays: u64,
+    /// Rows visited by the analysis loop, over all cascade rounds.
+    pub(crate) implied_rows_scanned: u64,
+    /// ... of which were actually analyzed (not skipped by generation,
+    /// width, or big-coefficient checks).
+    pub(crate) implied_rows_analyzed: u64,
+    /// Calls that returned early because nothing changed since the last
+    /// complete sweep (#inc-cib-nodelta).
+    pub(crate) implied_nodelta_skips: u64,
+
+    // ----- Implied-bound explanation telemetry -----
+    /// Lazy `ImpliedBound` propagations explained by the variable's own
+    /// direct bound (the slot was overlaid by a direct bound after enqueue).
+    pub(crate) implied_reason_direct_count: u64,
+    /// Lazy `ImpliedBound` propagations explained by the value-checked
+    /// derivation chain of the current row-derived bound.
+    pub(crate) implied_reason_chain_count: u64,
+    /// Lazy `ImpliedBound` propagations explained by re-deriving the bound
+    /// from the current row with direct bounds only.
+    pub(crate) implied_reason_row_count: u64,
+    /// Lazy `ImpliedBound` propagations explained by the direct-only interval
+    /// of the atom's own expression.
+    pub(crate) implied_reason_interval_count: u64,
+
     // ----- Stale-reason guard telemetry -----
     /// Propagations dropped by the stale-reason filter (#9031).
     pub(crate) stale_reason_filtered_count: u64,

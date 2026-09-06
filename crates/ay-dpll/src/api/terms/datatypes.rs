@@ -390,9 +390,9 @@ impl Solver {
                 Ok(self.wrap_term(term))
             }
         } else {
-            let term = self
-                .terms_mut()
-                .mk_app(Symbol::Named(ctor_identity), arg_ids, dt_sort);
+            let term =
+                self.terms_mut()
+                    .mk_app(Symbol::Named(ctor_identity.into()), arg_ids, dt_sort);
             Ok(self.wrap_term(term))
         }
     }
@@ -522,9 +522,11 @@ impl Solver {
             });
         }
 
-        let term =
-            self.terms_mut()
-                .mk_app(Symbol::Named(selector_identity), vec![expr], expected_sort);
+        let term = self.terms_mut().mk_app(
+            Symbol::Named(selector_identity.into()),
+            vec![expr],
+            expected_sort,
+        );
         Ok(self.wrap_term(term))
     }
 
@@ -605,9 +607,11 @@ impl Solver {
             });
         }
 
-        let term = self
-            .terms_mut()
-            .mk_app(Symbol::Named(tester_identity), vec![expr], Sort::Bool);
+        let term = self.terms_mut().mk_app(
+            Symbol::Named(tester_identity.into()),
+            vec![expr],
+            Sort::Bool,
+        );
         Ok(self.wrap_term(term))
     }
 }

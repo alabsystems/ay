@@ -26,6 +26,13 @@ use crate::ProofOutput;
 use ay_test_support::env::{lock_env, ScopedEnvVar};
 use sha2::{Digest, Sha256};
 
+/// Serialize the tests that mutate the Fmla Main/LRAT *authority-replay* env
+/// vars (`..._MAIN_PROOF_AUTHORITY_REPLAY` / `..._CURRENT_PROOF_OUT`).
+///
+/// Those two are still resolved from the process environment during UNSAT
+/// finalization, so concurrent tests would read each other's values. The
+/// dry-run artifact destination is no longer an env var — it is per-solver
+/// configuration — so artifact tests do not need this lock.
 fn lock_fmla_learned_lrat_env_test() -> std::sync::MutexGuard<'static, ()> {
     lock_env()
 }
@@ -1769,17 +1776,16 @@ fn test_fmla_learned_lrat_dry_run_artifact_export_writes_fail_closed_diagnostic(
 
 #[test]
 fn test_fmla_learned_lrat_dry_run_artifact_export_runs_before_take_proof_writer() {
-    let _lock = lock_fmla_learned_lrat_env_test();
     let (mut solver, materializer_id, learned_id) =
         setup_retained_fmla_learned_lrat_dry_run_fixture();
     let dir = tempfile::tempdir().expect("tempdir");
     let artifact_path = dir
         .path()
         .join("fmla-learned-lrat-dry-run-proof-artifact.json");
-    let _dry_run = ScopedEnvVar::set(
-        FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV,
-        artifact_path.to_str().expect("temp path is UTF-8"),
-    );
+    // Per-solver configuration, not a process-global env var: only THIS
+    // solver may write to this tempdir, so no unrelated test in the binary
+    // can overwrite the artifact whose content is asserted below.
+    solver.set_fmla_learned_lrat_dry_run_artifact_path(Some(artifact_path.clone()));
 
     let writer = solver
         .take_proof_writer()
@@ -1812,9 +1818,48 @@ fn test_fmla_learned_lrat_dry_run_artifact_export_runs_before_take_proof_writer(
     assert!(fragment.contains(&format!("{learned_id} 1 -2 0 6 {materializer_id} 1 0\n")));
 }
 
+/// Test-isolation regression: the solver core must NEVER discover the dry-run
+/// artifact destination from the process environment.
+///
+/// It used to read `AY_SAT_FMLA_LEARNED_LRAT_DRY_RUN_ARTIFACT` at every solve
+/// finalization, so any solve anywhere in the process wrote to whatever path
+/// that one variable named. In a test binary that meant unrelated tests
+/// clobbered the artifacts whose content the tests above assert on — a real,
+/// reproducible content-mismatch flake. Only explicit per-solver configuration
+/// may select a destination now.
+#[test]
+fn test_fmla_learned_lrat_dry_run_artifact_ignores_process_environment() {
+    let _lock = lock_fmla_learned_lrat_env_test();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ambient_path = dir.path().join("ambient-artifact.json");
+    let _dry_run = ScopedEnvVar::set(
+        FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV,
+        ambient_path.to_str().expect("temp path is UTF-8"),
+    );
+
+    let (mut solver, _materializer_id, _learned_id) =
+        setup_retained_fmla_learned_lrat_dry_run_fixture();
+    assert!(
+        solver.fmla_learned_lrat_dry_run_artifact_path().is_none(),
+        "an unconfigured solver must have no artifact destination"
+    );
+    drop(solver.take_proof_writer());
+    assert!(
+        !ambient_path.exists(),
+        "take_proof_writer must not export to an environment-named destination"
+    );
+
+    let mut plain = Solver::new(2);
+    plain.add_clause(vec![Literal::positive(Variable(0))]);
+    assert!(plain.solve().is_sat());
+    assert!(
+        !ambient_path.exists(),
+        "solve finalization must not export to an environment-named destination"
+    );
+}
+
 #[test]
 fn test_fmla_learned_lrat_dry_run_artifact_take_proof_writer_replaces_stale_artifact() {
-    let _lock = lock_fmla_learned_lrat_env_test();
     let proof = ProofOutput::lrat_text(Vec::new(), 8);
     let mut solver: Solver = Solver::with_proof_output(20, proof);
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1822,10 +1867,7 @@ fn test_fmla_learned_lrat_dry_run_artifact_take_proof_writer_replaces_stale_arti
         .path()
         .join("fmla-learned-lrat-dry-run-proof-artifact.json");
     std::fs::write(&artifact_path, b"stale artifact").expect("seed stale artifact");
-    let _dry_run = ScopedEnvVar::set(
-        FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV,
-        artifact_path.to_str().expect("temp path is UTF-8"),
-    );
+    solver.set_fmla_learned_lrat_dry_run_artifact_path(Some(artifact_path.clone()));
 
     let writer = solver
         .take_proof_writer()
@@ -2295,7 +2337,6 @@ fn test_fmla_fail_closed_learned_lrat_chain_final_solve_returns_unknown() {
 #[test]
 fn test_lrat_authority_fail_closed_replay_diagnostic_still_downgrades_unsat() {
     let _lock = lock_fmla_learned_lrat_env_test();
-    let _dry_run = ScopedEnvVar::unset(FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV);
     let dir = tempfile::tempdir().expect("tempdir");
     let seed_proof = dir.path().join("seed-proof.out");
 
@@ -2336,7 +2377,6 @@ fn test_lrat_authority_fail_closed_replay_diagnostic_still_downgrades_unsat() {
 #[test]
 fn test_lrat_authority_fail_closed_complete_verified_replay_admits_unsat() {
     let _lock = lock_fmla_learned_lrat_env_test();
-    let _dry_run = ScopedEnvVar::unset(FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV);
     let dir = tempfile::tempdir().expect("tempdir");
     let seed_proof = dir.path().join("seed-proof.out");
 

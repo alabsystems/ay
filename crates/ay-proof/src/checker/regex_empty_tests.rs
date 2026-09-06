@@ -640,16 +640,8 @@ fn bounded_loop_lengths_that_cannot_agree_are_empty() {
     let mut terms = TermStore::new();
     let x = str_var(&mut terms, "X");
     let d = range(&mut terms, "0", "9");
-    let l2 = terms.mk_app(
-        Symbol::Indexed("re.loop".to_string(), vec![2, 2]),
-        [d],
-        Sort::RegLan,
-    );
-    let l3 = terms.mk_app(
-        Symbol::Indexed("re.loop".to_string(), vec![3, 3]),
-        [d],
-        Sort::RegLan,
-    );
+    let l2 = terms.mk_app(Symbol::indexed("re.loop", vec![2, 2]), [d], Sort::RegLan);
+    let l3 = terms.mk_app(Symbol::indexed("re.loop", vec![3, 3]), [d], Sort::RegLan);
     let a = deny_in(&mut terms, x, l2);
     let b = deny_in(&mut terms, x, l3);
     assert!(recognize_regex_intersect_empty(&terms, &[a, b]));
@@ -660,16 +652,8 @@ fn bounded_loop_ranges_that_overlap_are_not_empty() {
     let mut terms = TermStore::new();
     let x = str_var(&mut terms, "X");
     let d = range(&mut terms, "0", "9");
-    let l23 = terms.mk_app(
-        Symbol::Indexed("re.loop".to_string(), vec![2, 3]),
-        [d],
-        Sort::RegLan,
-    );
-    let l34 = terms.mk_app(
-        Symbol::Indexed("re.loop".to_string(), vec![3, 4]),
-        [d],
-        Sort::RegLan,
-    );
+    let l23 = terms.mk_app(Symbol::indexed("re.loop", vec![2, 3]), [d], Sort::RegLan);
+    let l34 = terms.mk_app(Symbol::indexed("re.loop", vec![3, 4]), [d], Sort::RegLan);
     let a = deny_in(&mut terms, x, l23);
     let b = deny_in(&mut terms, x, l34);
     assert!(!recognize_regex_intersect_empty(&terms, &[a, b]));
@@ -814,11 +798,7 @@ fn gen_regex(terms: &mut TermStore, rng: &mut Rng, depth: u32) -> TermId {
         2 => star(terms, a),
         3 => re_app(terms, "re.opt", vec![a]),
         4 => comp(terms, a),
-        5 => terms.mk_app(
-            Symbol::Indexed("re.loop".to_string(), vec![0, 2]),
-            [a],
-            Sort::RegLan,
-        ),
+        5 => terms.mk_app(Symbol::indexed("re.loop", vec![0, 2]), [a], Sort::RegLan),
         _ => {
             let b = gen_regex(terms, rng, depth - 1);
             re_app(terms, "re.inter", vec![a, b])

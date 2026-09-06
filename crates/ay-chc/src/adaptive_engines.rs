@@ -1286,16 +1286,19 @@ impl AdaptivePortfolio {
             || caller_cancellation
                 .as_ref()
                 .is_some_and(crate::CancellationToken::is_cancelled);
-        if boundary_closed
+        let result = if boundary_closed
             && matches!(
                 &result,
                 crate::VerifiedChcResult::Safe(_) | crate::VerifiedChcResult::Unsafe(_)
-            )
-        {
+            ) {
             crate::VerifiedChcResult::Unknown(crate::engine_result::VerifiedUnknownMarker::new())
         } else {
             result
-        }
+        };
+        crate::engines::downgrade_unsafe_if_overapproximated(
+            result,
+            self.problem.has_stripped_body_forall(),
+        )
     }
 
     /// Internal BMC-only solve (runs on the solver thread).

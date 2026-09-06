@@ -1,0 +1,98 @@
+ay reads the problem and works out what it is. You almost never tell it:
+point ay at a file, or pipe one in, and it picks the SMT-LIB, DIMACS CNF or
+CHC front end on its own. MaxSAT, PB and LP files are solved straight from
+`ay solve` too, when their extension gives them away. QBF, FlatZinc and
+counting have solvers of their own behind subcommands, and `ay solve`
+refuses those files by naming the subcommand to run.
+
+HOW AY CLASSIFIES A FILE
+
+Checked in this order; the first match wins.
+
+  .fzn .qdimacs .mps .wcnf.xz   refused, naming the subcommand to use
+  .aig .aag .sl                 refused; no ay front end reads these
+  .wcnf .opb .lp                solved by the MaxSAT / PB / LP front end
+  .cnf                          DIMACS CNF -- the name decides, the
+                                contents are never consulted
+  first real line is `p cnf`    DIMACS CNF, whatever the file is named
+  `(set-logic HORN)`            CHC (Horn clauses, PDR/IC3 engine)
+  a `rule` or `query` command   CHC (a Z3 fixedpoint script)
+  anything else                 SMT-LIB 2.6
+
+"First real line" skips blank lines and lines starting with `c`, and nothing
+else. A leading `;` comment is NOT skipped -- it ends the search, so a CNF
+opening with one is read as SMT-LIB unless the file is named .cnf. And a
+`declare-rel` on its own is not enough to mean fixedpoint: ay wants a real
+`rule` or `query` before it hands the file to the CHC engine, so a script
+with relations but no query goes down the SMT path and returns `unknown`.
+
+READING FROM STDIN
+
+There is no extension to go on, so ay sniffs the first 64 KiB that arrives
+and applies the content rules only -- `p cnf` means DIMACS, a HORN set-logic
+or a `rule`/`query` means CHC, anything else means SMT-LIB. SMT-LIB is then
+streamed command by command rather than buffered, so an interactive session
+answers each `(check-sat)` as you type it.
+
+  ay < problem.smt2    read to EOF, then solve
+  ay - < problem.cnf   the same; a bare `-` means stdin
+  ay --stdin           the explicit spelling
+  ay --incremental     line-by-line, flushed after every command
+
+The extension rules cannot fire here. A WCNF, OPB or LP stream is read as
+SMT-LIB and fails to parse unless you force it (see OVERRIDES); the QBF and
+FlatZinc front ends take a FILE and read `-` as a literal filename.
+
+THE OTHER FRONT ENDS
+
+  WCNF, MaxSAT             .wcnf         ay maxsat solve FILE
+  OPB / WBO                .opb .wbo     ay pb solve FILE
+  QDIMACS, QBF             .qdimacs      ay qbf solve FILE
+  MPS / CPLEX LP           .mps .lp      ay lp solve FILE
+  FlatZinc                 .fzn          ay flatzinc solve FILE
+  DIMACS CNF, all models   .cnf          ay allsat FILE
+  Model Counting CNF       .cnf          ay model-count FILE
+  DRAT / LRAT proofs                     ay check drat, ay check lrat
+
+Each takes the file whatever it is named, so a misnamed instance is fine
+here: `ay maxsat solve wrong-name.cnf` still reads it as WCNF. `ay pb solve`
+picks OPB or WBO by extension and otherwise by the first real line, where
+`soft:` means WBO; `ay lp solve` picks MPS or CPLEX LP the same way. One
+gap: `.wbo` is neither refused nor detected by `ay solve`, so it reaches the
+SMT-LIB parser and errors. Name the subcommand.
+
+OVERRIDES
+
+  --chc              force the CHC engine (FILE only; rejected on stdin)
+  --portfolio        force CHC portfolio mode (FILE only)
+  -wcnf              read the input as WCNF, whatever it is named
+  -pbo               read the input as OPB
+  -lp                read the input as CPLEX LP
+  --format mps|lp    on `ay lp solve` only: force one of the two parsers
+  --                 stop option parsing, for files named like flags
+
+`-smt2` and `-dimacs` are accepted and dropped -- but not free. Either one
+marks the input format as explicitly chosen, and that switches OFF the
+.wcnf/.opb/.lp extension routing above: `ay file.wcnf` solves as MaxSAT,
+while `ay -smt2 file.wcnf` is refused with the subcommand pointer. Nothing
+forces a file back onto the SMT-LIB path once ay has classified it as
+DIMACS or CHC.
+
+WHEN IT GUESSES WRONG
+
+  A .cnf that is really WCNF
+    The name wins, so the DIMACS parser rejects the header: `invalid
+    problem line: p wcnf ...`. Run `ay maxsat solve FILE`, or `ay -wcnf
+    FILE` to stay on `ay solve`.
+
+  An .smt2 declaring HORN
+    It goes to the CHC engine, and the answer is a safety verdict with an
+    inductive invariant or a counterexample trace, not a model. Drop the
+    `(set-logic HORN)` line if you want DPLL(T) on the same assertions.
+
+  A quantified formula that is only nearly Horn
+    Nothing is inferred from the shape -- only `(set-logic HORN)` or a
+    `rule`/`query` routes to CHC. Add `--chc` to send it there anyway.
+
+Next: run `ay help z3` for the Z3-compatible flags that are read before any
+of this detection happens.

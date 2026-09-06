@@ -211,10 +211,13 @@ impl ChcProblem {
             }
             new_constraint = Self::conjoin_constraint(new_constraint, branch);
 
-            split_clauses.push(HornClause::new(
-                ClauseBody::new(clause.body.predicates.clone(), new_constraint),
-                clause.head.clone(),
-            ));
+            split_clauses.push(
+                HornClause::new(
+                    ClauseBody::new(clause.body.predicates.clone(), new_constraint),
+                    clause.head.clone(),
+                )
+                .with_inherited_provenance(clause),
+            );
         }
 
         Some(split_clauses)
@@ -241,14 +244,16 @@ impl ChcProblem {
                         Self::conjoin_constraint(Some(then_c), cond.clone()),
                     ),
                     clause.head.clone(),
-                );
+                )
+                .with_inherited_provenance(clause);
                 let b = HornClause::new(
                     ClauseBody::new(
                         clause.body.predicates.clone(),
                         Self::conjoin_constraint(Some(else_c), ChcExpr::not(cond)),
                     ),
                     clause.head.clone(),
-                );
+                )
+                .with_inherited_provenance(clause);
                 return Some((a, b));
             }
         }
@@ -273,11 +278,13 @@ impl ChcProblem {
                     let a = HornClause::new(
                         ClauseBody::new(preds_then, then_constraint),
                         clause.head.clone(),
-                    );
+                    )
+                    .with_inherited_provenance(clause);
                     let b = HornClause::new(
                         ClauseBody::new(preds_else, else_constraint),
                         clause.head.clone(),
-                    );
+                    )
+                    .with_inherited_provenance(clause);
                     return Some((a, b));
                 }
             }
@@ -302,11 +309,13 @@ impl ChcProblem {
                 let a = HornClause::new(
                     ClauseBody::new(clause.body.predicates.clone(), then_constraint),
                     ClauseHead::Predicate(*head_pred, head_then_args),
-                );
+                )
+                .with_inherited_provenance(clause);
                 let b = HornClause::new(
                     ClauseBody::new(clause.body.predicates.clone(), else_constraint),
                     ClauseHead::Predicate(*head_pred, head_else_args),
-                );
+                )
+                .with_inherited_provenance(clause);
                 return Some((a, b));
             }
         }

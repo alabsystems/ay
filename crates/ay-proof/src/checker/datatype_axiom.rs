@@ -916,14 +916,14 @@ pub(super) fn constructor_head<'a>(
 ) -> Option<(String, &'a str)> {
     let name = match terms.get(term) {
         TermData::App(Symbol::Named(name), _) => name.clone(),
-        TermData::Var(n, _) => n.clone(),
+        TermData::Var(n, _) => n.clone().into(),
         _ => return None,
     };
     let dt = constructor_datatype(dt_decls, &name)?;
     if !sort_matches_datatype(terms.sort(term), dt) {
         return None;
     }
-    Some((name, dt))
+    Some((name.to_string(), dt))
 }
 
 pub(super) fn sort_matches_datatype(sort: &Sort, datatype: &str) -> bool {
@@ -1737,7 +1737,11 @@ fn selector_over_constructor(
     let TermData::App(Symbol::Named(ctor_name), ctor_args) = terms.get(sel_args[0]) else {
         return None;
     };
-    Some((ctor_name.clone(), ctor_args.clone(), sel_name.clone()))
+    Some((
+        ctor_name.clone().to_string(),
+        ctor_args.clone(),
+        sel_name.clone().to_string(),
+    ))
 }
 
 /// The field position of `sel_name` among `ctor_name`'s registered selectors.

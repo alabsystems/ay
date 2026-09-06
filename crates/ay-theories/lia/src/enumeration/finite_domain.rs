@@ -806,7 +806,7 @@ impl LiaSolver<'_> {
                 }
                 apps.push(FdApp {
                     idx,
-                    symbol: name.clone(),
+                    symbol: name.clone().to_string(),
                     args: args.clone(),
                 });
             }

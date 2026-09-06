@@ -229,6 +229,9 @@ pub struct VeripbWriter<W: Write> {
     line: Vec<u8>,
     added_count: u64,
     deleted_count: u64,
+    /// Unit deletions dropped by [`Self::delete`] (see its docs). Kept so the
+    /// suppression is observable instead of silent.
+    unit_deletions_skipped: u64,
     io_failed: bool,
     header_written: bool,
     /// Set once the trailer is written; later writes are dropped.
@@ -244,6 +247,7 @@ impl<W: Write> VeripbWriter<W> {
             line: Vec::with_capacity(VERIPB_LINE_INITIAL_CAPACITY),
             added_count: 0,
             deleted_count: 0,
+            unit_deletions_skipped: 0,
             io_failed: false,
             header_written: false,
             concluded: false,
@@ -369,8 +373,40 @@ impl<W: Write> VeripbWriter<W> {
     /// is still a contradiction from a subset of the input — and this writer
     /// claims `output NONE`, i.e. no reformulation guarantee that the downgrade
     /// could invalidate.
+    ///
+    /// # Unit deletions are dropped
+    ///
+    /// A *unit* deletion is never written. On the DRAT surface it is already a
+    /// no-op: `drat-trim` (drat-trim.c:806-814) and `ay_drat_check`
+    /// (`Checker::delete_clause`, `pseudo_unit_skips`) both silently ignore the
+    /// deletion of a clause that is the current propagation reason for its
+    /// first literal, and a unit clause is unconditionally the reason for its
+    /// own literal once it is propagated. VeriPB has no such rule: it removes
+    /// the constraint for real, and a root-level fact whose only remaining
+    /// derivation *was* that unit stops being derivable for the rest of the
+    /// proof.
+    ///
+    /// That is not hypothetical. On `dc7817dfa2817916b266c1cfacd2ee66` the
+    /// stated unit `x12023` was written three times (proof lines 499425/499510/
+    /// 499513), deleted three times (518223/518225/915150), and then restated by
+    /// `Solver::proof_emit_level0_unit_for_lost_reason` at line 1044184 — at
+    /// which point every clause that could propagate it had also been deleted,
+    /// so VeriPB rejected with `Proofgoal 343446 could not be autoproven`.
+    /// Suppressing the unit deletions makes the restatement trivially RUP
+    /// against the still-live unit and the proof verifies.
+    ///
+    /// Dropping a deletion is always sound for a refutation: it leaves the
+    /// checker's database a *superset* of AY's, every member of which was
+    /// admitted by a satisfiability-preserving step, so the contradiction
+    /// eventually derived still refutes the input. The cost is bounded and
+    /// tiny — the same instance emits 5 157 147 deletions of which exactly 9
+    /// are units.
     pub fn delete(&mut self, clause: &[Literal]) -> io::Result<()> {
         if !self.accepting() {
+            return Ok(());
+        }
+        if clause.len() == 1 {
+            self.unit_deletions_skipped += 1;
             return Ok(());
         }
         let result = self.write_line(|line| {
@@ -391,6 +427,12 @@ impl<W: Write> VeripbWriter<W> {
     /// Clauses successfully deleted.
     pub fn deleted_count(&self) -> u64 {
         self.deleted_count
+    }
+
+    /// Unit deletions dropped rather than written (see [`Self::delete`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn unit_deletions_skipped(&self) -> u64 {
+        self.unit_deletions_skipped
     }
 
     /// True if any write failed.
@@ -551,12 +593,35 @@ mod tests {
         let mut writer = VeripbWriter::new(Vec::new());
         writer.add(&[pos(0)]).expect("write");
         writer.add_sr(&[neg(1)], &[neg(1)]).expect("write");
-        writer.delete(&[pos(0)]).expect("write");
+        writer.delete(&[pos(0), neg(2)]).expect("write");
         assert_eq!(writer.added_count(), 2);
         assert_eq!(writer.deleted_count(), 1);
         assert!(!writer.is_concluded());
         writer.add(&[]).expect("write");
         assert!(writer.is_concluded());
+    }
+
+    #[test]
+    fn test_unit_deletion_is_dropped_so_the_root_fact_stays_derivable() {
+        // Regression, dc7817dfa2817916b266c1cfacd2ee66: AY stated the root fact
+        // `x12023` as a unit, later deleted it, and later still restated it —
+        // by which point nothing could propagate it and VeriPB rejected the
+        // restatement (`Proofgoal 343446 could not be autoproven`). drat-trim
+        // and ay_drat_check both ignore this deletion; VeriPB does not, so the
+        // writer must not emit it.
+        let mut writer = VeripbWriter::new(Vec::new());
+        writer.add(&[pos(0)]).expect("write");
+        writer.delete(&[pos(0)]).expect("write");
+        writer.delete(&[neg(0)]).expect("write");
+        writer.delete(&[pos(0), neg(2)]).expect("write");
+        assert_eq!(writer.deleted_count(), 1);
+        assert_eq!(writer.unit_deletions_skipped(), 2);
+        let out = String::from_utf8(writer.into_inner().expect("no io error")).expect("utf8");
+        assert_eq!(
+            out,
+            "pseudo-Boolean proof version 3.0\nred 1 x1 >= 1 : x1 -> 1 ;\n\
+             del spec 1 x1 1 ~x3 >= 1 ;\n"
+        );
     }
 
     #[test]

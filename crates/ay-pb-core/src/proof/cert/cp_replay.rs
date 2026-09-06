@@ -209,6 +209,49 @@ impl CpRow {
         self.coeff.is_empty() && self.rhs >= 1
     }
 
+    /// The NEGATION of this `>=` row, as the `>=` row a checker adds when it
+    /// starts a `rup` check: `Σ c_v x_v <= rhs - 1`, i.e.
+    /// `Σ (-c_v) x_v >= 1 - rhs`.
+    ///
+    /// Over 0/1 variables and integer coefficients this is EXACTLY the
+    /// complement — there is no rounding to get wrong — which is what makes
+    /// "propagate the database together with this row" the definition of RUP
+    /// rather than an approximation of it.
+    pub(super) fn negate(&self) -> Option<Self> {
+        let mut out = CpRow {
+            coeff: BTreeMap::new(),
+            rhs: 1_i128.checked_sub(self.rhs)?,
+        };
+        for (&var, &c) in &self.coeff {
+            out.coeff.insert(var, c.checked_neg()?);
+        }
+        Some(out)
+    }
+
+    /// The NORMALIZED slack of this row under a partial assignment: the most
+    /// its unfalsified literals can still contribute, minus its degree.
+    ///
+    /// `slack < 0` is the checker's conflict test, and a literal whose weight
+    /// EXCEEDS the slack is the checker's propagation test — both are defined on
+    /// the normalized literal view (`x_v` when `c > 0`, `~x_v` when `c < 0`,
+    /// degree `rhs + Σ_{c<0}|c|`), which is why this is computed there and not
+    /// in the variable form. Fails closed on overflow: defect 10 in
+    /// `ci/veripb.pin` is a propagation slack computed in a width that wrapped.
+    fn norm_slack(&self, assign: &Assignment) -> Option<i128> {
+        let mut slack = self.norm_degree()?.checked_neg()?;
+        for (&var, &c) in &self.coeff {
+            let falsified = match assign.get(&var) {
+                // The literal is `x_v` when `c > 0` and `~x_v` when `c < 0`.
+                Some(&(value, _)) => (c > 0) != value,
+                None => false,
+            };
+            if !falsified {
+                slack = slack.checked_add(c.checked_abs()?)?;
+            }
+        }
+        Some(slack)
+    }
+
     /// `true` iff this row holds under `values` (indexed by `var - 1`).
     pub(super) fn holds(&self, values: &[bool]) -> bool {
         let mut acc: i128 = 0;
@@ -223,6 +266,179 @@ impl CpRow {
         }
         acc >= self.rhs
     }
+}
+
+/// A partial assignment during a RUP check: `var -> (value, the row that
+/// forced it)`. `None` as the reason means the target's own negation forced it,
+/// which is an assumption of the check rather than a database row.
+type Assignment = BTreeMap<u32, (bool, Option<u64>)>;
+
+/// The largest number of ROW VISITS one [`rup_refutes`] call may spend.
+///
+/// A deterministic COUNT, never a clock: the same proof text against the same
+/// instance costs the same number of visits on every machine and under every
+/// load, so a self-check that declines on this budget declines reproducibly.
+/// Propagation assigns each variable at most once and each assignment queues
+/// only the rows mentioning that variable, so the natural bound is
+/// `seeds + nnz(database)`; this cap is the guard for a database far larger
+/// than anything measured, not the thing that normally stops the loop.
+const MAX_RUP_ROW_VISITS: u64 = 1 << 24;
+
+/// The replay database together with the two indices a RUP check needs, so that
+/// one check costs the rows it TOUCHES rather than the whole database.
+///
+/// Kept as one type because the indices are an invariant of the map: an
+/// `insert` that updated `rows` and forgot `occ` would silently make every later
+/// RUP check miss a propagation, and a check that misses propagations FAILS
+/// CLOSED (it declines) — which is safe, but it would also make the guard
+/// quietly weaker than it reads. One insertion path, no way to skip it.
+struct CpDb {
+    rows: BTreeMap<u64, CpRow>,
+    /// `var -> ids of the rows mentioning it`.
+    occ: BTreeMap<u32, Vec<u64>>,
+    /// The rows that can conflict OR propagate under the EMPTY assignment, and
+    /// therefore have to be examined by every check even before it assigns
+    /// anything. Every other row is reached through [`CpDb::occ`] when one of
+    /// its variables is assigned, and cannot do anything before that: with no
+    /// assignment its slack is `Σ|c_v| - degree >= 0` and every literal weight
+    /// is `<= that slack`, which is exactly the condition tested here.
+    seeds: Vec<u64>,
+}
+
+impl CpDb {
+    fn new() -> Self {
+        CpDb {
+            rows: BTreeMap::new(),
+            occ: BTreeMap::new(),
+            seeds: Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, id: u64, row: CpRow) -> Option<()> {
+        let empty = Assignment::new();
+        let slack = row.norm_slack(&empty)?;
+        if slack < 0
+            || row
+                .coeff
+                .values()
+                .any(|c| c.checked_abs().is_none_or(|w| w > slack))
+        {
+            self.seeds.push(id);
+        }
+        for &var in row.coeff.keys() {
+            self.occ.entry(var).or_default().push(id);
+        }
+        self.rows.insert(id, row);
+        Some(())
+    }
+
+    fn get(&self, id: u64) -> Option<&CpRow> {
+        self.rows.get(&id)
+    }
+}
+
+/// VeriPB's `rup` rule, modelled rather than trusted: unit-propagate the
+/// database together with the NEGATION of `target` and report whether that
+/// reaches a conflict.
+///
+/// Returns the ids of the database rows the refutation USED — the transitive
+/// reasons of the conflict, in the same currency [`eval_pol`] reports for `pol`
+/// — so the caller can propagate the `soli` taint through a `rup` exactly as it
+/// does through a `pol`. Returns `None`, which is a REFUSAL and never an
+/// acceptance, when propagation reaches a fixed point with no conflict, when the
+/// visit budget is spent, or when any arithmetic would overflow.
+///
+/// WHY THIS IS THE WHOLE POINT. A `rup` line is an ASSUMPTION until something
+/// checks it. If this function answered "yes" for anything shaped like a clause,
+/// the route's self-check would be a rubber stamp on its own leaves: the one
+/// layer that reads the emitted bytes cold would have stopped reading them. So
+/// the propagation here is the real one — normalized slack, weight-versus-slack
+/// propagation, conflict on negative slack — and a target that is merely TRUE,
+/// or merely implied by something that needs a cut to see, is refused.
+fn rup_refutes(db: &CpDb, target: &CpRow) -> Option<Vec<u64>> {
+    // Not a database id: the negation is the check's assumption, not a row.
+    const NEGATION: u64 = u64::MAX;
+    let negation = target.negate()?;
+    let mut assign = Assignment::new();
+    let mut queue: Vec<u64> = db.seeds.clone();
+    queue.push(NEGATION);
+    let mut visits: u64 = 0;
+    let mut conflict: Option<u64> = None;
+
+    while let Some(id) = queue.pop() {
+        visits = visits.checked_add(1)?;
+        if visits > MAX_RUP_ROW_VISITS {
+            return decline("rup-visit-budget");
+        }
+        let row = if id == NEGATION {
+            &negation
+        } else {
+            db.get(id)?
+        };
+        let slack = row.norm_slack(&assign)?;
+        if slack < 0 {
+            conflict = Some(id);
+            break;
+        }
+        // A literal whose weight exceeds the slack must be TRUE, or the row
+        // cannot be satisfied. Assigning it does not change THIS row's slack (a
+        // true literal is not falsified), so the remaining tests in this loop
+        // stay valid; the rows that DO change are queued through `occ`.
+        for (&var, &c) in &row.coeff {
+            if assign.contains_key(&var) {
+                continue;
+            }
+            if c.checked_abs()? > slack {
+                let reason = if id == NEGATION { None } else { Some(id) };
+                assign.insert(var, (c > 0, reason));
+                if let Some(ids) = db.occ.get(&var) {
+                    queue.extend_from_slice(ids);
+                }
+            }
+        }
+    }
+
+    // No conflict is not a soft failure: the target is not RUP-implied, and the
+    // proof line claiming it is unsupported.
+    let Some(conflict) = conflict else {
+        return decline("rup-not-implied");
+    };
+    // The conflict's transitive reasons. An over-approximation would only make
+    // the taint wider (and the incumbent check weaker); this walk is the exact
+    // set the propagation actually leaned on.
+    let mut used: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut stack = vec![conflict];
+    while let Some(id) = stack.pop() {
+        if id == NEGATION || !used.insert(id) {
+            continue;
+        }
+        for var in db.get(id)?.coeff.keys() {
+            if let Some(&(_, Some(reason))) = assign.get(var) {
+                if !used.contains(&reason) {
+                    stack.push(reason);
+                }
+            }
+        }
+    }
+    Some(used.into_iter().collect())
+}
+
+/// Parses a `rup` line's inline constraint body (`1 x3 1 ~x7 >= 1`, without the
+/// trailing `;`) into variable form.
+///
+/// `>=` only. VeriPB accepts other relations in this position; modelling one
+/// this route never emits would be an untested branch in the one place that is
+/// supposed to be the second opinion, so anything else is refused.
+fn parse_rup_constraint(body: &str) -> Option<CpRow> {
+    let tokens: Vec<&str> = body.split_whitespace().collect();
+    let at = tokens.iter().position(|token| *token == ">=")?;
+    if tokens.len() != at.checked_add(2)? {
+        return decline("rup-constraint-tail");
+    }
+    let degree: i128 = tokens.get(at.checked_add(1)?)?.parse().ok()?;
+    let mut row = parse_terms(tokens.get(..at)?)?;
+    row.rhs = row.rhs.checked_add(degree)?;
+    Some(row)
 }
 
 /// One entry on the `pol` evaluation stack. A bare integer is ambiguous in
@@ -542,7 +758,7 @@ fn self_check_inner(
     // row of this family is a `>=` row, so the `=` split cannot arise; refuse
     // rather than assume if one ever does.
     let ids = veripb_input_row_ids(instance).ok()?;
-    let mut db: BTreeMap<u64, CpRow> = BTreeMap::new();
+    let mut db = CpDb::new();
     for (index, constraint) in instance.constraints.iter().enumerate() {
         match (constraint.rel, contract) {
             (PbRel::Ge, _) | (PbRel::Eq, FloorContract::WeightedObjectiveEqInputs) => {}
@@ -574,9 +790,9 @@ fn self_check_inner(
             for (&var, &coeff) in &row.coeff {
                 le.add_coeff(var, coeff.checked_neg()?)?;
             }
-            db.insert(id.checked_add(1)?, le);
+            db.insert(id.checked_add(1)?, le)?;
         }
-        db.insert(id, row);
+        db.insert(id, row)?;
     }
 
     let mut next_id = declared.checked_add(1)?;
@@ -615,16 +831,45 @@ fn self_check_inner(
             if rest.strip_suffix(';')?.trim_end() != format_assignment(incumbent) {
                 return decline("soli-assignment-is-not-the-incumbent");
             }
-            db.insert(next_id, objective_improving_row(instance, optimum)?);
+            db.insert(next_id, objective_improving_row(instance, optimum)?)?;
             soli_tainted.insert(next_id);
             next_id = next_id.checked_add(1)?;
             continue;
         }
-        // `pol` ONLY (plus the one `soli` above). No `red`, no `rup`, no `del`:
-        // every derived row is then a checked cutting-planes inference from the
-        // instance's own rows and the one logged solution, there is no extension
-        // variable anywhere, and nothing in the proof is an assumption. Anything
-        // else is refused rather than modelled.
+        if let Some(rest) = line.strip_prefix("rup ") {
+            // `rup` is REPLAYED, not believed. The other two contracts promise a
+            // `pol`-only derivation, and loosening them here would weaken three
+            // certifiers that never asked for it.
+            if contract != FloorContract::SoliRefutedContradiction {
+                return decline("rup-in-pol-only-contract");
+            }
+            if conclusion.is_some() {
+                return decline("rule-after-conclusion");
+            }
+            let body = rest.strip_suffix(';')?.trim_end();
+            let row = parse_rup_constraint(body)?;
+            let used = rup_refutes(&db, &row)?;
+            if used.iter().any(|id| soli_tainted.contains(id)) {
+                soli_tainted.insert(next_id);
+            } else if !row.holds(incumbent) {
+                // Same rule as `pol`, for the same reason, and it is not
+                // vacuous here: an untainted RUP-implied row is a consequence of
+                // the FORMULA, so the re-verified feasible incumbent has to
+                // satisfy it. The `soli`-tainted ones are refuting the
+                // objective-improving assumption and are expected to fail it.
+                return decline("rup-row-false-at-incumbent");
+            }
+            db.insert(next_id, row)?;
+            next_id = next_id.checked_add(1)?;
+            continue;
+        }
+        // `pol` (plus the one `soli` above, and `rup` for the refutation
+        // contract). No `red`, no `del`: every derived row is then either a
+        // checked cutting-planes inference or a checked reverse unit
+        // propagation from the instance's own rows and the one logged solution,
+        // there is no extension variable anywhere, and nothing in the proof is
+        // an unchecked assumption. Anything else is refused rather than
+        // modelled.
         let Some(expression) = line.strip_prefix("pol ") else {
             return decline("non-pol-rule");
         };
@@ -632,7 +877,7 @@ fn self_check_inner(
             return decline("rule-after-conclusion");
         }
         let body = expression.strip_suffix(';')?.trim_end();
-        let (row, used) = eval_pol(body, &db)?;
+        let (row, used) = eval_pol(body, &db.rows)?;
         if used.iter().any(|id| soli_tainted.contains(id)) {
             soli_tainted.insert(next_id);
         } else if !row.holds(incumbent) {
@@ -642,7 +887,7 @@ fn self_check_inner(
             // is expected to falsify them and this check does not apply.
             return decline("derived-row-false-at-incumbent");
         }
-        db.insert(next_id, row);
+        db.insert(next_id, row)?;
         next_id = next_id.checked_add(1)?;
     }
     if !saw_end {
@@ -656,7 +901,7 @@ fn self_check_inner(
         if soli_tainted.is_empty() {
             return decline("refutation-without-soli");
         }
-        let cited = db.get(&floor_id)?;
+        let cited = db.get(floor_id)?;
         if !cited.is_contradiction() {
             return decline("cited-row-is-not-a-contradiction");
         }
@@ -667,7 +912,7 @@ fn self_check_inner(
         // The row the conclusion cites must be the objective floor itself: unit
         // coefficient on every objective variable, nothing else, degree
         // `optimum`.
-        let floor = db.get(&floor_id)?;
+        let floor = db.get(floor_id)?;
         if floor.rhs != optimum {
             return decline("floor-degree");
         }
@@ -721,4 +966,110 @@ fn self_check_inner(
         return decline("conclusion-witness");
     }
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_rup_constraint, rup_refutes, CpDb, CpRow};
+    use std::collections::BTreeMap;
+
+    /// `Σ coeff·x >= rhs` in variable form.
+    fn row(coeff: &[(u32, i128)], rhs: i128) -> CpRow {
+        CpRow {
+            coeff: coeff.iter().copied().collect::<BTreeMap<_, _>>(),
+            rhs,
+        }
+    }
+
+    fn db_of(rows: &[(u64, CpRow)]) -> CpDb {
+        let mut db = CpDb::new();
+        for (id, r) in rows {
+            db.insert(*id, r.clone()).expect("insert");
+        }
+        db
+    }
+
+    /// THE CHAIN. Certifier #9's own leaves conflict on the FIRST row visited —
+    /// the aggregate row the leaf just derived — so nothing in the shipped
+    /// corpus exercises propagation past one step. That is exactly why it is
+    /// pinned here: a propagation loop that silently never re-examined a row
+    /// would pass every instance we have and be wrong the first time a leaf
+    /// needed it.
+    ///
+    /// `x1` is unit; `x2 >= x1` and `x3 >= x2` only become unit AFTER the
+    /// assignment before them; `x1 + x2 + x3 <= 2` only conflicts after all
+    /// three. Only the first row can act under the empty assignment, so a
+    /// refutation here requires three chained propagations.
+    #[test]
+    fn unit_propagation_chains_and_reports_every_row_it_leaned_on() {
+        let db = db_of(&[
+            (1, row(&[(1, 1)], 1)),                     // x1 >= 1
+            (2, row(&[(1, -1), (2, 1)], 0)),            // x2 >= x1
+            (3, row(&[(2, -1), (3, 1)], 0)),            // x3 >= x2
+            (4, row(&[(1, -1), (2, -1), (3, -1)], -2)), // x1 + x2 + x3 <= 2
+        ]);
+        // Only row 1 can act before anything is assigned.
+        assert_eq!(
+            db.seeds,
+            vec![1],
+            "rows 2-4 must not be reachable at the start"
+        );
+        let used = rup_refutes(&db, &row(&[], 1)).expect("the database is contradictory");
+        assert_eq!(
+            used,
+            vec![1, 2, 3, 4],
+            "the reasons are the whole chain, so the `soli` taint cannot leak"
+        );
+    }
+
+    /// TRUE IS NOT THE TEST. A triangle needs two of its three vertices covered,
+    /// so `x1 + x2 + x3 >= 2` is a THEOREM of these rows — and it is not
+    /// reachable by unit propagation (negating it leaves every row with slack 1
+    /// and every weight at 1, a fixed point). A guard that checked the claim
+    /// rather than the RULE would accept it.
+    #[test]
+    fn a_true_clause_that_needs_a_cut_is_not_rup() {
+        let db = db_of(&[
+            (1, row(&[(1, 1), (2, 1)], 1)),
+            (2, row(&[(2, 1), (3, 1)], 1)),
+            (3, row(&[(1, 1), (3, 1)], 1)),
+        ]);
+        assert!(rup_refutes(&db, &row(&[(1, 1), (2, 1), (3, 1)], 2)).is_none());
+        // The same database DOES imply each edge by RUP: it holds one verbatim.
+        assert!(rup_refutes(&db, &row(&[(1, 1), (2, 1)], 1)).is_some());
+    }
+
+    /// THE SLACK IS THE PB ONE, NOT THE CLAUSAL ONE. `3x1 + 2x2 + 2x3 >= 5`
+    /// forces `x1`: without it the most the row can reach is 4. Read as a
+    /// CLAUSE ("at least one literal true") it would force nothing, and a
+    /// self-check that made that mistake would decline every leaf whose
+    /// aggregate row has coefficients above 1 — which is all of them.
+    #[test]
+    fn propagation_uses_the_coefficients_not_just_the_literals() {
+        let db = db_of(&[(1, row(&[(1, 3), (2, 2), (3, 2)], 5))]);
+        assert!(
+            rup_refutes(&db, &row(&[(1, 1)], 1)).is_some(),
+            "dropping x1 leaves 4 < 5"
+        );
+        // Weakening the row by one unit removes exactly that: 4 >= 4 now.
+        let weaker = db_of(&[(1, row(&[(1, 3), (2, 2), (3, 2)], 4))]);
+        assert!(rup_refutes(&weaker, &row(&[(1, 1)], 1)).is_none());
+    }
+
+    /// The inline constraint body a `rup` line carries, including the empty
+    /// clause, which is how a leaf claims the contradiction.
+    #[test]
+    fn the_rup_body_parses_to_the_clause_it_spells() {
+        assert_eq!(
+            parse_rup_constraint("1 x3 1 ~x7 >= 1"),
+            Some(row(&[(3, 1), (7, -1)], 0)),
+            "`~x7` is `1 - x7`, so the degree drops by one"
+        );
+        let empty = parse_rup_constraint(">= 1").expect("the empty clause");
+        assert!(empty.is_contradiction());
+        // Anything that is not `<terms> >= <degree>` is refused, not guessed.
+        assert!(parse_rup_constraint("1 x3 >= 1 extra").is_none());
+        assert!(parse_rup_constraint("1 x3 <= 1").is_none());
+        assert!(parse_rup_constraint("1 x3").is_none());
+    }
 }

@@ -250,6 +250,7 @@ fn run_streaming_body(
         header.num_vars
     );
     configure_dimacs_solver(&mut solver, stats_cfg);
+    maybe_run_preprocess_only_route(&mut solver);
     let result = solver.solve_interruptible(is_timed_out).into_inner();
     finish_dimacs_solve(&mut solver, result, stats_cfg, content, None, None, None);
 }

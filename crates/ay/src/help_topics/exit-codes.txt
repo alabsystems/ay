@@ -1,0 +1,98 @@
+Exit codes
+
+A finished ay run puts its answer on stdout: `sat`, `unsat`, `unknown`, or
+the DIMACS `s SATISFIABLE` / `s UNSATISFIABLE` / `s UNKNOWN` line. The exit
+code is a second, coarser copy of that answer, meant for scripts and
+competition harnesses that need to branch without parsing text. It is not a
+richer verdict -- it carries less information than stdout, never more.
+
+The same number means different things in different modes, because ay speaks
+three conventions at once: its own, the SAT Competition's 10/20, and Z3's
+"exit 0 for everything". Read the table for the mode you are actually in.
+
+Default mode -- SMT-LIB 2.6 and CHC input
+
+  0     A verdict reached stdout: sat, unsat, or unknown alike
+  1     Input error -- file missing, parse failure, or an option ay
+        rejects for the input you gave it
+  2     Usage error -- an option ay does not recognize, or a bad value
+  124   No verdict: the deadline or the memory budget fired first
+
+  Note that 0 does NOT mean "solved". An `unknown` the solver reached on
+  its own is a normal, successful run. Note also that `unknown` arrives
+  with either 0 or 124: 0 when the solver gave up, 124 when a budget
+  fired. The code, not stdout, is what separates those two.
+
+DIMACS CNF -- the SAT Competition convention, default for .cnf input
+
+  10    s SATISFIABLE
+  20    s UNSATISFIABLE
+  0     s UNKNOWN -- the solver gave up without hitting a limit
+  1     Input error -- unparsable CNF
+  124   s UNKNOWN -- the deadline or the memory budget fired first
+
+  `s UNKNOWN` therefore arrives with either 0 or 124, and the difference is
+  the one a sweep cares about: 0 is incompleteness, 124 is a budget breach.
+
+Z3 compatibility surface -- --z3-mode, or an argv[0] of `z3`
+
+  0     Every verdict, sat and unsat alike, DIMACS included
+  1     Input error on the SMT-LIB path
+  109   Command-line error -- a bad, incomplete, or unsupported Z3 option
+  124   No verdict: the deadline or the memory budget fired first
+
+  Z3 reports its verdict on stdout only and exits 0 for both sat and unsat,
+  so a drop-in `z3` install has to do the same -- otherwise every caller
+  that tests $? reads a correct UNSAT as a failed run.
+
+  These two are the only things that switch the DIMACS convention to Z3's.
+  The alternate input formats below do not.
+
+Alternate input formats -- .wcnf, .opb, .lp
+
+  ay selects these from the file extension, or you force one with -wcnf,
+  -pbo, or -lp. The pseudo-Boolean flag is spelled `-pbo`; `-opb` is an
+  unsupported Z3 option and is rejected as a command-line error.
+
+  110   Input error reading one of these formats, including a file that
+        was given alongside stdin
+  109   The mode was requested with no input at all
+
+Choosing the DIMACS convention yourself
+
+  --sat-exit-codes competition   Always 10 / 20
+  --sat-exit-codes z3            Always 0
+
+  The default is `competition`, except on the Z3 compatibility surface,
+  where it is `z3`. An explicit --sat-exit-codes overrides either default.
+
+  `--competition` is a different switch and does not touch 10/20. What it
+  changes is the memory budget: a memout prints a `c memout` marker and
+  exits 0 rather than 124. A timeout under `--competition` still exits
+  124 -- the competition convention for timeouts is applied by the
+  submission wrapper, not by this flag.
+
+Signals
+
+  SIGTERM   Cooperative: ay prints the unknown verdict, then exits 124
+  SIGINT    The solve is killed outright; no verdict, and your shell
+  SIGHUP    reports the kill (137) rather than an ay exit code
+
+Writing a script against ay
+
+Read the verdict from stdout and use the exit code for control flow, not the
+other way around. The rule that keeps the two consistent: a printed verdict
+wins. Once `sat` or `unsat` is on stdout, a deadline firing during teardown
+-- proof materialization, model emission, cleanup -- is an overrun, not a
+failure to decide, so ay leaves the verdict standing and exits 0. A decisive
+answer is never followed by 124.
+
+  out=$(ay "$f"); rc=$?
+  case $rc in
+    0)   echo "$out" ;;          # sat, unsat, or unknown -- read stdout
+    124) echo "budget exhausted" ;;
+    *)   echo "ay failed: $out" >&2 ;;
+  esac
+
+For the flags that put ay on the Z3 compatibility surface, and what each one
+does to stdout, run `ay help z3`.

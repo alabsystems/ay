@@ -445,6 +445,27 @@ reproducible results and independently checked evidence.
   CLI now says so explicitly next to the file it wrote
   (`c ay.proof.certificate … ay_self_checkable=no`), so a zero exit status
   cannot be read as "externally checkable".
+- **Nested-array UNSAT is published only on checked evidence, so a correct
+  refutation AY cannot certify is withheld as `unknown`.** When the public roots
+  declare an array whose index or element sort is itself an array,
+  `Executor::quarantine_unverified_nested_array_unsat`
+  (`crates/ay-dpll/src/executor/check_sat/nested_array_quarantine.rs`) publishes
+  the refutation only through one of five checked authorities: a store-flat ROW
+  reduction marker, the `seq.foldl` higher-order-unfold marker, a full-problem
+  proof that passes the strict checker, the independent checked-SAT refutation
+  sidecar, a refuted nested-array-free entailed residue, or an exact finite
+  Bool/BV bit-blast re-proof. Anything else degrades to `unknown` with
+  `:unknown.phase "array-combination-quarantine"`, in **every** posture. This is
+  deliberate and it is a completeness cost taken to protect the zero-wrong-answer
+  bar: the class has a recorded wrong-`unsat` history (`53e9ac3c07`,
+  the development design notes), and the
+  refutations still withheld are exactly those whose proof reconstructs to a bare
+  `(step t0 (cl) :rule trust)` — which `--self-check` independently rejects.
+  Measured 2026-09-06 on `9fb122a24a`: 0 quarantine events over a seeded
+  200-file sample spanning ABV, ALIA, ANIA, AUFBV, AUFLIA, AUFLIRA, AUFNIA,
+  QF_ALIA, QF_AUFLIA, QF_AUFNIA and QF_AX, so on the current corpus the ladder,
+  not the reject, is what decides these files. Do not widen the predicate to
+  recover verdicts; give the ladder another checked authority instead.
 - **Build time and running tests.** The workspace includes one very large crate
   (`ay-dpll`, ~430,000 lines), so a from-scratch build of the whole workspace is
   slow and is the dominant compile cost. To *use* AY, prefer the release binary

@@ -343,7 +343,7 @@ impl Context {
             }
             let inner = self.terms.get(arg_ids[0]).clone();
             if let TermData::App(Symbol::Named(ctor_name), cargs) = &inner {
-                if let Some(sels) = self.ctor_selectors.get(ctor_name) {
+                if let Some(sels) = self.ctor_selectors.get(ctor_name.as_str()) {
                     if let Some(idx) = sels.iter().position(|s| s.as_str() == app_name) {
                         if let Some(&field) = cargs.get(idx) {
                             return Ok(field);
@@ -557,8 +557,8 @@ impl Context {
     /// can never fold unsoundly. (#rec-dt-expansion)
     pub(super) fn ctor_of_term(&self, t: TermId) -> Option<String> {
         match self.terms.get(t) {
-            TermData::App(Symbol::Named(c), _) if self.constructors.contains_key(c) => {
-                Some(c.clone())
+            TermData::App(Symbol::Named(c), _) if self.constructors.contains_key(c.as_str()) => {
+                Some(c.clone().to_string())
             }
             TermData::Var(v, _) if self.nullary_ctor_terms.get(v) == Some(&t) => Some(v.clone()),
             _ => None,
@@ -609,7 +609,7 @@ impl Context {
             TermData::App(Symbol::Named(ctor_name), cargs) => {
                 let idx = self
                     .ctor_selectors
-                    .get(&ctor_name)?
+                    .get(ctor_name.as_str())?
                     .iter()
                     .position(|s| s.as_str() == name)?;
                 cargs.get(idx).copied()
@@ -655,8 +655,8 @@ impl Context {
         if let (TermData::App(Symbol::Named(lc), largs), TermData::App(Symbol::Named(rc), rargs)) =
             (&l, &r)
         {
-            let l_dt = self.constructors.get(lc).map(|(dt, _)| dt.clone());
-            let r_dt = self.constructors.get(rc).map(|(dt, _)| dt.clone());
+            let l_dt = self.constructors.get(lc.as_str()).map(|(dt, _)| dt.clone());
+            let r_dt = self.constructors.get(rc.as_str()).map(|(dt, _)| dt.clone());
             if let (Some(l_dt), Some(r_dt)) = (l_dt, r_dt) {
                 if l_dt == r_dt {
                     if lc == rc {

@@ -58,31 +58,52 @@ impl<E> std::ops::DerefMut for ReasonScratch<'_, E> {
 }
 
 impl LraSolver {
-    /// Collect reasons using eagerly-stored explanation data (#6617).
-    /// See `implied_bounds.rs::collect_reasons_from_explanation` for docs.
+    /// Whether the bound `(cur_value, cur_strict)` on side `is_upper` is at
+    /// least as tight as `(used_value, used_strict)`: it entails it.
+    #[inline]
+    pub(crate) fn bound_at_least_as_tight(
+        cur_value: &Rational,
+        cur_strict: bool,
+        used_value: &Rational,
+        used_strict: bool,
+        is_upper: bool,
+    ) -> bool {
+        match cur_value.cmp(used_value) {
+            std::cmp::Ordering::Equal => cur_strict || !used_strict,
+            std::cmp::Ordering::Less => is_upper,
+            std::cmp::Ordering::Greater => !is_upper,
+        }
+    }
+
+    /// Collect the reason literals that ground a row-derived bound through
+    /// its derivation-time explanation (#6617), checking every step.
     ///
-    /// #8003: Added `max_vars_budget` parameter to bound total work on dense LPs.
-    /// When `visited_vars` exceeds the budget, returns false to signal that
-    /// eager reason collection is too expensive and should be abandoned.
-    /// Callers fall back to deferred reason collection or skip the propagation.
+    /// For each antecedent `(var, side, value, strict)` the derivation
+    /// consumed, the CURRENT bound on that side must be at least as tight
+    /// (`bound_at_least_as_tight`), otherwise the chain fails closed:
+    ///   * a direct bound that suffices and whose reason atoms are all
+    ///     asserted is cited (shortest reason, no recursion);
+    ///   * else a row-derived slot bound that suffices is recursed into
+    ///     through its own explanation, once per `(var, side)` on this walk;
+    ///   * else the antecedent cannot be grounded and the whole reason is
+    ///     rejected.
+    /// Because rows are equations valid in every model, "each antecedent is
+    /// entailed by the cited literals" gives "the derived bound is entailed
+    /// by the cited literals" by induction over the chain — the caller may
+    /// rely on the collected set entailing the slot's `(value, strict)`.
+    ///
     /// Soundness (#cyclic-explanation false-UNSAT): `on_stack` holds the
     /// (var, direction) pairs whose implied-bound explanation is CURRENTLY
     /// being resolved on this DFS path (gray nodes), seeded with the root
-    /// bound being explained. Implied-bound cascades store only
-    /// (var, direction) in `BoundExplanation` — not the derivation
-    /// generation — so re-walking the chains against CURRENT bounds can hit
-    /// a cycle (e.g. implied_ub(x) cites implied_lb(y) and implied_lb(y)
-    /// cites implied_ub(x); each was derived from the other's EARLIER-round
-    /// value). Previously a back edge was silently skipped via
-    /// `visited_vars`, DROPPING the antecedent entirely and producing an
-    /// over-strong reason clause (observed on _hhk2008 bpl_7/bpl_8: reason
-    /// set collapsed to one unrelated fringe atom => false UNSAT). A back
-    /// edge means the justification is circular and cannot be grounded on
-    /// this path: fail closed (return false) so the caller falls back to
-    /// another strategy or drops the propagation. Re-encounters of nodes
-    /// FULLY explained earlier (black: in `visited_vars` but not
-    /// `on_stack`) remain safe to skip — their reasons are already
-    /// collected.
+    /// bound being explained. Only the latest explanation per (var, side)
+    /// is stored, so re-walking chains against CURRENT bounds can hit a
+    /// cycle (implied_ub(x) cites implied_lb(y) which cites an EARLIER
+    /// implied_ub(x)); the value check passes on such an edge (the current
+    /// bound is tighter than the earlier one it replaced) but the
+    /// well-founded history is gone, so a back edge fails closed. Nodes
+    /// FULLY explained earlier on this walk (`visited_vars`, black) are
+    /// skipped after their value check — their reasons are already
+    /// collected and ground their current bound.
     pub(crate) fn collect_reasons_from_explanation(
         &self,
         explanation: &BoundExplanation,
@@ -91,166 +112,185 @@ impl LraSolver {
         visited_vars: &mut HashSet<(u32, bool)>,
         on_stack: &mut HashSet<(u32, bool)>,
     ) -> bool {
-        // #8003/#8452: Budget guard. Each contributing_var iteration does
-        // Rational comparisons (potential bignum) and may recurse. On
-        // benchmarks with many implied-bound chains, unbounded recursion
-        // produces O(depth^width) work.
-        //
-        // Raised from 40 to 500 (#8452): The old budget of 40 was too low
-        // for dense LP benchmarks (rand_70_300 with 70+ vars per row). A
-        // single row derivation visits all contributing variables (row width),
-        // and with row width > 40, the budget was exceeded on the first level,
-        // causing ALL implied bound propagations to fail reason collection.
-        // This produced 0 theory propagations (vs Z3's 56K), making the
-        // SAT solver rely entirely on decisions.
-        //
-        // Cost: 500 * O(Rational_cmp) per propagation. With ~5K propagations
-        // per solve, this adds at most ~1s total. The alternative (0 propagations)
-        // causes timeouts on all dense LP benchmarks.
-        //
-        // Reference: Z3 defers reason collection entirely (u_dependency in
-        // bound_analyzer_on_row.h), avoiding this cost at derivation time.
+        // #8003/#8452: Budget guard. Each antecedent does Rational
+        // comparisons (potential bignum) and may recurse; 500 keeps dense
+        // LP chains (rand_70_300, 70+ vars per row) explainable while
+        // bounding worst-case cost.
         const MAX_VISITED: usize = 500;
         if visited_vars.len() >= MAX_VISITED {
             return false;
         }
-        for &(var, used_upper) in &explanation.contributing_vars {
-            // Cycle (gray back edge): this bound is currently being explained
-            // higher on the DFS path — the justification is circular. Fail
-            // closed; silently skipping would drop a real antecedent.
+        for ante in &explanation.contributing_vars {
+            let var = ante.var;
+            let used_upper = ante.used_upper;
+            // Cycle (gray back edge): the justification is circular.
             if on_stack.contains(&(var, used_upper)) {
                 return false;
             }
-            if !visited_vars.insert((var, used_upper)) {
-                continue;
-            }
             let vi = var as usize;
-            let info = match self.vars.get(vi) {
-                Some(i) => i,
-                None => return false,
+            let Some(info) = self.vars.get(vi) else {
+                return false;
             };
-            let direct = if used_upper { &info.upper } else { &info.lower };
-
-            // #8254 fix: compute_implied_bounds() derives bounds using
-            // self.implied_bounds[vi] (the tighter of direct and row-derived).
-            // The old code unconditionally used the direct bound if it existed,
-            // even if the implied bound was tighter. This produces unsound theory
-            // lemmas: the reason references a weaker bound than what was actually
-            // used in the derivation. Fix: check if the implied bound is strictly
-            // tighter; if so, recurse through the implied bound's explanation chain.
-            let implied = if vi < self.implied_bounds.len() {
-                if used_upper {
-                    self.implied_bounds[vi].1.as_ref()
-                } else {
-                    self.implied_bounds[vi].0.as_ref()
-                }
+            let direct = if used_upper {
+                info.upper.as_ref()
             } else {
-                None
+                info.lower.as_ref()
             };
-
-            // #8003: Fast-path for dense LPs. If the implied bound slot holds
-            // a direct bound overlay (row_idx == usize::MAX), it cannot be
-            // tighter than `direct` — skip the expensive Rational comparison.
-            // Row-derived bounds (row_idx != usize::MAX) require the full check
-            // for soundness (#8254).
-            let implied_is_tighter = match (direct, implied) {
-                (Some(direct_b), Some(ib)) if ib.row_idx != usize::MAX => {
-                    if used_upper {
-                        ib.value < direct_b.value
-                            || (ib.value == direct_b.value && ib.strict && !direct_b.strict)
-                    } else {
-                        ib.value > direct_b.value
-                            || (ib.value == direct_b.value && ib.strict && !direct_b.strict)
-                    }
-                }
-                _ => false,
-            };
-
-            if implied_is_tighter {
-                match implied {
-                    Some(ib) if ib.explanation.is_some() => {
-                        on_stack.insert((var, used_upper));
-                        let ok = self.collect_reasons_from_explanation(
-                            ib.explanation.as_ref().unwrap(),
-                            reasons,
-                            seen,
-                            visited_vars,
-                            on_stack,
-                        );
-                        on_stack.remove(&(var, used_upper));
-                        if !ok {
-                            return false;
-                        }
-                    }
-                    _ => return false,
-                }
-            } else if let Some(bound) = direct {
-                // #8511 soundness fix: Before using direct bound reasons,
-                // verify ALL non-sentinel reason atoms are still asserted.
-                // Between derivation time and reason-collection time, the
-                // SAT solver may have backtracked, retracting some direct
-                // bound assertions. If that happens, the direct bound's
-                // reasons no longer form a valid justification. In that case,
-                // fall back to the implied bound's explanation chain (if
-                // available), which traces through a different derivation path
-                // that may still have asserted reasons.
-                //
-                // This is the root cause of #8511: collect_reasons_from_explanation
-                // was using direct bound reasons even when the direct bound had
-                // been retracted (making those reason atoms unasserted), producing
-                // syntactically-valid but semantically-wrong reason sets.
-                let all_direct_asserted = bound
+            // (1) The direct bound suffices and all its reason atoms are
+            // still asserted (#8511: a retracted direct bound must not be
+            // cited): cite it.
+            if let Some(b) = direct {
+                if Self::bound_at_least_as_tight(
+                    &b.value,
+                    b.strict,
+                    &ante.value,
+                    ante.strict,
+                    used_upper,
+                ) && b
                     .reason_pairs()
                     .filter(|(term, _)| !term.is_sentinel())
-                    .all(|(term, val)| self.asserted.get(&term) == Some(&val));
-
-                if all_direct_asserted {
-                    for (term, val) in bound.reason_pairs() {
+                    .all(|(term, val)| self.asserted.get(&term) == Some(&val))
+                {
+                    for (term, val) in b.reason_pairs() {
                         if !term.is_sentinel() && seen.insert((term, val)) {
                             reasons.push(TheoryLit::new(term, val));
                         }
                     }
+                    continue;
+                }
+            }
+            // (2) The current row-derived slot bound suffices: ground it
+            // through its own explanation.
+            let implied = self.implied_bounds.get(vi).and_then(|p| {
+                if used_upper {
+                    p.1.as_ref()
                 } else {
-                    // Direct bound retracted — try implied bound chain.
-                    match implied {
-                        Some(ib) if ib.explanation.is_some() => {
-                            on_stack.insert((var, used_upper));
-                            let ok = self.collect_reasons_from_explanation(
-                                ib.explanation.as_ref().unwrap(),
-                                reasons,
-                                seen,
-                                visited_vars,
-                                on_stack,
-                            );
-                            on_stack.remove(&(var, used_upper));
-                            if !ok {
-                                return false;
-                            }
-                        }
-                        _ => return false,
+                    p.0.as_ref()
+                }
+            });
+            match implied {
+                Some(ib)
+                    if ib.row_idx != usize::MAX
+                        && Self::bound_at_least_as_tight(
+                            &ib.value,
+                            ib.strict,
+                            &ante.value,
+                            ante.strict,
+                            used_upper,
+                        ) =>
+                {
+                    let Some(expl) = ib.explanation.as_ref() else {
+                        return false;
+                    };
+                    if !visited_vars.insert((var, used_upper)) {
+                        // Black node: this slot bound was grounded earlier on
+                        // this walk and it entails the antecedent (checked
+                        // above); its reasons are already collected.
+                        continue;
+                    }
+                    on_stack.insert((var, used_upper));
+                    let ok = self.collect_reasons_from_explanation(
+                        expl,
+                        reasons,
+                        seen,
+                        visited_vars,
+                        on_stack,
+                    );
+                    on_stack.remove(&(var, used_upper));
+                    if !ok {
+                        return false;
                     }
                 }
-            } else {
-                match implied {
-                    Some(ib) if ib.explanation.is_some() => {
-                        on_stack.insert((var, used_upper));
-                        let ok = self.collect_reasons_from_explanation(
-                            ib.explanation.as_ref().unwrap(),
-                            reasons,
-                            seen,
-                            visited_vars,
-                            on_stack,
-                        );
-                        on_stack.remove(&(var, used_upper));
-                        if !ok {
-                            return false;
-                        }
-                    }
-                    _ => return false,
-                }
+                _ => return false,
             }
         }
         true
+    }
+
+    /// Re-derive the `need_upper` bound on `var` from the CURRENT row at
+    /// `row_idx` using DIRECT bounds only, returning the reason literals
+    /// together with the derived `(value, strict)` they entail.
+    ///
+    /// The row equation `x_b - sum(a_j x_j) = constant` (equation
+    /// coefficients: `+1` for the basic variable, `-a_j` for the others) is
+    /// solved for `var`: with `e_t` its equation coefficient,
+    /// `e_t * var = constant - sum_{i != t} e_i x_i`, so an upper bound on
+    /// `var` needs the minimum of the sum when `e_t > 0` (lower bounds of
+    /// positive-`e_i` variables, upper bounds of negative-`e_i` ones) and its
+    /// maximum when `e_t < 0`; a lower bound is the mirror image. Every
+    /// consumed bound must be a direct bound whose reason atoms are all
+    /// asserted; otherwise `None`. The row is read as it is NOW, so the
+    /// result is exact for the current state regardless of pivots since the
+    /// slot bound was derived; the caller checks the returned value against
+    /// what it needs to prove.
+    pub(crate) fn derive_bound_from_row_direct_only(
+        &self,
+        var: u32,
+        need_upper: bool,
+        row_idx: usize,
+    ) -> Option<(Vec<TheoryLit>, Rational, bool)> {
+        let row = self.rows.get(row_idx)?;
+        let bv = row.basic_var;
+        // Equation coefficient of the target.
+        let e_t: Rational = if bv == var {
+            Rational::one()
+        } else {
+            let idx = row.coeffs.binary_search_by_key(&var, |(v, _)| *v).ok()?;
+            -&row.coeffs[idx].1
+        };
+        if e_t.is_zero() {
+            return None;
+        }
+        // Upper bound on var with e_t > 0 (or lower with e_t < 0) consumes the
+        // MINIMUM of sum_{i != t} e_i x_i; the other two cases its MAXIMUM.
+        let want_min = need_upper == e_t.is_positive();
+        let mut sum = Rational::zero();
+        let mut strict = false;
+        let mut reasons = Vec::new();
+        let mut seen = ReasonScratch::new(&self.scratch_reason_seen);
+        let mut consume =
+            |v: u32, e: &Rational, sum: &mut Rational, strict: &mut bool| -> Option<()> {
+                let info = self.vars.get(v as usize)?;
+                // min(e * x) uses lb(x) for e > 0 and ub(x) for e < 0.
+                let use_upper = if want_min {
+                    e.is_negative()
+                } else {
+                    e.is_positive()
+                };
+                let b = if use_upper {
+                    info.upper.as_ref()?
+                } else {
+                    info.lower.as_ref()?
+                };
+                if !b
+                    .reason_pairs()
+                    .filter(|(term, _)| !term.is_sentinel())
+                    .all(|(term, val)| self.asserted.get(&term) == Some(&val))
+                {
+                    return None;
+                }
+                sum.mul_add_assign(e, &b.value);
+                *strict |= b.strict;
+                for (term, val) in b.reason_pairs() {
+                    if !term.is_sentinel() && seen.insert((term, val)) {
+                        reasons.push(TheoryLit::new(term, val));
+                    }
+                }
+                Some(())
+            };
+        if bv != var {
+            consume(bv, &Rational::one(), &mut sum, &mut strict)?;
+        }
+        for &(v, ref coeff) in &row.coeffs {
+            if v == var {
+                continue;
+            }
+            let e = -coeff;
+            consume(v, &e, &mut sum, &mut strict)?;
+        }
+        drop(consume);
+        let value = &(&row.constant - &sum) / &e_t;
+        Some((reasons, value, strict))
     }
 
     /// Collect reasons for a variable's implied bound from its tableau row.

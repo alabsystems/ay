@@ -97,7 +97,7 @@ pub(crate) fn build_valid_euf_congruent_proof() -> (TermStore, Proof) {
     let not_a_eq_b = terms.mk_not(a_eq_b);
 
     // f(a) and f(b) — uninterpreted function Int -> Int
-    let f_sym = Symbol::Named("f".to_string());
+    let f_sym = Symbol::named("f");
     let fa = terms.mk_app(f_sym.clone(), vec![a], Sort::Int);
     let fb = terms.mk_app(f_sym, vec![b], Sort::Int);
     let fa_eq_fb = terms.mk_eq(fa, fb);
@@ -127,7 +127,7 @@ pub(crate) fn build_valid_euf_congruent_pred_proof() -> (TermStore, Proof) {
     let not_a_eq_b = terms.mk_not(a_eq_b);
 
     // p(a) and p(b) — uninterpreted predicate Int -> Bool
-    let p_sym = Symbol::Named("p".to_string());
+    let p_sym = Symbol::named("p");
     let pa = terms.mk_app(p_sym.clone(), vec![a], Sort::Bool);
     let pb = terms.mk_app(p_sym, vec![b], Sort::Bool);
     let not_pa = terms.mk_not(pa);
@@ -184,8 +184,8 @@ pub(crate) fn build_broken_euf_congruent_wrong_symbol_proof() -> (TermStore, Pro
     let a_eq_b = terms.mk_eq(a, b);
     let not_a_eq_b = terms.mk_not(a_eq_b);
 
-    let f_sym = Symbol::Named("f".to_string());
-    let g_sym = Symbol::Named("g".to_string());
+    let f_sym = Symbol::named("f");
+    let g_sym = Symbol::named("g");
     let fa = terms.mk_app(f_sym, vec![a], Sort::Int);
     let gb = terms.mk_app(g_sym, vec![b], Sort::Int);
     let fa_eq_gb = terms.mk_eq(fa, gb);
@@ -211,7 +211,7 @@ pub(crate) fn build_broken_euf_congruent_pred_arity_proof() -> (TermStore, Proof
     let a_eq_b = terms.mk_eq(a, b);
     let not_a_eq_b = terms.mk_not(a_eq_b);
 
-    let p_sym = Symbol::Named("p".to_string());
+    let p_sym = Symbol::named("p");
     let pa_x = terms.mk_app(p_sym.clone(), vec![a, x], Sort::Bool);
     let pb = terms.mk_app(p_sym, vec![b], Sort::Bool);
     let not_pa_x = terms.mk_not(pa_x);

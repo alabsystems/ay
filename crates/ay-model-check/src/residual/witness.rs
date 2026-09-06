@@ -12,7 +12,7 @@ use num_rational::BigRational;
 
 use crate::dt_axiom::DtResolve;
 use crate::{
-    confirm_completed_model, value_eq, ArrayValue, GateVerdict, ModelValue, ModelView,
+    confirm_completed_model, value_eq, ArrayValue, Evaluator, GateVerdict, ModelValue, ModelView,
     ProjectionLookupError, ProvenUnconstrainedKind,
 };
 
@@ -25,7 +25,7 @@ pub(crate) const MAX_WITNESS_ENTRIES: usize = 512;
 const MAX_INDEX_COMPARISONS: usize = 131_072;
 
 /// Maximum value nodes inspected or synthesized for one completed witness.
-const MAX_WITNESS_VALUE_WORK: usize = 8192;
+pub(crate) const MAX_WITNESS_VALUE_WORK: usize = 8192;
 
 /// Maximum nesting depth of a synthesized canonical inhabitant.
 const MAX_WITNESS_VALUE_DEPTH: usize = 128;
@@ -61,41 +61,181 @@ impl WitnessBudget {
         let Some(next) = self.index_comparisons.checked_add(1) else {
             return false;
         };
+        if next > MAX_INDEX_COMPARISONS {
+            return false;
+        }
         self.index_comparisons = next;
-        next <= MAX_INDEX_COMPARISONS
+        true
     }
 
     fn spend_value_node(&mut self) -> bool {
-        let Some(next) = self.value_work.checked_add(1) else {
+        self.spend_value_nodes(1)
+    }
+
+    fn spend_value_nodes(&mut self, amount: usize) -> bool {
+        let Some(next) = self.value_work.checked_add(amount) else {
             return false;
         };
+        if next > MAX_WITNESS_VALUE_WORK {
+            return false;
+        }
         self.value_work = next;
-        next <= MAX_WITNESS_VALUE_WORK
+        true
+    }
+
+    fn pending_values_fit(&self, pending: usize, additional: usize) -> bool {
+        self.value_work
+            .checked_add(pending)
+            .and_then(|count| count.checked_add(additional))
+            .is_some_and(|count| count <= MAX_WITNESS_VALUE_WORK)
+    }
+
+    fn spend_scalar_payload(&mut self, value: &ModelValue) -> bool {
+        let Some(payload_work) = scalar_payload_work(value) else {
+            return false;
+        };
+        self.spend_value_nodes(payload_work)
     }
 
     /// Account the complete shape before any model-provided value is copied
     /// into the witness. The walk is iterative so hostile nesting cannot grow
     /// the native stack before the independent replay gets a chance to refuse.
     fn account_value(&mut self, value: &ModelValue) -> bool {
-        let mut stack = vec![value];
-        while let Some(current) = stack.pop() {
+        let mut stack = vec![(value, 0usize)];
+        while let Some((current, depth)) = stack.pop() {
+            if depth > MAX_WITNESS_VALUE_DEPTH {
+                return false;
+            }
             if !self.spend_value_node() {
+                return false;
+            }
+            if !self.spend_scalar_payload(current) {
                 return false;
             }
             match current {
                 ModelValue::Array(array) => {
-                    stack.push(&array.default);
+                    let Some(child_depth) = depth.checked_add(1) else {
+                        return false;
+                    };
+                    if child_depth > MAX_WITNESS_VALUE_DEPTH {
+                        return false;
+                    }
+                    let Some(store_nodes) = array.store.len().checked_mul(2) else {
+                        return false;
+                    };
+                    let Some(child_count) = store_nodes.checked_add(1) else {
+                        return false;
+                    };
+                    if !self.pending_values_fit(stack.len(), child_count) {
+                        return false;
+                    }
+                    stack.push((&array.default, child_depth));
                     for (index, element) in &array.store {
-                        stack.push(index);
-                        stack.push(element);
+                        stack.push((index, child_depth));
+                        stack.push((element, child_depth));
                     }
                 }
-                ModelValue::Seq(elements) => stack.extend(elements),
-                ModelValue::Datatype { args, .. } => stack.extend(args),
+                ModelValue::Seq(elements) if !elements.is_empty() => {
+                    let Some(child_depth) = depth.checked_add(1) else {
+                        return false;
+                    };
+                    if child_depth > MAX_WITNESS_VALUE_DEPTH {
+                        return false;
+                    }
+                    if !self.pending_values_fit(stack.len(), elements.len()) {
+                        return false;
+                    }
+                    stack.extend(elements.iter().map(|element| (element, child_depth)));
+                }
+                ModelValue::Datatype { args, .. } if !args.is_empty() => {
+                    let Some(child_depth) = depth.checked_add(1) else {
+                        return false;
+                    };
+                    if child_depth > MAX_WITNESS_VALUE_DEPTH {
+                        return false;
+                    }
+                    if !self.pending_values_fit(stack.len(), args.len()) {
+                        return false;
+                    }
+                    stack.extend(args.iter().map(|argument| (argument, child_depth)));
+                }
                 _ => {}
             }
         }
         true
+    }
+}
+
+/// Charge model-provided entry values before the classifier retains them.
+///
+/// The update is transactional: a rejected `or` branch or over-budget entry
+/// cannot consume capacity that belongs to a later admissible branch.
+pub(super) fn account_entry_values(
+    value_work: &mut usize,
+    index: &ModelValue,
+    value: &ModelValue,
+) -> bool {
+    let mut candidate = WitnessBudget {
+        index_comparisons: 0,
+        value_work: *value_work,
+    };
+    if !candidate.account_value(index) || !candidate.account_value(value) {
+        return false;
+    }
+    *value_work = candidate.value_work;
+    true
+}
+
+fn scalar_payload_work(value: &ModelValue) -> Option<usize> {
+    fn bigint_bytes(value: &BigInt) -> Option<usize> {
+        usize::try_from(value.bits().checked_add(7)? / 8).ok()
+    }
+
+    fn rational_bytes(value: &BigRational) -> Option<usize> {
+        bigint_bytes(value.numer())?.checked_add(bigint_bytes(value.denom())?)
+    }
+
+    fn algebraic_bytes(value: &crate::algebraic::Algebraic) -> Option<usize> {
+        let mut work = 0usize;
+        for coefficient in value
+            .minimal_polynomial()
+            .iter()
+            .chain(value.representation())
+        {
+            work = work
+                .checked_add(1)?
+                .checked_add(rational_bytes(coefficient)?)?;
+        }
+        let (lower, upper) = value.interval();
+        for endpoint in [lower, upper] {
+            work = work
+                .checked_add(1)?
+                .checked_add(rational_bytes(endpoint)?)?;
+        }
+        Some(work)
+    }
+
+    match value {
+        ModelValue::Bool(_) | ModelValue::Array(_) | ModelValue::Seq(_) => Some(0),
+        ModelValue::Int(value) => bigint_bytes(value),
+        ModelValue::Real(value) => rational_bytes(value),
+        ModelValue::BitVec { width, value } => {
+            let width_bytes = usize::try_from((u64::from(*width).checked_add(7)?) / 8).ok()?;
+            Some(width_bytes.max(bigint_bytes(value)?))
+        }
+        ModelValue::FloatingPoint {
+            exponent_bits,
+            significand_bits,
+            ..
+        } => {
+            let total_bits = u64::from(*exponent_bits)
+                .checked_add(u64::from(*significand_bits))?
+                .checked_add(1)?;
+            usize::try_from(total_bits.checked_add(7)? / 8).ok()
+        }
+        ModelValue::Str(value) | ModelValue::Uninterpreted(value) => Some(value.len()),
+        ModelValue::Algebraic(value) => algebraic_bytes(value),
+        ModelValue::Datatype { ctor, .. } => Some(ctor.len()),
     }
 }
 
@@ -154,17 +294,20 @@ impl ModelView for CompletedModel<'_> {
 pub(super) fn materialize_and_replay(
     terms: &TermStore,
     model: &dyn ModelView,
+    evaluator: &Evaluator<'_>,
     assertions: &[TermId],
     resolve: &DtResolve<'_>,
     member_roots: HashMap<TermId, TermId>,
     entries: Vec<Entry>,
+    entry_value_work: usize,
 ) -> bool {
-    let mut budget = WitnessBudget::default();
-    for entry in &entries {
-        if !budget.account_value(&entry.index) || !budget.account_value(&entry.value) {
-            return false;
-        }
+    if entry_value_work > MAX_WITNESS_VALUE_WORK {
+        return false;
     }
+    let mut budget = WitnessBudget {
+        index_comparisons: 0,
+        value_work: entry_value_work,
+    };
 
     let Some(mut class_arrays) = build_class_arrays(terms, resolve, &member_roots, &mut budget)
     else {
@@ -185,6 +328,14 @@ pub(super) fn materialize_and_replay(
         .into_iter()
         .map(|(root, array)| (root, ModelValue::Array(Box::new(array))))
         .collect();
+    for (&root, array) in &arrays {
+        if evaluator
+            .ensure_value_inhabits_sort(array, terms.sort(root))
+            .is_err()
+        {
+            return false;
+        }
+    }
     let completed = CompletedModel {
         base: model,
         member_roots,
@@ -289,6 +440,7 @@ fn gather_index_group<'a>(
     budget: &mut WitnessBudget,
 ) -> Option<Vec<&'a Entry>> {
     let mut group = Vec::new();
+    let mut matched_indices = Vec::new();
     for (candidate_index, &(candidate_root, candidate)) in keyed.iter().enumerate() {
         if candidate_root != root {
             continue;
@@ -299,11 +451,14 @@ fn gather_index_group<'a>(
         match value_eq(&first.index, &candidate.index) {
             Ok(true) => {
                 group.push(candidate);
-                done[candidate_index] = true;
+                matched_indices.push(candidate_index);
             }
             Ok(false) => {}
             Err(_) => return None,
         }
+    }
+    for candidate_index in matched_indices {
+        done[candidate_index] = true;
     }
     Some(group)
 }
@@ -379,6 +534,11 @@ fn materialize_element(
         if !budget.spend_value_node() {
             return None;
         }
+        if !budget.spend_value_nodes(constructor.fields.len())
+            || !budget.spend_value_nodes(constructor.name.len())
+        {
+            return None;
+        }
         let mut active_datatypes = vec![datatype.name.clone()];
         let mut args = Vec::with_capacity(constructor.fields.len());
         let mut complete = true;
@@ -426,6 +586,12 @@ fn canonical_inhabitant(
         active_datatypes.push(datatype.name.clone());
         let mut result = None;
         for constructor in &datatype.constructors {
+            if !budget.spend_value_nodes(constructor.fields.len())
+                || !budget.spend_value_nodes(constructor.name.len())
+            {
+                active_datatypes.pop();
+                return None;
+            }
             let mut args = Vec::with_capacity(constructor.fields.len());
             let mut complete = true;
             for field in &constructor.fields {
@@ -453,7 +619,13 @@ fn canonical_inhabitant(
         Sort::Bool => Some(ModelValue::Bool(false)),
         Sort::Int => Some(ModelValue::Int(BigInt::from(0))),
         Sort::Real => Some(ModelValue::Real(BigRational::from_integer(BigInt::from(0)))),
-        Sort::BitVec(bitvec) => Some(ModelValue::bitvec(BigInt::from(0), bitvec.width)),
+        Sort::BitVec(bitvec) => {
+            let width_bytes =
+                usize::try_from((u64::from(bitvec.width).checked_add(7)?) / 8).ok()?;
+            budget
+                .spend_value_nodes(width_bytes)
+                .then(|| ModelValue::bitvec(BigInt::from(0), bitvec.width))
+        }
         Sort::Array(array) => {
             let default = canonical_inhabitant(
                 &array.element_sort,
@@ -472,24 +644,181 @@ fn canonical_inhabitant(
         Sort::FloatingPoint(exponent_bits, significand_bits)
             if (2..=64).contains(exponent_bits) && (2..=65).contains(significand_bits) =>
         {
-            Some(ModelValue::FloatingPoint {
-                sign: false,
-                exponent: 0,
-                significand: 0,
-                exponent_bits: *exponent_bits,
-                significand_bits: *significand_bits,
-            })
+            let total_bits = u64::from(*exponent_bits)
+                .checked_add(u64::from(*significand_bits))?
+                .checked_add(1)?;
+            let payload_bytes = usize::try_from(total_bits.checked_add(7)? / 8).ok()?;
+            budget
+                .spend_value_nodes(payload_bytes)
+                .then_some(ModelValue::FloatingPoint {
+                    sign: false,
+                    exponent: 0,
+                    significand: 0,
+                    exponent_bits: *exponent_bits,
+                    significand_bits: *significand_bits,
+                })
         }
-        Sort::Uninterpreted(name) => Some(ModelValue::Uninterpreted(format!(
-            "@ay-residual-inhabitant:uninterpreted:{name}"
-        ))),
+        Sort::Uninterpreted(name) => {
+            const PREFIX: &str = "@ay-residual-inhabitant:uninterpreted:";
+            let bytes = PREFIX.len().checked_add(name.len())?;
+            budget
+                .spend_value_nodes(bytes)
+                .then(|| ModelValue::Uninterpreted(format!("{PREFIX}{name}")))
+        }
         Sort::Datatype(_) => None,
         Sort::Seq(_) => Some(ModelValue::Seq(Vec::new())),
         Sort::Char => Some(ModelValue::Int(BigInt::from(0))),
         Sort::FiniteDomain(_, size) if *size > 0 => Some(ModelValue::Int(BigInt::from(0))),
-        Sort::TypeVar(name) => Some(ModelValue::Uninterpreted(format!(
-            "@ay-residual-inhabitant:type-var:{name}"
-        ))),
+        Sort::TypeVar(name) => {
+            const PREFIX: &str = "@ay-residual-inhabitant:type-var:";
+            let bytes = PREFIX.len().checked_add(name.len())?;
+            budget
+                .spend_value_nodes(bytes)
+                .then(|| ModelValue::Uninterpreted(format!("{PREFIX}{name}")))
+        }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::*;
+
+    #[test]
+    fn index_grouping_exhaustion_leaves_completion_state_unchanged() {
+        let mut terms = TermStore::new();
+        let root = terms.mk_var("array", Sort::array(Sort::Int, Sort::Bool));
+        let first = Entry {
+            array: root,
+            index: ModelValue::Int(BigInt::from(0)),
+            slot: Slot::Whole,
+            value: ModelValue::Bool(false),
+        };
+        let second = Entry {
+            array: root,
+            index: ModelValue::Int(BigInt::from(1)),
+            slot: Slot::Whole,
+            value: ModelValue::Bool(true),
+        };
+        let keyed = vec![(root, &first), (root, &second)];
+        let mut done = vec![false; keyed.len()];
+        let mut budget = WitnessBudget {
+            index_comparisons: MAX_INDEX_COMPARISONS - 1,
+            value_work: 0,
+        };
+
+        assert!(gather_index_group(root, &first, &keyed, &mut done, &mut budget).is_none());
+        assert_eq!(budget.index_comparisons, MAX_INDEX_COMPARISONS);
+        assert_eq!(done, vec![false; keyed.len()]);
+    }
+
+    #[test]
+    fn model_value_accounting_fails_closed_at_the_work_cap() {
+        let value = ModelValue::Datatype {
+            ctor: "pair".to_string(),
+            args: vec![ModelValue::Bool(false), ModelValue::Bool(true)],
+        };
+        let mut budget = WitnessBudget {
+            index_comparisons: 0,
+            value_work: MAX_WITNESS_VALUE_WORK - 1,
+        };
+
+        assert!(!budget.account_value(&value));
+        assert_eq!(budget.value_work, MAX_WITNESS_VALUE_WORK);
+    }
+
+    #[test]
+    fn model_value_accounting_rejects_hostile_width_before_enqueuing_it() {
+        let value = ModelValue::Datatype {
+            ctor: "wide".to_string(),
+            args: vec![ModelValue::Bool(false); MAX_WITNESS_VALUE_WORK],
+        };
+        let mut budget = WitnessBudget::default();
+
+        assert!(!budget.account_value(&value));
+        assert_eq!(budget.value_work, 1 + "wide".len());
+    }
+
+    #[test]
+    fn oversized_single_node_payloads_fail_before_entry_retention() {
+        let oversized_integer = BigInt::from(1u8) << (MAX_WITNESS_VALUE_WORK * 8);
+        let oversized_text = "x".repeat(MAX_WITNESS_VALUE_WORK);
+        let values = vec![
+            ModelValue::Int(oversized_integer.clone()),
+            ModelValue::Real(BigRational::from_integer(oversized_integer)),
+            ModelValue::BitVec {
+                width: u32::try_from(MAX_WITNESS_VALUE_WORK * 8 + 1).expect("test width fits u32"),
+                value: BigInt::from(0),
+            },
+            ModelValue::Str(oversized_text.clone()),
+            // Uninterpreted values are the gate's opaque-token carrier.
+            ModelValue::Uninterpreted(oversized_text.clone()),
+            ModelValue::Datatype {
+                ctor: oversized_text,
+                args: Vec::new(),
+            },
+        ];
+
+        for value in values {
+            let mut retained_work = 0;
+            assert!(!account_entry_values(
+                &mut retained_work,
+                &ModelValue::Bool(false),
+                &value,
+            ));
+            assert_eq!(
+                retained_work, 0,
+                "a rejected scalar must not consume retained-entry capacity"
+            );
+        }
+    }
+
+    #[test]
+    fn model_value_accounting_enforces_the_nested_depth_cap() {
+        fn nested_sequence(depth: usize) -> ModelValue {
+            let mut value = ModelValue::Bool(false);
+            for _ in 0..depth {
+                value = ModelValue::Seq(vec![value]);
+            }
+            value
+        }
+
+        let mut at_limit_budget = WitnessBudget::default();
+        assert!(at_limit_budget.account_value(&nested_sequence(MAX_WITNESS_VALUE_DEPTH)));
+
+        let mut over_limit_budget = WitnessBudget::default();
+        assert!(!over_limit_budget.account_value(&nested_sequence(MAX_WITNESS_VALUE_DEPTH + 1)));
+    }
+
+    #[test]
+    fn canonical_inhabitant_enforces_the_nested_value_depth_cap() {
+        fn nested_array_sort(depth: usize) -> Sort {
+            let mut sort = Sort::Bool;
+            for _ in 0..depth {
+                sort = Sort::array(Sort::Int, sort);
+            }
+            sort
+        }
+
+        let resolve = |_: &str| None;
+        let mut at_limit_budget = WitnessBudget::default();
+        assert!(canonical_inhabitant(
+            &nested_array_sort(MAX_WITNESS_VALUE_DEPTH),
+            &resolve,
+            &mut Vec::new(),
+            &mut at_limit_budget,
+            0,
+        )
+        .is_some());
+
+        let mut over_limit_budget = WitnessBudget::default();
+        assert!(canonical_inhabitant(
+            &nested_array_sort(MAX_WITNESS_VALUE_DEPTH + 1),
+            &resolve,
+            &mut Vec::new(),
+            &mut over_limit_budget,
+            0,
+        )
+        .is_none());
     }
 }

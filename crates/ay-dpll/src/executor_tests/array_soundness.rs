@@ -978,11 +978,26 @@ fn test_aufnra_select_const_consistent_product_not_wrong_unsat() {
     );
 }
 
-/// P0 regression: the combined nested-array/arithmetic path currently derives
-/// a false UNSAT on this satisfiable minimized SV-COMP instance (z3 supplies a
-/// model, and AY's strict proof reconstruction rejects its own refutation).
-/// Until the combination defect is root-caused, the public result boundary must
-/// quarantine the raw UNSAT as Unknown.
+/// P0 regression: this satisfiable minimized SV-COMP instance must never be
+/// reported UNSAT. It is the reproducer the nested-array quarantine
+/// (`53e9ac3c07`) was written for.
+///
+/// PREMISE REFRESHED, assertion unchanged. This test used to say the path
+/// "currently derives a false UNSAT ... until the combination defect is
+/// root-caused". The defect WAS root-caused and fixed at the source
+/// (`f978212a6f` + `7272612d89`): a vacuously true `all()` accepted a
+/// GC-compacted, zero-length pending-theory-conflict slice as a live conflict
+/// and handed conflict analysis a spurious empty clause. Since that fix the
+/// internal fast wrong `unsat` is gone, so this input now fails closed on its
+/// own budget and no longer reaches the quarantine at all — measured 2026-09-06
+/// on `9fb122a24a`: `interrupted`/`timeout` at `-T:60`, with no degrade
+/// warning. See Round 20 of
+/// the development design notes.
+///
+/// The pin therefore still guards the same soundness property (never `unsat`
+/// here) but it is no longer evidence that the quarantine works; the quantified
+/// pin below is. Keep both: this one covers the source fix, that one covers the
+/// gate.
 #[test]
 // This minimized ALIA instance is intentionally expensive: the solver must
 // reach the raw refutation before the public-result quarantine can reject it.
@@ -991,6 +1006,65 @@ fn test_aufnra_select_const_consistent_product_not_wrong_unsat() {
 fn test_nested_array_alia_false_unsat_is_quarantined() {
     let input = include_str!("../../../../repros/cs_stateful-1.i_2.MINIMIZED.smt2");
     assert_eq!(solve_one(input), "unknown");
+}
+
+/// #nested-array-quarantine-quantified — the boundary the 2026-09-06 z3-parity
+/// ledger proposed to move (the development design notes
+/// 2026-09-06-diagnoses-r2-quantified.md`, rank 3 / next-action 3), pinned
+/// where the evidence actually leaves it.
+///
+/// The input is the unit-split form of the Ultimate Automizer row
+/// `ABV/…UltimateAutomizerSvcomp2019__standard_running_true-unreach-call.i_3`.
+/// Splitting `(assert (and c1 … cn))` into bare conjuncts is an equivalent
+/// rewrite, and it is what makes `UnitFacts::from_assertions` see the negated
+/// `exists` as an entailed forall — so unlike the original file, AY reaches
+/// `CERT/classify: result=Unsat em_added=true` here. z3 4.16.0 also answers
+/// `unsat`, so the verdict AY computes is CORRECT.
+///
+/// It is withheld anyway, and that is the point. The refutation reconstructs to
+/// a bare `(step t0 (cl) :rule trust)`: `--self-check` rejects it ("computed
+/// UNSAT is not backed by a fully-checked refutation proof"), the strict
+/// full-problem proof leg fails, the checked-SAT sidecar declines, the entailed
+/// residue is satisfiable, and `authenticate_bool_bv_unsat_query` rejects the
+/// query outright because `Forall`/`Exists` are outside its ground fragment.
+/// Every rung of `nested_array_unsat_has_current_authority` therefore declines
+/// and the quarantine degrades to `unknown` / phase
+/// `array-combination-quarantine`.
+///
+/// Publishing this would be publishing a nested-array UNSAT on trust alone,
+/// which is exactly what the gate exists to stop — so a future change that
+/// makes this print `unsat` has not "unblocked the Ultimate family", it has
+/// removed the last check on a class with a recorded wrong-answer history. Fix
+/// it by giving the ladder a real authority for instance-closure refutations
+/// (which needs proof reconstruction for the ground BV core first — that core
+/// is uncertifiable today even when the instance is written out by hand), never
+/// by widening the predicate.
+#[test]
+#[timeout(120_000)]
+fn test_nested_array_quantified_instance_unsat_without_authority_is_quarantined() {
+    let input =
+        include_str!("../../../../repros/abv-nested-array-quantified-unsat-quarantine.smt2");
+    let commands = parse(input).expect("invariant: valid SMT-LIB input");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("invariant: execute succeeds");
+    assert_eq!(
+        outputs[0], "unknown",
+        "an E-matched nested-array UNSAT whose only proof is a Trust step must \
+         stay withheld"
+    );
+    assert_eq!(
+        exec.statistics().get_string("unknown.phase"),
+        Some("array-combination-quarantine"),
+        "the nested-array quarantine — not some upstream quantifier bail — must \
+         be the gate that withholds this verdict"
+    );
+    assert!(
+        !exec.last_command_unsat_was_strictly_verified(),
+        "nothing here is strictly verified; a true admission would mean the \
+         ladder found an authority and the verdict should have published"
+    );
 }
 
 /// #nested-array-residue-rescue: a nested-array DECLARATION must not condemn a

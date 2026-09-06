@@ -2602,8 +2602,10 @@ fn commit_certified_known_optimum(
     // THE WHOLE CHAIN, same single library definition as the sibling site above
     // and as the CLI. Routes 1-5 are pure arithmetic and never consult
     // `should_stop`, so this site still certifies with a fully-consumed
-    // deadline; only the three search rungs decline early, and each of those
-    // gets a slice of its own.
+    // deadline; FOUR rungs may decline early — the three search rungs, each of
+    // which gets a slice of its own, plus `certified-bb`, which gets NO slice
+    // but consults `should_stop` past the node envelope in which it has ever
+    // certified anything. That rung's bytes stay a function of its own counts.
     let Some((pbp, route)) = ay_pb::proof::certify_opt_lin_any_interruptible(
         instance,
         incumbent,

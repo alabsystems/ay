@@ -459,6 +459,14 @@ impl Solver {
                             // re-check from here to ensure no propagation is missed.
                             self.mark_trail_affected(self.var_data[vi].trail_pos as usize);
 
+                            // Same obligation on a strict-deletion surface
+                            // (VeriPB), which has no hint channel to carry the
+                            // derivation: state {lit} as a unit NOW, while this
+                            // clause still justifies it. After the `del spec`
+                            // below the fact is underivable, and the level-0
+                            // strengthenings that consume it stop being RUP.
+                            self.proof_emit_level0_unit_for_lost_reason(lit);
+
                             // ClearLevel0 victims: preserve a checker-visible
                             // unit proof ID before clearing their reason (#5686).
                             // The clause C is about to be deleted. Instead of saving
@@ -667,6 +675,13 @@ impl Solver {
                                 if self.cold.lrat_enabled {
                                     self.pin_lrat_level0_unit_materialize_for_var(vi);
                                 }
+                                // Same obligation as the LRAT branch above, for the
+                                // surfaces that have no proof IDs: VeriPB honours the
+                                // deletion of this reason clause, so the level-0 fact
+                                // it propagated must be stated while the clause is
+                                // still live. This arm bypasses delete_clause_checked
+                                // entirely, so it needs its own call.
+                                self.proof_emit_level0_unit_for_lost_reason(lit);
                                 self.var_data[vi].reason = NO_REASON;
                             }
                         }

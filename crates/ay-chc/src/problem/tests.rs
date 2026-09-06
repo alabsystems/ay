@@ -583,6 +583,108 @@ mod ite_split_tests {
     }
 }
 
+mod query_rewrite_provenance_tests {
+    use super::*;
+
+    fn assert_mixed_query_provenance(
+        problem: &ChcProblem,
+        action: ActionId,
+        expected_active_queries: usize,
+    ) {
+        let pruned = problem.pruned_false_query_ids();
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].ordinal(), 0);
+
+        let active: Vec<_> = problem.queries().collect();
+        assert_eq!(active.len(), expected_active_queries);
+        assert!(active.iter().all(|query| {
+            query.source_query_ordinal == Some(1) && query.action_id == Some(action)
+        }));
+
+        let obligations = problem
+            .query_obligations()
+            .expect("rewritten mixed-query problem should remain valid");
+        assert_eq!(obligations.len(), expected_active_queries);
+        assert!(obligations
+            .iter()
+            .all(|obligation| obligation.id().source_query_ordinal() == 1));
+        assert!(obligations.iter().all(|obligation| {
+            obligation
+                .problem()
+                .queries()
+                .all(|query| query.action_id == Some(action))
+        }));
+    }
+
+    fn marker_problem() -> (ChcProblem, ActionId) {
+        let mut problem = ChcProblem::new();
+        let state = problem.declare_predicate("state", vec![ChcSort::Int]);
+        let fail = problem.declare_predicate("fail", Vec::new());
+        let action = problem.declare_action("step");
+
+        problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::Bool(
+            false,
+        ))));
+        let x = ChcVar::new("x", ChcSort::Int);
+        problem.add_clause_with_action(
+            HornClause::new(
+                ClauseBody::predicates_only(vec![(state, vec![ChcExpr::var(x)])]),
+                ClauseHead::Predicate(fail, Vec::new()),
+            ),
+            action,
+        );
+        problem.add_clause(HornClause::query(ClauseBody::predicates_only(vec![(
+            fail,
+            Vec::new(),
+        )])));
+
+        (problem, action)
+    }
+
+    #[test]
+    fn query_case_splitting_retains_action_and_absolute_ordinal() {
+        let mut problem = ChcProblem::new();
+        let action = problem.declare_action("step");
+        problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::Bool(
+            false,
+        ))));
+
+        let guard = ChcVar::new("guard", ChcSort::Bool);
+        let x = ChcVar::new("x", ChcSort::Int);
+        let branch = ChcExpr::or(
+            ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0)),
+            ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(1)),
+        );
+        problem.add_clause_with_action(
+            HornClause::query(ClauseBody::constraint(ChcExpr::ite(
+                ChcExpr::var(guard),
+                branch,
+                ChcExpr::eq(ChcExpr::var(x), ChcExpr::int(2)),
+            ))),
+            action,
+        );
+
+        problem.try_split_ites_in_clauses(8, false);
+        problem.try_split_ors_in_clauses(8, false);
+
+        assert_mixed_query_provenance(&problem, action, 3);
+    }
+
+    #[test]
+    fn nullary_fail_expansion_combines_definition_action_and_goal_ordinal() {
+        let (mut problem, action) = marker_problem();
+        assert!(problem.expand_nullary_fail_queries(false));
+        assert_mixed_query_provenance(&problem, action, 1);
+    }
+
+    #[test]
+    fn trivial_marker_elimination_combines_definition_action_and_goal_ordinal() {
+        let (mut problem, action) = marker_problem();
+        problem.eliminate_trivial_bool_markers();
+        assert_mixed_query_provenance(&problem, action, 1);
+    }
+}
+
 mod phase_bounded_tests {
     use super::*;
 
@@ -898,10 +1000,188 @@ mod clause_simplification_tests {
 
         assert!(problem.clauses().is_empty());
         assert_eq!(problem.queries().count(), 0);
-        assert_eq!(problem.pruned_false_queries, 1);
+        assert_eq!(problem.pruned_false_query_count(), 1);
+        assert_eq!(problem.pruned_false_query_ids().len(), 1);
         problem
             .validate()
             .expect("pruned false query should validate");
+    }
+
+    #[test]
+    fn pruned_query_ids_bind_original_content_and_duplicate_ordinal() {
+        let mut problem = ChcProblem::new();
+        problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::Bool(
+            false,
+        ))));
+        problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::eq(
+            ChcExpr::int(0),
+            ChcExpr::int(1),
+        ))));
+        problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::Bool(
+            false,
+        ))));
+        let action = problem.declare_action("step");
+        problem.add_clause_with_action(
+            HornClause::query(ClauseBody::constraint(ChcExpr::Bool(false))),
+            action,
+        );
+
+        let ids = problem.pruned_false_query_ids();
+        assert_eq!(ids.len(), 4);
+        assert_eq!(
+            ids.iter().map(|id| id.ordinal()).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(ids[0].content_sha256(), ids[2].content_sha256());
+        assert_ne!(ids[0], ids[2], "duplicate clauses need distinct ordinals");
+        assert_ne!(
+            ids[0].content_sha256(),
+            ids[1].content_sha256(),
+            "different source expressions must not collapse with their common false result"
+        );
+        assert_ne!(
+            ids[0].content_sha256(),
+            ids[3].content_sha256(),
+            "the original action tag is part of the source clause content"
+        );
+        assert!(ids.iter().all(|id| {
+            !id.content_bytes().is_empty()
+                && id
+                    .content_bytes()
+                    .starts_with(id.content_schema().as_bytes())
+                && id.content_sha256().len() == 64
+                && id
+                    .content_sha256()
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && id.has_valid_content_digest()
+        }));
+        let mut corrupted = ids[0].clone();
+        corrupted.content = format!("{}x", corrupted.content).into();
+        assert!(!corrupted.has_valid_content_digest());
+
+        let cloned = problem.clone();
+        assert_eq!(cloned.pruned_false_query_ids(), ids);
+
+        let mut independently_built = ChcProblem::new();
+        independently_built.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::Bool(
+            false,
+        ))));
+        assert_eq!(independently_built.pruned_false_query_ids()[0], ids[0]);
+    }
+
+    #[test]
+    fn pruned_query_ids_use_final_registries_and_raw_action_ids() {
+        fn late_declared_query(first_name: &str, second_name: &str) -> ChcProblem {
+            let mut problem = ChcProblem::new();
+            problem.add_clause(HornClause::query(ClauseBody::new(
+                vec![(PredicateId::new(0), Vec::new())],
+                Some(ChcExpr::Bool(false)),
+            )));
+            problem.declare_predicate(first_name, Vec::new());
+            problem.declare_predicate(second_name, Vec::new());
+            problem
+        }
+
+        let a_first = late_declared_query("a", "b");
+        let b_first = late_declared_query("b", "a");
+        a_first
+            .validate()
+            .expect("late declaration should resolve ID 0");
+        b_first
+            .validate()
+            .expect("late declaration should resolve ID 0");
+        assert_ne!(
+            a_first.pruned_false_query_ids()[0].content_sha256(),
+            b_first.pruned_false_query_ids()[0].content_sha256(),
+            "final predicate registries must determine pruned clause identity"
+        );
+
+        let mut action_zero = ChcProblem::new();
+        let first = action_zero.declare_action("step");
+        action_zero.declare_action("step");
+        action_zero.add_clause_with_action(
+            HornClause::query(ClauseBody::constraint(ChcExpr::Bool(false))),
+            first,
+        );
+        let mut action_one = ChcProblem::new();
+        action_one.declare_action("step");
+        let second = action_one.declare_action("step");
+        action_one.add_clause_with_action(
+            HornClause::query(ClauseBody::constraint(ChcExpr::Bool(false))),
+            second,
+        );
+        assert_ne!(
+            action_zero.pruned_false_query_ids()[0].content_sha256(),
+            action_one.pruned_false_query_ids()[0].content_sha256(),
+            "duplicate action names must not erase the raw action tag"
+        );
+    }
+
+    #[test]
+    fn malformed_pruned_queries_fail_validation() {
+        let mut undefined = ChcProblem::new();
+        undefined.add_clause(HornClause::query(ClauseBody::new(
+            vec![(PredicateId::new(0), Vec::new())],
+            Some(ChcExpr::Bool(false)),
+        )));
+        assert!(matches!(
+            undefined.validate(),
+            Err(crate::ChcError::UndefinedPredicate(_))
+        ));
+
+        let mut wrong_arity = ChcProblem::new();
+        let predicate = wrong_arity.declare_predicate("p", vec![ChcSort::Int]);
+        wrong_arity.add_clause(HornClause::query(ClauseBody::new(
+            vec![(predicate, Vec::new())],
+            Some(ChcExpr::Bool(false)),
+        )));
+        assert!(matches!(
+            wrong_arity.validate(),
+            Err(crate::ChcError::ArityMismatch { .. })
+        ));
+
+        let mut undefined_action = ChcProblem::new();
+        undefined_action.add_clause_with_action(
+            HornClause::query(ClauseBody::constraint(ChcExpr::Bool(false))),
+            ActionId::new(0),
+        );
+        assert!(matches!(
+            undefined_action.validate(),
+            Err(crate::ChcError::Verification(_))
+        ));
+    }
+
+    #[test]
+    fn query_slices_clear_source_pruned_query_ids() {
+        let mut problem = ChcProblem::new();
+        problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::Bool(
+            false,
+        ))));
+        let x = ChcVar::new("x", ChcSort::Int);
+        problem.add_clause(HornClause::query(ClauseBody::constraint(ChcExpr::eq(
+            ChcExpr::var(x),
+            ChcExpr::int(0),
+        ))));
+
+        let obligations = problem
+            .query_obligations()
+            .expect("mixed pruned and surviving queries should split");
+        assert_eq!(problem.pruned_false_query_ids().len(), 1);
+        assert_eq!(obligations.len(), 1);
+        assert_eq!(obligations[0].id().source_query_ordinal(), 1);
+        assert!(obligations[0].problem().pruned_false_query_ids().is_empty());
+        assert_eq!(obligations[0].problem().pruned_false_query_count(), 0);
+        obligations[0]
+            .problem()
+            .validate()
+            .expect("the surviving query validates its slice independently");
+        let nested = obligations[0]
+            .problem()
+            .query_obligations()
+            .expect("the standalone slice can itself be split");
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].id().source_query_ordinal(), 0);
     }
 }
 

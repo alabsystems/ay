@@ -50,8 +50,8 @@ fn test_tester_results_restored_on_pop() {
     let x = terms.mk_var("x", list_sort);
 
     // Create all terms before solver (solver borrows terms immutably)
-    let is_cons_x = terms.mk_app(Symbol::Named("is-Cons".to_string()), vec![x], Sort::Bool);
-    let is_nil_x = terms.mk_app(Symbol::Named("is-Nil".to_string()), vec![x], Sort::Bool);
+    let is_cons_x = terms.mk_app(Symbol::named("is-Cons"), vec![x], Sort::Bool);
+    let is_nil_x = terms.mk_app(Symbol::named("is-Nil"), vec![x], Sort::Bool);
 
     let mut solver = DtSolver::new(&terms);
     solver.register_datatype("List", &["Cons".to_string(), "Nil".to_string()]);
@@ -201,8 +201,8 @@ fn test_tester_only_conflict_not_detected_by_solver_alone() {
     let list_sort = Sort::Uninterpreted("List".to_string());
     let x = terms.mk_var("x", list_sort);
 
-    let is_cons_x = terms.mk_app(Symbol::Named("is-Cons".to_string()), vec![x], Sort::Bool);
-    let is_nil_x = terms.mk_app(Symbol::Named("is-Nil".to_string()), vec![x], Sort::Bool);
+    let is_cons_x = terms.mk_app(Symbol::named("is-Cons"), vec![x], Sort::Bool);
+    let is_nil_x = terms.mk_app(Symbol::named("is-Nil"), vec![x], Sort::Bool);
 
     let mut solver = DtSolver::new(&terms);
     solver.register_datatype("List", &["Cons".to_string(), "Nil".to_string()]);

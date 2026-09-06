@@ -47,10 +47,17 @@
 
 pub mod invoke;
 pub mod proof;
+mod query_proof_report;
 pub mod sorts;
 pub mod terms;
 pub mod verdict;
 
+#[cfg(test)]
+mod query_proof_report_admission_tests;
+#[cfg(test)]
+mod query_proof_report_tests;
+#[cfg(test)]
+mod query_proof_report_vacuity_tests;
 #[cfg(test)]
 mod tests;
 
@@ -106,9 +113,9 @@ pub use ay_chc::{normalized_chc_input, normalized_chc_input_sha256};
 /// metadata JSON + `normalized_input_sha256` + `proof_status` accessors (G6)
 /// without depending on `ay-chc` directly.
 pub use ay_chc::{
-    ChcPdrProofRun, ChcProofArtifactDigest, ChcProofRunArtifact, ChcProofRunArtifacts,
-    ChcProofRunStopReason, ChcProofRunWithBudgetReport, ChcProofTranscriptConsumerEvidence,
-    ChcProofTranscriptMetadata,
+    ChcCheckedReplayRun, ChcPdrProofRun, ChcProofArtifactDigest, ChcProofRunArtifact,
+    ChcProofRunArtifacts, ChcProofRunStopReason, ChcProofRunWithBudgetReport,
+    ChcProofTranscriptConsumerEvidence, ChcProofTranscriptMetadata, ChcPrunedQueryObligationId,
 };
 
 /// Portfolio observability types from [`ay_chc`] (G8, optional).

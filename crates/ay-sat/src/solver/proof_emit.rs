@@ -66,6 +66,161 @@ impl Solver {
         }
     }
 
+    /// Whether the declared proof surface honours clause deletion strictly.
+    ///
+    /// VeriPB is a strict forward checker: a `del spec` removes the constraint
+    /// from the database its autoprover reasons with, permanently. DRAT
+    /// checkers do not — `drat-trim` silently ignores the deletion of a clause
+    /// that is the current propagation reason for its first literal
+    /// (drat-trim.c:806-814, mirrored in `ay-drat-check` with the
+    /// `pseudo_unit_skips` counter), so on DRAT a root-level fact stays
+    /// derivable even after AY deletes the clause that propagated it. On
+    /// VeriPB it does not, and every later step that strengthens a clause with
+    /// that fact stops being RUP.
+    pub(crate) fn proof_honors_strict_deletion(&self) -> bool {
+        self.proof_manager
+            .as_ref()
+            .is_some_and(|manager| manager.output().is_veripb())
+    }
+
+    /// State a level-0 fact as an explicit unit clause while the clause that
+    /// propagated it is still in the checker's database.
+    ///
+    /// Call this immediately before a level-0 reason clause is deleted or
+    /// replaced. At that instant the reason is still live, and every literal
+    /// it depends on is either still propagated by a live clause or has
+    /// already been stated by an earlier call, so `{lit}` is RUP and the step
+    /// is checkable. One instant later it is not: the fact's only derivation
+    /// has been removed from the database, and the strengthenings AY goes on
+    /// to emit with that fact become undischargeable proofgoals.
+    ///
+    /// Surface-scoped on purpose:
+    /// - LRAT already carries its own hint-bearing derivation for this
+    ///   (`emit_lrat_delete_unit_derivation`, `materialize_level0_unit_proofs`).
+    /// - DRAT does not need the step at all, and its byte stream must stay
+    ///   identical, so nothing is emitted there.
+    pub(crate) fn proof_emit_level0_unit_for_lost_reason(&mut self, lit: Literal) {
+        if self.cold.lrat_enabled || !self.proof_honors_strict_deletion() {
+            return;
+        }
+        let var_idx = lit.variable().index();
+        // Only ever state a fact that really is root level and really is true
+        // under the current assignment: a stale reason edge must not be
+        // allowed to turn into a bogus unit clause.
+        if var_idx >= self.num_vars
+            || self.var_data[var_idx].level != 0
+            || self.var_value_from_vals(var_idx) != Some(lit.is_positive())
+        {
+            return;
+        }
+        // Once stated, the unit is in the checker's database for the rest of
+        // the stream (`VeripbWriter::delete` drops unit deletions), so a
+        // second statement of the same fact is a redundant line. Idempotent
+        // per variable via the bitset; a root-fixed var never flips polarity,
+        // so keying on the variable alone is exact.
+        let word = var_idx / 64;
+        let bit = 1u64 << (var_idx % 64);
+        if self
+            .cold
+            .veripb_stated_root_units
+            .get(word)
+            .is_some_and(|w| w & bit != 0)
+        {
+            return;
+        }
+        // `Derived` (not `TrustedTransform`): the unit is genuinely RUP here,
+        // so debug builds run it through the forward checker's RUP check
+        // rather than trusting it.
+        if self
+            .proof_emit_add(&[lit], &[], ProofAddKind::Derived)
+            .is_ok()
+        {
+            if self.cold.veripb_stated_root_units.len() <= word {
+                self.cold.veripb_stated_root_units.resize(word + 1, 0);
+            }
+            self.cold.veripb_stated_root_units[word] |= bit;
+        }
+    }
+
+    /// State the root-level fact a clause currently derives before that clause
+    /// is deleted from the strict-deletion (VeriPB) proof surface.
+    ///
+    /// The third member of the DRAT-leniency family (after 6aa0bbe61c and
+    /// b2875b3b6a): the first fix restates a root fact when the clause being
+    /// deleted is recorded as the fact's *reason edge* (`var_data.reason ==
+    /// cref`). But a root fact's checker-side derivation can live in a clause
+    /// its reason edge does not name:
+    ///
+    /// - Under jump reasons (#8034, >= 99%-binary formulas, non-LRAT only),
+    ///   `enqueue_binary_reason` stores a bit-31 *literal-tagged* reason —
+    ///   with ChrBT it does so even for assignments at level 0
+    ///   (propagation.rs `assigned_level` computation). Tagged reasons set no
+    ///   reason-clause mark and can never compare equal to an arena offset,
+    ///   so every `reason == cref` protection is blind to them, and the
+    ///   binary clause that actually propagated the fact is freely deletable.
+    /// - A reason edge cleared earlier (scoped GC, stale-reason sweeps)
+    ///   leaves the fact with `NO_REASON` while its derivation still hangs on
+    ///   a live clause.
+    ///
+    /// DRAT checkers survive all of these because they track their *own*
+    /// propagation reasons and silently skip deleting a clause that is the
+    /// current reason of its first literal (drat-trim.c:806-814). VeriPB
+    /// honours the deletion, the fact becomes underivable, and the next `red`
+    /// step whose RUP support (or RAT resolvent) needs the fact dies with
+    /// "Proofgoal N could not be autoproven" (observed: b6de3c794e at the
+    /// 5000 s budget).
+    ///
+    /// The trigger condition is representation-independent: a clause is a
+    /// live unit-propagation derivation of a root fact iff exactly one of its
+    /// literals is root-true and every other literal is root-false. Deleting
+    /// any such clause states the fact first, while the clause still
+    /// justifies it — making the statement RUP at its stream position. The
+    /// per-variable bitset in `proof_emit_level0_unit_for_lost_reason` bounds
+    /// the cost at one unit line per root-fixed variable per stream.
+    ///
+    /// Soundness: the statement is emitted *before* the `del spec`, so the
+    /// checker's database at every position remains a superset of what AY
+    /// relies on — each retained/added member admitted by a checked step. No
+    /// deletion is suppressed and no check is weakened.
+    pub(crate) fn proof_emit_root_unit_for_lost_support(&mut self, clause: &[Literal]) {
+        if self.cold.lrat_enabled || !self.proof_honors_strict_deletion() {
+            return;
+        }
+        // Empty deletions are protocol-level; unit deletions are dropped by
+        // `VeripbWriter::delete`, so the fact they state stays derivable.
+        if clause.len() < 2 {
+            return;
+        }
+        if let Some(lit) = self.root_derived_literal(clause) {
+            self.proof_emit_level0_unit_for_lost_reason(lit);
+        }
+    }
+
+    /// The literal this clause currently unit-derives at root level, if any:
+    /// exactly one root-true literal with every other literal root-false.
+    fn root_derived_literal(&self, clause: &[Literal]) -> Option<Literal> {
+        let mut true_lit = None;
+        for &lit in clause {
+            let vi = lit.variable().index();
+            if vi >= self.num_vars || self.var_data[vi].level != 0 {
+                return None;
+            }
+            match self.var_value_from_vals(vi) {
+                Some(value) if value == lit.is_positive() => {
+                    if true_lit.is_some() {
+                        // Two root-true literals: the clause never fires under
+                        // unit propagation at root, so it derives nothing.
+                        return None;
+                    }
+                    true_lit = Some(lit);
+                }
+                Some(_) => {}        // root-false: exactly what a derivation needs
+                None => return None, // unassigned: not a root derivation
+            }
+        }
+        true_lit
+    }
+
     /// Emit a proof addition without mutating the forward checker.
     ///
     /// This is for call sites that already update checker state through a
@@ -479,6 +634,12 @@ impl Solver {
             return Ok(());
         }
 
+        // Strict-deletion surface: if this clause is currently the (possibly
+        // only) unit-propagation derivation of a root fact, state the fact
+        // while the clause still justifies it. Runs at true write time — after
+        // the defer branch — so the unit precedes the `del spec` in the stream.
+        self.proof_emit_root_unit_for_lost_support(clause);
+
         // Forward checker only tracks non-empty clauses; the empty clause
         // is a protocol-level signal (UNSAT proof completion), not a real
         // clause in the forward checker's database.
@@ -510,6 +671,9 @@ impl Solver {
                 .push((clause.to_vec(), clause_id));
             return Ok(());
         }
+
+        // Same lost-support protection as `proof_emit_delete` (see there).
+        self.proof_emit_root_unit_for_lost_support(clause);
 
         if !clause.is_empty() {
             if let Some(ref mut checker) = self.cold.forward_checker {
@@ -543,6 +707,21 @@ impl Solver {
             let lits = self.arena.literals(clause_idx).to_vec();
             self.deferred_proof_deletions.push((lits, clause_id));
             return Ok(());
+        }
+
+        // Same lost-support protection as `proof_emit_delete` (see there).
+        // Candidate literal is computed under the shared arena borrow; the
+        // statement itself needs `&mut self`, so it happens after.
+        if !self.cold.lrat_enabled && self.proof_honors_strict_deletion() {
+            let lits = self.arena.literals(clause_idx);
+            let derived = if lits.len() >= 2 {
+                self.root_derived_literal(lits)
+            } else {
+                None
+            };
+            if let Some(lit) = derived {
+                self.proof_emit_level0_unit_for_lost_reason(lit);
+            }
         }
 
         let lits = self.arena.literals(clause_idx);

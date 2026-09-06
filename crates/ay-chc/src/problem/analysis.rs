@@ -225,7 +225,7 @@ impl ChcProblem {
     /// requirement: it either still contains a query clause or recorded a
     /// pruned vacuously-false query.
     pub(crate) fn has_query_evidence(&self) -> bool {
-        self.pruned_false_queries > 0 || self.clauses.iter().any(HornClause::is_query)
+        !self.pruned_false_queries.is_empty() || self.clauses.iter().any(HornClause::is_query)
     }
 
     /// Get fact clauses (clauses with no predicates in body)
@@ -307,15 +307,15 @@ impl ChcProblem {
     /// Validate the problem
     pub fn validate(&self) -> ChcResult<()> {
         use crate::ChcError;
+        self.validate_frozen_pruned_query_source()?;
 
         for predicate in &self.predicates {
             for sort in &predicate.arg_sorts {
                 Self::validate_bitvector_widths_in_sort(sort)?;
             }
         }
-
-        // Check that all predicates used in clauses are declared
-        for clause in &self.clauses {
+        self.validate_source_clause_actions()?;
+        for clause in self.source_clauses() {
             if let Some(constraint) = &clause.body.constraint {
                 Self::validate_bitvector_widths_in_expr(constraint)?;
             }
@@ -387,7 +387,7 @@ impl ChcProblem {
         }
 
         // Check that there's at least one query
-        if self.queries().count() == 0 && self.pruned_false_queries == 0 {
+        if self.queries().count() == 0 && self.pruned_false_queries.is_empty() {
             return Err(ChcError::NoQuery);
         }
 
@@ -409,7 +409,300 @@ impl ChcProblem {
         Ok(())
     }
 
+    fn validate_frozen_pruned_query_source(&self) -> ChcResult<()> {
+        // A derived problem can carry exact raw pruned-query provenance whose
+        // predicate signatures no longer match the transformed live registry.
+        // Validate the complete frozen source separately instead of
+        // interpreting source clauses in a derived vocabulary.
+        self.pruned_query_source
+            .as_ref()
+            .map_or(Ok(()), |source| source.validate())
+    }
+
+    fn validate_source_clause_actions(&self) -> ChcResult<()> {
+        self.validate_clause_actions(self.source_clauses())
+    }
+
+    /// Validate action references over exactly the live clause list authenticated
+    /// by a ground artifact.
+    pub(crate) fn validate_live_clause_actions(&self) -> ChcResult<()> {
+        self.validate_clause_actions(self.clauses.iter())
+    }
+
+    fn validate_clause_actions<'a>(
+        &self,
+        clauses: impl IntoIterator<Item = &'a HornClause>,
+    ) -> ChcResult<()> {
+        for clause in clauses {
+            if let Some(action) = clause.action_id {
+                if self.action_name(action).is_none() {
+                    return Err(crate::ChcError::Verification(format!(
+                        "clause references undefined action ID {}",
+                        action.index()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_typed_function_applications(&self) -> ChcResult<()> {
+        self.validate_typed_function_applications_in_clauses(self.source_clauses())
+    }
+
+    /// Validate typed function applications over exactly the live clause list.
+    ///
+    /// Ground artifacts authenticate `clauses()`, not retained pruned-query
+    /// provenance. Their bounded preflight calls this after covering the same
+    /// live surface, so namespace/signature checks cannot wander into
+    /// unauthenticated metadata.
+    pub(crate) fn validate_live_typed_function_applications(&self) -> ChcResult<()> {
+        self.validate_typed_function_applications_in_clauses(self.clauses.iter())
+    }
+
+    /// Strictly type-check every background-theory expression on the live
+    /// ground-artifact source surface.
+    ///
+    /// The artifact boundary invokes this only after its iterative whole-source
+    /// preflight has bounded every expression and sort tree. This walk is also
+    /// iterative: it derives child sorts bottom-up and delegates the complete
+    /// `ChcOp` arity/input/result contract to the strict replay type checker.
+    pub(crate) fn validate_live_background_theory_expressions(&self) -> ChcResult<()> {
+        for (clause_index, clause) in self.clauses.iter().enumerate() {
+            let mut variables: FxHashMap<&str, &ChcSort> = FxHashMap::default();
+            if let Some(constraint) = &clause.body.constraint {
+                let constraint_sort = Self::validate_live_background_expression(
+                    clause_index,
+                    constraint,
+                    &mut variables,
+                )?;
+                if constraint_sort != ChcSort::Bool {
+                    return Err(crate::ChcError::Verification(format!(
+                        "live clause {clause_index} constraint has sort {constraint_sort}; expected Bool"
+                    )));
+                }
+            }
+            for (_, arguments) in &clause.body.predicates {
+                for argument in arguments {
+                    Self::validate_live_background_expression(
+                        clause_index,
+                        argument,
+                        &mut variables,
+                    )?;
+                }
+            }
+            if let ClauseHead::Predicate(_, arguments) = &clause.head {
+                for argument in arguments {
+                    Self::validate_live_background_expression(
+                        clause_index,
+                        argument,
+                        &mut variables,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_live_background_expression<'a>(
+        clause_index: usize,
+        root: &'a ChcExpr,
+        variables: &mut FxHashMap<&'a str, &'a ChcSort>,
+    ) -> ChcResult<ChcSort> {
+        let mut pending = vec![(root, false)];
+        let mut derived_sorts: Vec<ChcSort> = Vec::new();
+        while let Some((expression, expanded)) = pending.pop() {
+            let children: &[Arc<ChcExpr>] = match expression {
+                ChcExpr::Op(_, arguments)
+                | ChcExpr::PredicateApp(_, _, arguments)
+                | ChcExpr::FuncApp(_, _, arguments) => arguments,
+                ChcExpr::ConstArray(_, value) => std::slice::from_ref(value),
+                ChcExpr::Bool(_)
+                | ChcExpr::Int(_)
+                | ChcExpr::Real(_, _)
+                | ChcExpr::BitVec(_, _)
+                | ChcExpr::Var(_)
+                | ChcExpr::ConstArrayMarker(_)
+                | ChcExpr::IsTesterMarker(_) => &[],
+            };
+            if !expanded {
+                pending.push((expression, true));
+                pending.extend(children.iter().rev().map(|child| (child.as_ref(), false)));
+                continue;
+            }
+
+            let child_start = derived_sorts
+                .len()
+                .checked_sub(children.len())
+                .ok_or_else(|| {
+                    crate::ChcError::Verification(format!(
+                        "live clause {clause_index} background type stack underflow"
+                    ))
+                })?;
+            let child_sorts = &derived_sorts[child_start..];
+            let derived_sort = match expression {
+                ChcExpr::Bool(_) => ChcSort::Bool,
+                ChcExpr::Int(_) => ChcSort::Int,
+                ChcExpr::Real(_, _) => ChcSort::Real,
+                ChcExpr::BitVec(_, width) => ChcSort::BitVec(*width),
+                ChcExpr::Var(variable) => {
+                    if let Some(previous_sort) = variables.get(variable.name.as_str()) {
+                        if *previous_sort != &variable.sort {
+                            return Err(crate::ChcError::Verification(format!(
+                                "live clause {clause_index} variable `{}` has inconsistent sorts {} and {}",
+                                variable.name, previous_sort, variable.sort
+                            )));
+                        }
+                    } else {
+                        variables.insert(variable.name.as_str(), &variable.sort);
+                    }
+                    variable.sort.clone()
+                }
+                ChcExpr::PredicateApp(name, _, _) => {
+                    return Err(crate::ChcError::Verification(format!(
+                        "live clause {clause_index} nests predicate `{name}` inside a background-theory expression"
+                    )));
+                }
+                ChcExpr::FuncApp(_, return_sort, _) => return_sort.clone(),
+                ChcExpr::ConstArray(index_sort, _) => {
+                    let element_sort = child_sorts.first().ok_or_else(|| {
+                        crate::ChcError::Verification(format!(
+                            "live clause {clause_index} constant array has no element sort"
+                        ))
+                    })?;
+                    ChcSort::Array(
+                        Box::new(index_sort.clone()),
+                        Box::new((*element_sort).clone()),
+                    )
+                }
+                ChcExpr::ConstArrayMarker(_) | ChcExpr::IsTesterMarker(_) => {
+                    return Err(crate::ChcError::Verification(format!(
+                        "live clause {clause_index} contains an escaped internal parser marker"
+                    )));
+                }
+                ChcExpr::Op(operation, _) => {
+                    crate::pdr::validate_qf_operation(*operation, child_sorts).map_err(
+                        |type_error| {
+                            crate::ChcError::Verification(format!(
+                                "live clause {clause_index} has an ill-typed background operator: {type_error}"
+                            ))
+                        },
+                    )?
+                }
+            };
+            derived_sorts.truncate(child_start);
+            derived_sorts.push(derived_sort);
+        }
+        if derived_sorts.len() != 1 {
+            return Err(crate::ChcError::Verification(format!(
+                "live clause {clause_index} background type stack has {} roots; expected one",
+                derived_sorts.len()
+            )));
+        }
+        derived_sorts.pop().ok_or_else(|| {
+            crate::ChcError::Verification(format!(
+                "live clause {clause_index} background expression has no derived sort"
+            ))
+        })
+    }
+
+    /// Validate the predicate registry and every application on the live clause
+    /// surface used by ground-artifact authentication.
+    ///
+    /// The caller must first run the iterative whole-source preflight. It bounds
+    /// all declaration sorts and expression trees before the sort derivations
+    /// and comparisons below recurse through them.
+    pub(crate) fn validate_live_predicate_applications(&self) -> ChcResult<()> {
+        use crate::ChcError;
+
+        if self.predicate_names.len() != self.predicates.len() {
+            return Err(ChcError::Verification(format!(
+                "predicate registry has {} declarations but {} name bindings",
+                self.predicates.len(),
+                self.predicate_names.len()
+            )));
+        }
+        for (index, predicate) in self.predicates.iter().enumerate() {
+            if predicate.id.index() != index {
+                return Err(ChcError::Verification(format!(
+                    "predicate declaration at index {index} carries non-canonical ID {}",
+                    predicate.id.index()
+                )));
+            }
+            if self.predicate_names.get(&predicate.name) != Some(&predicate.id) {
+                return Err(ChcError::Verification(format!(
+                    "predicate declaration at index {index} is not bound to its canonical name `{}`",
+                    predicate.name
+                )));
+            }
+        }
+
+        for (clause_index, clause) in self.clauses.iter().enumerate() {
+            for (position, (predicate, arguments)) in clause.body.predicates.iter().enumerate() {
+                self.validate_live_predicate_application(
+                    clause_index,
+                    Some(position),
+                    *predicate,
+                    arguments,
+                )?;
+            }
+            if let ClauseHead::Predicate(predicate, arguments) = &clause.head {
+                self.validate_live_predicate_application(
+                    clause_index,
+                    None,
+                    *predicate,
+                    arguments,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_live_predicate_application(
+        &self,
+        clause_index: usize,
+        body_position: Option<usize>,
+        predicate_id: PredicateId,
+        arguments: &[ChcExpr],
+    ) -> ChcResult<()> {
+        use crate::ChcError;
+
+        let location = body_position.map_or_else(
+            || "head".to_string(),
+            |position| format!("body position {position}"),
+        );
+        let predicate = self.get_predicate(predicate_id).ok_or_else(|| {
+            ChcError::Verification(format!(
+                "live clause {clause_index} {location} references undefined predicate ID {}",
+                predicate_id.index()
+            ))
+        })?;
+        if arguments.len() != predicate.arg_sorts.len() {
+            return Err(ChcError::Verification(format!(
+                "live clause {clause_index} {location} applies predicate `{}` with {} arguments; expected {}",
+                predicate.name,
+                arguments.len(),
+                predicate.arg_sorts.len()
+            )));
+        }
+        for (argument_index, (argument, expected_sort)) in
+            arguments.iter().zip(&predicate.arg_sorts).enumerate()
+        {
+            let actual_sort = argument.sort();
+            if &actual_sort != expected_sort {
+                return Err(ChcError::Verification(format!(
+                    "live clause {clause_index} {location} argument {argument_index} of predicate `{}` has sort {actual_sort}; expected {expected_sort}",
+                    predicate.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_typed_function_applications_in_clauses<'a>(
+        &'a self,
+        clauses: impl IntoIterator<Item = &'a HornClause>,
+    ) -> ChcResult<()> {
         type FunctionSignature = (ChcSort, Vec<ChcSort>);
 
         let predicate_names: FxHashSet<&str> = self
@@ -441,7 +734,7 @@ impl ChcProblem {
         }
 
         let mut expressions = Vec::new();
-        for clause in &self.clauses {
+        for clause in clauses {
             if let Some(constraint) = &clause.body.constraint {
                 expressions.push(constraint);
             }
@@ -1101,8 +1394,10 @@ impl ChcProblem {
     ///   unambiguous even when public-API datatype names contain newlines or
     ///   text resembling the surrounding identity format.
     /// - The scalar / `Vec` metadata that changes the problem's meaning
-    ///   (`fixedpoint_format`, `pruned_false_queries`, `action_names`) is
-    ///   included so no two semantically-distinct problems can collide.
+    ///   (`fixedpoint_format`, the pruned-query count, `action_names`) is
+    ///   included so no two semantically-distinct problems can collide. The
+    ///   pruned-query content IDs are proof-reporting provenance: every such
+    ///   clause is semantically vacuous, so only their count belongs here.
     ///
     /// This is a SUPERSET of the safety-relevant structure, so equal identities
     /// denote the same problem and therefore the same verdict.
@@ -1113,7 +1408,7 @@ impl ChcProblem {
             out,
             "fp={} pfq={} np={} nc={}",
             self.fixedpoint_format,
-            self.pruned_false_queries,
+            self.pruned_false_queries.len(),
             self.predicates.len(),
             self.clauses.len()
         );

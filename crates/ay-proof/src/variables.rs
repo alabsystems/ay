@@ -245,7 +245,7 @@ pub(crate) fn application_symbol_names(
             TermData::App(symbol, args) => {
                 match symbol {
                     ay_core::Symbol::Named(name) | ay_core::Symbol::Indexed(name, _) => {
-                        names.insert(name.clone());
+                        names.insert(name.clone().to_string());
                     }
                     // `Symbol` is `#[non_exhaustive]`. An unrecognised head
                     // simply contributes no name; the preamble check then

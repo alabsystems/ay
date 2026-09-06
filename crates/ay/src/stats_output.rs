@@ -53,6 +53,8 @@ pub(crate) const BUILD_PROVENANCE: BuildProvenance = BuildProvenance {
 pub(crate) struct StatsConfig {
     /// Human-readable stats (--stats / -st).
     pub(crate) human: bool,
+    /// Every counter rather than the curated set (--stats-full).
+    pub(crate) full: bool,
     /// JSON stats to stderr (--stats-json).
     pub(crate) json: bool,
 }
@@ -233,13 +235,16 @@ impl RunStatistics {
     /// ...
     /// c
     /// ```
+    ///
+    /// The build stamp is deliberately absent: `c ay.session.start` already
+    /// states it once per run, and printing it again here made a `-st` run
+    /// carry the same 60-character token three times.
     pub(crate) fn print_to_stderr(&self) {
         safe_eprintln!("c");
         safe_eprintln!("c --- AY statistics ---");
         safe_eprintln!("c ay.mode:          {:>12}", self.mode.as_str());
         safe_eprintln!("c ay.result:        {:>12}", self.result);
         safe_eprintln!("c ay.wall_time_ms:  {:>12}", self.wall_time_ms);
-        safe_eprintln!("{}", BUILD_PROVENANCE.comment_line());
         for (key, value) in &self.counters {
             if !Self::should_emit_counter(key) {
                 continue;
@@ -305,6 +310,137 @@ impl RunStatistics {
 fn is_retired_sat_propagation_counter(key: &str) -> bool {
     key.starts_with("sat.retired_propagation_compiler_")
         || key.starts_with("sat.propagation_native_")
+}
+
+/// Column the curated block's values start at, counting the two-space indent.
+const CURATED_VALUE_COLUMN: usize = 32;
+
+/// Append one `  :key   value` row to the curated block.
+fn curated_row(out: &mut String, key: &str, value: &str) {
+    out.push_str(&format!("  {key:<CURATED_VALUE_COLUMN$} {value}\n"));
+}
+
+/// Render the curated `(:statistics …)` block for an SMT run.
+///
+/// The full block carries every counter the engines record — 131 of them on a
+/// three-line QF_LIA problem, in no particular order — which answers no question
+/// a reader arrives with. This selects the ones that do and groups them by what
+/// a solve spends itself on. Nothing is renamed and nothing is invented: every
+/// key below appears in the full block with the same spelling and the same
+/// value, so `--stats-full` is a strict superset and a script grepping a curated
+/// key keeps working.
+///
+/// Two keys are added rather than selected. `:result` names the verdict the
+/// numbers belong to, which the block never stated. `:total-time` is the process
+/// wall clock under z3's spelling for it — distinct from `:time`, which is the
+/// solver's own time and is kept here unchanged, so neither key shadows the
+/// other and `grep :total-time` finally answers on ay-native runs too.
+///
+/// `decorate` adds `; group` lines. They are legal SMT-LIB comments, but they
+/// are emitted only for a terminal, so a redirected `-st` stays a comment-free
+/// s-expression.
+pub(crate) fn curated_smt_statistics(
+    stats: &ay_dpll::Statistics,
+    result: &str,
+    elapsed: Duration,
+    decorate: bool,
+) -> String {
+    let mut out = String::from("(:statistics\n");
+    let group = |out: &mut String, label: &str| {
+        if decorate {
+            out.push_str(&format!("  ; {label}\n"));
+        }
+    };
+
+    group(&mut out, "answer");
+    curated_row(&mut out, ":result", result);
+    curated_row(
+        &mut out,
+        ":total-time",
+        &format!("{:.3}", elapsed.as_secs_f64()),
+    );
+    curated_row(&mut out, ":time", &format!("{:.2}", stats.time_seconds));
+
+    group(&mut out, "search");
+    for (key, value) in [
+        (":conflicts", stats.conflicts),
+        (":decisions", stats.decisions),
+        (":propagations", stats.propagations),
+        (":restarts", stats.restarts),
+        (":learned-clauses", stats.learned_clauses),
+        (":deleted-clauses", stats.deleted_clauses),
+    ] {
+        curated_row(&mut out, key, &value.to_string());
+    }
+
+    group(&mut out, "theory");
+    for (key, value) in [
+        (":theory-conflicts", stats.theory_conflicts),
+        (":theory-propagations", stats.theory_propagations),
+        (":theory-unknown-count", stats.theory_unknown_count),
+        (":nelson-oppen-rounds", stats.nelson_oppen_rounds),
+    ] {
+        curated_row(&mut out, key, &value.to_string());
+    }
+
+    group(&mut out, "proof & certificates");
+    // Certificate counters live in `extra` and are absent on runs that mint no
+    // certificates. Omit the row rather than print a fabricated zero: a missing
+    // key and a zero mean different things to whoever reads this.
+    for key in ["cert.decisions", "cert.proof_steps_recorded"] {
+        if let Some(value) = stats.get_int(key) {
+            curated_row(&mut out, &format!(":{key}"), &value.to_string());
+        }
+    }
+    for (key, value) in [
+        (
+            ":farkas-certificate-failures",
+            stats.farkas_certificate_failures,
+        ),
+        (
+            ":farkas-certificate-downgrades",
+            stats.farkas_certificate_downgrades,
+        ),
+    ] {
+        curated_row(&mut out, key, &value.to_string());
+    }
+
+    group(&mut out, "models");
+    for (key, value) in [
+        (":model-validation-skips", stats.model_validation_skips),
+        (
+            ":model-validation-failures",
+            stats.model_validation_failures,
+        ),
+    ] {
+        curated_row(&mut out, key, &value.to_string());
+    }
+
+    group(&mut out, "memory & terms");
+    curated_row(&mut out, ":memory", &format!("{:.2}", stats.memory_mb));
+    curated_row(
+        &mut out,
+        ":max-memory",
+        &format!("{:.2}", stats.max_memory_mb),
+    );
+    // The full block gates both term rows on `term_bytes > 0`. Mirror that
+    // condition rather than printing them unconditionally: a curated row the
+    // full block omits would make `--stats-full` a smaller set than the default
+    // on exactly the runs that allocate no terms.
+    if stats.term_bytes > 0 {
+        curated_row(&mut out, ":term-count", &stats.term_count.to_string());
+        curated_row(&mut out, ":term-bytes", &stats.term_bytes.to_string());
+    }
+    for (key, value) in [
+        (":num-vars", stats.num_vars),
+        (":num-clauses", stats.num_clauses),
+        (":num-assertions", stats.num_assertions),
+    ] {
+        curated_row(&mut out, key, &value.to_string());
+    }
+
+    out.push(')');
+    out
 }
 
 #[cfg(test)]

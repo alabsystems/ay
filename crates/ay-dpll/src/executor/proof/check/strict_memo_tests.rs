@@ -724,6 +724,25 @@ fn the_checker_read_term_store_surface_is_audited() {
         // — Immutable term-arena reads: covered by the SNAPSHOT-STAMP
         //   conjunct (entries are immutable; any append/rollback/compaction/
         //   replacement retires the stamp).
+        (
+            "as_str",
+            "stamp: immutable Symbol-name read — the same justification as \
+             `name`. Symbol names are fixed when the term is interned and the \
+             store is append-only, so for a live TermId the string can never \
+             change under a memo hit. (Newly visible because `Symbol::Named` \
+             now carries `SymName(Arc<str>)` rather than `String`, which puts \
+             `as_str` on the term-store surface the scan walks; the checker \
+             call sites themselves are unchanged.)",
+        ),
+        (
+            "capacity",
+            "stamp: length read, not term metadata. On `SymName` it returns \
+             `self.0.len()` — the interned name's length, immutable for the \
+             same reason as `as_str`. The flagged sighting is in fact \
+             `Vec::capacity` on a conflict buffer (memory accounting), i.e. a \
+             collection collision of the kind already recorded for `len` and \
+             `is_empty`.",
+        ),
         ("children", "stamp: immutable entry read"),
         ("entry_stamp", "stamp: immutable entry-identity read"),
         ("extract_integer_constant", "stamp: immutable entry read"),

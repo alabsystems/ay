@@ -35,7 +35,7 @@ fn elaborate(input: &str) -> Context {
 /// leaves N order axioms followed by the use itself.
 fn assertion_head(ctx: &Context, idx: usize) -> Option<String> {
     match ctx.terms.get(ctx.assertions[idx]) {
-        TermData::App(Symbol::Named(name), _) => Some(name.clone()),
+        TermData::App(Symbol::Named(name), _) => Some(name.to_string()),
         _ => None,
     }
 }

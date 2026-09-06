@@ -72,6 +72,10 @@ pub(super) struct SolveAbSwitches {
     /// Allow residual-dominated XOR routing (B41).
     #[arg(long, hide_short_help = true, hide_long_help = true)]
     xor_allow_residual: bool,
+    /// Take the XOR theory route even when almost no detected rows got a
+    /// Gaussian matrix (#xor-route-entry kill switch).
+    #[arg(long, hide_short_help = true, hide_long_help = true)]
+    xor_allow_unadmitted: bool,
 
     /// B42 dpll diagnostics (each replaces a keep-override env var).
     #[arg(long, hide_short_help = true, hide_long_help = true)]

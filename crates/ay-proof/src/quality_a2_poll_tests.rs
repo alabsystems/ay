@@ -9,7 +9,7 @@ fn cost_memo_fill_polls_cancellation_without_extra_debit() {
     let mut terms = TermStore::new();
     let mut root = terms.mk_var("memo_poll_root", Sort::Bool);
     for _ in 0..TERM_COST_MEMO_POLL_INTERVAL {
-        root = terms.mk_app(Symbol::Named("memo_poll_f".to_string()), [root], Sort::Bool);
+        root = terms.mk_app(Symbol::named("memo_poll_f"), [root], Sort::Bool);
     }
 
     let mut memo = TermCostMemo::default();
@@ -54,11 +54,7 @@ fn cold_cost_memo_high_fanout_copy_still_polls_cancellation() {
     let children: Vec<_> = (0..TERM_COST_MEMO_POLL_INTERVAL)
         .map(|index| terms.mk_var(format!("memo_child_{index}"), Sort::Bool))
         .collect();
-    let root = terms.mk_app(
-        Symbol::Named("memo_high_fanout".to_string()),
-        &children,
-        Sort::Bool,
-    );
+    let root = terms.mk_app(Symbol::named("memo_high_fanout"), &children, Sort::Bool);
 
     let mut memo = TermCostMemo::default();
     let mut polls = 0_usize;

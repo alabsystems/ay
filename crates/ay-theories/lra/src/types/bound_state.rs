@@ -48,22 +48,48 @@ impl Ord for ErrorKey {
     }
 }
 
+/// One antecedent of a row-derived implied bound: the bound on `var` that
+/// the derivation actually consumed.
+///
+/// A row `x_b = c + sum(a_j x_j)` is an equation valid in every model of the
+/// problem (rows are linear combinations of the slack definitions), so the
+/// derived bound `c + sum(a_j * b_j)` follows from the antecedent bounds
+/// `b_j` alone, at any later time. Recording `b_j` (value and strictness)
+/// makes that entailment checkable when the reason is materialized: an
+/// antecedent is grounded iff its CURRENT bound on `used_upper` is at least
+/// as tight as `(value, strict)`. Without the value, a chain walker can only
+/// cite whatever bound the variable carries now, and a slot that was reset
+/// or widened in between (pop-restore of a direct overlay, cascade
+/// re-derivation) silently yields a reason set that does not entail the
+/// stored bound.
+#[derive(Debug, Clone)]
+pub(crate) struct Antecedent {
+    /// Variable whose bound was consumed.
+    pub(crate) var: u32,
+    /// Which side was consumed (true = upper, false = lower).
+    pub(crate) used_upper: bool,
+    /// Strictness of the consumed bound.
+    pub(crate) strict: bool,
+    /// Value of the consumed bound at derivation time.
+    pub(crate) value: Rational,
+}
+
 /// Eager explanation data captured at bound derivation time (#6617).
 ///
 /// Equivalent to Z3's `m_explain_bound` closure in `implied_bound.h:36`.
 /// When called to produce reasons, iterates over `contributing_vars` and
-/// fetches each variable's current direct bound reason. Never recurses
-/// into the depth-limited `collect_row_reasons_recursive` walker.
+/// fetches each variable's current direct bound reason (or recurses into
+/// the variable's own row-derived explanation), checking at every step that
+/// the bound cited is at least as tight as the one consumed (`Antecedent`).
 ///
 /// Reference: Z3 `limit_j` (bound_analyzer_on_row.h:298-321) captures
 /// the row by value and fetches bound witnesses at explanation time.
 #[derive(Debug, Clone)]
 pub(crate) struct BoundExplanation {
-    /// Variables whose bounds contributed to this derivation, with the
-    /// direction of bound used (true = upper, false = lower).
-    /// Excludes the target variable itself.
+    /// Bounds that contributed to this derivation. Excludes the target
+    /// variable itself.
     /// Z3 equivalent: the loop body in `limit_j` (bound_analyzer_on_row.h:308-316).
-    pub(crate) contributing_vars: SmallVec<[(u32, bool); 8]>,
+    pub(crate) contributing_vars: SmallVec<[Antecedent; 3]>,
 }
 
 /// An implied bound derived from a tableau row during `compute_implied_bounds`.

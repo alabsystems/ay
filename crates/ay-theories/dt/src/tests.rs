@@ -96,7 +96,7 @@ fn test_clash_conflict_uses_equality_literals() {
     let x = terms.mk_var("x", dt_sort.clone());
     let y = terms.mk_var("y", Sort::Int);
     let none_term = terms.mk_var("None", dt_sort.clone());
-    let some_y_term = terms.mk_app(Symbol::Named("Some".to_string()), vec![y], dt_sort);
+    let some_y_term = terms.mk_app(Symbol::named("Some"), vec![y], dt_sort);
 
     let eq_x_none = terms.mk_eq(x, none_term);
     let eq_x_some_y = terms.mk_eq(x, some_y_term);
@@ -130,7 +130,7 @@ fn test_occurs_check_unsat_direct_cycle() {
 
     let x = terms.mk_var("x", list_sort.clone());
     let hd = terms.mk_var("hd", Sort::Int);
-    let cons_hd_x = terms.mk_app(Symbol::Named("cons".to_string()), vec![hd, x], list_sort);
+    let cons_hd_x = terms.mk_app(Symbol::named("cons"), vec![hd, x], list_sort);
     let eq = terms.mk_eq(x, cons_hd_x);
 
     let mut solver = DtSolver::new(&terms);
@@ -157,13 +157,9 @@ fn test_occurs_check_unsat_nested_ctor_selector_projection() {
     let lst_sort = Sort::Datatype(ay_core::DatatypeSort::new("Lst", vec![]));
 
     let x = terms.mk_var("x", lst_sort.clone());
-    let tl_x = terms.mk_app(Symbol::Named("tl".to_string()), vec![x], lst_sort.clone());
-    let cons_tl_x = terms.mk_app(
-        Symbol::Named("cons".to_string()),
-        vec![tl_x],
-        lst_sort.clone(),
-    );
-    let cons_cons_tl_x = terms.mk_app(Symbol::Named("cons".to_string()), vec![cons_tl_x], lst_sort);
+    let tl_x = terms.mk_app(Symbol::named("tl"), vec![x], lst_sort.clone());
+    let cons_tl_x = terms.mk_app(Symbol::named("cons"), vec![tl_x], lst_sort.clone());
+    let cons_cons_tl_x = terms.mk_app(Symbol::named("cons"), vec![cons_tl_x], lst_sort);
     let eq = terms.mk_eq(x, cons_cons_tl_x);
 
     let mut solver = DtSolver::new(&terms);
@@ -191,8 +187,8 @@ fn test_selector_projection_no_false_unsat() {
     let x = terms.mk_var("x", lst_sort.clone());
     let y = terms.mk_var("y", lst_sort.clone());
     // (tl x) exists in the store but is unrelated to y.
-    let _tl_x = terms.mk_app(Symbol::Named("tl".to_string()), vec![x], lst_sort.clone());
-    let cons_y = terms.mk_app(Symbol::Named("cons".to_string()), vec![y], lst_sort);
+    let _tl_x = terms.mk_app(Symbol::named("tl"), vec![x], lst_sort.clone());
+    let cons_y = terms.mk_app(Symbol::named("cons"), vec![y], lst_sort);
     let eq = terms.mk_eq(x, cons_y);
 
     let mut solver = DtSolver::new(&terms);
@@ -316,7 +312,7 @@ fn test_push_pop_undoes_tester_results() {
     let mut terms = TermStore::new();
     let dt_sort = Sort::Datatype(ay_core::DatatypeSort::new("Option", vec![]));
     let x = terms.mk_var("x", dt_sort);
-    let is_none_x = terms.mk_app(Symbol::Named("is-None".to_string()), vec![x], Sort::Bool);
+    let is_none_x = terms.mk_app(Symbol::named("is-None"), vec![x], Sort::Bool);
 
     let mut solver = DtSolver::new(&terms);
     solver.register_datatype("Option", &["None".to_string(), "Some".to_string()]);
@@ -416,7 +412,7 @@ fn test_check_tester_conflict_positive_mismatch() {
 
     let x = terms.mk_var("x", dt_sort.clone());
     let none_term = terms.mk_var("None", dt_sort);
-    let is_some_x = terms.mk_app(Symbol::Named("is-Some".to_string()), vec![x], Sort::Bool);
+    let is_some_x = terms.mk_app(Symbol::named("is-Some"), vec![x], Sort::Bool);
     let eq_x_none = terms.mk_eq(x, none_term);
 
     let mut solver = DtSolver::new(&terms);
@@ -444,7 +440,7 @@ fn test_check_tester_conflict_negative_mismatch() {
 
     let x = terms.mk_var("x", dt_sort.clone());
     let none_term = terms.mk_var("None", dt_sort);
-    let is_none_x = terms.mk_app(Symbol::Named("is-None".to_string()), vec![x], Sort::Bool);
+    let is_none_x = terms.mk_app(Symbol::named("is-None"), vec![x], Sort::Bool);
     let eq_x_none = terms.mk_eq(x, none_term);
 
     let mut solver = DtSolver::new(&terms);
@@ -583,12 +579,8 @@ fn test_occurs_check_indirect_cycle() {
     let y = terms.mk_var("y", list_sort.clone());
     let h1 = terms.mk_var("h1", Sort::Int);
     let h2 = terms.mk_var("h2", Sort::Int);
-    let cons_h1_y = terms.mk_app(
-        Symbol::Named("cons".to_string()),
-        vec![h1, y],
-        list_sort.clone(),
-    );
-    let cons_h2_x = terms.mk_app(Symbol::Named("cons".to_string()), vec![h2, x], list_sort);
+    let cons_h1_y = terms.mk_app(Symbol::named("cons"), vec![h1, y], list_sort.clone());
+    let cons_h2_x = terms.mk_app(Symbol::named("cons"), vec![h2, x], list_sort);
     let eq_x_cons = terms.mk_eq(x, cons_h1_y);
     let eq_y_cons = terms.mk_eq(y, cons_h2_x);
 
@@ -616,7 +608,7 @@ fn test_occurs_check_no_cycle_with_nil() {
     let y = terms.mk_var("y", list_sort.clone());
     let nil_term = terms.mk_var("nil", list_sort.clone());
     let hd = terms.mk_var("hd", Sort::Int);
-    let cons_hd_y = terms.mk_app(Symbol::Named("cons".to_string()), vec![hd, y], list_sort);
+    let cons_hd_y = terms.mk_app(Symbol::named("cons"), vec![hd, y], list_sort);
     let eq_x_cons = terms.mk_eq(x, cons_hd_y);
     let eq_y_nil = terms.mk_eq(y, nil_term);
 
@@ -776,7 +768,7 @@ fn test_reset_clears_all_mutable_state() {
     let dt_sort = Sort::Datatype(ay_core::DatatypeSort::new("Option", vec![]));
     let x = terms.mk_var("x", dt_sort.clone());
     let y = terms.mk_var("y", Sort::Int);
-    let some_y = terms.mk_app(Symbol::Named("Some".to_string()), vec![y], dt_sort);
+    let some_y = terms.mk_app(Symbol::named("Some"), vec![y], dt_sort);
     let eq = terms.mk_eq(x, some_y);
 
     let mut solver = DtSolver::new(&terms);
@@ -835,12 +827,8 @@ fn test_injectivity_conflict_with_diseq() {
     let b = terms.mk_var("b", Sort::Int);
     let c = terms.mk_var("c", Sort::Int);
     let d = terms.mk_var("d", Sort::Int);
-    let p1 = terms.mk_app(
-        Symbol::Named("mk_pair".to_string()),
-        vec![a, b],
-        dt_sort.clone(),
-    );
-    let p2 = terms.mk_app(Symbol::Named("mk_pair".to_string()), vec![c, d], dt_sort);
+    let p1 = terms.mk_app(Symbol::named("mk_pair"), vec![a, b], dt_sort.clone());
+    let p2 = terms.mk_app(Symbol::named("mk_pair"), vec![c, d], dt_sort);
     let eq_p1_p2 = terms.mk_eq(p1, p2);
     let eq_ac = terms.mk_eq(a, c);
 
@@ -924,8 +912,8 @@ fn test_internalize_atom_tracks_testers() {
     let mut terms = TermStore::new();
     let dt_sort = Sort::Datatype(ay_core::DatatypeSort::new("List", vec![]));
     let x = terms.mk_var("x", dt_sort);
-    let is_nil_x = terms.mk_app(Symbol::Named("is-nil".to_string()), vec![x], Sort::Bool);
-    let is_cons_x = terms.mk_app(Symbol::Named("is-cons".to_string()), vec![x], Sort::Bool);
+    let is_nil_x = terms.mk_app(Symbol::named("is-nil"), vec![x], Sort::Bool);
+    let is_cons_x = terms.mk_app(Symbol::named("is-cons"), vec![x], Sort::Bool);
 
     let mut solver = DtSolver::new(&terms);
     solver.register_datatype("List", &["nil".to_string(), "cons".to_string()]);
@@ -964,8 +952,8 @@ fn test_find_case_split_unconstrained_variable() {
     let mut terms = TermStore::new();
     let dt_sort = Sort::Datatype(ay_core::DatatypeSort::new("List", vec![]));
     let x = terms.mk_var("x", dt_sort);
-    let is_nil_x = terms.mk_app(Symbol::Named("is-nil".to_string()), vec![x], Sort::Bool);
-    let is_cons_x = terms.mk_app(Symbol::Named("is-cons".to_string()), vec![x], Sort::Bool);
+    let is_nil_x = terms.mk_app(Symbol::named("is-nil"), vec![x], Sort::Bool);
+    let is_cons_x = terms.mk_app(Symbol::named("is-cons"), vec![x], Sort::Bool);
 
     let mut solver = DtSolver::new(&terms);
     solver.register_datatype("List", &["nil".to_string(), "cons".to_string()]);
@@ -997,8 +985,8 @@ fn test_find_case_split_constrained_variable_returns_none() {
     let mut terms = TermStore::new();
     let dt_sort = Sort::Datatype(ay_core::DatatypeSort::new("List", vec![]));
     let x = terms.mk_var("x", dt_sort);
-    let is_nil_x = terms.mk_app(Symbol::Named("is-nil".to_string()), vec![x], Sort::Bool);
-    let is_cons_x = terms.mk_app(Symbol::Named("is-cons".to_string()), vec![x], Sort::Bool);
+    let is_nil_x = terms.mk_app(Symbol::named("is-nil"), vec![x], Sort::Bool);
+    let is_cons_x = terms.mk_app(Symbol::named("is-cons"), vec![x], Sort::Bool);
 
     let mut solver = DtSolver::new(&terms);
     solver.register_datatype("List", &["nil".to_string(), "cons".to_string()]);
@@ -1025,8 +1013,8 @@ fn test_find_case_split_with_constructor_returns_none() {
     let dt_sort = Sort::Datatype(ay_core::DatatypeSort::new("List", vec![]));
     let x = terms.mk_var("x", dt_sort.clone());
     let nil = terms.mk_var("nil", dt_sort);
-    let is_nil_x = terms.mk_app(Symbol::Named("is-nil".to_string()), vec![x], Sort::Bool);
-    let is_cons_x = terms.mk_app(Symbol::Named("is-cons".to_string()), vec![x], Sort::Bool);
+    let is_nil_x = terms.mk_app(Symbol::named("is-nil"), vec![x], Sort::Bool);
+    let is_cons_x = terms.mk_app(Symbol::named("is-cons"), vec![x], Sort::Bool);
     let eq_x_nil = terms.mk_eq(x, nil);
 
     let mut solver = DtSolver::new(&terms);
@@ -1053,8 +1041,8 @@ fn test_check_sets_pending_split_for_unconstrained() {
     let mut terms = TermStore::new();
     let dt_sort = Sort::Datatype(ay_core::DatatypeSort::new("Option", vec![]));
     let x = terms.mk_var("x", dt_sort);
-    let is_none_x = terms.mk_app(Symbol::Named("is-None".to_string()), vec![x], Sort::Bool);
-    let is_some_x = terms.mk_app(Symbol::Named("is-Some".to_string()), vec![x], Sort::Bool);
+    let is_none_x = terms.mk_app(Symbol::named("is-None"), vec![x], Sort::Bool);
+    let is_some_x = terms.mk_app(Symbol::named("is-Some"), vec![x], Sort::Bool);
 
     let mut solver = DtSolver::new(&terms);
     solver.register_datatype("Option", &["None".to_string(), "Some".to_string()]);
@@ -1084,7 +1072,7 @@ fn test_needs_final_check_after_sat_with_dt_terms() {
     let mut terms = TermStore::new();
     let dt_sort = Sort::Datatype(ay_core::DatatypeSort::new("Option", vec![]));
     let x = terms.mk_var("x", dt_sort);
-    let is_none_x = terms.mk_app(Symbol::Named("is-None".to_string()), vec![x], Sort::Bool);
+    let is_none_x = terms.mk_app(Symbol::named("is-None"), vec![x], Sort::Bool);
 
     let mut solver = DtSolver::new(&terms);
     solver.register_datatype("Option", &["None".to_string(), "Some".to_string()]);
@@ -1110,8 +1098,8 @@ fn test_pop_clears_split_state() {
     let mut terms = TermStore::new();
     let dt_sort = Sort::Datatype(ay_core::DatatypeSort::new("Option", vec![]));
     let x = terms.mk_var("x", dt_sort);
-    let is_none_x = terms.mk_app(Symbol::Named("is-None".to_string()), vec![x], Sort::Bool);
-    let is_some_x = terms.mk_app(Symbol::Named("is-Some".to_string()), vec![x], Sort::Bool);
+    let is_none_x = terms.mk_app(Symbol::named("is-None"), vec![x], Sort::Bool);
+    let is_some_x = terms.mk_app(Symbol::named("is-Some"), vec![x], Sort::Bool);
 
     let mut solver = DtSolver::new(&terms);
     solver.register_datatype("Option", &["None".to_string(), "Some".to_string()]);
@@ -1149,7 +1137,7 @@ fn test_reset_clears_split_state() {
     let mut terms = TermStore::new();
     let dt_sort = Sort::Datatype(ay_core::DatatypeSort::new("Option", vec![]));
     let x = terms.mk_var("x", dt_sort);
-    let is_none_x = terms.mk_app(Symbol::Named("is-None".to_string()), vec![x], Sort::Bool);
+    let is_none_x = terms.mk_app(Symbol::named("is-None"), vec![x], Sort::Bool);
 
     let mut solver = DtSolver::new(&terms);
     solver.register_datatype("Option", &["None".to_string(), "Some".to_string()]);
@@ -1185,7 +1173,7 @@ fn test_collect_statistics_includes_splits() {
     let mut terms = TermStore::new();
     let dt_sort = Sort::Datatype(ay_core::DatatypeSort::new("Option", vec![]));
     let x = terms.mk_var("x", dt_sort);
-    let is_none_x = terms.mk_app(Symbol::Named("is-None".to_string()), vec![x], Sort::Bool);
+    let is_none_x = terms.mk_app(Symbol::named("is-None"), vec![x], Sort::Bool);
 
     let mut solver = DtSolver::new(&terms);
     solver.register_datatype("Option", &["None".to_string(), "Some".to_string()]);
@@ -1212,9 +1200,9 @@ fn test_export_model_snapshots_egraph() {
     let y = terms.mk_var("y", nat.clone());
     let z = terms.mk_var("z", nat.clone());
     let zero = terms.mk_var("zero", nat.clone());
-    let eq_xy = terms.mk_app(Symbol::Named("=".to_string()), vec![x, y], Sort::Bool);
-    let eq_xz = terms.mk_app(Symbol::Named("=".to_string()), vec![x, z], Sort::Bool);
-    let is_succ_y = terms.mk_app(Symbol::Named("is-succ".to_string()), vec![y], Sort::Bool);
+    let eq_xy = terms.mk_app(Symbol::named("="), vec![x, y], Sort::Bool);
+    let eq_xz = terms.mk_app(Symbol::named("="), vec![x, z], Sort::Bool);
+    let is_succ_y = terms.mk_app(Symbol::named("is-succ"), vec![y], Sort::Bool);
 
     let mut solver = DtSolver::new(&terms);
     solver.register_datatype("nat", &["succ".to_string(), "zero".to_string()]);
@@ -1255,8 +1243,8 @@ fn test_export_model_deterministic() {
     let a = terms.mk_var("a", nat.clone());
     let b = terms.mk_var("b", nat.clone());
     let c = terms.mk_var("c", nat.clone());
-    let eq_ab = terms.mk_app(Symbol::Named("=".to_string()), vec![a, b], Sort::Bool);
-    let eq_bc = terms.mk_app(Symbol::Named("=".to_string()), vec![b, c], Sort::Bool);
+    let eq_ab = terms.mk_app(Symbol::named("="), vec![a, b], Sort::Bool);
+    let eq_bc = terms.mk_app(Symbol::named("="), vec![b, c], Sort::Bool);
 
     let mut solver = DtSolver::new(&terms);
     solver.register_datatype("nat", &["succ".to_string(), "zero".to_string()]);

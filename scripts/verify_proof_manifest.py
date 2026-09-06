@@ -202,6 +202,26 @@ def run_checker(checker, cnf, proof, timeout_s):
         wall = time.monotonic() - start
         if ACCEPT_RE.search(out or b""):
             return VERIFIED, wall, proc.returncode, "s VERIFIED UNSAT"
+        # A checker KILLED BY A SIGNAL never reached a verdict, so it cannot
+        # have rejected anything. Popen reports that as a negative returncode.
+        # Measured 2026-08-29: b0abaa97c4663e produced a 36.1 GB proof at the
+        # 5000 s budget and dsr-trim died with rc=-10 after 303 s; the row was
+        # filed `rejected / no output` and would have been counted as a
+        # DISQUALIFYING certificate rejection when in fact the checker crashed.
+        # Fair-budget runs make this routine, not exotic: they emit 18-36 GB
+        # proofs where 1500 s runs emitted megabytes.
+        #
+        # Same principle as the missing-verdict fix (#45): an outcome the
+        # measurement failed to obtain is UNMEASURED, never a bad answer. Both
+        # are non-wins, and both are visible -- but only one of them is an
+        # accusation against the solver.
+        if proc.returncode is not None and proc.returncode < 0:
+            return UNVERIFIED, wall, proc.returncode, (
+                f"checker-killed-by-signal-{-proc.returncode}"
+                f"-after-{wall:.0f}s-on-{os.path.getsize(proof) / 1e9:.1f}GB"
+                if os.path.exists(proof) else
+                f"checker-killed-by-signal-{-proc.returncode}-after-{wall:.0f}s"
+            )
         # The checker ran to completion and did NOT accept. That is a rejection,
         # not an inconvenience: it must never be counted.
         tail = (out or b"").decode("utf-8", "replace").strip().splitlines()

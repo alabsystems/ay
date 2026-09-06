@@ -558,7 +558,7 @@ impl Executor {
     ) -> Option<(TermId, String)> {
         let ctor_name = match self.ctx.terms.get(maybe_ctor) {
             TermData::Var(name, _) => name.clone(),
-            TermData::App(Symbol::Named(name), args) if args.is_empty() => name.clone(),
+            TermData::App(Symbol::Named(name), args) if args.is_empty() => name.clone().to_string(),
             _ => return None,
         };
         let (dt_name, _) = self.ctx.is_constructor(&ctor_name)?;
@@ -1179,7 +1179,7 @@ impl Executor {
     fn ctor_head(&self, t: TermId) -> Option<(String, Vec<TermId>)> {
         if let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(t) {
             if self.ctx.is_constructor(name).is_some() {
-                return Some((name.clone(), args.clone()));
+                return Some((name.clone().to_string(), args.clone()));
             }
         }
         None

@@ -189,6 +189,7 @@ mod farkas_collect;
 mod gomory;
 mod implied_bounds;
 mod implied_interval;
+mod implied_maintenance;
 mod implied_refinement;
 mod implied_row_reasons;
 mod implied_row_recursive;
@@ -229,9 +230,9 @@ pub use types::{
 };
 // Crate-internal imports
 use types::{
-    fractional_part, AtomRef, BoundExplanation, BoundType, ColEntry, DenseIdxSet, DenseU32Set,
-    ErrorKey, ExprInterval, ImpliedBound, InfRational, IntervalEndpoint, ParsedAtomInfo,
-    TableauRow, VarInfo,
+    fractional_part, Antecedent, AtomRef, BoundExplanation, BoundType, ColEntry, DenseIdxSet,
+    DenseU32Set, ErrorKey, ExprInterval, ImpliedBound, InfRational, IntervalEndpoint,
+    ParsedAtomInfo, TableauRow, VarInfo,
 };
 
 /// Lazy reason token for deferred reason materialization (#4919 Phase E, #6617 Phase 3).

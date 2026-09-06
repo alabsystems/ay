@@ -71,7 +71,7 @@ impl Solver {
         let TermData::App(Symbol::Named(name), args) = self.terms().get(candidate) else {
             return None;
         };
-        if !self.native_fun_signatures.contains_key(name) {
+        if !self.native_fun_signatures.contains_key(name.as_str()) {
             return None;
         }
         if args.len() != vars.len()
@@ -87,6 +87,6 @@ impl Solver {
         {
             return None;
         }
-        Some((name.clone(), args.clone(), candidate))
+        Some((name.clone().to_string(), args.clone(), candidate))
     }
 }

@@ -208,7 +208,7 @@ impl WideOverrideCase {
     fn new(arity: usize, shape: WideShape) -> Self {
         let mut terms = TermStore::new();
         let p = terms.mk_var("p", Sort::Bool);
-        let wide = terms.mk_app(Symbol::Named("or".to_string()), vec![p; arity], Sort::Bool);
+        let wide = terms.mk_app(Symbol::named("or"), vec![p; arity], Sort::Bool);
         let (root, surface) = match shape {
             WideShape::Plain => (wide, "p".to_string()),
             WideShape::UnderBinder => (
@@ -239,7 +239,7 @@ impl WideOverrideCase {
                     format!("(and {read_surface} p)")
                 };
                 (
-                    terms.mk_app(Symbol::Named("and".to_string()), conjuncts, Sort::Bool),
+                    terms.mk_app(Symbol::named("and"), conjuncts, Sort::Bool),
                     surface,
                 )
             }

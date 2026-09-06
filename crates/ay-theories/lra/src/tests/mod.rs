@@ -14,13 +14,16 @@ mod bound_interest;
 mod decision_index;
 mod deferred_reason_materialization;
 mod delta_objective;
+mod dirty_row_sweep;
 mod faithfulness_audit;
 mod farkas_optimization;
+mod implied_propagation_entailment;
 mod incremental_bounds;
 mod jit_propagation;
 mod jit_snapshot_persistence;
 mod model_snapshot;
 mod optimality_certificate;
+mod propagation_reason_audit;
 mod warm_simplex_state;
 
 /// Helper: check() may return NeedModelEquality or NeedModelEqualities when

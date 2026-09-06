@@ -391,6 +391,9 @@ fn create_owned_dimacs_proof_file_with_status(
             return Err(dimacs_proof_setup_error(error, cleanup, staging_label));
         }
     };
+    // Armed BEFORE the registry publishes this generation, so no window exists
+    // in which an abandoned staging file or status lock has no owner.
+    arm_abandoned_dimacs_proof_sweep();
     let write_failed = Arc::new(AtomicBool::new(false));
     owned.insert(
         resolved,

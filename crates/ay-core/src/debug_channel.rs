@@ -1047,6 +1047,10 @@ pub struct MiscCliFlags {
     pub xor_allow_large: bool,
     /// `--xor-allow-residual` — allow residual-dominated XOR routing (B41).
     pub xor_allow_residual: bool,
+    /// `--xor-allow-unadmitted` — take the XOR theory route even when almost
+    /// none of the detected rows got a Gaussian matrix (#xor-route-entry
+    /// kill switch; restores the pre-fix behaviour byte-for-byte).
+    pub xor_allow_unadmitted: bool,
     /// `--phase-trace` — dpll phase trace lines (B42 diagnostic).
     pub phase_trace: bool,
     /// `--debug-cert` — certificate-path diagnostics (B42).
@@ -1499,6 +1503,7 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         chc_checked_replay_secs: None,
         xor_allow_large: false,
         xor_allow_residual: false,
+        xor_allow_unadmitted: false,
         // B74: --phase-trace is the carrier; the env fallback (added against
         // a family pattern B72 deleted) is retired with the rest of it.
         phase_trace: false,

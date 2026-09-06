@@ -252,6 +252,9 @@ pub struct HornClause {
     /// in a TLA+ specification. PDR uses this to generate per-action blocking
     /// lemmas and produce action-annotated counterexample traces.
     pub action_id: Option<ActionId>,
+    /// Absolute source-query position assigned when this clause enters a
+    /// problem. Solver-generated non-query clauses leave this unset.
+    pub(crate) source_query_ordinal: Option<usize>,
 }
 
 impl HornClause {
@@ -261,6 +264,7 @@ impl HornClause {
             body,
             head,
             action_id: None,
+            source_query_ordinal: None,
         }
     }
 
@@ -270,6 +274,7 @@ impl HornClause {
             body: ClauseBody::constraint(constraint),
             head: ClauseHead::Predicate(pred, args),
             action_id: None,
+            source_query_ordinal: None,
         }
     }
 
@@ -279,12 +284,24 @@ impl HornClause {
             body,
             head: ClauseHead::False,
             action_id: None,
+            source_query_ordinal: None,
         }
     }
 
     /// Tag this clause with an action identifier for per-action invariant discovery.
     pub fn with_action(mut self, action: ActionId) -> Self {
         self.action_id = Some(action);
+        self
+    }
+
+    /// Fill unset source provenance from a clause used to derive this one.
+    ///
+    /// Keeping already-set fields lets rewrites with multiple semantic sources
+    /// retain, for example, an action from a defining clause and a query ordinal
+    /// from the goal clause that the definition was unfolded into.
+    pub(crate) fn with_inherited_provenance(mut self, source: &Self) -> Self {
+        self.action_id = self.action_id.or(source.action_id);
+        self.source_query_ordinal = self.source_query_ordinal.or(source.source_query_ordinal);
         self
     }
 

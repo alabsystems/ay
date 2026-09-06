@@ -770,12 +770,18 @@ impl<'a> Translator<'a> {
                     .map_err(|e| format!("distinct translation failed: {e}"));
             }
             ("not", [a]) => return Ok(solver.not(*a)),
-            ("and", _) if !targs.is_empty() => {
-                return Ok(fold_binary(&targs, |acc, t| solver.and(acc, t)));
-            }
-            ("or", _) if !targs.is_empty() => {
-                return Ok(fold_binary(&targs, |acc, t| solver.or(acc, t)));
-            }
+            // N-ARY, not a binary fold. `mk_and`/`mk_or` flatten a nested
+            // conjunction/disjunction by cloning and re-canonicalizing the
+            // accumulated argument list, so a left fold over `k` arguments
+            // costs O(k^2 log k) — and it runs BETWEEN the per-node envelope
+            // polls in `translate`, so nothing can interrupt it. Measured on
+            // QF_IDL/13.400.graph.smt2 (one 1.2 MB `and` of ~35k conjuncts):
+            // the fold ate the remaining 19 s of a 20 s budget inside
+            // `try_and`/`mk_and` (RawVec grow) and the wrapper hard-killed the
+            // solve after the SAT core had already refuted it at 3 s. One
+            // n-ary call flattens once; the result is the same canonical term.
+            ("and", _) if !targs.is_empty() => return Ok(solver.and_many(&targs)),
+            ("or", _) if !targs.is_empty() => return Ok(solver.or_many(&targs)),
             ("=>", [a, b]) => return Ok(solver.implies(*a, *b)),
             ("xor", [a, b]) => return Ok(solver.xor(*a, *b)),
             ("ite", [c, a, b]) => return Ok(solver.ite(*c, *a, *b)),

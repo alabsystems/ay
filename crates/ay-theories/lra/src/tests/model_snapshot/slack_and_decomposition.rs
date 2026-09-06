@@ -496,7 +496,12 @@ fn test_collect_row_reasons_dedup_handles_long_explanation_chain_issue_6617() {
             strict: false,
             row_idx: idx,
             explanation: Some(BoundExplanation {
-                contributing_vars: smallvec::smallvec![(var_ids[idx - 1], false)],
+                contributing_vars: smallvec::smallvec![Antecedent {
+                    var: var_ids[idx - 1],
+                    used_upper: false,
+                    strict: false,
+                    value: Rational::from((idx - 1) as i32),
+                }],
             }),
         });
     }

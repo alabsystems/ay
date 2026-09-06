@@ -549,7 +549,7 @@ fn test_instance_term_bytes_tracks_interning_with_heap_accounting() {
     assert_eq!(store.len(), len_before_y + 1);
     let len_before_app = store.len();
     let before_app = store.instance_term_bytes();
-    let _sum = store.mk_app(Symbol::Named("+".to_string()), vec![x, y], Sort::Int);
+    let _sum = store.mk_app(Symbol::named("+"), vec![x, y], Sort::Int);
     let after_app = store.instance_term_bytes();
     assert_eq!(store.len(), len_before_app + 1);
 

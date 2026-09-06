@@ -28,9 +28,9 @@ fn test_lia_conflict_explanation_soundness_gap11() {
     let three = terms.mk_int(3.into());
 
     // x >= 5 is (>= x 5)
-    let ge_5 = terms.mk_app(Symbol::Named(">=".to_string()), vec![x, five], Sort::Bool);
+    let ge_5 = terms.mk_app(Symbol::named(">="), vec![x, five], Sort::Bool);
     // x <= 3 is (<= x 3)
-    let le_3 = terms.mk_app(Symbol::Named("<=".to_string()), vec![x, three], Sort::Bool);
+    let le_3 = terms.mk_app(Symbol::named("<="), vec![x, three], Sort::Bool);
 
     // Create LIA solver and assert literals
     let mut lia = LiaSolver::new(&terms);
@@ -105,9 +105,9 @@ fn test_lia_integer_bounds_conflict_explanation_gap11() {
     let six = terms.mk_int(6.into());
 
     // x > 5 is (> x 5)
-    let gt_5 = terms.mk_app(Symbol::Named(">".to_string()), vec![x, five], Sort::Bool);
+    let gt_5 = terms.mk_app(Symbol::named(">"), vec![x, five], Sort::Bool);
     // x < 6 is (< x 6)
-    let lt_6 = terms.mk_app(Symbol::Named("<".to_string()), vec![x, six], Sort::Bool);
+    let lt_6 = terms.mk_app(Symbol::named("<"), vec![x, six], Sort::Bool);
 
     let mut lia = LiaSolver::new(&terms);
 

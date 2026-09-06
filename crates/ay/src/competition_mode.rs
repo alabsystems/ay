@@ -11,7 +11,11 @@ use super::{SolveArgs, SAT_COMPETITION_WRAPPER_ENV};
 pub(crate) static COMPETITION_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Whether a benchmark harness requested competition behavior.
-fn competition_env_active() -> bool {
+///
+/// Shared with [`super::build_info::session_log`], so the provenance verbosity a
+/// competition transcript gets can never drift from the set of signals that put
+/// the solver in competition mode.
+pub(crate) fn competition_env_active() -> bool {
     const SIGNALS: &[&str] = &[
         SAT_COMPETITION_WRAPPER_ENV,
         "AY_COMPETITION",

@@ -102,11 +102,131 @@ const MAX_DENSE_TABLEAU_ENTRIES: usize = 85_000_000;
 /// [`MAX_DENSE_TABLEAU_ENTRIES`]. Three PB25 `pbfvmc-formulae/hw32` instances
 /// (10_272 / 10_432 / 11_744 variables) were refused UNREAD at [`MAX_VARS`]
 /// while the tier that could have certified them was never consulted.
+///
+/// # These three were MEASURED against raising them, 2026-09-01. Do not.
+///
+/// The obvious next move is to finish the job the prose above starts: the tier
+/// that would actually run these models admits 50k/50k/2M, so make the
+/// certificate path admit that too, and split the conflated row cap (this
+/// `CERT_MAX_ROWS` counts constraint rows PLUS one box row per variable, while
+/// the tier counts constraint rows only — it carries the box as variable
+/// BOUNDS). That was built, frozen and measured against the shipped caps. It is
+/// a NET LOSS, and the reason is not memory.
+///
+/// WHAT THE CAP COSTS TODAY. On the 87-pair `3-SEARCH-PROOF-GAP` bucket
+/// (`census/probe-r2-2026-08-31`, 50 distinct instances), **18** never reach
+/// node one: `model-too-large(MAX_VARS=20000,measured=21101..21883)` on eight,
+/// `model-too-large(MAX_ROWS=40000,measured=40690..96409)` on ten. All 18 show
+/// `polls=0/32768` — the LP the route is guided by never runs once. Peak RSS of
+/// the refusal is 55.9–460.3 MiB, and it is NOT what the cap is protecting.
+///
+/// WHAT RAISING IT BUYS, AND COSTS. Every row below is one call of an
+/// UNSCHEDULED rung — it never consults the caller's clock — measured with one
+/// frozen probe per arm, one solve at a time, load recorded beside each row:
+///
+/// ```text
+///   instance          vars  s.rows  SHIPPED CAPS              CAPS RAISED TO THE TIER'S
+///   KE_450_009      20,023     372  certified 71,145,872 B    certified 902,662 B in 6.1 s
+///                                     in 431.6 s                (78.8x smaller, 71x faster)
+///   hw64-vm99p      45,696   1,556  certified 761,527 B       NO VERDICT, killed at 600 s
+///                                     in 0.5 s
+///   n3div36         22,120   4,484  no proof, 5.7 s           no proof, 335.9 s (59x)
+///   single-obj-f50  11,298  40,690  declines in 19.6 s        NO VERDICT, killed at 600 s
+///   f20c10b_011     13,304  43,326  declines in  3.4 s        NO VERDICT, killed at 1,240 s
+/// ```
+///
+/// One win, four losses, and the second row is the one that settles it: on
+/// `hw64-vm99p` the REFUSAL IS WHAT MAKES THE CERTIFICATE. With `lp=model-too-
+/// large` the tree falls back to ancestor-guided branching and closes 65 leaves
+/// by exact arithmetic in half a second (129 nodes, `polls=0/32768`, 761,527 B,
+/// `s VERIFIED BOUNDS 64 <= obj <= 64` under THE PIN). Hand the same tree an LP
+/// and it spends the whole poll budget and returns nothing. A bigger cap is not
+/// a superset of a smaller one here.
+///
+/// AND THE CONTROL SAYS THE CAP IS NOT WHAT PROTECTS US. `opm2-z7-s2` (2,023
+/// vars, 31,798 structural rows) is admitted BY THESE CAPS AS SHIPPED and
+/// already runs past 700 s in one call without returning. So the multi-minute
+/// hole is reachable inside the caps today: what is missing is not a smaller
+/// number here but a wall-aware budget in `certified_bb`, whose only bound is a
+/// poll COUNT (`MAX_TOTAL_LP_POLLS`) whose cost per poll grows with the row
+/// count. Until that exists, moving these three numbers trades certificates for
+/// stalls in both directions.
+///
+/// THE 18 ARE THEREFORE DOCUMENTED-EXCLUDED, NOT SILENTLY REFUSED. Grouped by
+/// the cap each one actually trips — `MAX_VARS` is tested first, so a model
+/// over both is refused on vars and its row count never reaches the row gate:
+///
+/// ```text
+///   MAX_VARS (8):  seven *.cudf.trendy  21,101-21,106 vars (100,032-100,050 rows)
+///                  single-obj-f53       21,883 vars      (63,749 rows)
+///   MAX_ROWS (10): three *.cudf.paranoid  96,403-96,409 rows (19,768-19,770 vars)
+///                  five 50-250-false-45-90-4-*opt
+///                                        61,821-63,877 rows (2,025 vars)
+///                  f20c10b_011           43,326 rows        (13,304 vars)
+///                  single-obj-f50        40,690 rows        (11,298 vars)
+/// ```
+///
+/// Seventeen of the eighteen carry an LP gap of 80 to 1.5e12 objective units
+/// against a 4,096-node budget, so no dual point admitted here could close them
+/// either. The ONE exception is `f20c10b_011`, whose gap is 1 — and it is also
+/// one of the two the raise admits (the other, `single-obj-f50`, has a gap of
+/// 100,423,456). Both are the two measured above, and both went from a seconds-
+/// long decline to no verdict at all. The upside worth chasing is
+/// `KE_450_009`'s 78.8x, and the way to get it is to run the tree BOTH ways and
+/// keep the smaller proof — not to widen a box that also deletes `hw64-vm99p`.
 const CERT_MAX_VARS: usize = 20_000;
-/// Row cap for the certificate path. Rows are constraints PLUS one box row per
-/// variable, so it must clear `CERT_MAX_VARS` with room for the constraints.
+/// Row cap for the certificate path.
+///
+/// THE SAME NUMBER IS APPLIED TO THREE DIFFERENT QUANTITIES, and knowing which
+/// one refused a model is the difference between a correct fix and a no-op:
+///
+/// ```text
+///   build_diagnosed, first gate   constraints.len()          CONSTRAINT ROWS ONLY
+///   LpSizeCaps::decline, split    rows.len() after splitting >= constraints.len()
+///   LpSizeCaps::decline, +box     rows.len() + one per var   constraints + n
+/// ```
+///
+/// The FIRST is the one that refuses every model in the measured exclusion list
+/// above: all ten `MAX_ROWS` decliners report `measured` equal to their
+/// constraint count (`single-obj-f50` 40,690, `f20c10b_011` 43,326), with the
+/// box rows never reached. So a raise to just above a model's CONSTRAINT count
+/// admits it, whatever its variable count adds later — which is why the guard
+/// test below asserts on `40_690` and `43_326` directly and not on
+/// `vars + rows`.
+///
+/// It must still clear `CERT_MAX_VARS` with room for the constraints, because
+/// the third use adds one box row per variable. (That conflation is real — the
+/// tier downstream counts constraint rows only, carrying the box as variable
+/// BOUNDS — and separating it was measured; see [`CERT_MAX_VARS`] for why it
+/// did not land.)
 const CERT_MAX_ROWS: usize = 40_000;
 /// Nonzero cap for the certificate path (structural entries plus box rows).
+///
+/// SEVEN instances sit outside it and are DOCUMENTED-EXCLUDED rather than
+/// silently refused. Four cross only once the box rows are added, three are
+/// already over on structural entries alone (`census/size-caps-2026-09-01/
+/// data/blast.txt`):
+///
+/// ```text
+///   over by the box entries alone (nonzeros += one per variable):
+///     bnn_mnist_rot_16_label5              399,051 struct + 1,456 box = 400,507
+///     bnn_mnist_back_image_73_label5       399,521 + 1,450 = 400,971
+///     bnn_mnist_7_label9                   399,212 + 1,447 = 400,659
+///     bnn_mnist_back_image_32_label3       399,503 + 1,441 = 400,944
+///   over on structural entries alone:
+///     sp98ar                               426,143
+///     OGR_19                               743,262
+///     neos-544324                        1,757,280
+/// ```
+///
+/// The band between this cap and the tier's own `MAX_NONZEROS` is therefore
+/// POPULATED, not empty: `sp98ar` and `OGR_19` both live in it, and both would
+/// be newly admitted by a 5x raise. Neither has been measured through the
+/// certificate path, so the raise is still not inferable from this corpus — but
+/// the reason is missing measurement, not missing models. (An earlier version
+/// of this comment claimed "nothing measured here saw a model between 353,930
+/// nonzeros and two million", which its own preceding sentence already
+/// contradicted at ~399,000.)
 const CERT_MAX_NONZEROS: usize = 400_000;
 /// Poll cadence, in tableau entries, INSIDE a single Gauss-Jordan pivot. A
 /// pivot rewrites up to `n * (m + n)` entries (order 1e8 on the largest
@@ -4037,6 +4157,73 @@ mod tests {
         // The certificate path admits it; only the DENSE tiers are capped there.
         assert!(
             LpModel::build_diagnosed(&obj, &[], too_many_vars, LpSizeCaps::CERTIFICATE).is_ok()
+        );
+    }
+
+    /// THE CERTIFICATE CAPS ARE HELD DOWN BY MEASUREMENT, NOT BY INERTIA.
+    ///
+    /// Their doc comment reads like an unfinished job — the tier that runs these
+    /// models admits 50k/50k/2M and these say 20k/40k/400k — so the natural
+    /// next edit is to "finish" it. That edit was built, frozen and measured on
+    /// 2026-09-01, and it LOSES certificates: `hw64-vm99p` (45,696 vars, 1,556
+    /// structural rows) certifies in 0.5 s and 761,527 bytes precisely BECAUSE
+    /// the cap refuses its LP — with the LP admitted the same tree returns no
+    /// verdict at all inside 600 s. Two more (`single-obj-f50` 40,690 rows,
+    /// `f20c10b_011` 43,326) go from a 19.6 s and a 3.4 s decline to no verdict
+    /// in 600 s and 1,240 s, in a rung that never consults the caller's clock.
+    /// The one measured win, `KE_450_009` (71,145,872 B in 431.6 s -> 902,662 B
+    /// in 6.1 s), is worth having and is NOT worth having this way.
+    ///
+    /// This test fails if someone raises them, and says which measurement they
+    /// are contradicting. Raise it only with a new measurement that covers those
+    /// four rows, and put the numbers in the doc comment when you do.
+    #[test]
+    fn the_certificate_caps_are_the_measured_ones() {
+        assert_eq!(
+            (CERT_MAX_VARS, CERT_MAX_ROWS, CERT_MAX_NONZEROS),
+            (20_000, 40_000, 400_000),
+            "raising these was measured on 2026-09-01 and lost more certificates \
+             than it gained; see the doc comment on CERT_MAX_VARS"
+        );
+        // The shapes whose behaviour the numbers above are chosen to preserve,
+        // asserted IN THE QUANTITY THE GATE ACTUALLY COMPARES. `build_diagnosed`
+        // tests `num_vars > caps.vars` and then `constraints.len() > caps.rows`
+        // — constraint rows ALONE, before any box row exists. Writing these as
+        // `vars + rows > CERT_MAX_ROWS` (which they were) makes them pass at
+        // CERT_MAX_ROWS = 45_000, where `single-obj-f50` is admitted and, by
+        // this commit's own measurement, returns nothing in 600 s. That is
+        // false assurance aimed at exactly the person who relaxes the
+        // `assert_eq!` above and looks here to see what else must hold.
+        //
+        // `hw64-vm99p` must stay REFUSED: its certificate exists because of
+        // that. It declines on VARS — its 1,556 constraint rows are far under
+        // the row cap, so no row-cap assertion describes its refusal at all.
+        assert!(
+            45_696 > CERT_MAX_VARS,
+            "hw64-vm99p (45,696 vars) must be refused UNREAD: admitted, the same \
+             tree returns no verdict in 600 s, where the refusal certifies it in \
+             0.5 s and 761,527 bytes"
+        );
+        // `single-obj-f50` and `f20c10b_011` must stay REFUSED on their
+        // CONSTRAINT counts: admitted, each ran past ten minutes in one
+        // unscheduled call without a verdict.
+        assert!(
+            40_690 > CERT_MAX_ROWS,
+            "single-obj-f50 has 40,690 constraint rows and that is the number the \
+             gate compares; admitted, it returned nothing in 600 s"
+        );
+        assert!(
+            43_326 > CERT_MAX_ROWS,
+            "f20c10b_011 has 43,326 constraint rows; admitted, it returned nothing \
+             in 1,240 s, against a 3.4 s decline today"
+        );
+        // `opm2-z7-s2` is the CONTROL and stays ADMITTED: it already runs past
+        // 700 s inside these caps, which is why lowering them is not the answer
+        // either — the missing bound is a work-aware one in `certified_bb`.
+        assert!(
+            2_023 <= CERT_MAX_VARS && 31_798 <= CERT_MAX_ROWS,
+            "opm2-z7-s2 (2,023 vars, 31,798 constraint rows) must stay ADMITTED: it \
+             is the evidence that a smaller cap is not the answer either"
         );
     }
 

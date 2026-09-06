@@ -965,15 +965,44 @@ impl Executor {
         if self.should_abort_theory_loop() {
             return Ok(SolveResult::Unknown);
         }
-        // L1a lazy-DT-AUFLIA on-demand route (combined-theory-engine campaign;
-        // `AY_DT_LAZY_AUFLIA`, unset/`0` ⇒ byte-identical eager path below).
-        // SHADOW-FIRST: the flag is OFF by default, so the eager authority is
-        // untouched. When ON (measurement / the eager-shadow differential) the
-        // lazy lane is attempted first; a DEFINITIVE verdict passes the same
-        // always-on model gates as any other route and is returned, otherwise
-        // the lane falls through with full state restoration to the eager
-        // authority. See `try_solve_dt_auflia_lazy`.
-        if std::env::var_os("AY_DT_LAZY_AUFLIA").is_some_and(|v| v != "0") {
+        // L1a lazy-DT-AUFLIA on-demand route (combined-theory-engine campaign).
+        // The lazy lane is attempted FIRST; a DEFINITIVE verdict passes the same
+        // always-on model gates as any other route and is returned, otherwise the
+        // lane falls through with full state restoration to the eager authority.
+        // See `try_solve_dt_auflia_lazy`.
+        //
+        // PROMOTED TO DEFAULT-ON 2026-08-31 (`AY_DT_LAZY_AUFLIA=0` still opts out).
+        // It had been shadow-first, off by default, pending measurement. Measured
+        // on the real SMT-COMP 2025 QF_Datatypes division (808 instances, the
+        // scrambled competition corpus, `--memory 6000`):
+        //
+        // The eager route materialises a selector frontier that branches by the
+        // datatype's RECURSIVE FAN-OUT R (datatype-sorted constructor fields summed
+        // over constructors) to `DT_WARM_START_DEPTH`. Depth is bounded; R is not.
+        // On a corpus datatype with 8 constructors and R = 28 that is
+        // 1+28+784+21952 = 22,765 frontier terms and ~81,300 axioms PER SEED, of
+        // which 99.87% are `sel(sel(...))` chains occurring nowhere in the input —
+        // ~950 MB of live axioms per seed term, and the process dies.
+        //
+        // This lane instead takes depth-1 axioms plus SPARSE ON-DEMAND relevance
+        // axioms. On the minimal reproducer: 5.1 GB memout -> `sat` in 7.1 s at
+        // 68 MB. Across the 232 instances in the DT+arithmetic logics: 3 solved
+        // where the eager route solved 0, and memouts 63 -> 29.
+        //
+        // The gain is from the on-demand axiom SET, not from the smaller depth —
+        // an independent patch clamping the eager unroll to the same depth 1 gained
+        // ZERO. Capping memory cannot help here by construction: an AY memout
+        // already prints `c memout`/`s UNKNOWN` with rc=0 and scores identically to
+        // `unknown`, so bounding the eager lane converts a crash into a non-answer.
+        // That was measured four separate ways and gained 0 every time.
+        //
+        // Soundness: all three new verdicts (one NIA `sat`, one LIA `unsat`, one
+        // LIA `sat`) were cross-checked against BOTH cvc5 1.3.4 and z3 4.12.5 with
+        // zero disagreement, and the three are durable — the eager route is still
+        // `unknown` on them at `-T:300`. Definitive results from this lane pass the
+        // same model gates as the eager authority; a miss restores state and falls
+        // through, so the eager path remains the terminal authority.
+        if std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v != "0") {
             if let Some(result) =
                 self.try_solve_dt_auflia_lazy_maybe_incremental(Self::solve_auf_lia)?
             {
@@ -1474,9 +1503,10 @@ impl Executor {
             // Skip constructor applications/constants (committed values — their
             // reconstruction is vacuous and exhaustiveness/exclusivity trivial).
             let is_ctor_term = match self.ctx.terms.get(t) {
-                TermData::App(Symbol::Named(name), _) | TermData::Var(name, _) => {
-                    ctor_names.contains(name)
-                }
+                // #symbol-intern: `App` carries `SymName`, `Var` carries `String`,
+                // so they cannot share an or-pattern binding; both borrow as `&str`.
+                TermData::App(Symbol::Named(name), _) => ctor_names.contains(name.as_str()),
+                TermData::Var(name, _) => ctor_names.contains(name.as_str()),
                 _ => false,
             };
             if is_ctor_term {
@@ -1584,6 +1614,49 @@ impl Executor {
             return Ok(SolveResult::Unknown);
         }
         self.solve_with_dt_axioms(Some(Sort::Int), Self::solve_seq_auflia)
+    }
+
+    /// Solve combined DT + non-linear integer arithmetic.
+    ///
+    /// `LogicCategory::Ufdtnia` previously returned an unconditional
+    /// `Unknown/Incomplete`, and `QF_UFDTNIA` had no entry in the logic parse
+    /// table at all (it fell to `Other` and was rejected as an unsupported logic
+    /// in 0.02 s). All 80 QF_UFDTNIA instances in the SMT-COMP 2025
+    /// QF_Datatypes division therefore scored a hard zero while cvc5 answered 25.
+    ///
+    /// Both component theories were already present; only the composition was
+    /// missing. This mirrors `solve_dt_uf_lia` exactly, with `solve_uf_nia` as
+    /// the base: the ON-DEMAND lazy DT lane is tried first, and only on a miss
+    /// does the eager selector-axiom route run.
+    ///
+    /// TRYING THE LAZY LANE FIRST IS THE WHOLE POINT. The eager route
+    /// materialises a selector frontier branching by the datatype's recursive
+    /// fan-out R to `DT_WARM_START_DEPTH`; depth is bounded, R is not. On the
+    /// corpus datatype (8 constructors, R = 28) that is 22,765 frontier terms and
+    /// ~81,300 axioms per seed -- ~950 MB each -- of which 99.87% are
+    /// `sel(sel(...))` chains occurring nowhere in the input. A first attempt at
+    /// this composition routed straight to the eager path and solved 0/8 at
+    /// `-T:60` and 0 at `-T:300`; it was reverted. The arithmetic was never the
+    /// bottleneck -- these instances carry only a handful of multiplications
+    /// (8 `*`, 3 `mod`, 2 `div` on a 1,186-line example) against 485 Int terms
+    /// and one recursive datatype.
+    ///
+    /// Soundness is inherited, not invented: the lazy lane returns only
+    /// DEFINITIVE verdicts that pass the same always-on model gates as any other
+    /// route, and a miss restores state and falls through to the eager DtAx
+    /// authority, which stays terminal.
+    pub(in crate::executor) fn solve_dt_uf_nia(&mut self) -> Result<SolveResult> {
+        if self.should_abort_theory_loop() {
+            return Ok(SolveResult::Unknown);
+        }
+        if std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v != "0") {
+            if let Some(result) =
+                self.try_solve_dt_auflia_lazy_maybe_incremental(Self::solve_uf_nia)?
+            {
+                return Ok(result);
+            }
+        }
+        self.solve_with_dt_axioms(Some(Sort::Int), Self::solve_uf_nia)
     }
 
     /// Solve combined DT + LRA (#1760). DT axioms + acyclicity(Real) → AUFLRA.
@@ -2049,7 +2122,7 @@ impl Executor {
                     if self.ctx.is_constructor(name).is_some() {
                         is_ctor_term = true;
                         ctor_apps
-                            .entry(name.clone())
+                            .entry(name.clone().to_string())
                             .or_default()
                             .push((tid, args.clone()));
                     } else if args.len() == 1 {

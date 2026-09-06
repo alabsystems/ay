@@ -84,15 +84,20 @@ mod competition_jit_hot_inputs;
 mod competition_jit_probe;
 mod competition_jit_release;
 mod competition_mode;
+mod compose;
 mod dimacs;
 mod explain;
 mod explain_reason;
 mod features;
 mod firewall_verify;
+mod help_style;
+mod help_topics;
 mod lean_verify;
 mod maxsat_cert;
 mod maxsat_proof;
 mod milp_fastpath;
+#[cfg(unix)]
+mod parent_death;
 mod proof_artifact;
 mod proof_verify;
 mod run;
@@ -306,6 +311,17 @@ pub(crate) fn dimacs_verdict_exit_code(competition_code: i32) -> i32 {
 /// Set by `--progress-json` CLI flag. Read by executor and DIMACS path to
 /// attach [`ay_sat::json_observer::JsonProgressObserver`] to SAT solvers.
 pub(crate) static PROGRESS_JSON_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Destination for `--dump-cnf`: run SAT preprocessing to its initial
+/// fixpoint, write the residual DIMACS there, and exit without searching.
+/// Read by the DIMACS solver runners, which own the only fully-configured
+/// solver every sequential route passes through.
+pub(crate) static DUMP_CNF_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Source assignment for `--extend-model`: preprocess as `--dump-cnf` would,
+/// then replay the reconstruction stack over this assignment to recover a
+/// model of the original formula.
+pub(crate) static EXTEND_MODEL_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// SAT techniques disabled via `--disable` CLI flag (#8331).
 /// Populated once by `run_solve()`. Read by `configure_dimacs_solver()` to
@@ -642,53 +658,30 @@ include!("main/cli_value_types.rs");
     version = build_info::CLAP_VERSION,
     long_version = build_info::CLAP_LONG_VERSION,
     long_about = None,
+    styles = help_style::STYLES,
+    color = help_style::clap_color(),
+    max_term_width = 80,
+    // `ay help` is ours: clap's builtin prints the same screen as `--help`,
+    // whereas ours also serves the long-form topic pages that the 47-line z3
+    // wall moved into. Disabled rather than shadowed, since two subcommands of
+    // the same name is a parser ambiguity, not an override.
+    disable_help_subcommand = true,
+    // The 47-line z3 wall that used to live here is now `ay help z3`, which can
+    // afford to explain the divergences properly instead of listing spellings.
+    // What stays is the pointer chain: the two facts a reader needs on THIS
+    // screen, and the exact command for each thing they might have come for.
     after_help = "\
 File format auto-detection:\n  \
   .cnf / 'p cnf'      DIMACS CNF (SAT competition format)\n  \
   (set-logic HORN)    CHC (Horn clauses, PDR/IC3 solver)\n  \
   Otherwise           SMT-LIB 2.6\n\n\
-Z3-compatible options (preprocessed before parsing):\n  \
-  -t:N                Timeout in milliseconds\n  \
-  -T:N                Timeout in seconds\n  \
-  -memory:N           Memory limit in megabytes\n  \
-  -smt2               Auto-detected (accepted, dropped)\n  \
-  -dimacs             DIMACS mode (accepted, auto-detected)\n  \
-  -in                 Read from stdin\n  \
-  -file:PATH          Solve PATH\n  \
-  -model              Print model for satisfiable SMT-LIB input\n  \
-  -st                 Print statistics\n  \
-  -nw                 Disable warnings (accepted, dropped)\n  \
-  -v:N                Verbosity level (accepted, dropped)\n  \
-  -p, -pd             List all Z3 5.0.0 parameters\n  \
-  -pm[:NAME]          List Z3 5.0.0 modules or one module's parameters\n  \
-  -pmmd[:NAME]        List modules or one module's parameters as Markdown\n  \
-  -pp:NAME            Describe any Z3 5.0.0 parameter\n  \
-  -tactics[:NAME]     List Z3 5.0.0 tactics or one tactic's parameters\n  \
-  -tacticsmd:NAME     Describe one Z3 5.0.0 tactic as Markdown\n  \
-  -simplifiers[:NAME] List Z3 5.0.0 simplifiers or one simplifier's parameters\n  \
-  -probes             List Z3 5.0.0 probes\n  \
-  --z3-mode           Suppress AY transcript provenance for Z3 comparisons\n  \
-  --                  End option parsing; useful for files named '-...'\n  \
-  timeout=N           Timeout in milliseconds\n  \
-  memory_max_size=N   Memory limit in megabytes\n  \
-  stats=true          Print statistics\n  \
-  dump_models=true, dump-models=true\n  \
-                      Print model for satisfiable SMT-LIB input\n  \
-  ctrl_c=true|false, ctrl-c=true|false\n  \
-                      Accepted interrupt compatibility no-op\n  \
-  type-check=true|false, well-sorted-check=true|false\n  \
-                      Accepted type-check compatibility no-ops\n  \
-  model.v2=true|false, model.compact=true|false,\n  \
-  pp.single-line=true|false, pp.bv-literals=true|false,\n  \
-  pp.fixed-indent=true|false\n  \
-                      Accepted model/pretty-printer compatibility no-ops\n  \
-  trace=true|false    Accepted trace compatibility no-op\n  \
-  trace_file_name=PATH\n  \
-                      Accepted trace-file compatibility no-op\n  \
-  fp.engine=spacer    CHC engine (accepted, dropped)\n  \
-  -?, -version        Help/version aliases\n\n\
-Unsupported Z3 options are rejected explicitly instead of emulated:\n  \
-  -dl, -opb, -log",
+Coming from z3? Your option spellings are accepted -- -t: -T: -memory:\n\
+-in -file: -model -st, the key=value parameters, and the -p/-pm/-pp\n\
+catalogs. `ay help z3` maps them, and names the three places ay\n\
+deliberately differs.\n\n\
+Help topics:  ay help z3 | formats | exit-codes | output\n\
+Commands:     ay commands          Environment:  ay options\n\
+Learn:        ay tutorial",
 )]
 struct Cli {
     #[command(subcommand)]
@@ -698,7 +691,7 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand)]
 enum Command {
-    /// Solve an SMT-LIB2, DIMACS CNF, or CHC formula (default subcommand)
+    /// Solve an SMT-LIB2, DIMACS CNF, or CHC formula (the default)
     Solve(SolveArgs),
     /// Verify DRAT/LRAT proofs
     #[command(subcommand)]
@@ -746,10 +739,10 @@ enum Command {
     Bisect(cmd_bisect::BisectCommand),
     /// Enumerate all satisfying assignments of a DIMACS CNF formula
     Allsat(cmd_allsat::AllSatArgs),
-    /// Emit Model Counting Competition output for exact unweighted MC/PMC CNF
+    /// Count models of a CNF (MC Competition conventions)
     #[command(name = "model-count")]
     ModelCount(cmd_model_count::ModelCountArgs),
-    /// Diagnose a wrong-answer (runs --validate, compares against z3, surfaces --explain)
+    /// Triage a suspected wrong answer against a reference solver
     Diagnose(cmd_diagnose::DiagnoseCommand),
     /// Run the release-readiness gate
     #[command(name = "launch-gate", hide = true)]
@@ -775,13 +768,30 @@ enum Command {
     /// Exercise the closed Unknown-reason and stale-artifact contract
     #[command(name = "unknown-policy-probe", hide = true)]
     UnknownPolicyProbe(cmd_unknown_policy_probe::UnknownPolicyProbeArgs),
+    /// List every command, grouped by purpose
+    Commands,
+    /// List AY_* environment options and what each one does
+    Options,
+    /// Print a help topic, or a command's help
+    ///
+    /// With no argument, lists the topics. `ay help <topic>` prints one of
+    /// them; `ay help <command>` is the same as `ay <command> --help`.
+    Help {
+        /// A topic name, or a command name
+        #[arg(value_name = "TOPIC")]
+        topic: Option<String>,
+    },
 }
 
 include!("main/sat_exit_codes.rs");
 
 /// Arguments for `ay solve` (the default subcommand).
 #[derive(clap::Args, Default)]
-#[command(after_help = "\
+// `after_long_help`, not `after_help`: this block is twenty lines of reference
+// material, and printing it under `-h` is what made the one-screen summary a
+// three-screen scroll. clap shows `after_help` on BOTH screens and
+// `after_long_help` only on `--help`, so naming the long one is the whole fix.
+#[command(after_long_help = "\
 Rigor (--rigor <LEVEL>): how much AY proves and re-checks its OWN answer.
 The verdict is always sound at every level -- AY never publishes a wrong sat/unsat;
 this only controls proof/self-check work, not confidence in the answer.
@@ -810,7 +820,7 @@ struct SolveArgs {
     file: Option<PathBuf>,
 
     /// Read from stdin
-    #[arg(long)]
+    #[arg(long, help_heading = "Input", hide_short_help = true)]
     stdin: bool,
 
     /// Suppress AY's stderr provenance commentary.
@@ -821,7 +831,7 @@ struct SolveArgs {
     /// machine-parsed result stays byte-identical while the human commentary
     /// goes away. Distinct from `--z3-mode`, which reshapes the transcript for
     /// Z3 comparisons.
-    #[arg(short = 'q', long = "quiet")]
+    #[arg(short = 'q', long = "quiet", help_heading = "Output")]
     quiet: bool,
 
     /// Internal compatibility flag for Z3 `-model`.
@@ -833,7 +843,7 @@ struct SolveArgs {
     /// Default AY output keeps richer provenance and diagnostics. This flag
     /// only reshapes visible transcript details for downstream tools that
     /// compare against Z3-style stdout/stderr.
-    #[arg(long = "z3-mode")]
+    #[arg(long = "z3-mode", help_heading = "Compatibility")]
     z3_mode: bool,
 
     /// Exit-code convention for DIMACS verdicts (`z3` or `competition`).
@@ -842,7 +852,12 @@ struct SolveArgs {
     /// compatibility surface is active -- an explicit `--z3-mode`, or an
     /// `argv[0]` of `z3` from a drop-in install -- where it defaults to `z3`
     /// (0 for both). An explicit value here overrides both.
-    #[arg(long = "sat-exit-codes", value_enum)]
+    #[arg(
+        long = "sat-exit-codes",
+        value_enum,
+        help_heading = "Compatibility",
+        hide_short_help = true
+    )]
     sat_exit_codes: Option<SatExitCodes>,
 
     /// Internal compatibility carrier for unsupported Z3 `key=value` params.
@@ -875,21 +890,22 @@ struct SolveArgs {
     unsupported_z3_option: Vec<String>,
 
     /// Force CHC solving mode
-    #[arg(long)]
+    #[arg(long, help_heading = "Input", hide_short_help = true)]
     chc: bool,
 
     /// Force CHC portfolio mode
-    #[arg(long)]
+    #[arg(long, help_heading = "Resources", hide_short_help = true)]
     portfolio: bool,
 
     /// Enable verbose output
-    #[arg(long)]
+    #[arg(long, help_heading = "Output", hide_short_help = true)]
     verbose: bool,
 
-    /// Rigor: how much AY proves and re-checks its OWN answer, on one
-    /// mutually-exclusive ladder (default: standard). The verdict is ALWAYS
+    /// Proof effort: fast, standard, strict, certified
+    ///
+    /// One mutually-exclusive ladder, default `standard`. The verdict is ALWAYS
     /// SOUND at every level — AY never publishes a wrong `sat`/`unsat`; this dial
-    /// controls proof/self-check work, not confidence in the answer.
+    /// controls proof and self-check work, not confidence in the answer.
     ///
     ///   fast       just the answer, like z3 (was --competition): no default
     ///              validation / proof emission / proof re-check. Soundness
@@ -913,7 +929,11 @@ struct SolveArgs {
         alias = "assurance",
         value_enum,
         value_name = "LEVEL",
-        help_heading = "Rigor"
+        help_heading = "Rigor",
+        // The summary line already names the four levels in ladder order,
+        // which is the order that matters; clap's own list repeats them
+        // alphabetically and pushed this row to 149 columns.
+        hide_possible_values = true
     )]
     assurance: Option<CliAssuranceLevel>,
 
@@ -1001,24 +1021,79 @@ struct SolveArgs {
     verify_firewall: bool,
 
     /// Print periodic progress lines to stderr (~5s)
-    #[arg(long)]
+    #[arg(long, help_heading = "Output", hide_short_help = true)]
     progress: bool,
 
     /// Write JSONL progress events to file
-    #[arg(long, value_name = "FILE")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        help_heading = "Output",
+        hide_short_help = true
+    )]
     progress_json: Option<PathBuf>,
 
     /// Timeout in milliseconds
-    #[arg(short = 't', long)]
+    #[arg(short = 't', long, help_heading = "Resources")]
     timeout: Option<u64>,
 
-    /// Memory limit in megabytes (default: auto-detect from physical RAM; 0 = unlimited)
-    #[arg(long)]
+    /// Memory ceiling in megabytes (0 = unlimited)
+    ///
+    /// Default: auto-detected from physical RAM.
+    #[arg(long, help_heading = "Resources")]
     memory: Option<u64>,
 
     /// Parallel portfolio solver threads (DIMACS SAT only)
-    #[arg(long, value_name = "N")]
+    #[arg(
+        long,
+        value_name = "N",
+        help_heading = "Resources",
+        hide_short_help = true
+    )]
     parallel: Option<usize>,
+
+    /// Second engine for a SEQUENTIAL-FALLBACK solve (DIMACS CNF only).
+    ///
+    /// AY solves the original CNF for `--fallback-after` milliseconds. If it
+    /// publishes no verdict, this binary is given the remaining budget on the
+    /// SAME original file. Requires `--timeout`, which is the whole wall clock.
+    ///
+    /// Only the SAT direction is composed. A model returned by the second
+    /// engine is re-checked here against every clause of the original CNF
+    /// before `s SATISFIABLE` is emitted, so it is self-certifying and needs no
+    /// proof. An UNSAT returned by the second engine is DISCARDED and the run
+    /// reports unknown: AY's declared checker cannot read another engine's
+    /// refutation, and an uncertifiable UNSAT is never published.
+    #[arg(
+        long,
+        value_name = "BINARY",
+        requires = "timeout",
+        requires = "fallback_after",
+        hide_short_help = true
+    )]
+    fallback_solver: Option<PathBuf>,
+
+    /// First-stage budget in milliseconds for `--fallback-solver`.
+    #[arg(
+        long,
+        value_name = "MS",
+        requires = "fallback_solver",
+        hide_short_help = true
+    )]
+    fallback_after: Option<u64>,
+
+    /// Extra argument for the `--fallback-solver` binary. Repeatable; passed
+    /// before the instance path, in order. `allow_hyphen_values` is what makes
+    /// `--fallback-arg --time=300` reach the second engine instead of being
+    /// parsed as one of AY's own options.
+    #[arg(
+        long,
+        value_name = "ARG",
+        requires = "fallback_solver",
+        allow_hyphen_values = true,
+        hide_short_help = true
+    )]
+    fallback_arg: Vec<String>,
 
     /// Cube-and-conquer lookahead depth
     #[arg(
@@ -1030,40 +1105,97 @@ struct SolveArgs {
     cube_and_conquer: Option<usize>,
 
     /// Print statistics to stderr
-    #[arg(long, visible_alias = "st")]
+    #[arg(long, visible_alias = "st", help_heading = "Output")]
     stats: bool,
 
+    /// Print every statistics counter, not the curated set
+    ///
+    /// `--stats` prints the counters that answer what a solve spent itself on.
+    /// This prints all of them — every namespaced timer, certificate counter,
+    /// and JIT application counter the engines record — which is what you want
+    /// when profiling a specific subsystem and nothing else. Implies `--stats`.
+    #[arg(long, help_heading = "Output", hide_short_help = true)]
+    stats_full: bool,
+
     /// Print statistics as JSON to stderr
-    #[arg(long)]
+    #[arg(long, help_heading = "Output", hide_short_help = true)]
     stats_json: bool,
 
-    /// Write proof certificate on UNSAT (format inferred from extension)
+    /// When to color output: auto, always, never
+    ///
+    /// `auto` colors a terminal only. NO_COLOR, AY_NO_COLOR, CLICOLOR=0
+    /// and TERM=dumb each turn it off; CLICOLOR_FORCE turns it on, for
+    /// piping into a pager that renders escapes.
+    ///
+    /// Color never touches a verdict. `sat`, `unsat`, `unknown` and
+    /// `s SATISFIABLE` are a machine contract: they stay bare bytes in
+    /// every mode, so a script reads the same thing a terminal shows.
+    //
+    // Authored at width on purpose: clap's `wrap_help` feature is not
+    // enabled (it would pull terminal_size in, against the no-outside-deps
+    // rule), so clap reflows nothing and a long line here reaches the user
+    // exactly as written.
+    #[arg(long, value_name = "WHEN", default_value_t = help_style::ColorWhen::Auto, help_heading = "Output",
+        hide_possible_values = true)]
+    color: help_style::ColorWhen,
+
+    /// Write a proof certificate on UNSAT
+    ///
+    /// The format is inferred from the file extension unless
+    /// `--proof-format` says otherwise.
     ///
     /// Member of the mutually-exclusive `proof_output` group together with the
     /// hidden legacy `--drat`/`--drat-binary`/`--lrat`/`--lrat-binary` flags,
     /// so exactly one proof-output destination can be selected.
-    #[arg(long, value_name = "FILE", group = "proof_output")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        group = "proof_output",
+        help_heading = "Proof verification"
+    )]
     proof: Option<PathBuf>,
 
     /// Proof format (overrides extension; Alethe is unavailable for DIMACS)
-    #[arg(long, value_enum, requires = "proof")]
+    #[arg(
+        long,
+        value_enum,
+        requires = "proof",
+        help_heading = "Proof verification",
+        hide_short_help = true
+    )]
     proof_format: Option<CliProofFormat>,
 
-    /// Declared external checker for the emitted DIMACS proof (capability
-    /// axis, not a format). Default dsr-trim: the verified SR chain, so the
-    /// SR-witnessed symmetry routes stay enabled — the historical behaviour.
-    /// `veripb` keeps them enabled on the pseudo-Boolean surface and is what
-    /// the SAT-COMP submission declares (with `--proof-format veripb`). Any
-    /// declaration that cannot verify a substitution witness on the LIVE
-    /// surface — dpr-trim, drat-trim, gratgen, or a mismatch like `drat` +
-    /// `veripb` — disables those routes with a clean plain-CDCL fallback, so
-    /// the run can never emit a proof its own declared checker rejects.
-    #[arg(long, value_enum)]
+    /// Which external checker the proof must satisfy [default: dsr-trim]
+    ///
+    /// A capability axis, not a format: it declares what will re-check the
+    /// proof, and ay then restricts itself to steps that checker accepts.
+    ///
+    /// `dsr-trim` is the verified SR chain, which keeps the SR-witnessed
+    /// symmetry routes enabled. `veripb` keeps them enabled on the
+    /// pseudo-Boolean surface and is what the SAT-COMP submission declares,
+    /// paired with `--proof-format veripb`.
+    ///
+    /// Declare a checker that cannot verify a substitution witness on the live
+    /// surface — dpr-trim, drat-trim, gratgen, or a mismatch such as `drat`
+    /// with `veripb` — and those routes are disabled, falling back to plain
+    /// CDCL. The run can then never emit a proof its own declared checker
+    /// would reject.
+    #[arg(
+        long,
+        value_enum,
+        help_heading = "Proof verification",
+        hide_short_help = true
+    )]
     proof_checker: Option<CliProofChecker>,
 
     /// Write binary DRAT/LRAT proof (with --proof).
     /// SMT Alethe and CHC certificate routes reject binary output.
-    #[arg(long, requires = "proof")]
+    #[arg(
+        long,
+        requires = "proof",
+        help_heading = "Proof verification",
+        hide_short_help = true
+    )]
     proof_binary: bool,
 
     /// Write a Lean 4 proof-artifact-v1 JSON envelope for a DIMACS/SMT proof.
@@ -1096,44 +1228,64 @@ struct SolveArgs {
     /// certified only after its intended checker accepts it. Pass `--no-proof`
     /// to suppress the default (e.g. when proof I/O adds benchmark overhead),
     /// or select an explicit `--proof FILE`; clap rejects combining the two.
-    #[arg(long, help_heading = "Proof verification", conflicts_with = "proof")]
+    #[arg(
+        long,
+        help_heading = "Proof verification",
+        conflicts_with = "proof",
+        hide_short_help = true
+    )]
     no_proof: bool,
 
-    /// Re-check the emitted proof after UNSAT using the built-in DRAT/LRAT
-    /// checker. If no `--proof` path is given for DIMACS, a temporary DRAT file
-    /// is written and deleted after verification. Default: ON in all builds
-    /// (batteries included), turned off by `--no-verify-proof` or
-    /// `--competition`; an explicit proof opt-out (`--no-proof` / `--z3-mode`)
-    /// also suppresses the temp-proof synthesis this implies (re-checking a
-    /// certificate the user declined is incoherent, and the synthesis enables
-    /// costly in-solver proof tracking). A rejected explicitly required proof
-    /// is an error (exit code 1); failure of an opportunistic synthesized
-    /// default proof warns and preserves the solver verdict unless
-    /// `--strict-proofs` or `--self-check` makes certification mandatory.
-    /// Explicit `--verify-proof` is rejected for SMT-LIB/Alethe and CHC inputs
-    /// because this checker supports DIMACS DRAT/LRAT only; it is never
-    /// silently treated as verification.
-    #[arg(long, help_heading = "Proof verification")]
+    /// Re-check the emitted proof after UNSAT (on by default)
+    ///
+    /// Uses the built-in DRAT/LRAT checker. For DIMACS with no `--proof` path,
+    /// a temporary DRAT file is written and deleted after the check.
+    ///
+    /// Turned off by `--no-verify-proof` or `--competition`. An explicit proof
+    /// opt-out (`--no-proof`, `--z3-mode`) also suppresses the temporary proof
+    /// this would otherwise synthesize: re-checking a certificate the user
+    /// declined is incoherent, and the synthesis turns on costly in-solver
+    /// proof tracking.
+    ///
+    /// When a check fails, what happens depends on who asked for the proof.
+    /// A proof you requested and ay could not verify is an error (exit 1). A
+    /// proof ay synthesized on its own initiative warns and keeps the solver's
+    /// verdict — unless `--rigor strict` or `--rigor certified` made
+    /// certification mandatory, which is exactly what those levels mean.
+    ///
+    /// Rejected for SMT-LIB/Alethe and CHC input: this checker reads DIMACS
+    /// DRAT/LRAT only. It is refused rather than quietly treated as verified.
+    #[arg(long, help_heading = "Proof verification", hide_short_help = true)]
     verify_proof: bool,
 
     /// Explicitly disable `--verify-proof`.
     #[arg(
         long,
         help_heading = "Proof verification",
-        conflicts_with = "verify_proof"
+        conflicts_with = "verify_proof",
+        hide_short_help = true
     )]
     no_verify_proof: bool,
 
-    /// After emitting a Lean4 proof via `--proof FILE.lean4`, invoke the pinned
-    /// Lean project to check its `AySoundness.lratCheck_sound` theorem.
-    /// This is a stricter variant of `--verify-proof`: rather than using ay's
-    /// built-in DRAT/LRAT checker, it routes the input-bound UNSAT theorem
-    /// through the embedded soundness project and its pinned toolchain; the authenticated descriptor route is currently Linux-only.
-    /// Requires `--proof FILE.lean4` (or `--proof-format lean4`). Exit codes:
-    /// 20 only when Lean accepts the proof; 2 when Lean rejects it, cannot run,
-    /// or the requested proof is not Lean4. An unfulfilled explicit kernel
-    /// check never publishes UNSAT.
-    #[arg(long, help_heading = "Proof verification", requires = "proof")]
+    /// Have Lean's kernel check the emitted Lean4 proof
+    ///
+    /// A stricter `--verify-proof`: instead of ay's own DRAT/LRAT checker, the
+    /// input-bound UNSAT theorem goes through the embedded soundness project
+    /// and its pinned toolchain, which checks
+    /// `AySoundness.lratCheck_sound`. The authenticated descriptor route is
+    /// Linux-only today.
+    ///
+    /// Requires `--proof FILE.lean4`, or `--proof-format lean4`.
+    ///
+    /// Exit codes: 20 only when Lean ACCEPTS the proof; 2 when Lean rejects
+    /// it, cannot run, or the requested proof is not Lean4. An explicit kernel
+    /// check that did not happen never publishes UNSAT.
+    #[arg(
+        long,
+        help_heading = "Proof verification",
+        requires = "proof",
+        hide_short_help = true
+    )]
     lean_verify: bool,
 
     /// Compatible `lean` override (default: pinned `lake env lean`; Lake is required).
@@ -1141,7 +1293,8 @@ struct SolveArgs {
         long,
         value_name = "PATH",
         help_heading = "Proof verification",
-        requires = "lean_verify"
+        requires = "lean_verify",
+        hide_short_help = true
     )]
     lean_path: Option<PathBuf>,
 
@@ -1155,7 +1308,7 @@ struct SolveArgs {
     replay: Option<PathBuf>,
 
     /// Line-by-line stdin (for incremental solvers)
-    #[arg(long)]
+    #[arg(long, help_heading = "Input", hide_short_help = true)]
     incremental: bool,
 
     /// Disable SAT techniques (comma-separated)
@@ -1277,7 +1430,7 @@ struct SolveArgs {
     /// For UNSAT: explains which constraints conflict and why, and emits a
     /// stable reason code classifying *why* UNSAT was derived (preprocessing,
     /// theory conflict, unit propagation, ...).
-    #[arg(long, help_heading = "Explainability")]
+    #[arg(long, help_heading = "Explainability", hide_short_help = true)]
     explain: bool,
 
     /// Output format for the `--explain` reason-code block.
@@ -1286,7 +1439,7 @@ struct SolveArgs {
     /// `json` emits a single-line JSON object suitable for tooling consumers
     /// and suppresses the rich English block — only the reason-code JSON is
     /// printed on stdout after `unsat`.
-    #[arg(long, value_enum, default_value_t = CliExplainFormat::Plain, help_heading = "Explainability")]
+    #[arg(long, value_enum, default_value_t = CliExplainFormat::Plain, help_heading = "Explainability", hide_short_help = true)]
     explain_format: CliExplainFormat,
 
     /// Render recognized SAT solutions as `ascii` (default) or `svg`.
@@ -1301,11 +1454,11 @@ struct SolveArgs {
         default_missing_value = "ascii",
         value_name = "FORMAT",
         help_heading = "Explainability"
-    )]
+    , hide_short_help = true)]
     visualize: Option<CliVisualizationFormat>,
 
     /// Print build features and supported logics (JSON)
-    #[arg(long)]
+    #[arg(long, help_heading = "Output", hide_short_help = true)]
     features: bool,
 
     // -- Theory feature disable flags --
@@ -1411,6 +1564,31 @@ struct SolveArgs {
         hide_long_help = true
     )]
     dump_encoding: Option<PathBuf>,
+
+    /// Run SAT preprocessing to its initial fixpoint, write the residual
+    /// formula to FILE as DIMACS, and exit without searching. The dump is
+    /// equisatisfiable with the input and keeps the input's variable
+    /// numbering (eliminated variables become holes).
+    #[arg(
+        long,
+        value_name = "FILE",
+        help_heading = "Explainability",
+        hide_short_help = true,
+        hide_long_help = true
+    )]
+    dump_cnf: Option<PathBuf>,
+
+    /// Lift an assignment over a `--dump-cnf` formula back to a model of this
+    /// input by replaying AY's reconstruction stack. FILE holds whitespace- or
+    /// `v`-line-separated DIMACS literals (a downstream solver's model).
+    #[arg(
+        long,
+        value_name = "FILE",
+        help_heading = "Explainability",
+        hide_short_help = true,
+        hide_long_help = true
+    )]
+    extend_model: Option<PathBuf>,
 
     // NOTE (#8833): `--annotated-core`, `--model-provenance`, and
     // `--core-evolution` were previously declared here but never consumed
@@ -1575,7 +1753,9 @@ struct SolveArgs {
     )]
     kind_dump_dir: Option<PathBuf>,
 
-    /// SAT solver variant for DIMACS input: default, aggressive, minimal, probe
+    /// SAT variant for DIMACS input
+    ///
+    /// One of: default, aggressive, minimal, probe.
     #[arg(long, value_name = "VARIANT", help_heading = "SAT primary path")]
     sat_variant: Option<String>,
 
@@ -1711,6 +1891,13 @@ fn abandon_unfinished_bv_cnf_export(reason: &str) -> bool {
 }
 
 fn hard_timeout_fallback_exit() -> ! {
+    // This is the ONE place both the global-timeout watchdog and the SIGTERM
+    // handler converge on, and it ends in `process::exit` — which runs no
+    // destructor on any thread. A composed run (`--fallback-solver`) may have a
+    // second engine live at this instant, and its RAII guard is one of the
+    // destructors that will be skipped, so reap it here or orphan it. No-op
+    // when no stage child is running, which is every non-composed run.
+    compose::kill_live_stage_child();
     let sat_competition_wrapper = sat_competition_wrapper_timeout_policy();
     let export_abandoned = abandon_unfinished_bv_cnf_export("hard timeout or termination");
     if !export_abandoned && !VERDICT_PRINTED.swap(true, Ordering::SeqCst) {
@@ -2472,6 +2659,8 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "scripts",
     "unknown-policy-probe",
     "help",
+    "commands",
+    "options",
 ];
 
 /// Internal env var used by the solve-session provenance wrapper.
@@ -2590,6 +2779,38 @@ fn solve_z3_mode_requested(processed: &[String]) -> bool {
         .skip(2)
         .take_while(|arg| arg.as_str() != "--")
         .any(|arg| arg.as_str() == "--z3-mode")
+}
+
+/// Latch `--color <WHEN>` before anything prints.
+///
+/// Mirrors [`solve_quiet_requested`] and [`solve_z3_mode_requested`], and exists
+/// for a sharper version of their reason: the FIRST thing a bad invocation
+/// prints is a clap error, and the first thing `--help` prints is the help
+/// screen — both of which style themselves. Waiting for the parsed args would
+/// leave exactly those two screens deciding color differently from every screen
+/// after them.
+///
+/// Scans the raw spelling rather than asking clap, since clap has not run yet.
+/// Both `--color never` and `--color=never` are accepted because both are what
+/// people type; an unrecognized value is left alone for clap to reject with a
+/// proper error naming the valid ones.
+fn latch_color_choice(processed: &[String]) {
+    let mut args = processed.iter().skip(1).take_while(|a| a.as_str() != "--");
+    while let Some(arg) = args.next() {
+        let value = match arg.as_str() {
+            "--color" => args.next().map(String::as_str),
+            other => other.strip_prefix("--color="),
+        };
+        let Some(value) = value else { continue };
+        let when = match value {
+            "always" => help_style::ColorWhen::Always,
+            "never" => help_style::ColorWhen::Never,
+            "auto" => help_style::ColorWhen::Auto,
+            _ => continue,
+        };
+        help_style::set_color_when(when);
+        return;
+    }
 }
 
 fn maybe_print_solve_full_help(processed: &[String]) -> bool {
@@ -3550,9 +3771,11 @@ fn solve_session_crash_description(status: &std::process::ExitStatus) -> Option<
 }
 
 /// Emit a session provenance marker (`c ay.session.start` / `c ay.session.end`)
-/// to stderr, unless `-q`/`--quiet` or `--z3-mode` is active. Centralizes the
-/// commentary gate for every supervisor emission site; stdout/proof/exit-code
-/// paths are never touched.
+/// to stderr, unless `-q`/`--quiet`, `--z3-mode`, or `AY_SESSION_LOG=off` is
+/// active. Centralizes the commentary gate for every supervisor emission site;
+/// stdout/proof/exit-code paths are never touched. The marker's verbosity —
+/// compact by default, full under any competition signal — is
+/// [`build_info::session_log`]'s decision, not this gate's.
 ///
 /// `--z3-mode` suppresses the marker rather than skipping supervision. z3 writes
 /// nothing to stderr on a normal run, and these markers are precisely the AY
@@ -3562,9 +3785,60 @@ fn solve_session_crash_description(status: &std::process::ExitStatus) -> Option<
 /// cost of turning every crash on the Z3-compatible path into a lost answer,
 /// which is the path every benchmark harness actually runs.
 fn eprint_session_marker(marker: String) {
-    if !quiet_enabled() && !Z3_MODE_ENABLED.load(Ordering::Relaxed) {
-        safe_eprintln!("{marker}");
+    if quiet_enabled() || Z3_MODE_ENABLED.load(Ordering::Relaxed) {
+        return;
     }
+    if build_info::session_log() == build_info::SessionLog::Off {
+        return;
+    }
+    if INTERACTIVE_START_SCREEN.load(Ordering::Relaxed) {
+        return;
+    }
+    safe_eprintln!("{marker}");
+}
+
+/// Set when this invocation will open the interactive start screen, whose first
+/// line already states the version, build increment and date.
+///
+/// The markers exist so a CAPTURED transcript can be traced back to a binary.
+/// On the start screen nothing is being captured — a human is watching — and a
+/// 116-character machine line above a screen designed to be read is noise that
+/// says nothing the screen does not already say.
+pub(crate) static INTERACTIVE_START_SCREEN: AtomicBool = AtomicBool::new(false);
+
+/// Decide, before the supervisor prints anything, whether this run is the
+/// interactive start screen.
+///
+/// FAILS SAFE IN ONE DIRECTION ONLY. Provenance is audit-load-bearing — a
+/// competition transcript is evidence — so every uncertainty resolves toward
+/// PRINTING the marker. All three streams must be terminals (any redirection
+/// anywhere means something is capturing, so the marker stays), no input file
+/// may be named, and none of the flags that mean "not a human session" may be
+/// present. A file argument is recognized by EXISTING on disk, so a flag value
+/// such as `--timeout 100` is never mistaken for one, and an unreadable path
+/// counts as a file and keeps the marker.
+fn interactive_start_screen_expected(processed: &[String]) -> bool {
+    use std::io::IsTerminal;
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() || !io::stderr().is_terminal() {
+        return false;
+    }
+    if std::env::var_os("AY_PLAIN_REPL").is_some_and(|v| !v.is_empty() && v != "0") {
+        return false;
+    }
+    for arg in processed.iter().skip(1) {
+        if arg == "--" {
+            return false;
+        }
+        match arg.as_str() {
+            "--incremental" | "-in" | "--stdin" | "--z3-mode" => return false,
+            _ => {}
+        }
+        // A path that exists is an input; ay is solving it, not opening a session.
+        if !arg.starts_with('-') && arg != "solve" && FsPath::new(arg).exists() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Observe a reaped solve-session child (however it was born — `fork` or re-exec)
@@ -3724,6 +3998,12 @@ enum ForkSupervise {
 fn fork_supervised_solve_session(start: Instant) -> ForkSupervise {
     use std::os::unix::process::ExitStatusExt;
 
+    // Death pipe, created BEFORE the fork so both sides hold their end from the
+    // child's first instruction: the child terminates itself when this parent dies
+    // for ANY reason — SIGKILL included, the one case the signal reaper below can
+    // never cover. See `parent_death`.
+    let death_pipe = parent_death::create();
+
     // Block the external control signals ACROSS the fork so there is no window in
     // which the child exists but the parent's reaper is not yet installed; a signal
     // arriving in that window stays pending and is handled once the parent unblocks.
@@ -3742,6 +4022,11 @@ fn fork_supervised_solve_session(start: Instant) -> ForkSupervise {
             // Restore the inherited signal mask so the solve sees normal dispositions
             // (cooperative SIGTERM shutdown etc.) exactly as the re-exec'd child does.
             ay_sys::supervisor::restore_sigmask(&saved_mask);
+
+            // Keep only the read end of the death pipe (closing this copy of the
+            // write end) and park the parent-death watchdog on it — while still
+            // single-threaded, before any solve work can start.
+            parent_death::watch_in_forked_child(death_pipe);
 
             // (The peak-RSS arena trim already applied in this process's FIRST
             // allocation and is inherited across the fork via COW — see
@@ -3769,6 +4054,11 @@ fn fork_supervised_solve_session(start: Instant) -> ForkSupervise {
             // Reaper installed: unblock so its handlers can fire on the main thread.
             ay_sys::supervisor::restore_sigmask(&saved_mask);
 
+            // Hold the write end of the death pipe for as long as the child lives
+            // (dropping this copy of the read end, which only the child needs).
+            let death_pipe_writer =
+                death_pipe.map(ay_sys::supervisor::DeathPipe::into_parent_writer);
+
             // Arm a Drop guard that SIGKILLs the child if this function unwinds
             // (panic) before a clean reap — belt-and-suspenders atop the reaper.
             let mut kill_guard = ChildKillGuard::new(pid);
@@ -3794,6 +4084,8 @@ fn fork_supervised_solve_session(start: Instant) -> ForkSupervise {
             // never target a PID the OS may have recycled.
             child_pid.store(0, Ordering::SeqCst);
             kill_guard.disarm();
+            // The child is reaped, so releasing the write end is a no-op for it.
+            drop(death_pipe_writer);
 
             finish_supervised_session(start, &std::process::ExitStatus::from_raw(raw_status));
         }
@@ -3865,6 +4157,12 @@ fn reexec_supervised_solve_session(raw_args: &[String], start: Instant) -> ! {
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
+    // Death pipe: the exec'd child inherits the read end and terminates itself when
+    // this process dies for ANY reason — SIGKILL included. See `parent_death`.
+    #[cfg(unix)]
+    let death_pipe = parent_death::create();
+    #[cfg(unix)]
+    parent_death::configure_reexec_child(&mut command, death_pipe.as_ref());
 
     // Peak-RSS trim: the solve child is where all the real allocation (and thus
     // peak RSS) lives. mimalloc's eager arena reservation can make the committed
@@ -3897,6 +4195,9 @@ fn reexec_supervised_solve_session(raw_args: &[String], start: Instant) -> ! {
     child_pid.store(raw_pid, Ordering::SeqCst);
     #[cfg(unix)]
     let mut kill_guard = ChildKillGuard::new(raw_pid);
+    // Hold the write end of the death pipe until the child has been reaped.
+    #[cfg(unix)]
+    let death_pipe_writer = death_pipe.map(ay_sys::supervisor::DeathPipe::into_parent_writer);
 
     let status = match child.wait() {
         Ok(status) => status,
@@ -3919,6 +4220,8 @@ fn reexec_supervised_solve_session(raw_args: &[String], start: Instant) -> ! {
     child_pid.store(0, Ordering::SeqCst);
     #[cfg(unix)]
     kill_guard.disarm();
+    #[cfg(unix)]
+    drop(death_pipe_writer);
 
     // Classify the wait-status identically to the fork supervisor: crash → sound
     // `unknown`+exit(0), normal exit → propagate the child's real exit code.
@@ -4096,6 +4399,7 @@ fn solve_artifact_path_collision(
         ("replay input", args.replay.as_deref()),
         ("Lean binary", args.lean_path.as_deref()),
         ("solution witness", args.solution_file.as_deref()),
+        ("model to extend", args.extend_model.as_deref()),
     ] {
         if let Some(path) = path {
             read_paths.push((label, comparable_read_path(path)?));
@@ -4111,6 +4415,7 @@ fn solve_artifact_path_collision(
         ("decision trace", args.decision_trace.as_deref()),
         ("trace output", args.trace_file.as_deref()),
         ("encoding dump", args.dump_encoding.as_deref()),
+        ("preprocessed CNF dump", args.dump_cnf.as_deref()),
         ("DRAT proof", args.drat.as_deref()),
         ("binary DRAT proof", args.drat_binary.as_deref()),
         ("LRAT proof", args.lrat.as_deref()),
@@ -4309,7 +4614,7 @@ fn bv_cnf_dump_collision(args: &SolveArgs, dump: &FsPath) -> io::Result<Option<S
     // boundary.  Read-side aliases can be truncated by the export transaction;
     // write-side aliases can replace a finalized certificate after the check.
     let selected_bv_drat = bv_drat.is_some();
-    let explicit_paths: [(&str, Option<&FsPath>); 20] = [
+    let explicit_paths: [(&str, Option<&FsPath>); 21] = [
         ("input", args.file.as_deref()),
         (
             "firewall Lean output directory",
@@ -4330,6 +4635,7 @@ fn bv_cnf_dump_collision(args: &SolveArgs, dump: &FsPath) -> io::Result<Option<S
         ("solution witness", args.solution_file.as_deref()),
         ("trace output", args.trace_file.as_deref()),
         ("encoding dump", args.dump_encoding.as_deref()),
+        ("preprocessed CNF dump", args.dump_cnf.as_deref()),
         (
             "DRAT proof",
             (!selected_bv_drat)
@@ -4912,7 +5218,8 @@ fn run_solve(args: &SolveArgs) {
     // Verbose/stats
     let stats_human = args.stats;
     let stats_cfg = stats_output::StatsConfig {
-        human: stats_human,
+        human: stats_human || args.stats_full,
+        full: args.stats_full,
         json: args.stats_json,
     };
 
@@ -4956,6 +5263,49 @@ fn run_solve(args: &SolveArgs) {
     if args.explain {
         EXPLAIN_ENABLED.store(true, Ordering::SeqCst);
     }
+    // Preprocess-and-dump / model-extension routes. Both stop before search,
+    // so they are incompatible with the multi-solver DIMACS routes, which
+    // never reach the single configured solver they hook.
+    if args.dump_cnf.is_some() || args.extend_model.is_some() {
+        let flag = if args.dump_cnf.is_some() {
+            "--dump-cnf"
+        } else {
+            "--extend-model"
+        };
+        if args.parallel.is_some() || args.cube_and_conquer.is_some() {
+            safe_eprintln!(
+                "Error: {flag} is incompatible with --parallel/--cube-and-conquer; those DIMACS routes do not expose a single preprocessed solver"
+            );
+            std::process::exit(1);
+        }
+        if args.chc || args.portfolio {
+            safe_eprintln!(
+                "Error: {flag} is incompatible with forced CHC/portfolio solving; it operates on one DIMACS formula"
+            );
+            std::process::exit(1);
+        }
+        // Refuse an explicit proof request rather than quietly ignoring it:
+        // these routes stop before any verdict a proof could certify, so the
+        // file would either be absent or — worse — a derivation prefix sitting
+        // at a path a harness reads as a refutation.
+        if args.proof.is_some()
+            || args.drat.is_some()
+            || args.drat_binary.is_some()
+            || args.lrat.is_some()
+            || args.lrat_binary.is_some()
+        {
+            safe_eprintln!(
+                "Error: {flag} is incompatible with proof emission: it stops before any verdict a proof could certify, so the emitted file would prove nothing"
+            );
+            std::process::exit(1);
+        }
+    }
+    if let Some(ref path) = args.dump_cnf {
+        let _ = DUMP_CNF_PATH.set(path.clone());
+    }
+    if let Some(ref path) = args.extend_model {
+        let _ = EXTEND_MODEL_PATH.set(path.clone());
+    }
     // Phase 1 reason-code output format (#8693).
     if matches!(args.explain_format, CliExplainFormat::Json) {
         EXPLAIN_FORMAT_JSON.store(true, Ordering::SeqCst);
@@ -4980,6 +5330,44 @@ fn run_solve(args: &SolveArgs) {
     let timeout_ms = args.timeout;
     if let Some(ms) = timeout_ms {
         set_global_timeout(ms);
+    }
+
+    // Sequential-fallback composed solve. Dispatched here — after the global
+    // watchdog is armed, before anything reads the input — because the driver
+    // is a scheduler, not a solve path: it re-execs THIS binary for the first
+    // stage, so AY's own routes below are reached by that child completely
+    // unchanged, and nothing between here and them is aware the driver exists.
+    // The watchdog stays armed as a backstop only; every deadline the driver
+    // enforces is strictly inside it. Never returns.
+    if let Some(ref fallback_solver) = args.fallback_solver {
+        // clap's `requires` already guarantees both of these are present.
+        let (Some(total_ms), Some(stage1_ms)) = (args.timeout, args.fallback_after) else {
+            safe_eprintln!("Error: --fallback-solver requires --timeout and --fallback-after");
+            std::process::exit(1);
+        };
+        if args.dump_cnf.is_some() || args.extend_model.is_some() {
+            safe_eprintln!(
+                "Error: --fallback-solver is incompatible with the preprocess-only routes; \
+                 those stop before search, so there is no verdict for a fallback to replace"
+            );
+            std::process::exit(1);
+        }
+        let Some(instance) = args.file.clone() else {
+            safe_eprintln!(
+                "Error: --fallback-solver composes two engines on one DIMACS FILE; no input \
+                 file was given"
+            );
+            std::process::exit(1);
+        };
+        compose::run_composed_solve(&compose::ComposeConfig {
+            instance,
+            fallback_solver: fallback_solver.clone(),
+            fallback_args: args.fallback_arg.clone(),
+            stage1_ms,
+            total_ms,
+            raw_args: env::args().collect(),
+            proof_path: args.proof.clone(),
+        });
     }
 
     // Memory limit — auto-detect from physical RAM if not explicitly set (#8600).
@@ -5303,6 +5691,17 @@ fn build_proof_config(args: &SolveArgs) -> Option<ProofConfig> {
     // `trace_config().bv_drat_path`. `bv_drat_path` is only ever set when the
     // CNF dump is also configured (see `trace_config_from_solve_args`).
     if ay_core::trace_config().bv_drat_path.is_some() {
+        return None;
+    }
+    // The preprocess-only routes never publish a verdict that needs a
+    // certificate: `--dump-cnf` writes a formula and `--extend-model` emits a
+    // model. Arming proof emission would stage a proof file, exit before the
+    // sealing epilogue that owns its cleanup, and leave a stray
+    // `.ay-dimacs-proof-*.stage` beside the input — while also paying the
+    // LRAT-tracking cost and changing which preprocessing routes are allowed
+    // to run. An EXPLICIT `--proof` is rejected in `run_solve` rather than
+    // silently dropped; this only suppresses the implicit default.
+    if args.dump_cnf.is_some() || args.extend_model.is_some() {
         return None;
     }
     let artifact_path = args
@@ -5662,6 +6061,15 @@ fn main() {
     }
     let processed = preprocess_args(raw_args.clone());
 
+    // Before ANY screen renders — help, a clap error, a topic page — so every
+    // one of them makes the same color decision.
+    latch_color_choice(&processed);
+    // Before the supervisor's `c ay.session.start`, which is the whole point:
+    // the start screen states the build identity itself.
+    if interactive_start_screen_expected(&processed) {
+        INTERACTIVE_START_SCREEN.store(true, Ordering::SeqCst);
+    }
+
     if maybe_print_solve_full_help(&processed) {
         return;
     }
@@ -5692,6 +6100,10 @@ fn main() {
     // invocation never faults here — the fork child has no such env and already
     // handled the hook upstream.
     if env::var_os(SESSION_PROVENANCE_CHILD_ENV).is_some() {
+        // Re-exec'd solve child: adopt the death pipe the supervisor handed down
+        // BEFORE anything can spawn a thread or a process (see `parent_death`).
+        #[cfg(unix)]
+        parent_death::adopt_in_reexec_child();
         maybe_inject_test_child_fault();
     }
 
@@ -5770,6 +6182,22 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        Some(Command::Commands) => {
+            help_topics::print_commands();
+            let _ = io::stdout().flush();
+        }
+        Some(Command::Options) => {
+            help_topics::print_options();
+            let _ = io::stdout().flush();
+        }
+        Some(Command::Help { topic }) => {
+            let code = help_topics::print(topic.as_deref());
+            let _ = io::stdout().flush();
+            let _ = io::stderr().flush();
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Some(Command::CompetitionJit(cmd)) => {
             if let Err(e) = cmd_competition_jit::run(cmd) {
                 safe_eprintln!("Error: {e:#}");

@@ -291,7 +291,7 @@ impl Solver {
                 // rewritten actuals.
                 let matched = match &symbol {
                     Symbol::Named(name) => fun_map
-                        .get(name)
+                        .get(name.as_str())
                         .filter(|&&(_, arity)| arity == new_args.len())
                         .copied(),
                     Symbol::Indexed(_, _) => None,

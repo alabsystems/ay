@@ -36,21 +36,29 @@ fn main() {
     let start = std::time::Instant::now();
     let proof = ay_pb_core::proof::certify_opt_lin_certified_bb(&instance, &incumbent, optimum);
     let ms = start.elapsed().as_millis();
-    // The diagnosis re-runs the search. That is the price of reporting the
-    // COUNTS the budgets are expressed in, and this is a probe, so it is worth
-    // paying on both paths rather than only on the failing one.
-    let diagnosis = ay_pb_core::proof::certified_bb_diagnosis(&instance, &incumbent, optimum);
-    match proof {
+    // THE ROUTE'S OWN RESULT IS PRINTED AND WRITTEN BEFORE THE DIAGNOSIS RUNS,
+    // and that ordering is load-bearing rather than tidy. The diagnosis re-runs
+    // the whole search to report the COUNTS the budgets are expressed in, so it
+    // doubles the wall; when a caller kills the probe on a timeout, printing
+    // afterwards loses the verdict AND the bytes of a run that had already
+    // finished. On the size-cap measurements this route is being sized from,
+    // the difference is a `CERTIFIED` row against nothing at all.
+    match &proof {
         Some(text) => {
             println!(
-                "CERTIFIED bytes={} lines={} ms={ms} {diagnosis}",
+                "CERTIFIED bytes={} lines={} ms={ms}",
                 text.len(),
                 text.lines().count()
             );
             if let Some(out) = args.get(4) {
-                std::fs::write(out, &text).expect("write");
+                std::fs::write(out, text).expect("write");
             }
         }
-        None => println!("NO-PROOF ms={ms} {diagnosis}"),
+        None => println!("NO-PROOF ms={ms}"),
     }
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+    let start = std::time::Instant::now();
+    let diagnosis = ay_pb_core::proof::certified_bb_diagnosis(&instance, &incumbent, optimum);
+    println!("DIAG ms={} {diagnosis}", start.elapsed().as_millis());
 }
