@@ -12,8 +12,9 @@ fn every_strict_funnel_uses_the_scoped_authority_wrapper() {
     let scoped_call = ["self.verify_model_strict_", "with_scoped_authority()"].concat();
     assert_eq!(
         source.matches(&scoped_call).count(),
-        6,
-        "each of the three strict funnels and its retry must share one authority policy"
+        7,
+        "each of the three strict funnels, its retry, and the \
+         #repair-fallback-unrepaired re-check must share one authority policy"
     );
     let raw_call = ["self.verify_model_", "strict()"].concat();
     assert_eq!(

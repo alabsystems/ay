@@ -32,6 +32,7 @@ mod cegar_qfax_refinement;
 mod cert_default_row_key;
 mod certificate_pins;
 mod cross_base_witness_defchase;
+mod diseq_shift_pinned_read;
 mod div_witness_index;
 mod dt_construct_budget;
 mod dt_element_canon_gate;

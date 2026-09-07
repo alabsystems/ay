@@ -26,6 +26,28 @@ const DT_MODEL_RECHECK_MAX_ROUNDS: u32 = 32;
 
 include!("dt/lazy_attempt_state.rs");
 
+/// Which verdicts a caller admits from the sparse on-demand DT axiom lane
+/// (`try_solve_dt_auflia_lazy`).
+///
+/// The lane asserts a STRICT SUBSET of the eager route's axiom families
+/// (the depth-1 syntactic slice, guarded acyclicity, eager UF-bridge congruence
+/// and the occurrence-driven sparse relevance axioms), all datatype
+/// tautologies. An UNSAT is therefore sound on every route. A `Sat`, however,
+/// is only as good as the post-`Sat` passes that vouch for it, and those differ
+/// per eager authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::executor) enum DtLazyAcceptance {
+    /// Publish either verdict. For routes whose eager authority has no post-
+    /// `Sat` datatype pass beyond the always-on model gates the lane already
+    /// runs (`solve_dt_auflia`, `solve_dt_uf_lia`, `solve_dt_uf_nia`).
+    Definitive,
+    /// Publish only UNSAT; demote a lane `Sat` to a lane MISS so the eager
+    /// authority — and its datatype-carrying-array degrade gate and D0
+    /// model-e-graph recheck — stays terminal (`solve_dt_ax`,
+    /// `solve_dt_ufbv`, `solve_dt_aufbv`).
+    UnsatOnly,
+}
+
 impl Executor {
     fn has_persistent_dt_lazy_session(&self) -> bool {
         self.incremental_mode
@@ -1003,9 +1025,10 @@ impl Executor {
         // same model gates as the eager authority; a miss restores state and falls
         // through, so the eager path remains the terminal authority.
         if std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v != "0") {
-            if let Some(result) =
-                self.try_solve_dt_auflia_lazy_maybe_incremental(Self::solve_auf_lia)?
-            {
+            if let Some(result) = self.try_solve_dt_auflia_lazy_maybe_incremental(
+                Self::solve_auf_lia,
+                DtLazyAcceptance::Definitive,
+            )? {
                 return Ok(result);
             }
         }
@@ -1105,7 +1128,8 @@ impl Executor {
     ///   ledgers are restored together unless the measured AUFLIA proof-step
     ///   guard retains both, in which case no recycled ID can dangle.
     ///
-    /// Returns `Ok(Some(_))` only for a definitive Sat/Unsat.
+    /// Returns `Ok(Some(_))` only for a definitive verdict the caller's
+    /// `acceptance` admits.
     ///
     /// `solve_fn` is the inner combiner the residual is routed through —
     /// `solve_auf_lia` (array-enabled) or `solve_uf_lia` (array-free) — chosen
@@ -1113,6 +1137,7 @@ impl Executor {
     fn try_solve_dt_auflia_lazy(
         &mut self,
         solve_fn: fn(&mut Self) -> Result<SolveResult>,
+        acceptance: DtLazyAcceptance,
     ) -> Result<Option<SolveResult>> {
         // Incremental gate (#dt-lazy-incremental-gate): the lane's term-store
         // rollback contract is unenforceable under a persistent incremental
@@ -1333,6 +1358,23 @@ impl Executor {
                 self.last_model_validated = false;
                 Ok(SolveResult::Unknown)
             }
+            // UNSAT-ONLY routes (#dt-lazy-dtax-route): the eager authority for
+            // `solve_dt_ax`/`solve_dt_ufbv`/`solve_dt_aufbv` runs post-`Sat`
+            // datatype passes this lane does not — the datatype-carrying-array
+            // injectivity degrade gate and the D0 model-e-graph recheck that the
+            // BV cores have no combiner-hosted equivalent for. Rather than
+            // duplicate them here, a lane `Sat` on those routes is a lane MISS:
+            // it rolls back and the eager authority stays terminal. UNSAT is
+            // admitted because the lane only ever asserts datatype TAUTOLOGIES
+            // (a strict subset of the eager axiom families), so a refutation of
+            // `assertions ∧ sparse-axioms` refutes `assertions` outright.
+            Ok(SolveResult::Sat) if matches!(acceptance, DtLazyAcceptance::UnsatOnly) => {
+                if ay_core::misc_cli_flags().phase_trace {
+                    eprintln!("c phase-trace dt-auflia-lazy-unsat-only-fallback");
+                }
+                self.last_model_validated = false;
+                Ok(SolveResult::Unknown)
+            }
             other => other,
         };
         match result {
@@ -1363,6 +1405,7 @@ impl Executor {
     pub(in crate::executor) fn try_solve_dt_auflia_lazy_maybe_incremental(
         &mut self,
         solve_fn: fn(&mut Self) -> Result<SolveResult>,
+        acceptance: DtLazyAcceptance,
     ) -> Result<Option<SolveResult>> {
         // Detect a live incremental session — the EXACT condition the in-lane
         // gate (`#dt-lazy-incremental-gate`) tests.
@@ -1377,7 +1420,7 @@ impl Executor {
             });
         if !incremental {
             // Non-incremental: the original single-shot lane, unchanged path.
-            return self.try_solve_dt_auflia_lazy(solve_fn);
+            return self.try_solve_dt_auflia_lazy(solve_fn, acceptance);
         }
         // Fail closed: internal proof tracking is mandatory even when
         // user-facing proof output is disabled. The former optional oracle
@@ -1595,12 +1638,33 @@ impl Executor {
         }
         // L1a lazy-DT-AUFLIA on-demand route (array-free sibling; the actual
         // route the rusthorn List-sum VC gl.smt2 takes — it is array-free so
-        // the DtAuflia dispatch tries `solve_dt_uf_lia` first). Flag OFF ⇒
-        // byte-identical. See `solve_dt_auflia` / `try_solve_dt_auflia_lazy`.
+        // the DtAuflia dispatch tries `solve_dt_uf_lia` first).
+        //
+        // This call site reads `is_some_and` — i.e. it stays OPT-IN — where the
+        // sibling `solve_dt_auflia` reads `is_none_or`. That asymmetry looks
+        // like an oversight from the 2026-08-31 default-on promotion, and it is
+        // NOT: flipping it was tried and MEASURED, and it costs more than it
+        // gains. Turning the lane on here closes the ground DT+LIA
+        // `red_ground_dtlia` probe to its z3-correct `unsat` (a real win), but
+        // this is also the route the DT-MBQI-Sat certificate's re-sequence
+        // probe takes on its MIN1 shape, and the lane's half-remaining-budget
+        // time split starves that capped ground-core solve: the grant is lost
+        // and a published `sat` degrades to `unknown`. Three pins trip on it —
+        // `dt_cert_grants_min1_under_on`,
+        // `dt_cert_grants_min1_under_on_and_lazy` and
+        // `dt_cert_min1_grant_independent_of_lazy_kill_switch` — which is
+        // exactly the composition failure their own comment was written to
+        // catch ("a FUTURE lazy-lane change that becomes eligible on a DT-cert
+        // shape ... could then starve the cert via the R1 half-budget time
+        // split"). Landing it needs the cert probe's scoped solve to opt out of
+        // the lane first; until then the array-free DT+LIA route still reaches
+        // the lane through the `solve_dt_auflia` fallback, one eager attempt
+        // later. See `solve_dt_auflia` / `try_solve_dt_auflia_lazy`.
         if std::env::var_os("AY_DT_LAZY_AUFLIA").is_some_and(|v| v != "0") {
-            if let Some(result) =
-                self.try_solve_dt_auflia_lazy_maybe_incremental(Self::solve_uf_lia)?
-            {
+            if let Some(result) = self.try_solve_dt_auflia_lazy_maybe_incremental(
+                Self::solve_uf_lia,
+                DtLazyAcceptance::Definitive,
+            )? {
                 return Ok(result);
             }
         }
@@ -1650,9 +1714,10 @@ impl Executor {
             return Ok(SolveResult::Unknown);
         }
         if std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v != "0") {
-            if let Some(result) =
-                self.try_solve_dt_auflia_lazy_maybe_incremental(Self::solve_uf_nia)?
-            {
+            if let Some(result) = self.try_solve_dt_auflia_lazy_maybe_incremental(
+                Self::solve_uf_nia,
+                DtLazyAcceptance::Definitive,
+            )? {
                 return Ok(result);
             }
         }
@@ -1680,6 +1745,27 @@ impl Executor {
         if self.should_abort_theory_loop() {
             return Ok(SolveResult::Unknown);
         }
+        // Sparse on-demand DT axiom lane, UNSAT-only (#dt-lazy-dtax-route).
+        // The eager authority below materialises a selector frontier that
+        // branches by the datatype's recursive fan-out to `DT_WARM_START_DEPTH`
+        // and deepens to 64; on the Barrett `rec-fun-ijcar2016` ForElimination
+        // members that is 3.2 GB in 2.3 s and 6.6 GB by the deadline, with no
+        // verdict, on files z3 refutes in 0.02 s. The lane replaces the flood
+        // with the depth-1 syntactic slice plus occurrence-driven sparse
+        // relevance axioms — every one a datatype tautology, so its UNSAT is a
+        // refutation of the original problem. A lane `Sat` is demoted to a lane
+        // MISS (`DtLazyAcceptance::UnsatOnly`) because this route's post-`Sat`
+        // datatype passes live in `solve_with_dt_axioms`; the eager authority
+        // stays terminal for every non-UNSAT outcome. Kill switch and gating
+        // are the lane's own (`AY_DT_LAZY_AUFLIA`).
+        if std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v != "0") {
+            if let Some(result) = self.try_solve_dt_auflia_lazy_maybe_incremental(
+                Self::solve_ufbv,
+                DtLazyAcceptance::UnsatOnly,
+            )? {
+                return Ok(result);
+            }
+        }
         self.solve_with_dt_axioms(None, Self::solve_ufbv)
     }
 
@@ -1687,6 +1773,27 @@ impl Executor {
     pub(in crate::executor) fn solve_dt_aufbv(&mut self) -> Result<SolveResult> {
         if self.should_abort_theory_loop() {
             return Ok(SolveResult::Unknown);
+        }
+        // Sparse on-demand DT axiom lane, UNSAT-only (#dt-lazy-dtax-route).
+        // The eager authority below materialises a selector frontier that
+        // branches by the datatype's recursive fan-out to `DT_WARM_START_DEPTH`
+        // and deepens to 64; on the Barrett `rec-fun-ijcar2016` ForElimination
+        // members that is 3.2 GB in 2.3 s and 6.6 GB by the deadline, with no
+        // verdict, on files z3 refutes in 0.02 s. The lane replaces the flood
+        // with the depth-1 syntactic slice plus occurrence-driven sparse
+        // relevance axioms — every one a datatype tautology, so its UNSAT is a
+        // refutation of the original problem. A lane `Sat` is demoted to a lane
+        // MISS (`DtLazyAcceptance::UnsatOnly`) because this route's post-`Sat`
+        // datatype passes live in `solve_with_dt_axioms`; the eager authority
+        // stays terminal for every non-UNSAT outcome. Kill switch and gating
+        // are the lane's own (`AY_DT_LAZY_AUFLIA`).
+        if std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v != "0") {
+            if let Some(result) = self.try_solve_dt_auflia_lazy_maybe_incremental(
+                Self::solve_aufbv,
+                DtLazyAcceptance::UnsatOnly,
+            )? {
+                return Ok(result);
+            }
         }
         self.solve_with_dt_axioms(None, Self::solve_aufbv)
     }
@@ -1712,6 +1819,32 @@ impl Executor {
         // half-budget deadline) falls through to the eager lane unchanged.
         if let Some(result) = self.try_solve_dt_lazy()? {
             return Ok(result);
+        }
+        // Sparse on-demand DT axiom lane, UNSAT-only (#dt-lazy-dtax-route).
+        // The eager authority below materialises a selector frontier that
+        // branches by the datatype's recursive fan-out to `DT_WARM_START_DEPTH`
+        // and deepens to 64; on the Barrett `rec-fun-ijcar2016` ForElimination
+        // members that is 3.2 GB in 2.3 s and 6.6 GB by the deadline, with no
+        // verdict, on files z3 refutes in 0.02 s. The lane replaces the flood
+        // with the depth-1 syntactic slice plus occurrence-driven sparse
+        // relevance axioms — every one a datatype tautology, so its UNSAT is a
+        // refutation of the original problem. A lane `Sat` is demoted to a lane
+        // MISS (`DtLazyAcceptance::UnsatOnly`) because this route's post-`Sat`
+        // datatype passes live in `solve_with_dt_axioms`; the eager authority
+        // stays terminal for every non-UNSAT outcome. Kill switch and gating
+        // are the lane's own (`AY_DT_LAZY_AUFLIA`).
+        //
+        // `try_solve_dt_lazy` above declines any non-Bool/uninterpreted/datatype
+        // sort (`dt_lazy_content_eligible`), so the Barrett members — whose
+        // datatypes carry `(_ BitVec 32)` and Int fields — reach this line with
+        // no lazy coverage at all today.
+        if std::env::var_os("AY_DT_LAZY_AUFLIA").is_none_or(|v| v != "0") {
+            if let Some(result) = self.try_solve_dt_auflia_lazy_maybe_incremental(
+                Self::solve_array_euf,
+                DtLazyAcceptance::UnsatOnly,
+            )? {
+                return Ok(result);
+            }
         }
         self.solve_with_dt_axioms(None, Self::solve_array_euf)
     }
@@ -2514,7 +2647,7 @@ mod rollback_artifact_tests {
         executor.proof_tracker.enable();
 
         let result = executor
-            .try_solve_dt_auflia_lazy_maybe_incremental(must_not_run)
+            .try_solve_dt_auflia_lazy_maybe_incremental(must_not_run, DtLazyAcceptance::Definitive)
             .expect("clamped lane cannot fail");
 
         assert!(result.is_none());

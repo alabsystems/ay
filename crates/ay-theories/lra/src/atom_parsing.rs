@@ -247,12 +247,47 @@ impl LraSolver {
                         let var = self.intern_var(term);
                         LinearExpr::var(var)
                     }
-                    // Integer div/mod: opaque to LRA. Always mark as
-                    // unsupported even in combined_theory_mode — model
-                    // validation cannot verify opaque variable assignments
-                    // match div/mod semantics (#6165).
+                    // Integer `div`/`mod`: LRA cannot interpret them, so the
+                    // application is abstracted as a fresh tableau variable —
+                    // a sound OVER-approximation (the variable is free, so
+                    // every model of the formula induces one of the
+                    // abstraction, and an abstraction UNSAT is a real UNSAT).
+                    //
+                    // Whether a simplex `Sat` over that abstraction may be
+                    // REPORTED depends on who consumes it.
+                    //
+                    // Standalone (`!combined_theory_mode`): the caller takes
+                    // LRA's `Sat` as evidence and nothing downstream
+                    // re-interprets the term, so mark the atom unsupported and
+                    // let `check_impl` fail closed (#6165).
+                    //
+                    // `combined_theory_mode`: LRA is one DPLL(T) callback
+                    // inside a lane whose every published `sat` goes through
+                    // `Executor::emit_sat_verdict`'s mandatory independent
+                    // model gate (`independent_model_gate_enabled()` is
+                    // `const … true`), which re-evaluates the AUTHORED
+                    // assertions. That evaluator DOES interpret these terms:
+                    // Euclidean quotient/remainder for a non-zero divisor, and
+                    // for a zero divisor an arbitrary-but-fixed value the model
+                    // must COMMIT, adopted by operand VALUES so `div`/`mod`
+                    // stay functions (`ay-model-check` `division_by_zero`). A
+                    // model that violates the atom is refuted (`ModelViolates`);
+                    // one that commits nothing cannot be confirmed
+                    // (`CannotConfirm`); both publish `unknown`. So the
+                    // fail-closed property #6165 wanted is supplied by the
+                    // gate, and marking here only deletes verdicts the gate
+                    // would have confirmed — this is the same division of
+                    // labour the nonlinear `*` (#4125), symbolic `/` (#6811),
+                    // `abs` and unknown-function (#5524) arms already use.
+                    //
+                    // The binary form is the whole exemption: the model
+                    // evaluator's `div`/`mod` rules take exactly two operands,
+                    // so an n-ary chain has no downstream interpreter and keeps
+                    // the fail-closed marking in every mode.
                     "div" | "mod" if !args.is_empty() => {
-                        self.mark_current_atom_unsupported();
+                        if !self.combined_theory_mode || args.len() != 2 {
+                            self.mark_current_atom_unsupported();
+                        }
                         let var = self.intern_var(term);
                         LinearExpr::var(var)
                     }

@@ -750,7 +750,12 @@ impl Executor {
         } else {
             DpllT::from_tseitin(&self.ctx.terms, &tseitin_result, theory)
         };
-        dpll.set_proof_bookkeeping_budget(self.search_proof_bookkeeping_budget());
+        // Guarded for the same reason as the `run_dpll_with_models!` site in
+        // `assumption_solving.rs`: without a clause trace the ay-sat lifecycle
+        // refuses a bookkeeping budget outright.
+        if proof_enabled {
+            dpll.set_proof_bookkeeping_budget(self.search_proof_bookkeeping_budget());
+        }
         self.apply_random_seed_to_dpll(&mut dpll);
         self.apply_progress_to_dpll(&mut dpll);
         dpll.set_max_learned_clauses(self.learned_clause_limit);

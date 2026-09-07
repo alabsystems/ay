@@ -876,6 +876,157 @@ fn test_default_proofs_suppressed_by_competition() {
     assert!(default_proofs_suppressed(false, false, true));
 }
 
+/// `--no-proof`, `--z3-mode`, `--rigor fast` (`--competition`) and a PLAIN
+/// solve shed the executor's proof cycle; every certification request keeps
+/// it armed.
+#[test]
+fn test_proof_cycle_shed_follows_the_opt_outs() {
+    let bare = SolveArgs::default();
+    let no_proof = SolveArgs {
+        no_proof: true,
+        ..SolveArgs::default()
+    };
+    let z3_mode = SolveArgs {
+        z3_mode: true,
+        ..SolveArgs::default()
+    };
+    let competition = SolveArgs {
+        competition: true,
+        ..SolveArgs::default()
+    };
+    let rigor_fast = SolveArgs {
+        assurance: Some(CliAssuranceLevel::Fast),
+        ..SolveArgs::default()
+    };
+    let rigor_standard = SolveArgs {
+        assurance: Some(CliAssuranceLevel::Standard),
+        ..SolveArgs::default()
+    };
+    let strict = SolveArgs {
+        strict_proofs: true,
+        ..SolveArgs::default()
+    };
+    let self_check = SolveArgs {
+        self_check: true,
+        ..SolveArgs::default()
+    };
+    let explicit_proof = SolveArgs {
+        proof: Some(PathBuf::from("out.alethe")),
+        ..SolveArgs::default()
+    };
+    let verify_proof = SolveArgs {
+        verify_proof: true,
+        ..SolveArgs::default()
+    };
+    // The env-signal leg of `competition_mode` is not exercised here; the
+    // certifying expectations below hold only when no harness signal is
+    // present in the test environment.
+    if crate::competition_mode::competition_env_active() {
+        return;
+    }
+    // Shed: the opt-outs and the plain default (z3's posture).
+    for args in [&bare, &no_proof, &z3_mode, &competition, &rigor_fast] {
+        assert!(!certification_requested(args));
+        assert!(proof_cycle_shed(args));
+    }
+    // Armed: every way of asking for certification.
+    for args in [
+        &rigor_standard,
+        &strict,
+        &self_check,
+        &explicit_proof,
+        &verify_proof,
+    ] {
+        assert!(certification_requested(args));
+        assert!(!proof_cycle_shed(args));
+    }
+    // A certification request combined with an opt-out still sheds at the CLI
+    // latch; executor-side precedence (`competition_shedding_active`) is what
+    // keeps the certified lanes armed for the demand itself.
+    let strict_no_proof = SolveArgs {
+        strict_proofs: true,
+        no_proof: true,
+        ..SolveArgs::default()
+    };
+    assert!(certification_requested(&strict_no_proof));
+    assert!(proof_cycle_shed(&strict_no_proof));
+}
+
+/// The memory-budget verdict LINES follow the input format at every posture;
+/// the EXIT CODE keeps the wrapper/competition conventions.
+#[test]
+fn test_memout_verdict_lines_follow_the_input_format_not_the_posture() {
+    use VerdictGrammarRoute::*;
+    let sat_lines = |v: MemoutVerdict| v.sat_competition_lines;
+    // SMT-LIB: never the SAT-competition grammar, whatever the posture.
+    for (wrapper, competition) in [(false, false), (false, true), (true, false), (true, true)] {
+        let verdict = memout_verdict_for(SmtLib, wrapper, competition);
+        assert!(!sat_lines(verdict), "SMT-LIB memout must print `unknown`");
+        assert_eq!(verdict.stdout_line(), MEMOUT_STDOUT_SMTLIB);
+        assert_eq!(verdict.stderr_line(), MEMOUT_STDERR_SMTLIB);
+        // Exit code: 0 only under the submission wrapper, like an SMT timeout.
+        assert_eq!(
+            verdict.exit_code,
+            if wrapper {
+                SAT_COMPETITION_UNKNOWN_EXIT_CODE
+            } else {
+                DEFAULT_TIMEOUT_EXIT_CODE
+            }
+        );
+    }
+    // DIMACS: always the SAT-competition lines (as the DIMACS timeout path
+    // prints); exit 0 under the wrapper OR competition mode, else 124.
+    for (wrapper, competition) in [(false, false), (false, true), (true, false), (true, true)] {
+        let verdict = memout_verdict_for(Dimacs, wrapper, competition);
+        assert!(sat_lines(verdict), "DIMACS memout must print `s UNKNOWN`");
+        assert_eq!(verdict.stdout_line(), MEMOUT_STDOUT_SAT_COMPETITION);
+        assert_eq!(
+            verdict.exit_code,
+            if wrapper || competition {
+                SAT_COMPETITION_UNKNOWN_EXIT_CODE
+            } else {
+                DEFAULT_TIMEOUT_EXIT_CODE
+            }
+        );
+    }
+    // Route not yet known: the legacy heuristic (posture-keyed) stands.
+    assert!(!sat_lines(memout_verdict_for(Undecided, false, false)));
+    assert!(sat_lines(memout_verdict_for(Undecided, false, true)));
+    assert!(sat_lines(memout_verdict_for(Undecided, true, false)));
+    assert_eq!(
+        memout_verdict_for(Undecided, false, false).exit_code,
+        DEFAULT_TIMEOUT_EXIT_CODE
+    );
+    assert_eq!(
+        memout_verdict_for(Undecided, false, true).exit_code,
+        SAT_COMPETITION_UNKNOWN_EXIT_CODE
+    );
+    // Every (lines, exit) pair maps to a static whose bytes agree with it, so
+    // the allocator-time breach prints exactly what the watchdog would.
+    for route in [SmtLib, Dimacs, Undecided] {
+        for (wrapper, competition) in [(false, false), (false, true), (true, false)] {
+            let verdict = memout_verdict_for(route, wrapper, competition);
+            let action = verdict.hard_ceiling_action();
+            assert_eq!(action.stdout_line, verdict.stdout_line());
+            assert_eq!(action.stderr_line, verdict.stderr_line());
+            assert_eq!(action.exit_code, verdict.exit_code);
+        }
+    }
+}
+
+#[test]
+fn test_verdict_grammar_route_from_input_extension() {
+    use VerdictGrammarRoute::*;
+    let route = |p: &str| VerdictGrammarRoute::from_input_path(Some(FsPath::new(p)));
+    assert_eq!(route("a.smt2"), SmtLib);
+    assert_eq!(route("dir/b.SMT"), SmtLib);
+    assert_eq!(route("c.cnf"), Dimacs);
+    assert_eq!(route("d.DIMACS"), Dimacs);
+    assert_eq!(route("e.wcnf"), Undecided);
+    assert_eq!(route("noext"), Undecided);
+    assert_eq!(VerdictGrammarRoute::from_input_path(None), Undecided);
+}
+
 #[test]
 fn test_firewall_emission_requires_persistent_alethe_proof() {
     assert!(firewall_emission_config_error(false, None).is_none());
@@ -1153,38 +1304,48 @@ fn memory_watchdog_escalates_immediately_when_already_over_budget() {
 }
 
 /// A memout and a timeout both emit the required `unknown` verdict, but carry
-/// distinct markers so a harness can tell them apart. The competition memout
+/// distinct markers so a harness can tell them apart. The DIMACS memout
 /// additionally carries its `c memout` marker on STDOUT: wrapper scripts
 /// (~/ay-bench/bin/ay-proofmode) forward only stdout plus an exit code that is
 /// 0 for every competition unknown, so a stderr-only marker made a memout
 /// unscoreable through them.
+///
+/// The memout lines are now selected by the INPUT ROUTE, so this pairs each
+/// route with the timeout grammar that route's timeout path already prints:
+/// DIMACS with the SAT-competition lines, SMT-LIB with z3's.
 #[test]
 fn memout_and_timeout_share_the_verdict_but_not_the_reason() {
-    for wrapper in [false, true] {
+    for (route, sat_lines) in [
+        (VerdictGrammarRoute::SmtLib, false),
+        (VerdictGrammarRoute::Dimacs, true),
+    ] {
+        let memout = memout_verdict_for(route, sat_lines, false);
+        assert_eq!(memout.sat_competition_lines, sat_lines);
         assert!(
-            memory_stdout_line_for_sat_competition_wrapper(wrapper)
-                .ends_with(timeout_stdout_line_for_sat_competition_wrapper(wrapper)),
+            memout
+                .stdout_line()
+                .ends_with(timeout_stdout_line_for_sat_competition_wrapper(sat_lines)),
             "resource exhaustion must end in the same unknown verdict grammar"
         );
         assert_ne!(
-            memory_stderr_line_for_sat_competition_wrapper(wrapper),
-            timeout_stderr_line_for_sat_competition_wrapper(wrapper),
+            memout.stderr_line(),
+            timeout_stderr_line_for_sat_competition_wrapper(sat_lines),
             "a memout must be distinguishable from a timeout"
         );
     }
     assert_eq!(
-        memory_stdout_line_for_sat_competition_wrapper(true),
+        memout_verdict_for(VerdictGrammarRoute::Dimacs, false, false).stdout_line(),
         b"c memout\ns UNKNOWN\n",
-        "competition memouts must carry the marker on stdout for \
+        "DIMACS memouts must carry the marker on stdout for \
          stdout-only wrappers"
     );
     assert_eq!(
-        memory_stdout_line_for_sat_competition_wrapper(false),
+        memout_verdict_for(VerdictGrammarRoute::SmtLib, false, false).stdout_line(),
         b"unknown\n",
         "the SMT-LIB verdict stream stays a bare verdict"
     );
     assert_eq!(
-        memory_stderr_line_for_sat_competition_wrapper(false),
+        memout_verdict_for(VerdictGrammarRoute::SmtLib, false, false).stderr_line(),
         b"(:reason-unknown \"memout\")\n",
         "SMT-LIB runs report Z3's memout reason"
     );

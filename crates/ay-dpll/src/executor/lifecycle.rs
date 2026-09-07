@@ -476,8 +476,13 @@ impl Executor {
         self.self_check
     }
 
-    /// Enable or disable competition mode (`--competition` / `AY_COMPETITION=1`,
-    /// #proof-capability B1).
+    /// Enable or disable competition mode (#proof-capability B1) — the
+    /// executor's proof-cycle-shedding posture. The CLI selects it for
+    /// `--competition` / `AY_COMPETITION=1`, `--no-proof`, `--z3-mode`, and
+    /// for every plain SMT-LIB solve that requests no certification (the z3
+    /// default posture; see `certification_requested` in the `ay` binary).
+    /// The name is historical: the mode sheds proof work only and leaves the
+    /// independent model gate and every wrong-answer guard untouched.
     ///
     /// In competition mode a public solve with no explicit proof demand sheds
     /// the internal proof cycle: `begin_public_solve` leaves the proof tracker
@@ -835,6 +840,64 @@ impl Executor {
             return None;
         }
         reconstruction_budget.map(|b| (b / SEARCH_PROOF_BOOKKEEPING_WORK_DIVISOR).max(1))
+    }
+
+    /// Per-query budget, in registered-bound units, for the fresh theory
+    /// refutations the trust-leaf rebuild runs while materializing a
+    /// SYNTHESIZED-DEFAULT certificate (`refute_disjunct_against_bounds`,
+    /// `try_rebuild_with_pure_bounds` in `proof_original_rebuild`).
+    ///
+    /// `None` means unbounded and is returned for every explicit proof demand
+    /// (`--proof`, `--strict-proofs`, `--self-check`, `:produce-proofs`):
+    /// those modes promise the artifact and keep today's behaviour exactly.
+    /// Only the best-effort artifact — the one whose contract is "never trade
+    /// a fast verdict for minutes of materialization" — is metered.
+    ///
+    /// Why it exists: each refutation builds a fresh LRA solver over EVERY
+    /// linear bound of the problem, and the rebuild tries it per disjunct per
+    /// candidate with no ceiling. On QF_AUFLIA storecomm_t1_pp_sf_ai_00060_001
+    /// (1894 bounds, 1771 disjunction candidates) the EUF route refutes in
+    /// 0.24 s and the rebuild then spent the whole 20 s budget on ~30 ms LRA
+    /// checks — a `unknown` timeout in `--rigor standard` for a certificate
+    /// that ends as a `hole` anyway. Exhaustion is fail-closed for the
+    /// CERTIFICATE only: the refutation declines, the trust leaf stays, the
+    /// artifact degrades to the documented "not fully checkable" warning, and
+    /// the verdict — decided before reconstruction starts — is unchanged.
+    ///
+    /// Charge = registered bounds + 1 per refutation, so the meter scales
+    /// with the LRA size it proxies: at the 1M default budget it admits ~8
+    /// storecomm-sized refutations (~0.25 s) and hundreds on the small
+    /// instances whose rebuilds succeed today. Deterministic: units, not time.
+    pub(crate) fn best_effort_rebuild_refutation_budget(&self) -> Option<u64> {
+        const REBUILD_REFUTATION_WORK_DIVISOR: u64 = 64;
+        let script_demands_proof = matches!(
+            self.ctx.get_option("produce-proofs"),
+            Some(OptionValue::Bool(true))
+        );
+        if script_demands_proof {
+            return None;
+        }
+        self.proof_reconstruction_step_budget
+            .map(|b| (b / REBUILD_REFUTATION_WORK_DIVISOR).max(1))
+    }
+
+    /// Debit `units` from [`Self::best_effort_rebuild_refutation_budget`];
+    /// `false` declines the refutation about to run without spending.
+    pub(in crate::executor) fn charge_best_effort_rebuild_refutation(
+        &mut self,
+        units: u64,
+    ) -> bool {
+        let Some(budget) = self.best_effort_rebuild_refutation_budget() else {
+            return true;
+        };
+        let spent = self
+            .best_effort_rebuild_refutation_spent
+            .saturating_add(units);
+        if spent > budget {
+            return false;
+        }
+        self.best_effort_rebuild_refutation_spent = spent;
+        true
     }
 
     /// Set the maximum learned clauses limit for SAT solving (#1609)

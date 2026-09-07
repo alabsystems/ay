@@ -86,6 +86,11 @@ impl Executor {
         let should_stop = self.make_should_stop();
 
         for _round in 0..MAX_CEGQI_ROUNDS {
+            // Observation only (z3-parity stage 0): one tick per CEGQI
+            // refinement round entered. The neighbour-enumeration fallback
+            // below is a widening WITHIN one refinement attempt, not a round,
+            // and is deliberately not counted here.
+            self.last_statistics.quantifier_cegqi_rounds += 1;
             // Stop refining once the budget is spent. We are in the SAT-from-
             // ground-solve path: returning Unknown(Timeout) instead of
             // continuing prevents both an overrun and a truncated final Sat.

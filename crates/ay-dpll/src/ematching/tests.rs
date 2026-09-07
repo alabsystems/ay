@@ -2229,4 +2229,397 @@ fn nested_binder_outer_only_let_alias_remains_a_trigger() {
     );
 }
 
+// ===========================================================================
+// (#unit-and-harvest) UnitFacts descends through an asserted `and`.
+// ===========================================================================
+
+/// The UltimateAutomizer shape, in miniature: the guard set arrives as ONE
+/// `(assert (and g1 g2))` and the property as `(assert (not (and E g1 g2)))`,
+/// which `mk_not` stores as `(or (not E) (not g1) (not g2))`. Only if the
+/// conjuncts of the first assertion become unit facts does unit propagation
+/// through that `or` leave `(not E)` as the survivor, making the negated
+/// existential an ENTAILED universal that E-matching may instantiate.
+#[test]
+fn unit_facts_descend_through_an_asserted_conjunction() {
+    let mut terms = TermStore::new();
+    let mem = terms.mk_var("uah_mem", Sort::Int);
+    let base = terms.mk_var("uah_base", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let g1 = terms.mk_eq(base, zero);
+    let g2 = terms.mk_app(Symbol::named("uah_short"), [mem], Sort::Bool);
+    let guards = terms.mk_and(vec![g1, g2]);
+
+    let i = terms.mk_var("uah_i", Sort::Int);
+    let f_i = terms.mk_app(Symbol::named("uah_f"), [i], Sort::Int);
+    let inner = terms.mk_eq(f_i, zero);
+    let exists = terms.mk_exists(vec![("uah_i".to_string(), Sort::Int)], inner);
+    let conj = terms.mk_and(vec![exists, g1, g2]);
+    let property = terms.mk_not(conj);
+
+    let assertions = vec![guards, property];
+
+    let units = UnitFacts::from_assertions(&terms, &assertions);
+    assert_eq!(
+        units.value(&terms, g1),
+        Some(true),
+        "a conjunct of an asserted conjunction is itself asserted"
+    );
+    assert_eq!(units.value(&terms, g2), Some(true));
+
+    let entailed = entailed_forall_set(&mut terms, &assertions);
+    assert_eq!(
+        entailed.len(),
+        1,
+        "the negated existential is the one entailed universal; got {entailed:?}"
+    );
+    let quant = *entailed.iter().next().expect("one entailed universal");
+    assert!(
+        matches!(terms.get(quant), TermData::Forall(..)),
+        "NOT(exists) is recorded as the dual universal"
+    );
+}
+
+/// Descending through `and` must not descend through anything else. A universal
+/// reachable only under a positive `or` is a DISJUNCT, and instantiating it
+/// would fabricate a constraint (#auflia-disjunct-forall-false-unsat).
+#[test]
+fn unit_facts_do_not_descend_through_a_disjunction() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("uah_or_a", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let d1 = terms.mk_eq(a, zero);
+    let x = terms.mk_var("uah_or_x", Sort::Int);
+    let p_x = terms.mk_app(Symbol::named("uah_or_p"), [x], Sort::Bool);
+    let forall = terms.mk_forall(vec![("uah_or_x".to_string(), Sort::Int)], p_x);
+    let disj = terms.mk_or(vec![d1, forall]);
+
+    let assertions = vec![disj];
+    let units = UnitFacts::from_assertions(&terms, &assertions);
+    assert_eq!(
+        units.value(&terms, d1),
+        None,
+        "a disjunct is not a unit fact"
+    );
+    let entailed = entailed_forall_set(&mut terms, &assertions);
+    assert!(
+        entailed.is_empty(),
+        "a forall under a positive `or` is not entailed; got {entailed:?}"
+    );
+}
+
+/// A negated conjunct keeps its polarity through the descent, and the `and`
+/// walk terminates on a DAG whose conjuncts are shared.
+#[test]
+fn unit_facts_harvest_negated_and_shared_conjuncts() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("uah_sh_a", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let atom = terms.mk_eq(a, zero);
+    let neg = terms.mk_not(atom);
+    let q = terms.mk_app(Symbol::named("uah_sh_q"), [a], Sort::Bool);
+    // `atom` occurs twice, and the inner `and` is shared by both outer arms.
+    let inner = terms.mk_and(vec![neg, q]);
+    let outer = terms.mk_and(vec![inner, q, inner]);
+
+    let units = UnitFacts::from_assertions(&terms, &[outer]);
+    assert_eq!(
+        units.value(&terms, atom),
+        Some(false),
+        "`(not atom)` under an asserted conjunction pins the atom FALSE"
+    );
+    assert_eq!(units.value(&terms, q), Some(true));
+}
+
+// ===========================================================================
+// (rank 4) The memoized bound-variable walk is behaviour-preserving.
+// ===========================================================================
+
+/// Differential: the memoized `collect_bound_var_ids` must return exactly the
+/// set the un-memoized walk returns, for every root of a non-trivial shared
+/// term DAG — including roots INSIDE quantifier bodies, where the walk sees an
+/// empty binder scope and classifies nothing.
+#[test]
+fn memoized_bound_var_walk_matches_the_unmemoized_walk() {
+    use crate::ematching::pattern::{BoundVarScopeMemo, TermIndex};
+
+    let mut terms = TermStore::new();
+    // Shared ground spine.
+    let c = terms.mk_var("bvm_c", Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let g_c = terms.mk_app(Symbol::named("bvm_g"), [c], Sort::Int);
+
+    // forall x. (f(x, g(c)) = 0) /\ (exists y. h(y) = g(c))
+    let x = terms.mk_var("bvm_x", Sort::Int);
+    let y = terms.mk_var("bvm_y", Sort::Int);
+    let f_xy = terms.mk_app(Symbol::named("bvm_f"), [x, g_c], Sort::Int);
+    let eq1 = terms.mk_eq(f_xy, zero);
+    let h_y = terms.mk_app(Symbol::named("bvm_h"), [y], Sort::Int);
+    let eq2 = terms.mk_eq(h_y, g_c);
+    let inner_exists = terms.mk_exists(vec![("bvm_y".to_string(), Sort::Int)], eq2);
+    let body = terms.mk_and(vec![eq1, inner_exists]);
+    let forall = terms.mk_forall(vec![("bvm_x".to_string(), Sort::Int)], body);
+
+    // A second, ite/let/not-bearing root that SHARES `g_c`, `eq1` and `eq2`.
+    let cond = terms.mk_app(Symbol::named("bvm_p"), [c], Sort::Bool);
+    let ite = terms.mk_ite(cond, eq1, eq2);
+    let not_ite = terms.mk_not(ite);
+    let let_term = terms.mk_let(vec![("bvm_alias".to_string(), g_c)], not_ite);
+    let outer2 = terms.mk_forall(vec![("bvm_y".to_string(), Sort::Int)], let_term);
+    let _root = terms.mk_and(vec![forall, outer2, eq1]);
+
+    // Every id in the store is a root, exactly as `collect_ground_terms_by_sort`
+    // uses it — and the memo is shared across the whole loop, as it is there.
+    let mut memo_ids: HashSet<u32> = HashSet::default();
+    let mut memo_names: HashSet<String> = HashSet::default();
+    let mut memo = BoundVarScopeMemo::default();
+    for idx in 0..terms.len() {
+        TermIndex::collect_bound_var_ids(
+            &terms,
+            TermId(idx as u32),
+            &mut memo_ids,
+            &mut memo_names,
+            &mut memo,
+        );
+        assert!(
+            memo_names.is_empty(),
+            "the binder scope must be push/pop balanced after every root walk"
+        );
+    }
+
+    let mut ref_ids: HashSet<u32> = HashSet::default();
+    let mut ref_names: HashSet<String> = HashSet::default();
+    for idx in 0..terms.len() {
+        TermIndex::collect_bound_var_ids_unmemoized(
+            &terms,
+            TermId(idx as u32),
+            &mut ref_ids,
+            &mut ref_names,
+        );
+    }
+
+    let mut memo_sorted: Vec<u32> = memo_ids.iter().copied().collect();
+    memo_sorted.sort_unstable();
+    let mut ref_sorted: Vec<u32> = ref_ids.iter().copied().collect();
+    ref_sorted.sort_unstable();
+    assert_eq!(
+        memo_sorted, ref_sorted,
+        "memoized and un-memoized bound-var sets must be identical"
+    );
+    assert!(
+        !ref_sorted.is_empty(),
+        "the fixture must actually bind variables, or the differential is vacuous"
+    );
+
+    // Per-root differential: each root ALONE must agree too, so the equality is
+    // not an artifact of the union over all roots.
+    for idx in 0..terms.len() {
+        let mut one_memo_ids: HashSet<u32> = HashSet::default();
+        let mut one_memo_names: HashSet<String> = HashSet::default();
+        let mut one_memo = BoundVarScopeMemo::default();
+        TermIndex::collect_bound_var_ids(
+            &terms,
+            TermId(idx as u32),
+            &mut one_memo_ids,
+            &mut one_memo_names,
+            &mut one_memo,
+        );
+        let mut one_ref_ids: HashSet<u32> = HashSet::default();
+        let mut one_ref_names: HashSet<String> = HashSet::default();
+        TermIndex::collect_bound_var_ids_unmemoized(
+            &terms,
+            TermId(idx as u32),
+            &mut one_ref_ids,
+            &mut one_ref_names,
+        );
+        let mut a: Vec<u32> = one_memo_ids.iter().copied().collect();
+        a.sort_unstable();
+        let mut b: Vec<u32> = one_ref_ids.iter().copied().collect();
+        b.sort_unstable();
+        assert_eq!(
+            a, b,
+            "root {idx} disagrees between memoized and un-memoized"
+        );
+    }
+}
+
+/// The memo must key on the SCOPE as well as the term: the same shared subterm
+/// reached under different binder scopes contributes different ids, and a
+/// term-id-only memo would silently drop the second contribution.
+#[test]
+fn memoized_bound_var_walk_distinguishes_binder_scopes() {
+    use crate::ematching::pattern::{BoundVarScopeMemo, TermIndex};
+
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("bvs_x", Sort::Int);
+    let y = terms.mk_var("bvs_y", Sort::Int);
+    // ONE shared body mentioning both variables.
+    let shared = terms.mk_app(Symbol::named("bvs_f"), [x, y], Sort::Bool);
+    // Two quantifiers over the same shared body, each binding a different name.
+    let qx = terms.mk_forall(vec![("bvs_x".to_string(), Sort::Int)], shared);
+    let qy = terms.mk_forall(vec![("bvs_y".to_string(), Sort::Int)], shared);
+
+    let mut ids: HashSet<u32> = HashSet::default();
+    let mut names: HashSet<String> = HashSet::default();
+    let mut memo = BoundVarScopeMemo::default();
+    for root in [qx, qy] {
+        TermIndex::collect_bound_var_ids(&terms, root, &mut ids, &mut names, &mut memo);
+    }
+    assert!(
+        ids.contains(&x.0) && ids.contains(&y.0),
+        "the shared body must be re-walked under the second binder scope; got {ids:?}"
+    );
+
+    let mut ref_ids: HashSet<u32> = HashSet::default();
+    let mut ref_names: HashSet<String> = HashSet::default();
+    for root in [qx, qy] {
+        TermIndex::collect_bound_var_ids_unmemoized(&terms, root, &mut ref_ids, &mut ref_names);
+    }
+    let mut a: Vec<u32> = ids.iter().copied().collect();
+    a.sort_unstable();
+    let mut b: Vec<u32> = ref_ids.iter().copied().collect();
+    b.sort_unstable();
+    assert_eq!(a, b);
+}
+
+// ===========================================================================
+// (#unit-int-bound-key) The unit lookup sees an integer order atom through the
+// rewrite `tighten_int_strict_term` has already applied to its negation.
+// ===========================================================================
+
+/// The pipeline shape, reproduced exactly. `(assert (<= a 4))` is the unit;
+/// the goal's negated guard reaches the unit table as the POSITIVE atom
+/// `(<= 5 a)`, because `tighten_int_strict_term` rewrites `(not (<= a b))` to
+/// `(<= (+ b 1) a)` before E-matching runs. Without the canonical bound key
+/// the disjunct is "live" and the universal is not recognised as entailed.
+#[test]
+fn unit_facts_see_a_tightened_integer_bound_complement() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("uib_a", Sort::Int);
+    let four = terms.mk_int(BigInt::from(4));
+    let five = terms.mk_int(BigInt::from(5));
+    let unit = terms.mk_le(a, four); // a <= 4
+    let tightened_negation = terms.mk_le(five, a); // 5 <= a, i.e. NOT (a <= 4)
+
+    let x = terms.mk_var("uib_x", Sort::Int);
+    let f_x = terms.mk_app(Symbol::named("uib_f"), [x], Sort::Int);
+    let zero = terms.mk_int(BigInt::from(0));
+    let body = terms.mk_lt(zero, f_x);
+    let forall = terms.mk_forall(vec![("uib_x".to_string(), Sort::Int)], body);
+    let goal = terms.mk_or(vec![tightened_negation, forall]);
+
+    let assertions = vec![unit, goal];
+    let units = UnitFacts::from_assertions(&terms, &assertions);
+    assert_eq!(units.value(&terms, unit), Some(true));
+    assert_eq!(
+        units.value(&terms, tightened_negation),
+        Some(false),
+        "`5 <= a` is the exact integer complement of the unit `a <= 4`"
+    );
+
+    let entailed = entailed_forall_set(&mut terms, &assertions);
+    assert!(
+        entailed.contains(&forall),
+        "the surviving disjunct is the entailed universal; got {entailed:?}"
+    );
+}
+
+/// The same for a STRICT unit and the `(not (< a b))` => `(<= b a)` rewrite,
+/// and for the `(< a b)` => `(<= a (- b 1))` rewrite of the unit itself.
+#[test]
+fn unit_facts_see_strict_integer_bound_complements() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("uis_a", Sort::Int);
+    let four = terms.mk_int(BigInt::from(4));
+    let three = terms.mk_int(BigInt::from(3));
+    // Unit `a < 4`, tightened by the pipeline to `a <= 3`; either spelling must
+    // key the same bound.
+    let strict_unit = terms.mk_lt(a, four);
+    let tightened_unit = terms.mk_le(a, three);
+    // `(not (< a 4))` is rewritten to `(<= 4 a)`.
+    let negation = terms.mk_le(four, a);
+
+    for unit in [strict_unit, tightened_unit] {
+        let units = UnitFacts::from_assertions(&terms, &[unit]);
+        assert_eq!(units.value(&terms, unit), Some(true));
+        assert_eq!(
+            units.value(&terms, negation),
+            Some(false),
+            "`4 <= a` is the exact integer complement of `a < 4` / `a <= 3`"
+        );
+    }
+}
+
+/// The offset peel: `(<= 4 a)` as a unit makes `(<= (+ a 1) 4)` false, which is
+/// the shape `(not (<= 4 a))` is rewritten into.
+#[test]
+fn unit_facts_peel_an_integer_offset() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("uio_a", Sort::Int);
+    let one = terms.mk_int(BigInt::from(1));
+    let four = terms.mk_int(BigInt::from(4));
+    let unit = terms.mk_le(four, a); // 4 <= a
+    let a_plus_1 = terms.mk_add(vec![a, one]);
+    let negation = terms.mk_le(a_plus_1, four); // a+1 <= 4, i.e. NOT (4 <= a)
+
+    let units = UnitFacts::from_assertions(&terms, &[unit]);
+    assert_eq!(units.value(&terms, unit), Some(true));
+    assert_eq!(units.value(&terms, negation), Some(false));
+}
+
+/// The bound key is INTEGER-ONLY. Over the reals `c <= r` is not `¬(r <= c-1)`,
+/// so a Real order atom must never be keyed — otherwise `(<= 5.0 a)` would be
+/// read as the complement of `(<= a 4.0)` and `a = 4.5` would be lost.
+#[test]
+fn unit_facts_do_not_key_real_order_atoms() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("uir_a", Sort::Real);
+    let four = terms.mk_rational(num_rational::BigRational::from_integer(BigInt::from(4)));
+    let five = terms.mk_rational(num_rational::BigRational::from_integer(BigInt::from(5)));
+    let unit = terms.mk_le(a, four);
+    let other = terms.mk_le(five, a);
+
+    let units = UnitFacts::from_assertions(&terms, &[unit]);
+    assert_eq!(units.value(&terms, unit), Some(true));
+    assert_eq!(
+        units.value(&terms, other),
+        None,
+        "a Real order atom has no discrete complement and must stay unknown"
+    );
+}
+
+/// The key must not make an atom that is merely IMPLIED by the unit look
+/// DETERMINED. `a <= 4` implies `a <= 5`, but says nothing about the truth of
+/// `a <= 3`; only the exact complement may be read off.
+#[test]
+fn unit_facts_do_not_decide_a_merely_implied_bound() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("uii_a", Sort::Int);
+    let three = terms.mk_int(BigInt::from(3));
+    let four = terms.mk_int(BigInt::from(4));
+    let five = terms.mk_int(BigInt::from(5));
+    let unit = terms.mk_le(a, four);
+    let weaker = terms.mk_le(a, five);
+    let stronger = terms.mk_le(a, three);
+
+    let units = UnitFacts::from_assertions(&terms, &[unit]);
+    assert_eq!(units.value(&terms, weaker), None);
+    assert_eq!(units.value(&terms, stronger), None);
+}
+
+/// A different subject is a different bound: `b <= 4` must not be answered from
+/// a unit about `a`.
+#[test]
+fn unit_facts_bound_key_is_per_subject() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("uip_a", Sort::Int);
+    let b = terms.mk_var("uip_b", Sort::Int);
+    let four = terms.mk_int(BigInt::from(4));
+    let five = terms.mk_int(BigInt::from(5));
+    let unit = terms.mk_le(a, four);
+    let other_subject = terms.mk_le(five, b);
+
+    let units = UnitFacts::from_assertions(&terms, &[unit]);
+    assert_eq!(units.value(&terms, other_subject), None);
+}
+
 include!("tests/exact_substitution.rs");

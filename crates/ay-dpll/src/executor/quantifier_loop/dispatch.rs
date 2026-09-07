@@ -121,17 +121,41 @@ impl Executor {
             LogicCategory::QfNia | LogicCategory::QfEia | LogicCategory::Nia => self.solve_nia(),
             LogicCategory::QfNra | LogicCategory::Nra => self.solve_nra(),
             LogicCategory::QfLira | LogicCategory::Lira => self.solve_lira(),
-            LogicCategory::QfNira | LogicCategory::Nira => {
+            // NIRA routing: solve_nia()/solve_uf_nia() lack LRA, so Real
+            // constraints produce false SAT — but only WHEN REALS ARE PRESENT.
+            // `route_to_solver` has always taken the real lane otherwise; this
+            // table used to answer a blanket Unknown, so a NIRA-categorised
+            // problem with no Real sort lost its ground solve on every
+            // refinement round (#8200, mirrored #5989).
+            LogicCategory::QfNira => {
+                if features.has_real {
+                    self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                    Ok(SolveResult::Unknown)
+                } else {
+                    self.solve_nia()
+                }
+            }
+            // Quantified `Nira` keeps the unconditional Unknown that
+            // `route_to_solver` gives it — mirroring means mirroring both ways.
+            LogicCategory::Nira => {
+                debug_assert!(
+                    !category.has_ground_lane(),
+                    "{category:?} has a ground lane in route_to_solver but the \
+                     quantifier-loop table answers Unknown — the two dispatch \
+                     tables must mirror (#5989)"
+                );
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 Ok(SolveResult::Unknown)
             }
             LogicCategory::QfUfnra | LogicCategory::Ufnra => self.solve_uf_nra(),
             LogicCategory::QfUfnia | LogicCategory::Ufnia => self.solve_uf_nia(),
-            // NIRA routing: solve_uf_nia() lacks LRA, so Real constraints
-            // produce false SAT. Return Unknown for NIRA variants (#8200).
             LogicCategory::QfUfnira | LogicCategory::Ufnira => {
-                self.last_unknown_reason = Some(UnknownReason::Incomplete);
-                Ok(SolveResult::Unknown)
+                if features.has_real {
+                    self.last_unknown_reason = Some(UnknownReason::Incomplete);
+                    Ok(SolveResult::Unknown)
+                } else {
+                    self.solve_uf_nia()
+                }
             }
             LogicCategory::QfUflia | LogicCategory::Uflia => self.solve_auf_lia(),
             LogicCategory::QfUflra | LogicCategory::Uflra => self.solve_uf_lra(),
@@ -177,11 +201,30 @@ impl Executor {
             LogicCategory::Ufdtlia | LogicCategory::Aufdtlia => self.solve_dt_auflia(),
             LogicCategory::Ufdtlra => self.solve_dt_auflra(),
             LogicCategory::Ufdtlira | LogicCategory::Aufdtlira => self.solve_dt_auflira(),
-            LogicCategory::Ufdtnia | LogicCategory::Ufdtnra | LogicCategory::Ufdtnira => {
+            // DT + non-linear INTEGER arithmetic composes over the existing
+            // UF+NIA route, lazy DT lane first — exactly as check_sat.rs's
+            // `LogicCategory::Ufdtnia => self.solve_dt_uf_nia()`. This table
+            // used to answer a blanket Unknown for all three DT-nonlinear
+            // categories, so the ground solve inside the quantifier loop threw
+            // away the lane check-sat's own table routes to (#5989).
+            LogicCategory::Ufdtnia => self.solve_dt_uf_nia(),
+            // NRA/NIRA keep the sound `unknown`: there is no `solve_uf_nra`
+            // sibling to compose the DT axioms with. Mirrors check_sat.rs.
+            LogicCategory::Ufdtnra | LogicCategory::Ufdtnira => {
+                debug_assert!(
+                    !category.has_ground_lane(),
+                    "{category:?} has a ground lane in route_to_solver but the \
+                     quantifier-loop table answers Unknown — the two dispatch \
+                     tables must mirror (#5989)"
+                );
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 Ok(SolveResult::Unknown)
             }
             LogicCategory::Other => {
+                debug_assert!(
+                    !category.has_ground_lane(),
+                    "LogicCategory::Other must stay the fail-closed residue"
+                );
                 self.last_unknown_reason = Some(UnknownReason::QuantifierCegqiIncomplete);
                 Ok(SolveResult::Unknown)
             }

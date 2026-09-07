@@ -2168,6 +2168,12 @@ impl Context {
     fn set_option(&mut self, keyword: &str, value: &crate::sexp::SExpr) {
         use crate::sexp::SExpr;
         let key = keyword.trim_start_matches(':').to_string();
+        // `set-option` deliberately does not advance the source revision (it is
+        // session configuration, not a declaration), but `:int-real-coercions`
+        // and `:numeral-as-real` decide how a `define-fun` body TYPES. Drop the
+        // macro expansion memo so a body elaborated under the old policy is
+        // never replayed under the new one.
+        self.invalidate_macro_expansion_memo();
         let opt_value = match value {
             SExpr::True => OptionValue::Bool(true),
             SExpr::False => OptionValue::Bool(false),

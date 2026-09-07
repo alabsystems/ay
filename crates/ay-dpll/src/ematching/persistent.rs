@@ -32,7 +32,7 @@
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{TermId, TermStore};
 
-use super::pattern::{EqualityClasses, TermIndex};
+use super::pattern::{BoundVarScopeMemo, EqualityClasses, TermIndex};
 
 /// Persistent, incrementally-maintained E-matching index/eqclass/seen state.
 ///
@@ -200,12 +200,17 @@ impl PersistentMatchState {
             // FRESH local scope stack per refresh call (push/pop balanced within a
             // root walk); only `bound_var_ids` persists.
             let mut bound_names: HashSet<String> = HashSet::default();
+            // Memo for this root walk only; it is paired with the accumulator
+            // `self.bound_var_ids` and with the immutable `terms` borrow, and is
+            // dropped before either can change (see `BoundVarScopeMemo`).
+            let mut bound_var_memo = BoundVarScopeMemo::default();
             for &id in &reachable_new {
                 TermIndex::collect_bound_var_ids(
                     terms,
                     id,
                     &mut self.bound_var_ids,
                     &mut bound_names,
+                    &mut bound_var_memo,
                 );
             }
             debug_assert!(

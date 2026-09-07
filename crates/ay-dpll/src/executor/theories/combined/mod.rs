@@ -549,6 +549,80 @@ enum UfliaSplitArm {
     Hybrid,
 }
 
+/// Which solver pipeline re-derives a post-CDCL-split UNSAT in the
+/// verify-before-accept backstop (#6812, #post-split-verify-lane).
+///
+/// The verification is what licenses publishing an UNSAT the #6812
+/// stale-learned-clause guard would otherwise escalate to `Unknown`, so the
+/// re-derivation has to run the *calling* lane's own pipeline: a fresh solve by
+/// a different theory combination certifies a different problem. Before this
+/// existed the backstop hard-coded `solve_uf_lia`, which is why the Real lanes
+/// (`solve_uf_lra`, `solve_uf_nra`) could not opt into it at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::executor) enum PostSplitVerifyLane {
+    /// EUF + LIA (`solve_uf_lia`) — the historical hard-coded lane.
+    UfLia,
+    /// EUF + LRA (`solve_uf_lra`).
+    UfLra,
+    /// EUF + NRA (`solve_uf_nra`).
+    UfNra,
+    /// EUF + NIA (`solve_uf_nia`).
+    UfNia,
+}
+
+impl PostSplitVerifyLane {
+    /// The pipeline entry point the fresh isolated verification solve runs.
+    fn solve_fn(self) -> fn(&mut Executor) -> Result<SolveResult> {
+        match self {
+            Self::UfLia => Executor::solve_uf_lia,
+            Self::UfLra => Executor::solve_uf_lra,
+            Self::UfNra => Executor::solve_uf_nra,
+            Self::UfNia => Executor::solve_uf_nia,
+        }
+    }
+}
+
+/// A split-loop lane's `verify_unsat_after_splits` opt-in.
+///
+/// `Off` keeps the historical unconditional escalate. `Via(lane)` runs the
+/// verify-before-accept backstop, re-deriving with `lane`. A lane opts in by
+/// passing a [`PostSplitVerifyLane`]; the `bool` conversion preserves the
+/// original spelling (`verify_unsat_after_splits: true`) and its original
+/// meaning — verify through the UF+LIA lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::executor) enum PostSplitVerify {
+    /// No verify-before-accept: a post-split UNSAT escalates to `Unknown`.
+    Off,
+    /// Verify by re-deriving the UNSAT on a fresh isolated solve of this lane.
+    Via(PostSplitVerifyLane),
+}
+
+impl PostSplitVerify {
+    /// The lane to re-derive with, or `None` when the opt-in is off.
+    pub(in crate::executor) fn lane(self) -> Option<PostSplitVerifyLane> {
+        match self {
+            Self::Off => None,
+            Self::Via(lane) => Some(lane),
+        }
+    }
+}
+
+impl From<bool> for PostSplitVerify {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::Via(PostSplitVerifyLane::UfLia)
+        } else {
+            Self::Off
+        }
+    }
+}
+
+impl From<PostSplitVerifyLane> for PostSplitVerify {
+    fn from(lane: PostSplitVerifyLane) -> Self {
+        Self::Via(lane)
+    }
+}
+
 /// Env-selected UFLIA split arm (`AY_UFLIA_ARM=eager|lazy|hybrid`).
 /// Process-cached.
 ///
@@ -5533,7 +5607,22 @@ impl Executor {
                         .as_ref()
                         .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
                         || solve_deadline.expired()
-                }
+                },
+                // #6812 sound relaxation (#post-split-verify-lane): accept a
+                // post-expression-split propositional UNSAT ONLY when a FRESH,
+                // isolated UF+LRA solve re-derives UNSAT from the ORIGINAL
+                // `ctx.assertions`. Non-optimistic: any other fresh verdict
+                // (Sat / Unknown / verifier failure) escalates to Unknown as
+                // before, so the #6812 stale-learned-clause guard is satisfied
+                // rather than weakened. Without it this lane discarded EVERY
+                // post-split refutation it derived — the mathsat `pb_real_*`
+                // family reaches `solve: unsat` with z3-comparable conflict
+                // counts and then published `unknown`. The expression split
+                // here is the guarded real trichotomy `a=b ∨ a<b ∨ a>b`
+                // (split_incremental.rs `encode_and_add_split_clause`), a
+                // theory tautology, so the fresh solve's own depth>0 accept is
+                // reasoning from the original assertions alone.
+                verify_unsat_after_splits: PostSplitVerifyLane::UfLra
             )
         })
     }
@@ -5577,18 +5666,36 @@ impl Executor {
                         .as_ref()
                         .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
                         || solve_deadline.expired()
-                }
+                },
+                // #6812 sound relaxation (#post-split-verify-lane), same
+                // contract as the UFLRA arm: publish a post-expression-split
+                // propositional UNSAT ONLY when a FRESH, isolated UF+NRA solve
+                // re-derives UNSAT from the ORIGINAL `ctx.assertions`; any
+                // other fresh verdict still escalates to Unknown. Without it
+                // this lane discarded refutations it had already derived (the
+                // QF_UFNRA `FFT` family logs `solve: unsat` and then the
+                // escalation WARN). Re-deriving on the CALLER'S lane matters
+                // here: a nonlinear core is not re-derivable by the UF+LIA
+                // pipeline the verifier used to hard-code.
+                verify_unsat_after_splits: PostSplitVerifyLane::UfNra
             )
         })
     }
 
-    /// #6812 sound relaxation: verify-before-accept for a post-CDCL-split UF+LIA
+    /// #6812 sound relaxation: verify-before-accept for a post-CDCL-split
     /// UNSAT. Re-derives UNSAT of the ORIGINAL assertion `core` (invariant (a):
     /// the caller passes only original-clause terms) on a FRESH, isolated solve
     /// (invariant (b)): a brand-new `IncrementalTheoryState` (fresh persistent
-    /// SAT + theory, NO carried-over learned/split clauses) running the full
-    /// UF+LIA pipeline. Returns `true` (ACCEPT) iff that fresh solve reports
+    /// SAT + theory, NO carried-over learned/split clauses) running `lane`'s
+    /// full pipeline. Returns `true` (ACCEPT) iff that fresh solve reports
     /// `Unsat`. Non-optimistic: `Sat`/`Unknown`/error => `false` (escalate).
+    ///
+    /// `lane` names the pipeline the re-derivation runs. It MUST be the calling
+    /// lane's own (#post-split-verify-lane): the fresh solve is what licenses
+    /// publishing the outer UNSAT, so a re-derivation by some *other* theory
+    /// combination certifies a different problem than the one being answered.
+    /// Before this parameter existed the verifier hard-coded the UF+LIA lane,
+    /// which is why the Real lanes could not opt in at all.
     ///
     /// The fresh solve sets `post_split_verify_depth`, so its own eager arm
     /// accepts a post-split UNSAT directly (tautological split clauses, §2) rather
@@ -5599,6 +5706,7 @@ impl Executor {
     /// state is absent from the fresh solve and cannot drive a spurious UNSAT.
     pub(in crate::executor) fn verify_post_split_unsat_via_fresh_solve(
         &mut self,
+        lane: PostSplitVerifyLane,
         core: &[TermId],
     ) -> bool {
         if core.is_empty() {
@@ -5661,7 +5769,7 @@ impl Executor {
         self.skip_model_eval = true;
         let core_assertions = core.to_vec();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.with_isolated_incremental_state(Some(core_assertions), Self::solve_uf_lia)
+            self.with_isolated_incremental_state(Some(core_assertions), lane.solve_fn())
         }));
         self.post_split_verify_depth = saved_verify_depth;
 
@@ -6531,7 +6639,11 @@ impl Executor {
                         .as_ref()
                         .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
                         || solve_deadline.expired()
-                }
+                },
+                // #6812 sound relaxation (#post-split-verify-lane): the same
+                // omission the UFNRA arm carried. Verify-before-accept on this
+                // lane's own pipeline; anything but a fresh Unsat escalates.
+                verify_unsat_after_splits: PostSplitVerifyLane::UfNia
             )
         })
     }
@@ -8374,7 +8486,10 @@ mod post_split_verify_tests {
         let contradiction = exec.ctx.terms.false_term();
 
         assert!(
-            exec.verify_post_split_unsat_via_fresh_solve(&[contradiction]),
+            exec.verify_post_split_unsat_via_fresh_solve(
+                PostSplitVerifyLane::UfLia,
+                &[contradiction]
+            ),
             "the isolated verification core must re-derive UNSAT"
         );
         assert_eq!(

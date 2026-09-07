@@ -2401,6 +2401,13 @@ impl Executor {
         self.bv_subst_model_rejected = false;
         self.bv_subst_retry_done = false;
         self.bv_subst_retry_disable_preprocess = false;
+        // #qfax-isolated-lane-retry: fresh per public check-sat (mirrors the
+        // trio above). `qfax_force_combiner` must also be reset so an early
+        // return during a prior retry cannot leave the isolated ladder
+        // permanently suppressed on an incremental Executor.
+        self.qfax_isolated_model_rejected = false;
+        self.qfax_isolated_retry_done = false;
+        self.qfax_force_combiner = false;
         // CEGAR budget (#dt-array-cegar): reset the refine-and-re-solve allowance
         // per user (check-sat). Persists across the per-round internal re-solves
         // in `cegar_refine_solve` (which wraps `check_sat_internal` and re-solves
@@ -2626,6 +2633,45 @@ impl Executor {
             self.bv_subst_retry_disable_preprocess = false;
             self.last_statistics
                 .set_int("model_validation.bv.subst_retry", 1);
+        }
+        // #qfax-isolated-lane-retry: REACTIVE combiner re-solve. The isolated
+        // QF_AUFLIA array+EUF escalation ladder is LIA-less; on the
+        // skolemized-extensionality shape `i = (sk A B)` over long store
+        // chains (SMT-COMP `storecomm_invalid_*_pp_sf_*`,
+        // `swap_invalid_*_pp_sf_*`, which z3 answers `sat` in 0.02 s) the
+        // witness index gets no arithmetic model slot, so the ladder's `Sat`
+        // reaches the strict/independent gates as a model they refute and the
+        // verdict fail-closes to Unknown — a genuine `sat` thrown away.
+        // Re-solve ONCE with the ladder suppressed: the QfAuflia arm then
+        // takes `solve_auf_lia`, whose `has_substantive_int_constraints`
+        // already routes exactly this shape through LIA, and it decides the
+        // family. SOUND: the retry solves the identical original assertion set
+        // by a DIFFERENT complete route and its verdict passes the same
+        // strict/independent/authoritative gates via `emit_sat_verdict`; a
+        // still-rejected re-solve stays the fail-closed Unknown. Gated on an
+        // actual model refutation from that lane, so files the ladder already
+        // decides never pay a second solve. Retry-once latch + deadline guard
+        // mirror the two arms above.
+        if result == SolveResult::Unknown
+            && self.qfax_isolated_model_rejected
+            && !self.qfax_isolated_retry_done
+            && !matches!(self.last_unknown_reason, Some(UnknownReason::Timeout))
+            && !self.solve_deadline.expired()
+        {
+            self.qfax_isolated_retry_done = true;
+            self.qfax_force_combiner = true;
+            self.last_unknown_reason = None;
+            self.last_result = None;
+            self.last_model = None;
+            let retry = self.check_sat_internal()?;
+            if retry.is_unsat() && self.produce_proofs_enabled() && self.last_proof.is_none() {
+                self.build_unsat_proof();
+            }
+            result = self.emit_sat_verdict(retry, &[])?;
+            // Never let the route-facing flag outlive the re-solve.
+            self.qfax_force_combiner = false;
+            self.last_statistics
+                .set_int("model_validation.qfax.combiner_retry", 1);
         }
         // #nonstring-seq-unsat-corroboration: an UNSAT produced for a non-string
         // sequence problem WITHOUT proof production is not trustworthy on its own.
@@ -3311,7 +3357,12 @@ impl Executor {
         // `unsat` -> `unknown` as a direct result — and records that they were
         // moved to `is_producing_proofs()`, which still means what their comments
         // say. This was a missed eleventh site.
-        if self.is_producing_proofs() {
+        //
+        // Narrowed again to `checked_certificate_demanded()`: `is_producing_proofs`
+        // is also true for the synthesized best-effort sidecar, which must not
+        // suppress a refinement that can only turn `unknown` into a correct
+        // definite verdict. A demanded certificate still skips the loop.
+        if self.checked_certificate_demanded() {
             return Ok(result);
         }
         loop {
@@ -3439,6 +3490,7 @@ impl Executor {
         self.clear_finite_enum_proof_state();
         self.last_unsat_proof_reconstruction_suppressed = false;
         self.proof_source_work.reset();
+        self.best_effort_rebuild_refutation_spent = 0;
         self.quantified_proof_translation_incomplete = false;
         self.last_proof_term_overrides = None;
         self.last_proof_quality = None;
@@ -3483,6 +3535,12 @@ impl Executor {
         // NOT cleared here — the retry re-solve re-enters this fn and must
         // preserve the disable-flag.)
         self.bv_subst_lane = false;
+        // #qfax-isolated-lane-retry: `qfax_isolated_lane` marks a verdict
+        // published by the isolated QF_AUFLIA array+EUF ladder; that arm
+        // re-asserts it just before it returns. (`qfax_force_combiner` is
+        // deliberately NOT cleared here — the retry re-solve re-enters this fn
+        // and must preserve the route-facing flag.)
+        self.qfax_isolated_lane = false;
         self.bypass_string_tautology_guard = false;
         self.slia_accepted_unknown = false;
         self.array_axiom_scope = None;
@@ -4476,7 +4534,25 @@ impl Executor {
                     // over `(Array Int Bool)`; regressed in 4a853221). Route
                     // quantified problems through `solve_auf_lia` like the
                     // explicit-AUFLIA arm instead.
-                    let constants_only = !self.incremental_mode
+                    // #qfax-isolated-lane-retry: `qfax_force_combiner` is set
+                    // ONLY by the reactive re-solve in `check_sat_guarded`,
+                    // after the model gates refuted this ladder's `Sat`. The
+                    // first pass is therefore completely unchanged — the fast
+                    // isolated route still runs first for every file — and the
+                    // second pass takes the fall-through `solve_auf_lia`,
+                    // whose `has_substantive_int_constraints` clause
+                    // `is_int_uf_app_with_array_arg` classifies the
+                    // skolemized-extensionality witness `i = (sk A B)` as
+                    // needing LIA. (The two predicates disagree on exactly
+                    // that shape: `int_constraints_are_constants_only` ignores
+                    // UF applications, so `storecomm_invalid_*_pp_sf_*` /
+                    // `swap_invalid_*_pp_sf_*` were decided by the LIA-less
+                    // ladder and lost at the gate. Reconciling them by
+                    // disqualifying the shape outright was MEASURED to cost
+                    // three files the isolated route decides in <0.25 s, so
+                    // the disagreement is resolved reactively instead.)
+                    let constants_only = !self.qfax_force_combiner
+                        && !self.incremental_mode
                         && !self.original_problem_had_quantifiers
                         && crate::term_helpers::int_constraints_are_constants_only(
                             &self.ctx.terms,
@@ -4505,6 +4581,11 @@ impl Executor {
                             );
                         }
                         if stage_result != SolveResult::Unknown {
+                            // #qfax-isolated-lane-retry: this verdict is PUBLISHED by the
+                            // LIA-less isolated ladder. Mark the lane so a model-gate
+                            // refutation of it arms the single combiner re-solve in
+                            // `check_sat_guarded` (see `qfax_isolated_lane`).
+                            self.qfax_isolated_lane = true;
                             return Ok(stage_result);
                         }
                         let can_continue = |exec: &Self| {
@@ -4529,6 +4610,11 @@ impl Executor {
                                 );
                             }
                             if stage_result != SolveResult::Unknown {
+                                // #qfax-isolated-lane-retry: this verdict is PUBLISHED by the
+                                // LIA-less isolated ladder. Mark the lane so a model-gate
+                                // refutation of it arms the single combiner re-solve in
+                                // `check_sat_guarded` (see `qfax_isolated_lane`).
+                                self.qfax_isolated_lane = true;
                                 return Ok(stage_result);
                             }
                         }
@@ -4560,6 +4646,11 @@ impl Executor {
                                     );
                                 }
                                 if stage_result != SolveResult::Unknown {
+                                    // #qfax-isolated-lane-retry: this verdict is PUBLISHED by the
+                                    // LIA-less isolated ladder. Mark the lane so a model-gate
+                                    // refutation of it arms the single combiner re-solve in
+                                    // `check_sat_guarded` (see `qfax_isolated_lane`).
+                                    self.qfax_isolated_lane = true;
                                     return Ok(stage_result);
                                 }
                             } else {
@@ -4600,6 +4691,11 @@ impl Executor {
                             let refined = self.solve_array_euf()?;
                             if refined != SolveResult::Unknown {
                                 self.ctx.assertions = saved_assertions;
+                                // #qfax-isolated-lane-retry: this verdict is PUBLISHED by the
+                                // LIA-less isolated ladder. Mark the lane so a model-gate
+                                // refutation of it arms the single combiner re-solve in
+                                // `check_sat_guarded` (see `qfax_isolated_lane`).
+                                self.qfax_isolated_lane = true;
                                 return Ok(refined);
                             }
                         }
@@ -4893,6 +4989,19 @@ impl Executor {
                 }
             }
         };
+
+        // Anti-divergence guard (#5989). `LogicCategory::has_ground_lane` is the
+        // shared statement of which categories have a theory lane at all; the
+        // quantifier loop's mirror table (`solve_for_category`) asserts the
+        // other direction. A definitive verdict from a category marked laneless
+        // means a lane was added HERE without updating that predicate — and the
+        // mirror table would then be silently answering Unknown for it.
+        debug_assert!(
+            category.has_ground_lane() || matches!(&result, Ok(SolveResult::Unknown) | Err(_)),
+            "{category:?} is recorded as having no ground lane but route_to_solver \
+             returned a definitive verdict; update LogicCategory::has_ground_lane \
+             and the quantifier-loop dispatch table together"
+        );
 
         if matches!(result, Ok(SolveResult::Unknown)) {
             self.refine_unsupported_fragment_unknown_reason(features);

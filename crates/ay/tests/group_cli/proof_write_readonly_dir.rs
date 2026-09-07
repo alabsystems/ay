@@ -103,10 +103,13 @@ fn block_default_chc_certificate(
 fn default_proof_write_failure_keeps_exit_zero_on_readonly_dir() {
     let (dir, file) = readonly_unsat_input("optional");
     // Make the directory read-only so the default `<input>.alethe` write fails
-    // (under a non-root test runner — the common CI case).
+    // (under a non-root test runner — the common CI case). The synthesized
+    // default sidecar is a `--rigor standard` behaviour: a plain solve has
+    // z3's posture and never attempts the write.
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).expect("chmod ro");
 
     let out = Command::new(env!("CARGO_BIN_EXE_ay"))
+        .args(["--rigor", "standard"])
         .arg(&file)
         .output()
         .expect("spawn ay");

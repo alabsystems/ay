@@ -1427,8 +1427,16 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                             // FRESH, isolated solve (invariant (b)) and accept ONLY on
                             // an explicit fresh Unsat. Non-optimistic: anything else
                             // (Sat / Unknown / verifier failure) => escalate.
-                            let _verify = false;
-                            $(let _verify = $verify_unsat;)?
+                            // `$verify_unsat` names the lane that re-derives
+                            // (`PostSplitVerifyLane`); `true` keeps its original
+                            // meaning, "verify through the UF+LIA lane".
+                            let _verify =
+                                $crate::executor::theories::combined::PostSplitVerify::Off;
+                            $(let _verify =
+                                $crate::executor::theories::combined::PostSplitVerify::from(
+                                    $verify_unsat,
+                                );)?
+                            let _verify_lane = _verify.lane();
                             // #6812: when this solve IS the fresh re-derivation of a
                             // post-split UNSAT core (post_split_verify_depth > 0), the
                             // incremental state is brand-new — no stale learned theory
@@ -1439,7 +1447,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 _accept = true;
                             }
                             let mut _accept_via_verify = false;
-                            if !_accept && _verify {
+                            if let (false, Some(_islp_verify_lane)) = (_accept, _verify_lane) {
                                 // Guard (design §4d V4): disable verify-accept under a
                                 // non-zero incremental scope (push/pop). The fresh
                                 // re-derivation solves the core flat at scope depth 0;
@@ -1461,13 +1469,17 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                     let _islp_core: Vec<TermId> =
                                         $self.ctx.assertions.clone();
                                     _accept_via_verify = $self
-                                        .verify_post_split_unsat_via_fresh_solve(&_islp_core);
+                                        .verify_post_split_unsat_via_fresh_solve(
+                                            _islp_verify_lane,
+                                            &_islp_core,
+                                        );
                                 }
                             }
                             if !_accept && !_accept_via_verify {
                                 tracing::warn!(
                                     split_clauses = _islp_added_split_clauses.len(),
-                                    verify_attempted = _verify,
+                                    verify_attempted = _verify_lane.is_some(),
+                                    verify_lane = ?_verify_lane,
                                     concat!("Eager ", $tag, " UNSAT after expression splits; escalating to Unknown")
                                 );
                                 $self.last_unknown_reason = Some(UnknownReason::Incomplete);

@@ -9,6 +9,18 @@ page gives you the map, then names the exact three places where ay's
 behavior diverges from z3's. Two of those three change an exit code, so
 read them before you trust ay's exit status in a script.
 
+What does NOT diverge is the default posture of a plain solve. `ay
+problem.smt2` (also `ay solve problem.smt2` and `ay -in`) does what `z3
+problem.smt2` does: it answers, records no proof during search, mints and
+re-checks no certificate afterwards, and writes nothing next to the input
+(z3: proof=false). ay's certification ladder is opt-in, exactly as z3's
+proof=true is: --rigor standard | strict | certified, --proof FILE,
+--self-check, --strict-proofs, or (set-option :produce-proofs true) in the
+script. --no-proof and --z3-mode select the plain posture explicitly. The
+independent model gate behind every `sat` is on in every posture; the
+ladder changes proof work only, never a verdict. DIMACS (<input>.drat) and
+CHC (<input>.chccert) keep their proof-carrying defaults.
+
 Named or symlinked as z3, ay enables --z3-mode on its own, so the
 transcript carries no ay provenance comments:
 

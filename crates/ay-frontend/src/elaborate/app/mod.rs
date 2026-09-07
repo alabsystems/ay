@@ -9,8 +9,8 @@ use crate::command::Term as ParsedTerm;
 use ay_core::{Constant, Sort, Symbol, TermData, TermId};
 
 use super::{
-    is_canonical_theory_operator_identity, Context, ElaborateError, Result, SymbolInfo,
-    MAX_FUN_EXPANSION_DEPTH,
+    is_canonical_theory_operator_identity, Context, ElaborateError, MacroCallSite,
+    MacroExpansionWatermark, Result, SymbolInfo, MAX_FUN_EXPANSION_DEPTH,
 };
 
 mod arithmetic;
@@ -126,6 +126,7 @@ impl Context {
                     MAX_FUN_EXPANSION_DEPTH,
                 ));
             }
+            let entry_depth = self.fun_expansion_depth;
             self.fun_expansion_depth += 1;
             let mut arg_ids = Vec::with_capacity(args.len());
             for arg in args {
@@ -165,10 +166,23 @@ impl Context {
             // AY also disagreed with ITSELF: the standard's own expansion of the
             // same script — `(declare-fun f () Int)` + `(assert (= f x))` —
             // answered `sat`.
+            //
+            // The body below therefore depends on nothing but the callee and
+            // these argument terms, which is exactly what the memo is keyed on:
+            // re-walking the same parse tree in the same fresh environment can
+            // only rebuild the same hash-consed term, so a chain of definitions
+            // each naming the previous one is elaborated once instead of once
+            // per path through it.
+            let memo_key = (MacroCallSite::Applied, name.to_string(), arg_ids.clone());
+            if let Some(memoized) = self.memoized_macro_expansion(&memo_key, entry_depth) {
+                self.fun_expansion_depth -= 1;
+                return Ok(memoized);
+            }
             let mut new_env = HashMap::default();
             for ((param_name, _), arg_id) in params.iter().zip(arg_ids) {
                 new_env.insert(param_name.clone(), arg_id);
             }
+            let watermark = MacroExpansionWatermark::open(self, entry_depth, &body);
             let result = self.elaborate_term(&body, &new_env).and_then(|body_term| {
                 let actual = self.terms.sort(body_term).clone();
                 if actual == result_sort {
@@ -185,6 +199,9 @@ impl Context {
                     })
                 }
             });
+            // Only a success is recorded: a malformed body must raise its
+            // diagnostic at every call site that reaches it, exactly as before.
+            watermark.close(self, memo_key, result.as_ref().ok().copied());
             self.fun_expansion_depth -= 1;
             return result;
         }

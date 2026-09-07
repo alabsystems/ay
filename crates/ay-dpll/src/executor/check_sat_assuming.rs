@@ -521,6 +521,7 @@ impl Executor {
         self.clear_finite_enum_proof_state();
         self.last_unsat_proof_reconstruction_suppressed = false;
         self.proof_source_work.reset();
+        self.best_effort_rebuild_refutation_spent = 0;
         self.last_lrat_certificate = None;
         self.last_proof_term_overrides = None;
         self.last_proof_quality = None;

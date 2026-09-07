@@ -173,11 +173,15 @@ impl Executor {
                     *INC_ENV.get_or_init(|| !ay_core::theory_disable_flags().no_lra_inc_engine)
                 }
             };
-            if inc_engine_on && !self.is_producing_proofs() {
+            // Routing keys on a CHECKED certificate being demanded
+            // (`checked_certificate_demanded`), not on `is_producing_proofs()`:
+            // the synthesized best-effort sidecar must never demote the
+            // engine (see the predicate's doc for the measured verdict loss).
+            if inc_engine_on && !self.checked_certificate_demanded() {
                 return self.solve_lra_inc_engine();
             }
-            let eager_routing =
-                self.lra_incremental_eager_override.unwrap_or(true) && !self.is_producing_proofs();
+            let eager_routing = self.lra_incremental_eager_override.unwrap_or(true)
+                && !self.checked_certificate_demanded();
             if eager_routing {
                 return self.solve_lra_standalone_incremental();
             }
@@ -284,13 +288,16 @@ impl Executor {
             // clause is a theory tautology over term-semantic atoms
             // (map_conflict_lits / TheoryExtension term_to_literal both fail
             // closed on partial mappings). NOTE: the inc-engine lane
-            // structurally EXCLUDES proof sessions — solve_lra only routes
-            // here under `inc_engine_on && !self.produce_proofs_enabled()` —
-            // so no proof stream ever has to justify an unguarded lemma
-            // surviving its birth scope (debug-asserted below).
+            // structurally EXCLUDES checked-certificate sessions — solve_lra
+            // only routes here under `inc_engine_on &&
+            // !self.checked_certificate_demanded()` — so no DEMANDED proof
+            // stream ever has to justify an unguarded lemma surviving its
+            // birth scope (debug-asserted below). A best-effort tracker may
+            // still be armed here; every routed clause is a theory tautology,
+            // so whatever it records is strict-checkable step by step.
             debug_assert!(
-                !self.is_producing_proofs(),
-                "#lra-inc-engine lane must exclude proof sessions (routing guard in solve_lra)"
+                !self.checked_certificate_demanded(),
+                "#lra-inc-engine lane must exclude checked-certificate sessions (routing guard in solve_lra)"
             );
             sat.set_unguarded_theory_conflict_lemmas(inc_engine_unguarded_lemmas_on());
             sat.set_random_seed(random_seed);

@@ -543,6 +543,11 @@ impl Executor {
         let empty_model = super::model::Model::empty();
 
         for _round in 0..MAX_BV_MBQI_ROUNDS {
+            // Observation only (z3-parity stage 0): the bit-vector lane's rounds
+            // are summed into the same counter as the generic and finite-model
+            // lanes, because the census question is "did MBQI run", not "which
+            // MBQI".
+            self.last_statistics.quantifier_mbqi_rounds += 1;
             // MODEL-LESS REFUTE-ONLY MODE (#broadcast-vacuity empty-ground):
             // when the ground slice of the problem is empty (e.g. a lone
             // quantified axiom, as in deductive-checks's broadcast-vacuity precheck)
@@ -802,6 +807,9 @@ impl Executor {
                     }
 
                     checked += 1;
+                    // Observation only: one tick per candidate tuple observed
+                    // against the model.
+                    self.last_statistics.quantifier_mbqi_candidates_probed += 1;
 
                     // Advance to next combination
                     let mut carry = true;

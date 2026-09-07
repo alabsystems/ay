@@ -966,6 +966,48 @@ const OPTION_GLOBAL_DECLS: &str = "global-decls";
 
 type FunctionDefinition = (Vec<(String, Sort)>, Sort, ParsedTerm);
 
+/// Which site expanded a `define-fun`.
+///
+/// The two sites spend the [`MAX_FUN_EXPANSION_DEPTH`] budget differently: an
+/// applied `(f a)` charges a level to itself (`elaborate/app/mod.rs`), a bare
+/// nullary `f` does not (`elaborate/term.rs`). A recorded expansion's depth
+/// reach is therefore measured from a different base at each, so entries are
+/// not interchangeable and the key keeps them apart — otherwise replaying a
+/// bare-symbol entry at an applied site could clear the depth guard by one
+/// level that the un-memoized walk would not.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum MacroCallSite {
+    /// `(f a …)`, including an explicitly applied nullary `(f)`.
+    Applied,
+    /// A bare `f` naming a nullary definition.
+    BareSymbol,
+}
+
+/// Identity of one `define-fun` macro expansion: the expanding site, the
+/// callee's surface name, and the ALREADY-ELABORATED argument terms.
+///
+/// Keying on argument `TermId`s — never on the use-site environment — is what
+/// makes the memo agree with the capture-avoiding expansion in
+/// `elaborate/app/mod.rs`: the body is elaborated in a fresh environment that
+/// binds exactly the formals to exactly these terms, so two call sites that
+/// agree on this key elaborate the same body in the same environment.
+type MacroExpansionKey = (MacroCallSite, String, Vec<TermId>);
+
+/// One memoized `define-fun` expansion.
+#[derive(Clone, Copy, Debug)]
+struct MacroExpansion {
+    /// The elaborated body, after the declared-result-sort coercion.
+    term: TermId,
+    /// Deepest `fun_expansion_depth` any nested expansion of this body entered,
+    /// measured RELATIVE to the depth this entry was recorded at.
+    ///
+    /// Replaying the entry skips those nested entries, so it must only be
+    /// served where they would all still have cleared
+    /// [`MAX_FUN_EXPANSION_DEPTH`]; otherwise a cached success would silently
+    /// replace the `RecursionDepthExceeded` the un-memoized walk raises.
+    relative_depth: usize,
+}
+
 /// How to render one solver-invented single-constructor FIELD constant as
 /// SMT-LIB text an external proof checker can read: a selector application over
 /// the DECLARED parent constant (`s_!left` -> `(left s_)`).
@@ -1398,6 +1440,36 @@ pub struct Context {
     z3_debug_exprs: HashMap<String, String>,
     /// Current depth of define-fun-rec expansion (#8622)
     fun_expansion_depth: usize,
+    /// Deepest `fun_expansion_depth` entered while elaborating the macro body
+    /// currently in progress. Read back to stamp a [`MacroExpansion`] with the
+    /// nested depth its replay would skip.
+    fun_expansion_depth_watermark: usize,
+    /// Use-site memo for `define-fun` macro expansion.
+    ///
+    /// A `define-fun` is a macro, and `elaborate_app` inlines it by elaborating
+    /// the callee's PARSE TREE at every call site. A chain of definitions each
+    /// naming the previous one therefore costs exponentially in the chain
+    /// length even though the hash-consed result stays tiny — a 30-line
+    /// Fibonacci-shaped chain of unary definitions with no datatypes and no
+    /// arithmetic already burns a 20 s deadline at n = 32. Elaborating each
+    /// `(callee, argument terms)` pair once collapses that to linear.
+    ///
+    /// The memo is a pure cache and every entry is REPLAYABLE BY CONSTRUCTION:
+    /// it is cleared by [`Context::advance_source_revision`] (so no entry
+    /// outlives a change to the declaration environment it resolved against),
+    /// only successful expansions are recorded (so every diagnostic is still
+    /// raised at every offending call site), only expansions that minted no
+    /// fresh variable are recorded (so a body whose occurrences must each get
+    /// their OWN under-specified value — a quantifier binder, `pow_neg_at_zero`,
+    /// `map.empty`'s default — is never shared), and an entry is served only
+    /// where its recorded nested depth still clears
+    /// [`MAX_FUN_EXPANSION_DEPTH`].
+    macro_expansion_memo: HashMap<MacroExpansionKey, MacroExpansion>,
+    /// Over-approximation of every name any memoized expansion resolved, taken
+    /// from the parse trees it walked (binder-shadowed and operator spellings
+    /// included). Read by [`Context::advance_source_revision_introducing`] to
+    /// decide whether a brand-new binding could have changed an entry.
+    macro_expansion_memo_names: HashSet<String>,
     /// Set (only) while elaborating the direct function argument of a
     /// higher-order sequence combinator (`seq.foldl`/`seq.foldli`/`seq.map`/
     /// `seq.mapi` and their `fold_left*` aliases). A MULTI-variable lambda is
@@ -1550,12 +1622,61 @@ impl Context {
     /// context identity instead of wrapping into a revision that could equal a
     /// stale snapshot.
     pub(super) fn advance_source_revision(&mut self) {
+        // Every memoized macro expansion resolved its body against the
+        // declaration environment as it stood BEFORE this change, and this is
+        // the funnel every declaration, definition, macro adoption, scope push
+        // or pop, `set-logic` and reset already passes through. Dropping the
+        // memo here is what keeps a replayed expansion identical to a fresh one
+        // (a redeclaration can make a bare name ambiguous, a later declaration
+        // can take a spelling away from a builtin, `pop` can remove a callee).
+        self.invalidate_macro_expansion_memo();
         if let Some(next) = self.source_revision.checked_add(1) {
             self.source_revision = next;
         } else {
             self.context_identity = ContextIdentity::fresh();
             self.source_revision = 0;
         }
+    }
+
+    /// Drop every memoized `define-fun` expansion.
+    ///
+    /// Call this from anything that changes what a body's free symbols resolve
+    /// to, or how a body TYPES — the declaration environment, the scope stack,
+    /// the logic, or a typing policy such as `:int-real-coercions`. Entries are
+    /// a pure cache, so dropping them can only cost a re-walk.
+    pub(super) fn invalidate_macro_expansion_memo(&mut self) {
+        self.macro_expansion_memo.clear();
+        self.macro_expansion_memo_names.clear();
+    }
+
+    /// [`Self::advance_source_revision`] for a command whose ONLY effect on name
+    /// resolution is to introduce `name`, which had NO binding of any kind
+    /// before (`define-fun` is the one such command: `reject_redefinition` plus
+    /// `reject_unrepresentable_overload` reject every name that already denotes
+    /// something, and the reserved-symbol and datatype-member gates reject the
+    /// rest).
+    ///
+    /// Such a command cannot change what any earlier expansion's free symbols
+    /// resolved to — one exception aside: a spelling that elaborates as a
+    /// BUILTIN while undeclared (`const`, say) starts denoting the new macro
+    /// instead, because `fun_defs` is consulted before the builtins. That is
+    /// exactly what the recorded name set is checked for, so the memo survives
+    /// only where no memoized expansion ever named this spelling.
+    ///
+    /// This is what makes a chain of definitions linear rather than quadratic:
+    /// the cpachecker QF_UFLRA files are 18k nullary definitions each naming the
+    /// previous one, so re-elaborating every chain from scratch at each new
+    /// definition is 165M expansions even with a per-command memo.
+    pub(super) fn advance_source_revision_introducing(&mut self, name: &str) {
+        if self.macro_expansion_memo_names.contains(name) {
+            self.advance_source_revision();
+            return;
+        }
+        let memo = std::mem::take(&mut self.macro_expansion_memo);
+        let names = std::mem::take(&mut self.macro_expansion_memo_names);
+        self.advance_source_revision();
+        self.macro_expansion_memo = memo;
+        self.macro_expansion_memo_names = names;
     }
 
     /// Iterate declared symbols (name -> info). Used by problem-dump
@@ -1708,6 +1829,9 @@ impl Context {
             named_terms: HashMap::default(),
             z3_debug_exprs: HashMap::default(),
             fun_expansion_depth: 0,
+            fun_expansion_depth_watermark: 0,
+            macro_expansion_memo: HashMap::default(),
+            macro_expansion_memo_names: HashSet::default(),
             multivar_lambda_curry_allowed: false,
             uses_multiset: false,
             uses_set: false,
@@ -1900,6 +2024,13 @@ impl Context {
     /// Select whether official SMT-LIB logic declarations are enforced as
     /// language boundaries instead of being treated only as routing hints.
     pub fn set_strict_logic_compliance(&mut self, strict: bool) {
+        // Deliberately does not advance the source revision (it is a host
+        // policy, not a source change), so drop the macro expansion memo here:
+        // the policy decides whether a body's operators are in the declared
+        // language at all.
+        if self.strict_logic_compliance != strict {
+            self.invalidate_macro_expansion_memo();
+        }
         self.strict_logic_compliance = strict;
     }
 
@@ -2689,6 +2820,8 @@ pub use public_sorts::{
     PublicTermMetadata,
 };
 mod logic_policy;
+mod macro_memo;
+use macro_memo::MacroExpansionWatermark;
 mod qualified;
 mod sort_parameters;
 mod sorts;

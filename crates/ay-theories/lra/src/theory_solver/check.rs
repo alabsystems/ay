@@ -452,6 +452,7 @@ impl LraSolver {
         // to Unknown because the model may be incomplete.
         let mut result = match simplex_result {
             TheoryResult::Sat if has_asserted_unsupported => {
+                self.stats.unsupported_sat_downgrades += 1;
                 tracing::warn!(
                     unsupported_count = self.persistent_unsupported_atoms.len(),
                     asserted_unsupported = self

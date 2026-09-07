@@ -14,6 +14,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::TermData;
 use ay_core::{Sort, TermId, TermStore};
 use ay_euf::EufModel;
+use num_bigint::BigInt;
 use std::collections::BTreeMap;
 
 /// Red zone size for `stacker::maybe_grow` in ematching recursion (#5612).
@@ -1404,32 +1405,90 @@ pub(crate) fn collect_entailed_foralls(
 #[derive(Default)]
 pub(crate) struct UnitFacts {
     values: HashMap<TermId, bool>,
+    /// (#unit-int-bound-key) The same facts, re-keyed on the CANONICAL integer
+    /// upper bound they express: `(subject, c) -> truth of (subject <= c)`.
+    ///
+    /// A `TermId` lookup alone cannot see that `(<= 5 a)` is the complement of
+    /// the unit `(<= a 4)`, because `tighten_int_strict_term`
+    /// (`quantifier_loop/preprocess/term_rewrites.rs:48`) has already rewritten
+    /// the syntactic `(not (<= a 4))` into that positive atom. This index closes
+    /// the gap on the lookup side; see [`int_upper_bound_key`].
+    bounds: HashMap<(TermId, BigInt), bool>,
 }
 
 impl UnitFacts {
     /// Collect the top-level unit facts of `assertions`.
+    ///
+    /// (#unit-and-harvest) The harvest descends through an asserted `and`.
+    /// `(assert (and c₁ … cₙ))` asserts the conjunction, and a conjunction is
+    /// true exactly when every conjunct is, so the problem entails each `cᵢ`
+    /// unconditionally — `cᵢ` is precisely as much of a unit FACT as a bare
+    /// `(assert cᵢ)` would have made it. Descending is therefore sound in the
+    /// same sense as the bare-assertion case above; it recognises more units,
+    /// never a wrong one.
+    ///
+    /// It matters because `is_unit_atom` answers `false` for `and`, so before
+    /// this descent an assertion list of ONE conjunction had NO units at all.
+    /// Every UltimateAutomizer verification condition has that shape (its guard
+    /// set is one `(assert (and …))`), so its guards never became units, the
+    /// `#unit-conjunctive` branches in [`collect_entailed_foralls_with_units`]
+    /// never fired, and the negated `exists` in the property assertion was never
+    /// recognised as an entailed universal — 0 E-matching instances where z3
+    /// needs 2-60.
+    ///
+    /// Iterative with a seen set: assertion DAGs share subterms (a `let`-bound
+    /// guard can occur in many conjuncts), and `and` nesting is flattened by
+    /// `mk_and` but not guaranteed flat for terms built by other routes.
     pub(crate) fn from_assertions(terms: &TermStore, assertions: &[TermId]) -> Self {
-        let mut values: HashMap<TermId, bool> = HashMap::default();
-        for &a in assertions {
+        let mut facts = Self::default();
+        let mut stack: Vec<TermId> = assertions.iter().rev().copied().collect();
+        let mut seen: HashSet<TermId> = HashSet::default();
+        while let Some(a) = stack.pop() {
+            if !seen.insert(a) {
+                continue;
+            }
             match terms.get(a) {
                 TermData::Not(inner) => {
                     let inner = *inner;
                     if is_unit_atom(terms, inner) {
-                        values.insert(inner, false);
+                        facts.record(terms, inner, false);
                     }
+                }
+                // An asserted conjunction asserts every conjunct. Only `and` is
+                // descended: `or`/`=>`/`ite`/`xor` conjuncts are NOT entailed,
+                // and a `Not` is handled by the arm above (`mk_not` already
+                // pushed De Morgan through `and`/`or`, so a surviving `Not`
+                // wraps an atom, a quantifier or an uninterpreted application).
+                TermData::App(ay_core::Symbol::Named(name), args) if name == "and" => {
+                    stack.extend(args.iter().copied());
                 }
                 _ => {
                     if is_unit_atom(terms, a) {
-                        values.insert(a, true);
+                        facts.record(terms, a, true);
                     }
                 }
             }
         }
-        Self { values }
+        facts
+    }
+
+    /// Record `atom = truth`, on BOTH keys the lookup can arrive by: the atom's
+    /// own `TermId`, and — when the atom is an integer order atom — its
+    /// canonical upper-bound key (see [`int_upper_bound_key`]).
+    fn record(&mut self, terms: &TermStore, atom: TermId, truth: bool) {
+        self.values.insert(atom, truth);
+        if let Some((subject, c, positive)) = int_upper_bound_key(terms, atom) {
+            // `atom` is `subject <= c` when `positive`, its negation otherwise,
+            // so the bound's own truth is `truth == positive`.
+            self.bounds.insert((subject, c), truth == positive);
+        }
     }
 
     /// Truth of `t` under the units, if determined. Handles a negated atom by
-    /// flipping its atom's unit value.
+    /// flipping its atom's unit value, and an integer order atom by its
+    /// canonical bound (which is how the SAME fact reaches this lookup after
+    /// `tighten_int_strict_term` has rewritten `(not (<= a c))` into the
+    /// positive atom `(<= (c+1) a)`).
     fn value(&self, terms: &TermStore, t: TermId) -> Option<bool> {
         if let Some(&v) = self.values.get(&t) {
             return Some(v);
@@ -1439,11 +1498,148 @@ impl UnitFacts {
                 return Some(!v);
             }
         }
+        if self.bounds.is_empty() {
+            return None;
+        }
+        if let Some(v) = self.bound_value(terms, t) {
+            return Some(v);
+        }
+        if let TermData::Not(inner) = terms.get(t) {
+            if let Some(v) = self.bound_value(terms, *inner) {
+                return Some(!v);
+            }
+        }
         None
     }
 
+    /// Truth of `t` read off the canonical integer-bound index.
+    fn bound_value(&self, terms: &TermStore, t: TermId) -> Option<bool> {
+        let (subject, c, positive) = int_upper_bound_key(terms, t)?;
+        let bound_holds = *self.bounds.get(&(subject, c))?;
+        // `t` is the bound when `positive`, its negation otherwise.
+        Some(bound_holds == positive)
+    }
+
     fn is_empty(&self) -> bool {
+        // Every `bounds` entry is written beside a `values` entry, so this one
+        // test covers both indices.
         self.values.is_empty()
+    }
+}
+
+/// The canonical INTEGER upper bound an order atom expresses, if it expresses
+/// one: `(subject, c, positive)` reads as "`t` ≡ `subject <= c`" when
+/// `positive`, and "`t` ≡ `¬(subject <= c)`" otherwise.
+///
+/// # Why this exists (#unit-int-bound-key)
+///
+/// `UnitFacts` is consulted by the `#unit-conjunctive` branches of
+/// [`collect_entailed_foralls_with_units`], which need to know that a disjunct
+/// is FALSIFIED by a unit. On the UltimateAutomizer / Boogie shape
+/// `(or ¬G₁ … ∀x̄.B … ¬Gₙ)` the guards `Gᵢ` are asserted units, so `¬Gᵢ` should
+/// be false and the universal should survive as the entailed consequence. For a
+/// Boolean or `=` guard that works by `TermId`. For an INTEGER ORDER guard it
+/// does not, because `tighten_int_strict_term`
+/// (`quantifier_loop/preprocess/term_rewrites.rs:48`) has already rewritten the
+/// negation into a positive atom over fresh terms:
+///
+/// ```text
+///   (not (<= a b))  =>  (<= (+ b 1) a)
+///   (not (< a b))   =>  (<= b a)
+///   (< a b)         =>  (<= a (- b 1))
+/// ```
+///
+/// so `(<= 5 a)` and the unit `(<= a 4)` are unrelated `TermId`s. Keying both on
+/// the bound they denote makes the lookup see the complement. Measured: the
+/// otherwise-identical probes `t1b` (Bool unit) and `t1c` (`(<= a 4)` unit)
+/// answered `unsat`/1 instance and `unknown`/0 instances respectively.
+///
+/// # Soundness
+///
+/// Every step is an EXACT equivalence over the integers, so an atom and its key
+/// are true in exactly the same models — the predicate widens the LOOKUP, never
+/// the set of facts:
+///
+/// * `l ≤ c`      ⇔ `l ≤ c`
+/// * `l < c`      ⇔ `l ≤ c-1`
+/// * `c ≤ r`      ⇔ `¬(r ≤ c-1)`
+/// * `c < r`      ⇔ `¬(r ≤ c)`
+/// * `x + k ≤ c`  ⇔ `x ≤ c-k`   (and `x - k ≤ c` ⇔ `x ≤ c+k`)
+///
+/// The last two require the discreteness of `Int`, so BOTH operands must be
+/// `Int`-sorted; `Real` is rejected outright (over the reals `c ≤ r` is NOT
+/// `¬(r ≤ c-1)`). Two atoms share a key only if they name the same `subject`
+/// `TermId` and the same bound, i.e. they denote the literally same predicate,
+/// so the recorded truth transfers exactly. Atoms with a constant on BOTH sides
+/// are rejected — the constructors have already folded those to `true`/`false`.
+fn int_upper_bound_key(terms: &TermStore, t: TermId) -> Option<(TermId, BigInt, bool)> {
+    let TermData::App(ay_core::Symbol::Named(name), args) = terms.get(t) else {
+        return None;
+    };
+    let strict = match name.as_str() {
+        "<=" => false,
+        "<" => true,
+        _ => return None,
+    };
+    let [lhs, rhs] = args[..] else { return None };
+    // Int ONLY. `>`/`>=` never appear: `mk_gt`/`mk_ge` normalize them into
+    // `<`/`<=` with the operands swapped.
+    if !matches!(terms.sort(lhs), Sort::Int) || !matches!(terms.sort(rhs), Sort::Int) {
+        return None;
+    }
+    match (int_constant(terms, lhs), int_constant(terms, rhs)) {
+        // `lhs ≤ c` / `lhs < c` ⇔ `lhs ≤ c-1`.
+        (None, Some(c)) => {
+            let bound = if strict { c - 1 } else { c };
+            let (subject, shift) = peel_int_offset(terms, lhs);
+            Some((subject, bound - shift, true))
+        }
+        // `c ≤ rhs` ⇔ `¬(rhs ≤ c-1)`; `c < rhs` ⇔ `¬(rhs ≤ c)`.
+        (Some(c), None) => {
+            let bound = if strict { c } else { c - 1 };
+            let (subject, shift) = peel_int_offset(terms, rhs);
+            Some((subject, bound - shift, false))
+        }
+        _ => None,
+    }
+}
+
+/// The integer value of `t` if it is an integer literal.
+fn int_constant(terms: &TermStore, t: TermId) -> Option<BigInt> {
+    match terms.get(t) {
+        TermData::Const(ay_core::term::Constant::Int(i)) => Some(i.clone()),
+        _ => None,
+    }
+}
+
+/// Split `e` into `(base, shift)` with `e = base + shift` EXACTLY, peeling one
+/// top-level integer literal off a binary `+`/`-`. Returns `(e, 0)` when there
+/// is nothing to peel, so `x + k ≤ c` and `x ≤ c - k` reach the same key.
+///
+/// Only a two-argument `+`/`-` is peeled, and only when exactly one operand is
+/// a literal: unary `-` is negation, not subtraction, and an n-ary `+` of two
+/// literals has already been folded by `mk_add`.
+fn peel_int_offset(terms: &TermStore, e: TermId) -> (TermId, BigInt) {
+    let TermData::App(ay_core::Symbol::Named(name), args) = terms.get(e) else {
+        return (e, BigInt::from(0));
+    };
+    let [lhs, rhs] = args[..] else {
+        return (e, BigInt::from(0));
+    };
+    match name.as_str() {
+        // `x + k` and `k + x`.
+        "+" => match (int_constant(terms, lhs), int_constant(terms, rhs)) {
+            (None, Some(k)) => (lhs, k),
+            (Some(k), None) => (rhs, k),
+            _ => (e, BigInt::from(0)),
+        },
+        // `x - k` = `x + (-k)`. NOT `k - x`: that flips the subject's sign and
+        // is not an offset.
+        "-" => match (int_constant(terms, lhs), int_constant(terms, rhs)) {
+            (None, Some(k)) => (lhs, -k),
+            _ => (e, BigInt::from(0)),
+        },
+        _ => (e, BigInt::from(0)),
     }
 }
 

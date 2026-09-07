@@ -654,7 +654,12 @@ impl Context {
         );
         // Track in current scope for pop() cleanup (#8621).
         self.track_scoped_fun_def(name.to_string());
-        self.advance_source_revision();
+        // `name` had no binding of any kind on entry (the redefinition,
+        // overload, reserved-symbol and datatype-member gates above), so the
+        // macro expansion memo built while type-checking this body stays valid
+        // — that is what keeps a chain of definitions linear rather than
+        // quadratic. The one spelling-shadowing exception is checked inside.
+        self.advance_source_revision_introducing(name);
         Ok(())
     }
 

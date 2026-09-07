@@ -15,6 +15,7 @@ mod decision_index;
 mod deferred_reason_materialization;
 mod delta_objective;
 mod dirty_row_sweep;
+mod divmod_unsupported;
 mod faithfulness_audit;
 mod farkas_optimization;
 mod implied_propagation_entailment;

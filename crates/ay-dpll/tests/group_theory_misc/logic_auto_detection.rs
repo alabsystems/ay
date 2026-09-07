@@ -385,3 +385,133 @@ fn test_qf_lra_linear_stays_lra() {
         result.trim()
     );
 }
+
+/// Datatypes + NONLINEAR integer arithmetic must reach the DT+NIA lane.
+///
+/// Content detection routes datatype+Int content to the internal `_DT_AUFLIA`
+/// category; `with_nonlinear` then used to collapse it to `Other`, and check-sat
+/// answered `Err(UnsupportedLogic)` — the CLI's opaque
+/// `(incomplete decision-execution-error)`. The Barrett `rec-fun-ijcar2016`
+/// family (SMT-LIB divisions AUFBVDTNIA/AUFBVDTLIA) hits exactly this path,
+/// because `AUFBVDTNIA` is an accepted-but-unmapped token that routes through
+/// content detection. The same file with a declared `AUFDTNIA` already solved.
+/// (#dt-nia-content-route)
+const DT_NONLINEAR_INT_UNSAT_BODY: &str = r#"
+    (declare-datatypes ((Lst 0)) (((Cons (hd Int) (tl Lst)) (Nil))))
+    (declare-fun l () Lst)
+    (declare-fun n () Int)
+    (declare-fun m () Int)
+    (assert ((_ is Cons) l))
+    (assert (= (hd l) (* n m)))
+    (assert (> (hd l) 5))
+    (assert (< (* n m) 3))
+    (check-sat)
+"#;
+
+#[test]
+#[timeout(60_000)]
+fn dt_nonlinear_int_without_set_logic_reaches_a_lane() {
+    let result = crate::common::solve(DT_NONLINEAR_INT_UNSAT_BODY);
+    assert_eq!(
+        result.trim(),
+        "unsat",
+        "DT + nonlinear Int must route to the DT+NIA lane, got: {}",
+        result.trim()
+    );
+}
+
+#[test]
+#[timeout(60_000)]
+fn dt_nonlinear_int_under_unmapped_aufbvdtnia_reaches_a_lane() {
+    let smt = format!("(set-logic AUFBVDTNIA){DT_NONLINEAR_INT_UNSAT_BODY}");
+    let result = crate::common::solve(&smt);
+    assert_eq!(
+        result.trim(),
+        "unsat",
+        "an accepted-but-unmapped AUFBVDTNIA routes through content detection \
+         and must reach the same lane, got: {}",
+        result.trim()
+    );
+}
+
+#[test]
+#[timeout(60_000)]
+fn dt_nonlinear_int_under_all_reaches_a_lane() {
+    let smt = format!("(set-logic ALL){DT_NONLINEAR_INT_UNSAT_BODY}");
+    let result = crate::common::solve(&smt);
+    assert_eq!(
+        result.trim(),
+        "unsat",
+        "(set-logic ALL) must not report `unsupported logic: ALL` on content \
+         that has a lane, got: {}",
+        result.trim()
+    );
+}
+
+/// The declared arm this mirrors keeps working.
+#[test]
+#[timeout(60_000)]
+fn dt_nonlinear_int_under_declared_aufdtnia_reaches_a_lane() {
+    let smt = format!("(set-logic AUFDTNIA){DT_NONLINEAR_INT_UNSAT_BODY}");
+    let result = crate::common::solve(&smt);
+    assert_eq!(result.trim(), "unsat");
+}
+
+/// Array-bearing DT + nonlinear Int stays fail-closed: the `Ufdtnia` lane
+/// composes DT axioms over `solve_uf_nia`, which has no array theory, so
+/// `select`/`store` would be uninterpreted and a `sat` could violate
+/// read-over-write. It must NOT publish a verdict.
+#[test]
+#[timeout(60_000)]
+fn array_bearing_dt_nonlinear_int_stays_fail_closed() {
+    let smt = r#"
+        (declare-datatypes ((Lst 0)) (((Cons (hd Int) (tl Lst)) (Nil))))
+        (declare-fun l () Lst)
+        (declare-fun a () (Array Int Int))
+        (declare-fun n () Int)
+        (declare-fun m () Int)
+        (assert ((_ is Cons) l))
+        (assert (= (hd l) (select (store a 0 (* n m)) 0)))
+        (assert (> (hd l) 5))
+        (assert (< (* n m) 3))
+        (check-sat)
+    "#;
+    let commands = ay_frontend::parse(smt).expect("parse");
+    let mut exec = ay_dpll::Executor::new();
+    match exec.execute_all(&commands) {
+        // Fail-closed: either a hard `UnsupportedLogic` refusal (today) or a
+        // sound `unknown`. A definitive verdict from a lane with no array
+        // theory is what this test forbids.
+        Ok(lines) => assert!(
+            lines
+                .iter()
+                .all(|l| l.trim() != "sat" && l.trim() != "unsat"),
+            "array-bearing DT+NIA must not publish a verdict from an \
+             array-blind lane, got: {lines:?}"
+        ),
+        Err(_) => {}
+    }
+}
+
+/// DT + FP has no sound combined solver (#8728) and must keep its QUIET
+/// `unknown` — the `Other` fallback is narrowed by the DT+NIA arm above, not
+/// deleted.
+#[test]
+#[timeout(60_000)]
+fn dt_plus_fp_keeps_its_quiet_unknown() {
+    let smt = r#"
+        (declare-datatypes ((Box 0)) (((Mk (getFlt (_ FloatingPoint 8 24))))))
+        (declare-fun b () Box)
+        (declare-fun x () (_ FloatingPoint 8 24))
+        (assert (distinct (Mk ((_ to_fp 8 24) RNE 1.0)) (Mk x)))
+        (assert (fp.isNaN x))
+        (check-sat)
+    "#;
+    let result = crate::common::solve(smt);
+    assert_eq!(
+        result.trim(),
+        "unknown",
+        "DT + FP must stay a sound fail-closed unknown, got: {}",
+        result.trim()
+    );
+}

@@ -215,10 +215,18 @@ enum CliAssuranceLevel {
     /// solver techniques, the always-on independent model gate, automatic
     /// engine selection -- are UNCHANGED. Also forced automatically when a
     /// SAT-competition wrapper env signal is present.
+    ///
+    /// A plain SMT-LIB solve with no `--rigor` and no proof flag already runs
+    /// this rung's PROOF posture (nothing recorded, minted, re-checked, or
+    /// written -- z3's default) while keeping the validation batteries on;
+    /// see `certification_requested`.
     Fast,
-    /// The default. Batteries included: runtime result validation is ON,
-    /// default proof-certificate emission is ON, and the emitted proof is
-    /// re-checked afterward (the built-in --verify-proof re-check).
+    /// The certifying rung. Batteries included: runtime result validation is
+    /// ON, default proof-certificate emission is ON (SMT-LIB writes
+    /// `<input>.alethe`; DIMACS/CHC do so at every rung but `fast`), and the
+    /// emitted proof is re-checked afterward (the built-in --verify-proof
+    /// re-check). Opt-in for SMT-LIB input; `None` on the dial resolves here
+    /// only for the legacy switches' projection, not for a plain solve.
     Standard,
     /// Strict proof diagnostic and terminal-trust screen (== --strict-proofs).
     /// Uses AY's strict semantic checker while constructing proofs and

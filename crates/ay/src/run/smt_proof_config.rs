@@ -14,12 +14,25 @@
 /// writing Alethe, and deleting it without verification. An explicit
 /// `--verify-proof` is rejected by the route gate before this adapter runs.
 ///
-/// Returns `None` when `proof_config` is `None` or verify-only temporary.
-/// Persistent default and explicit proof configs are returned unchanged; the
-/// caller validates that their format is Alethe.
+/// A SYNTHESIZED DEFAULT is likewise dropped while the proof cycle is shed
+/// (`PROOF_CYCLE_SHED_ENABLED`: a plain solve, `--no-proof`, `--z3-mode`,
+/// competition mode). A shedding executor records no proof, so the artifact
+/// could never be rendered, and handing the config to `configure_proof_policy`
+/// would call `set_best_effort_produce_proofs` and silently re-arm the tracker
+/// for a sidecar nobody asked for. `build_proof_config` still synthesizes the
+/// default for every `.smt2` input because the CHC runner retargets it to
+/// `<input>.chccert`; only the SMT decision route sheds it.
+///
+/// Returns `None` when `proof_config` is `None`, verify-only temporary, or a
+/// synthesized default under shedding. Explicit proof configs are returned
+/// unchanged; the caller validates that their format is Alethe.
 fn adapt_proof_config_for_smt(proof_config: Option<&ProofConfig>) -> Option<ProofConfig> {
     let src = proof_config?;
     if src.is_temp {
+        return None;
+    }
+    if src.synthesized_default && PROOF_CYCLE_SHED_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+    {
         return None;
     }
     Some(src.clone())

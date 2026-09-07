@@ -16,7 +16,7 @@
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -211,7 +211,10 @@ pub(crate) static PROGRESS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Precedence lives executor-side: any explicit proof demand (`--proof`,
 /// `--strict-proofs`, `--self-check`, in-script `:produce-proofs` /
 /// `:check-proofs-strict`) overrides the shedding, never conflicts with it.
-pub(crate) use competition_mode::{competition_mode, COMPETITION_MODE_ENABLED};
+pub(crate) use competition_mode::{
+    certification_requested, competition_mode, proof_cycle_shed, COMPETITION_MODE_ENABLED,
+    PROOF_CYCLE_SHED_ENABLED,
+};
 /// Whether aggressive model minimization is enabled (#8297).
 /// Set by `--minimize-model` CLI flag. Read by executor creation paths.
 pub(crate) static MINIMIZE_MODEL_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -796,9 +799,15 @@ Rigor (--rigor <LEVEL>): how much AY proves and re-checks its OWN answer.
 The verdict is always sound at every level -- AY never publishes a wrong sat/unsat;
 this only controls proof/self-check work, not confidence in the answer.
   fast       just the answer, like z3 -- no proof, no re-check (was --competition)
-  standard   default: validate the answer, emit a proof, re-check that proof
+  standard   validate the answer, emit a proof next to the input, re-check that proof
   strict     strict proof checker; a terminal-trust unsat it cannot prove -> unknown (was --strict-proofs)
   certified  fail-closed: emit only answers AY can self-verify, else unknown (was --self-check)
+A plain `ay FILE.smt2` (no --rigor, no proof flag) has z3's posture: the fast rung's
+proof work -- nothing recorded, minted, re-checked, or written next to the input --
+with the validation batteries left on. Certification is one flag away: --rigor
+standard, --proof FILE, --self-check, --strict-proofs, or (set-option :produce-proofs
+true) in the script. DIMACS (<input>.drat) and CHC (<input>.chccert) keep their
+proof-carrying defaults.
 
 Proof artifact:
   --proof FILE [--proof-format alethe|drat|lrat|lean4|veripb] [--proof-binary]
@@ -841,8 +850,10 @@ struct SolveArgs {
     /// Opt in to a clean Z3-compatible transcript surface.
     ///
     /// Default AY output keeps richer provenance and diagnostics. This flag
-    /// only reshapes visible transcript details for downstream tools that
-    /// compare against Z3-style stdout/stderr.
+    /// reshapes visible transcript details for downstream tools that compare
+    /// against Z3-style stdout/stderr, and on SMT-LIB input sheds the internal
+    /// proof cycle exactly like `--rigor fast` (no proof recording, no
+    /// certificate mint, no nested re-solve, no sidecar) — z3's own posture.
     #[arg(long = "z3-mode", help_heading = "Compatibility")]
     z3_mode: bool,
 
@@ -1218,16 +1229,23 @@ struct SolveArgs {
 
     /// Opt out of default proof-artifact emission on supported UNSAT paths.
     ///
-    /// For supported file inputs, proof emission is ON BY DEFAULT: after an
-    /// UNSAT result, ay attempts to write a proof artifact next to the input —
-    /// DRAT for DIMACS (`<input>.drat`), Alethe for SMT (`<input>.alethe`), or
-    /// an ay-chc-cert for CHC (`<input>.chccert`). Support depends on the solver
+    /// For DIMACS and CHC file inputs, proof emission is ON BY DEFAULT: after
+    /// an UNSAT result, ay attempts to write a proof artifact next to the input
+    /// — DRAT for DIMACS (`<input>.drat`) or an ay-chc-cert for CHC
+    /// (`<input>.chccert`). An SMT-LIB input gets its Alethe certificate
+    /// (`<input>.alethe`) only at `--rigor standard` or above; a plain solve
+    /// has z3's posture and records no proof. Support depends on the solver
     /// path, theory, and format. Outside `--strict-proofs`/`--self-check`, a
     /// default-emission failure warns without changing the solver verdict;
     /// those gates instead fail closed. Treat an artifact as independently
     /// certified only after its intended checker accepts it. Pass `--no-proof`
     /// to suppress the default (e.g. when proof I/O adds benchmark overhead),
     /// or select an explicit `--proof FILE`; clap rejects combining the two.
+    ///
+    /// On SMT-LIB input `--no-proof` sheds the whole internal proof cycle
+    /// exactly like `--rigor fast`: no search-time proof recording, no
+    /// post-UNSAT certificate mint, no nested corroboration re-solve. It used
+    /// to suppress only the file while leaving that cycle armed, unbudgeted.
     #[arg(
         long,
         help_heading = "Proof verification",
@@ -1941,47 +1959,176 @@ const MEMOUT_STDERR_SMTLIB: &[u8] = b"(:reason-unknown \"memout\")\n";
 const MEMOUT_STDERR_SAT_COMPETITION: &[u8] = b"c memout\n";
 
 /// Verdict emitted when the allocator's hard ceiling refuses growth, per output
-/// grammar. These are `static` because the breach happens inside the global
-/// allocator, which can only reach `'static` bytes — nothing may be formatted
-/// there.
+/// grammar and exit convention. These are `static` because the breach happens
+/// inside the global allocator, which can only reach `'static` bytes — nothing
+/// may be formatted there. One static per (grammar, exit code) pair the
+/// [`MemoutVerdict`] decision can produce.
 static HARD_CEILING_SMTLIB: ay_sys::HardMemoryCeiling = ay_sys::HardMemoryCeiling {
     stdout_line: MEMOUT_STDOUT_SMTLIB,
     stderr_line: MEMOUT_STDERR_SMTLIB,
     exit_code: DEFAULT_TIMEOUT_EXIT_CODE,
+};
+static HARD_CEILING_SMTLIB_WRAPPER_EXIT: ay_sys::HardMemoryCeiling = ay_sys::HardMemoryCeiling {
+    stdout_line: MEMOUT_STDOUT_SMTLIB,
+    stderr_line: MEMOUT_STDERR_SMTLIB,
+    exit_code: SAT_COMPETITION_UNKNOWN_EXIT_CODE,
 };
 static HARD_CEILING_SAT_COMPETITION: ay_sys::HardMemoryCeiling = ay_sys::HardMemoryCeiling {
     stdout_line: MEMOUT_STDOUT_SAT_COMPETITION,
     stderr_line: MEMOUT_STDERR_SAT_COMPETITION,
     exit_code: SAT_COMPETITION_UNKNOWN_EXIT_CODE,
 };
+static HARD_CEILING_SAT_COMPETITION_PLAIN_EXIT: ay_sys::HardMemoryCeiling =
+    ay_sys::HardMemoryCeiling {
+        stdout_line: MEMOUT_STDOUT_SAT_COMPETITION,
+        stderr_line: MEMOUT_STDERR_SAT_COMPETITION,
+        exit_code: DEFAULT_TIMEOUT_EXIT_CODE,
+    };
 
-/// Output grammar for the memory-budget verdicts (the watchdog fallback and
-/// the allocator hard ceiling): SAT-competition grammar when the submission
-/// wrapper env is present OR competition mode was requested on the command
-/// line. `--competition` is latched into [`COMPETITION_MODE_ENABLED`] before
+/// The input format this run is serving, as far as it is known, for the
+/// memory-budget verdict grammar (see [`memout_verdict_for`]).
+///
+/// Guessed from the input file's extension in `run_solve` BEFORE the memory
+/// ceiling is armed, then confirmed at every route dispatch in `run.rs`
+/// (content sniffing decides DIMACS vs SMT-LIB/CHC for stdin and for files
+/// whose extension says nothing). Stdin before the sniff stays `Undecided`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum VerdictGrammarRoute {
+    Undecided = 0,
+    /// SMT-LIB 2.6 (and CHC, which shares its verdict grammar).
+    SmtLib = 1,
+    /// DIMACS CNF: `s UNKNOWN` verdict lines whatever the posture, exactly as
+    /// the DIMACS timeout path already prints them.
+    Dimacs = 2,
+}
+
+impl VerdictGrammarRoute {
+    /// The best guess available before the input is read: its extension.
+    pub(crate) fn from_input_path(path: Option<&FsPath>) -> Self {
+        let Some(ext) = path.and_then(FsPath::extension).and_then(|e| e.to_str()) else {
+            return Self::Undecided;
+        };
+        match ext.to_ascii_lowercase().as_str() {
+            "cnf" | "dimacs" => Self::Dimacs,
+            "smt2" | "smt" => Self::SmtLib,
+            _ => Self::Undecided,
+        }
+    }
+
+    fn load() -> Self {
+        match VERDICT_GRAMMAR_ROUTE.load(Ordering::SeqCst) {
+            1 => Self::SmtLib,
+            2 => Self::Dimacs,
+            _ => Self::Undecided,
+        }
+    }
+}
+
+static VERDICT_GRAMMAR_ROUTE: AtomicU8 = AtomicU8::new(0);
+/// The armed `--memory` ceiling in bytes (0 = none), kept so a later route
+/// decision can re-arm the allocator's breach action with the right grammar.
+static HARD_MEMORY_LIMIT_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Record which input format this run serves. Re-arms the allocator's hard
+/// ceiling with the matching breach action so a breach after this point — the
+/// common case, since the route is decided before solving starts — prints the
+/// grammar of the input, not of the posture.
+pub(crate) fn note_verdict_grammar_route(route: VerdictGrammarRoute) {
+    VERDICT_GRAMMAR_ROUTE.store(route as u8, Ordering::SeqCst);
+    let limit = HARD_MEMORY_LIMIT_BYTES.load(Ordering::SeqCst);
+    if limit > 0 {
+        ay_sys::arm_hard_memory_ceiling(limit, memout_verdict().hard_ceiling_action());
+    }
+}
+
+/// The memory-budget verdict: which grammar its lines use and which exit code
+/// it leaves with. The two are decided separately, exactly as they are for
+/// timeouts (`exit_if_timed_out`: the DIMACS route prints `s UNKNOWN` at every
+/// posture while the exit code follows the wrapper policy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MemoutVerdict {
+    sat_competition_lines: bool,
+    exit_code: i32,
+}
+
+impl MemoutVerdict {
+    fn stdout_line(self) -> &'static [u8] {
+        if self.sat_competition_lines {
+            MEMOUT_STDOUT_SAT_COMPETITION
+        } else {
+            MEMOUT_STDOUT_SMTLIB
+        }
+    }
+
+    fn stderr_line(self) -> &'static [u8] {
+        if self.sat_competition_lines {
+            MEMOUT_STDERR_SAT_COMPETITION
+        } else {
+            MEMOUT_STDERR_SMTLIB
+        }
+    }
+
+    fn hard_ceiling_action(self) -> &'static ay_sys::HardMemoryCeiling {
+        let wrapper_exit = self.exit_code == SAT_COMPETITION_UNKNOWN_EXIT_CODE;
+        match (self.sat_competition_lines, wrapper_exit) {
+            (false, false) => &HARD_CEILING_SMTLIB,
+            (false, true) => &HARD_CEILING_SMTLIB_WRAPPER_EXIT,
+            (true, true) => &HARD_CEILING_SAT_COMPETITION,
+            (true, false) => &HARD_CEILING_SAT_COMPETITION_PLAIN_EXIT,
+        }
+    }
+}
+
+/// Decide the memory-budget verdict (the watchdog fallback and the allocator
+/// hard ceiling) from the input route, the submission-wrapper env, and the
+/// competition latch.
+///
+/// The LINES follow the input format: an SMT-LIB input prints `unknown` plus
+/// `(:reason-unknown "memout")` at every posture, a DIMACS input prints
+/// `c memout` / `s UNKNOWN` at every posture. Before the route is known the
+/// legacy heuristic stands (SAT grammar iff wrapper env or competition mode).
+/// Keying the lines on the posture made `--rigor fast` — and any competition
+/// sweep — answer an SMT-LIB memout in DIMACS grammar (28 of 789 sampled
+/// files in one corpus scan), which no SMT-LIB consumer can parse.
+///
+/// The EXIT CODE keeps the existing conventions: 0 under the SAT-competition
+/// wrapper; for DIMACS also under `--competition` (a local `--competition`
+/// DIMACS sweep once emitted exit 124, which sweep.py's rc fallback scored as
+/// an impossible 8 s "timeout" on a 300 s budget); 124 otherwise — the same
+/// resource-exhaustion code an SMT-LIB timeout leaves with in every posture.
+fn memout_verdict_for(
+    route: VerdictGrammarRoute,
+    sat_competition_wrapper: bool,
+    competition_mode: bool,
+) -> MemoutVerdict {
+    let sat_competition_lines = match route {
+        VerdictGrammarRoute::SmtLib => false,
+        VerdictGrammarRoute::Dimacs => true,
+        VerdictGrammarRoute::Undecided => sat_competition_wrapper || competition_mode,
+    };
+    let unknown_exits_zero = match route {
+        VerdictGrammarRoute::SmtLib => sat_competition_wrapper,
+        VerdictGrammarRoute::Dimacs | VerdictGrammarRoute::Undecided => {
+            sat_competition_wrapper || competition_mode
+        }
+    };
+    MemoutVerdict {
+        sat_competition_lines,
+        exit_code: timeout_exit_code_for_sat_competition_wrapper(unknown_exits_zero),
+    }
+}
+
+/// [`memout_verdict_for`] over the live process state. `--competition` is
+/// latched into [`COMPETITION_MODE_ENABLED`] and the route guessed before
 /// `arm_hard_memory_ceiling`/`arm_memory_watchdog` run (see `run_solve`), so
-/// the latch is authoritative at both arm time and breach time. Keying on the
-/// wrapper env alone made a local `--competition` sweep emit the SMT-LIB
-/// `(:reason-unknown "memout")` grammar with exit 124, which sweep.py's rc
-/// fallback scored as an impossible 8 s "timeout" on a 300 s budget.
-fn memory_grammar_is_sat_competition() -> bool {
-    sat_competition_wrapper_timeout_policy() || COMPETITION_MODE_ENABLED.load(Ordering::SeqCst)
-}
-
-fn memory_stdout_line_for_sat_competition_wrapper(sat_competition_wrapper: bool) -> &'static [u8] {
-    if sat_competition_wrapper {
-        MEMOUT_STDOUT_SAT_COMPETITION
-    } else {
-        MEMOUT_STDOUT_SMTLIB
-    }
-}
-
-fn memory_stderr_line_for_sat_competition_wrapper(sat_competition_wrapper: bool) -> &'static [u8] {
-    if sat_competition_wrapper {
-        MEMOUT_STDERR_SAT_COMPETITION
-    } else {
-        MEMOUT_STDERR_SMTLIB
-    }
+/// this is authoritative at both arm time and breach time.
+fn memout_verdict() -> MemoutVerdict {
+    memout_verdict_for(
+        VerdictGrammarRoute::load(),
+        sat_competition_wrapper_timeout_policy(),
+        COMPETITION_MODE_ENABLED.load(Ordering::SeqCst),
+    )
 }
 
 /// Arm the allocator's hard ceiling at the full `--memory` budget.
@@ -1993,12 +2140,8 @@ fn memory_stderr_line_for_sat_competition_wrapper(sat_competition_wrapper: bool)
 /// checkpoints, measured at 3-4x the budget on bit-blasting workloads, which no
 /// observer-based signal can bound because they can only request a stop.
 fn arm_hard_memory_ceiling(limit_bytes: usize) {
-    let action = if memory_grammar_is_sat_competition() {
-        &HARD_CEILING_SAT_COMPETITION
-    } else {
-        &HARD_CEILING_SMTLIB
-    };
-    ay_sys::arm_hard_memory_ceiling(limit_bytes, action);
+    HARD_MEMORY_LIMIT_BYTES.store(limit_bytes, Ordering::SeqCst);
+    ay_sys::arm_hard_memory_ceiling(limit_bytes, memout_verdict().hard_ceiling_action());
 }
 
 /// Emit the `unknown` verdict for a breached `--memory` budget, then exit.
@@ -2008,25 +2151,17 @@ fn arm_hard_memory_ceiling(limit_bytes: usize) {
 /// run) and the exit code is the same resource-exhaustion code, so only the
 /// `:reason-unknown` payload distinguishes a memout from a timeout.
 fn hard_memory_fallback_exit() -> ! {
-    let sat_competition_wrapper = memory_grammar_is_sat_competition();
+    let verdict = memout_verdict();
     let export_abandoned = abandon_unfinished_bv_cnf_export("memory limit exceeded");
     if !export_abandoned && !VERDICT_PRINTED.swap(true, Ordering::SeqCst) {
-        let _ = Write::write_all(
-            &mut io::stdout(),
-            memory_stdout_line_for_sat_competition_wrapper(sat_competition_wrapper),
-        );
+        let _ = Write::write_all(&mut io::stdout(), verdict.stdout_line());
         let _ = Write::flush(&mut io::stdout());
     }
     if !export_abandoned {
-        let _ = Write::write_all(
-            &mut io::stderr(),
-            memory_stderr_line_for_sat_competition_wrapper(sat_competition_wrapper),
-        );
+        let _ = Write::write_all(&mut io::stderr(), verdict.stderr_line());
     }
     let _ = Write::flush(&mut io::stderr());
-    std::process::exit(timeout_exit_code_for_sat_competition_wrapper(
-        sat_competition_wrapper,
-    ));
+    std::process::exit(verdict.exit_code);
 }
 
 /// Whether the `Unknown` about to be published is actually a memory abort:
@@ -5234,6 +5369,12 @@ fn run_solve(args: &SolveArgs) {
     if competition_mode(args) {
         COMPETITION_MODE_ENABLED.store(true, Ordering::SeqCst);
     }
+    // Proof-cycle shedding: latched here for the same reason. `--no-proof`
+    // and `--z3-mode` shed exactly what `--rigor fast` sheds (see
+    // `proof_cycle_shed`); an explicit proof demand still wins executor-side.
+    if proof_cycle_shed(args) {
+        PROOF_CYCLE_SHED_ENABLED.store(true, Ordering::SeqCst);
+    }
 
     // Strict proof mode (#8555, #8759).
     if args.strict_proofs {
@@ -5412,6 +5553,10 @@ fn run_solve(args: &SolveArgs) {
         // Returns 0 if physical memory detection fails (limit disabled).
         ay_sys::default_standalone_memory_limit()
     };
+    // Guess the verdict grammar from the input's extension BEFORE arming the
+    // ceiling, so a breach during the file read already prints the grammar of
+    // the input; the route dispatch in `run.rs` confirms it from the content.
+    note_verdict_grammar_route(VerdictGrammarRoute::from_input_path(args.file.as_deref()));
     if memory_limit_bytes > 0 {
         ay_sys::set_process_memory_limit(memory_limit_bytes);
         arm_memory_watchdog();
@@ -5763,9 +5908,20 @@ fn build_proof_config(args: &SolveArgs) -> Option<ProofConfig> {
     // that requires a proof must request one explicitly. Announce the chosen
     // path to stderr so users know where to find it, but stay silent under
     // `--stats-json`, whose contract is one machine-readable JSON line.
+    //
+    // The SMT-LIB (Alethe) default is synthesized for every `.smt2`/`.smt`
+    // input because the CHC runner retargets it to `<input>.chccert` and CHC
+    // is only recognised after the file is read — but the SMT DECISION route
+    // honours it only when certification was requested: a plain solve runs
+    // at the `fast` rung's proof posture (`proof_cycle_shed`), and
+    // `adapt_proof_config_for_smt` drops the synthesized config there. So the
+    // announcement, which names an `.alethe` a plain solve will never write,
+    // is printed only for a certifying invocation. DIMACS keeps its DRAT
+    // default and announcement unchanged.
     if !default_proofs_suppressed(args.no_proof, args.z3_mode, competition_mode(args)) {
         if let Some((path, format)) = default_proof_path(args.file.as_deref()) {
-            if !args.stats_json && !quiet_enabled() {
+            let announce = format != ProofFormat::Alethe || certification_requested(args);
+            if announce && !args.stats_json && !quiet_enabled() {
                 // "on unsat": this is announced before solving, and the
                 // certificate is only actually written for an UNSAT verdict —
                 // a SAT/unknown run creates no file. `-q`/`--quiet` suppresses

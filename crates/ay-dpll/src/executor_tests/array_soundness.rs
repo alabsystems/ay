@@ -662,12 +662,21 @@ fn test_qf_aufbv_const_array_store_select_soundness() {
 // pervasive in its VCs.
 
 fn solve_one(input: &str) -> String {
+    solve_one_with_term_count(input).0
+}
+
+/// `solve_one`, additionally reporting the final size of the term arena.
+///
+/// Used by the AUFLIA preprocessing pins: a pass that mints scratch terms and
+/// then discards its own output leaves them interned in an append-only store,
+/// where every later whole-store scan and every split-loop round pays for them.
+fn solve_one_with_term_count(input: &str) -> (String, usize) {
     let commands = parse(input).expect("invariant: valid SMT-LIB input");
     let mut exec = Executor::new();
     let outputs = exec
         .execute_all(&commands)
         .expect("invariant: execute succeeds");
-    outputs[0].clone()
+    (outputs[0].clone(), exec.ctx.terms.len())
 }
 
 #[test]
@@ -1005,7 +1014,29 @@ fn test_aufnra_select_const_consistent_product_not_wrong_unsat() {
 #[timeout(600_000)]
 fn test_nested_array_alia_false_unsat_is_quarantined() {
     let input = include_str!("../../../../repros/cs_stateful-1.i_2.MINIMIZED.smt2");
-    assert_eq!(solve_one(input), "unknown");
+    let (verdict, term_count) = solve_one_with_term_count(input);
+    assert_eq!(verdict, "unknown");
+
+    // #arraylazy-lift-garbage (z3-parity r3 rank 11): this file is also the
+    // committed reproducer for the AUFLIA preprocess ITE-lift blow-up. Its
+    // 331 generated array axioms expand into select-over-store ITEs, the
+    // arithmetic Shannon lift then overruns `ITE_LIFT_NEW_TERM_BUDGET`
+    // (200,000), and the pass is ABANDONED in favour of definitional ITE
+    // naming — but the ~203,000 terms it minted used to stay interned in the
+    // append-only arena. Measured at -T:20 before the reclaim landed:
+    // `:term-count 206,520`, peak RSS 1,915 MB, 119 refinement rounds;
+    // after: 5,680 / 100 MB / 1,135 rounds, same verdict. The lift's output
+    // is discarded wholesale on that branch, so reclaiming it cannot change
+    // any verdict — only what every later whole-store scan has to walk.
+    //
+    // The bound is deliberately far above the measured 5,680 and far below
+    // the 206,520 regression: it fails on a reintroduced blow-up, not on
+    // ordinary drift.
+    assert!(
+        term_count < 50_000,
+        "AUFLIA preprocess must not retain the abandoned Shannon expansion: \
+         term arena held {term_count} terms (pre-fix regression: ~206,520)"
+    );
 }
 
 /// #nested-array-quarantine-quantified — the boundary the 2026-09-06 z3-parity

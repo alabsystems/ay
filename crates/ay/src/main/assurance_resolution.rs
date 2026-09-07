@@ -339,9 +339,13 @@ mod assurance_cli_tests {
             .expect("solve subcommand")
             .render_long_help()
             .to_string();
-        assert!(help.contains("Assurance ladder (--assurance <LEVEL>"));
-        assert!(help.contains("fast       batteries off for speed"));
+        assert!(help.contains("Rigor (--rigor <LEVEL>"));
+        assert!(help.contains("fast       just the answer, like z3"));
         assert!(help.contains("certified  fail-closed"));
+        // The plain-file posture is documented right under the ladder.
+        assert!(
+            help.contains("A plain `ay FILE.smt2` (no --rigor, no proof flag) has z3's posture")
+        );
 
         let proof_conflict = Cli::try_parse_from([
             "ay",

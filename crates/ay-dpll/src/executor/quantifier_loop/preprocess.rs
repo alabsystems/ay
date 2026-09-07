@@ -2036,6 +2036,13 @@ impl Executor {
                         self.ctx.assertions.push(ce_lemma);
                         raw_ce_lemma_ids.push(ce_lemma);
                         raw_ce_lemma_quants.push(quant);
+                        // Observation only (z3-parity stage 0): counted here,
+                        // at the mint, rather than off `cegqi_ce_lemma_ids`
+                        // after `flatten_and_strip_quantifiers`, because that
+                        // list is the AND-flattened conjunct set with genuine
+                        // pre-existing assertions filtered out — a different
+                        // quantity from "CE lemmas produced".
+                        self.last_statistics.quantifier_cegqi_ce_lemmas += 1;
                         handled_by_cegqi = true;
                         cegqi_state.push((quant, inst));
                     }

@@ -605,6 +605,10 @@ impl Executor {
             });
 
         for _round in 0..MAX_MBQI_ROUNDS {
+            // Observation only (z3-parity stage 0): one tick per MBQI round
+            // actually entered, so a later stage can tell "the lane ran and
+            // found nothing" from "the lane never ran".
+            self.last_statistics.quantifier_mbqi_rounds += 1;
             // Collect ground terms by sort from current assertions.
             let ground_by_sort = crate::ematching::collect_ground_terms_by_sort(
                 &self.ctx.terms,
@@ -850,6 +854,10 @@ impl Executor {
                     }
 
                     checked += 1;
+                    // Observation only: one tick per candidate tuple evaluated
+                    // against the model, i.e. the same event the local
+                    // `checked` budget counts.
+                    self.last_statistics.quantifier_mbqi_candidates_probed += 1;
 
                     // Advance to next combination.
                     let mut carry = true;

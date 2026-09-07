@@ -112,3 +112,34 @@ fn test_uflra_cpachecker_benchmark_not_false_unsat_6812() -> Result<()> {
     );
     Ok(())
 }
+
+/// #post-split-verify-lane: a post-expression-split propositional UNSAT on the
+/// UF+LRA lane is now VERIFIED and PUBLISHED instead of downgraded.
+///
+/// `solve_uf_lra` used to pass neither UNSAT opt-in to the split-loop macro, so
+/// the #6812 stale-learned-clause guard escalated **every** propositional UNSAT
+/// the lane reached after an expression split
+/// (`Eager UFLRA UNSAT after expression splits … verify_attempted=false`) — the
+/// lane derived the refutation and then answered `unknown`. This mathsat
+/// `pb_real` benchmark is the flagship of that family: the SAT core reports
+/// `solve: unsat` after ~131 conflicts, which is z3's own search effort on the
+/// same file, and the verdict was thrown away.
+///
+/// The lane now passes `verify_unsat_after_splits: PostSplitVerifyLane::UfLra`,
+/// so the refutation is re-derived on a FRESH, isolated UF+LRA solve of the
+/// ORIGINAL assertions and published only on an explicit fresh `Unsat`. The
+/// file's own `(set-info :status unsat)` and z3 4.16.0 both corroborate the
+/// verdict; `unknown` here means the lane went back to discarding it.
+#[test]
+#[timeout(30_000)]
+fn test_uflra_post_split_unsat_is_verified_and_published() -> Result<()> {
+    let benchmark =
+        workspace_path("benchmarks/smt/QF_UFLRA/mathsat-RandomDecoupled/pb_real_30_75_45_81.smt2");
+    let outcome = run_executor_file_with_timeout(&benchmark, 20)?;
+    assert_eq!(
+        outcome,
+        SolverOutcome::Unsat,
+        "#post-split-verify-lane: the verified post-split UNSAT must be published, got {outcome:?}"
+    );
+    Ok(())
+}

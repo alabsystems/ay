@@ -395,3 +395,88 @@ fn test_debug_assert_consistency_panics_when_theory_propagations_exceed_sat() {
     stats.theory_propagations = 2;
     stats.debug_assert_consistency();
 }
+
+/// The seven `:quantifier.*` guarded-instantiation counters are the frozen
+/// baseline of the z3-parity quantifier campaign. Three of them have no
+/// producer yet; all seven must still PRINT, and print zero, because a later
+/// stage is measured as movement away from that zero and an absent row cannot
+/// be distinguished from an unwired one.
+#[test]
+fn guarded_quantifier_counters_render_zero_by_default() {
+    let stats = Statistics::default();
+    let block = stats.to_string();
+    for key in [
+        ":quantifier.proxies_minted",
+        ":quantifier.guarded_instances_created",
+        ":quantifier.guarded_instances_asserted",
+        ":quantifier.mbqi.rounds",
+        ":quantifier.mbqi.candidates_probed",
+        ":quantifier.cegqi.rounds",
+        ":quantifier.cegqi.ce_lemmas",
+    ] {
+        assert!(
+            block.contains(&format!("  {key} 0\n")),
+            "{key} must render as zero in the default block, got:\n{block}"
+        );
+    }
+    // Unlike the E-matching pair, which the block gates on a non-zero round
+    // count, these rows are unconditional.
+    assert!(!block.contains(":ematching-rounds-completed"), "{block}");
+}
+
+/// A harness reads these counters back by the dotted key it grepped, and
+/// in-tree callers read them by field name. Both spellings must resolve to the
+/// same field, and each must survive a write.
+#[test]
+fn guarded_quantifier_counters_read_back_under_both_spellings() {
+    let mut stats = Statistics::default();
+    stats.quantifier_proxies_minted = 3;
+    stats.quantifier_guarded_instances_created = 5;
+    stats.quantifier_guarded_instances_asserted = 4;
+    stats.quantifier_mbqi_rounds = 2;
+    stats.quantifier_mbqi_candidates_probed = 91;
+    stats.quantifier_cegqi_rounds = 6;
+    stats.quantifier_cegqi_ce_lemmas = 7;
+
+    for (dotted, snake, expected) in [
+        ("quantifier.proxies_minted", "quantifier_proxies_minted", 3),
+        (
+            "quantifier.guarded_instances_created",
+            "quantifier_guarded_instances_created",
+            5,
+        ),
+        (
+            "quantifier.guarded_instances_asserted",
+            "quantifier_guarded_instances_asserted",
+            4,
+        ),
+        ("quantifier.mbqi.rounds", "quantifier_mbqi_rounds", 2),
+        (
+            "quantifier.mbqi.candidates_probed",
+            "quantifier_mbqi_candidates_probed",
+            91,
+        ),
+        ("quantifier.cegqi.rounds", "quantifier_cegqi_rounds", 6),
+        (
+            "quantifier.cegqi.ce_lemmas",
+            "quantifier_cegqi_ce_lemmas",
+            7,
+        ),
+    ] {
+        assert_eq!(stats.get_int(dotted), Some(expected), "dotted {dotted}");
+        assert_eq!(stats.get_int(snake), Some(expected), "snake {snake}");
+    }
+
+    let block = stats.to_string();
+    assert!(
+        block.contains("  :quantifier.mbqi.candidates_probed 91\n"),
+        "{block}"
+    );
+    // Each key is printed exactly once: the field is the single source, so a
+    // producer must never also `set_int` the dotted name into `extra`.
+    assert_eq!(
+        block.matches(":quantifier.cegqi.rounds ").count(),
+        1,
+        "{block}"
+    );
+}

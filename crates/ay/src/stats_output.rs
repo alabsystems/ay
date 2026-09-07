@@ -383,6 +383,39 @@ pub(crate) fn curated_smt_statistics(
         curated_row(&mut out, key, &value.to_string());
     }
 
+    // The quantifier lane is conditional, whole-group. The seven
+    // `:quantifier.*` counters and the E-matching pair are unconditional in the
+    // full block, so this stays a strict selection of it; but printing nine rows
+    // about quantifier instantiation on a QF_BV run answers no question, and the
+    // curated block exists to not do that. When a run does engage the machinery,
+    // all nine appear here rather than only under `--stats-full` — an
+    // instantiation count reachable only from the full block is exactly what
+    // hampered the quantifier-parity census this group was added to serve.
+    if stats.quantifier_lane_engaged() {
+        group(&mut out, "quantifiers");
+        // Mirror the full block's own gate on this pair, so the curated block
+        // can never print a key the full block omitted.
+        if stats.ematching_rounds_completed > 0 {
+            for (key, value) in [
+                (
+                    ":ematching-rounds-completed",
+                    stats.ematching_rounds_completed,
+                ),
+                (
+                    ":ematching-instances-created",
+                    stats.ematching_instances_created,
+                ),
+            ] {
+                curated_row(&mut out, key, &value.to_string());
+            }
+        }
+        // One array, shared with the full block, so the two can never
+        // disagree on a key's spelling or on the order they appear in.
+        for (key, value) in stats.guarded_quantifier_counters() {
+            curated_row(&mut out, key, &value.to_string());
+        }
+    }
+
     group(&mut out, "proof & certificates");
     // Certificate counters live in `extra` and are absent on runs that mint no
     // certificates. Omit the row rather than print a fabricated zero: a missing

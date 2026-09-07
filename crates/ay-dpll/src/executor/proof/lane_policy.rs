@@ -79,4 +79,31 @@ impl Executor {
     pub(in crate::executor) fn unvetted_no_proof_lane_allowed(&self) -> bool {
         !self.produce_proofs_enabled() && !self.competition_shedding_active()
     }
+
+    /// Whether a CHECKED certificate is demanded for this solve, so theory
+    /// engine routing must stay on the proof-capable arms.
+    ///
+    /// This is the predicate the routing sites consult (`solve_lra`'s
+    /// incremental-engine / eager arms, `solve_lia`'s eager split loop, and
+    /// the CEGAR pending-lemma loop in `cegar_refine_solve`). It is the same
+    /// demand set that decides whether a missing proof changes the verdict
+    /// ([`Self::strict_unsat_presentation_required`]): an explicit artifact
+    /// request (`--proof`, `set_produce_proofs(true)`), `--self-check`,
+    /// `--strict-proofs` / `:check-proofs-strict`, API proof checking, or an
+    /// in-script `(set-option :produce-proofs true)`.
+    ///
+    /// It is deliberately NOT [`Self::is_producing_proofs`]. That accessor is
+    /// also true for the synthesized best-effort artifact
+    /// (`set_best_effort_produce_proofs`), whose contract is "write a
+    /// certificate if one falls out of the search, never change the verdict".
+    /// Routing on it demoted every best-effort session to the lazy arms:
+    /// measured on QF_AUFLIA storecomm_t1_pp_sf_ai_00060_001, the demoted
+    /// route runs 268 LRA-check rounds and times out at 22 s where the eager
+    /// route refutes in 0.09 s — a verdict lost to an OPTIONAL sidecar. With
+    /// this predicate the routing is identical between a shedding solve and
+    /// any solve where no proof artifact is required; the sidecar is still
+    /// rendered best-effort from whatever the tracker recorded.
+    pub(in crate::executor) fn checked_certificate_demanded(&self) -> bool {
+        self.strict_unsat_presentation_required()
+    }
 }

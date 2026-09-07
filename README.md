@@ -127,12 +127,14 @@ community's independent Alethe checker (`ay tool install carcara` builds the
 exact commit AY's tests pin):
 
 ```bash
-ay examples/quickstart_unsat.smt2                 # prints: unsat
+ay --rigor standard examples/quickstart_unsat.smt2   # prints: unsat
 carcara check examples/quickstart_unsat.smt2.alethe examples/quickstart_unsat.smt2
 ```
 
-AY writes the `.alethe` proof next to the input; Carcara replays it
-independently.
+`--rigor standard` is what asks for the certificate: a plain `ay
+examples/quickstart_unsat.smt2` has z3's posture and writes nothing next to
+the input. At `standard` AY writes the `.alethe` proof beside it and Carcara
+replays it independently.
 
 ## Check AY's answers without trusting AY
 
@@ -163,22 +165,32 @@ does not yet prove optimality on every one.
 close all of them, and the certified-PB gate re-proves those fixes against
 committed defect fixtures before it trusts a verdict.
 
-**Proofs are on by default.** Get `unsat` on a file and AY writes the proof
-next to it (`problem.cnf.drat`, `problem.smt2.alethe`, `problem.smt2.chccert`).
-A default proof that cannot be produced is reported, never silently swapped for
-a different verdict; an explicit `--proof FILE` that cannot be written is a hard
-failure. `--rigor` sets how much AY proves and re-checks about its own answer:
+**Proofs are on by default where they are a byproduct of the solve.** Get
+`unsat` on a DIMACS or CHC file and AY writes the proof next to it
+(`problem.cnf.drat`, `problem.smt2.chccert`). An SMT-LIB Alethe certificate is
+not a byproduct — producing it arms search-time proof recording and a
+post-UNSAT mint that re-solves the problem, measured at 2.7x–20x the search
+time — so a plain `ay problem.smt2` has z3's posture (no proof, no
+certificate, nothing written) and `problem.smt2.alethe` appears at `--rigor
+standard` or above. A default proof that cannot be produced is reported, never
+silently swapped for a different verdict; an explicit `--proof FILE` that
+cannot be written is a hard failure. `--rigor` sets how much AY proves and
+re-checks about its own answer:
 
 | `--rigor LEVEL` | What you get |
 | --- | --- |
 | `fast` | just the answer, like `z3`: no default validation, proof emission, or proof re-check |
-| `standard` (default) | validate the answer, emit a proof, and re-check that proof |
+| `standard` | validate the answer, emit a proof, and re-check that proof |
 | `strict` | strict proof checker; a terminal Trust-backed `unsat` it cannot prove becomes `unknown` |
 | `certified` | fail-closed: only answers AY can self-verify, everything else becomes `unknown` |
 
-The verdict is sound at every level — the ladder controls proof and self-check
-work, not confidence — and resolution is monotone, so the strongest level any
-flag requests wins. `--no-proof` suppresses default emission (benchmarking);
+With no `--rigor` at all, an SMT-LIB solve takes the `fast` rung's proof
+posture while keeping the validation batteries — including the always-on
+independent model gate behind every `sat` — switched on; DIMACS and CHC keep
+`standard`'s. The verdict is sound at every level — the ladder controls proof
+and self-check work, not confidence — and resolution is monotone, so the
+strongest level any flag requests wins. `--no-proof` suppresses default
+emission (benchmarking);
 `--proof FILE`, `--proof-format alethe|drat|lrat|lean4|veripb`, and
 `--proof-checker dsr-trim|dpr-trim|drat-trim|gratgen|veripb` select the
 artifact and the checker it must satisfy — routes whose steps the declared

@@ -34,10 +34,11 @@
 #
 # Run this before claiming AY "produces proofs" for any logic.
 #
-# NOTE ON `--z3-mode`: AY's default-on proof emission is SUPPRESSED by
-# --z3-mode (and by --competition / --no-proof). The competition path therefore
-# writes no proof at all. This script deliberately runs AY WITHOUT --z3-mode,
-# which is the configuration that actually writes <input>.smt2.alethe.
+# NOTE ON `--rigor standard`: since 2026-09-06 a plain `ay FILE.smt2` has z3's
+# posture and writes NO proof; the Alethe certificate is opt-in. This script
+# therefore runs AY at `--rigor standard`, which is the configuration that
+# writes <input>.smt2.alethe. It also deliberately avoids --z3-mode (and
+# --competition / --no-proof), each of which sheds the proof cycle outright.
 #
 # CORPUS HYGIENE: AY writes the proof next to its INPUT. To avoid littering the
 # benchmark tree, this script never hands AY the real file — it hands AY a
@@ -416,7 +417,10 @@ while IFS= read -r src; do
   sib_pre=0; [ -e "$sibling" ] && sib_pre=1
 
   t0=$(date +%s)
-  ay_out="$("$AY" -T:"$AY_TIMEOUT" "$cell/$base" 2>&1)"
+  # --rigor standard is what REQUESTS the certificate: since 2026-09-06 a plain
+  # `ay FILE.smt2` has z3's posture (no proof recorded, none minted, nothing
+  # written next to the input), so without this the script would check nothing.
+  ay_out="$("$AY" --rigor standard -T:"$AY_TIMEOUT" "$cell/$base" 2>&1)"
   t1=$(date +%s)
   secs=$((t1 - t0))
 

@@ -374,13 +374,9 @@ fn with_nonlinear_qf_auf_linear_to_uf_nonlinear() {
     );
 }
 
-/// DT + nonlinear → Other (no combined DT+NIA/NRA solver; #6088).
+/// DT + nonlinear REAL/mixed → Other (no `solve_uf_nra` DT composition; #6088).
 #[test]
 fn with_nonlinear_dt_to_other() {
-    assert_eq!(
-        LogicCategory::DtAuflia.with_nonlinear(&nl_int()),
-        LogicCategory::Other
-    );
     assert_eq!(
         LogicCategory::DtAuflra.with_nonlinear(&nl_real()),
         LogicCategory::Other
@@ -395,6 +391,46 @@ fn with_nonlinear_dt_to_other() {
     );
     assert_eq!(
         LogicCategory::DtAuflira.with_nonlinear(&nl_both()),
+        LogicCategory::Other
+    );
+}
+
+/// Content-detected DT + nonlinear Int routes to the SAME category a DECLARED
+/// `AUFDTNIA`/`UFDTNIA` gets (#dt-nia-content-route). Before this arm the
+/// `AUFBVDTNIA`/`ALL` copies of a Barrett `rec-fun-ijcar2016` VC collapsed to
+/// `Other`, and check-sat answered `Err(UnsupportedLogic)` — while the byte-
+/// identical file with `(set-logic AUFDTNIA)` went `unsat` in hundredths of a
+/// second through `Ufdtnia`.
+#[test]
+fn with_nonlinear_array_free_dt_nia_routes_to_ufdtnia() {
+    assert_eq!(
+        LogicCategory::DtAuflia.with_nonlinear(&nl_int()),
+        LogicCategory::Ufdtnia
+    );
+    // The declared-logic arms this mirrors.
+    assert_eq!(
+        LogicCategory::Ufdtlia.with_nonlinear(&nl_int()),
+        LogicCategory::Ufdtnia
+    );
+    assert_eq!(
+        LogicCategory::Aufdtlia.with_nonlinear(&nl_int()),
+        LogicCategory::Ufdtnia
+    );
+}
+
+/// Array-bearing DT + nonlinear Int keeps the fail-closed `Other`: the
+/// `Ufdtnia` lane composes DT axioms over `solve_uf_nia`, which has NO array
+/// theory, so `select`/`store` would be uninterpreted and a `sat` could violate
+/// read-over-write.
+#[test]
+fn with_nonlinear_array_bearing_dt_nia_stays_fail_closed() {
+    let arrays_and_nl_int = StaticFeatures {
+        has_nonlinear_int: true,
+        has_arrays: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        LogicCategory::DtAuflia.with_nonlinear(&arrays_and_nl_int),
         LogicCategory::Other
     );
 }
@@ -1178,4 +1214,31 @@ fn declared_logic_routes_as_all_excludes_fail_closed_and_mapped() {
             "{fc} must NOT route as ALL (keeps sound `unknown` dispatch)"
         );
     }
+}
+
+// ── dispatch-table mirror guard (#5989) ─────────────────────────
+
+/// `Ufdtnia` is the category the two dispatch tables disagreed on:
+/// `route_to_solver` routed it to `solve_dt_uf_nia` while the quantifier loop's
+/// `solve_for_category` answered a blanket `Unknown`, so every file whose
+/// quantifiers were stripped lost its ground solve. `has_ground_lane` is the
+/// shared statement both tables `debug_assert` against.
+#[test]
+fn dt_nonlinear_int_is_recorded_as_having_a_ground_lane() {
+    assert!(LogicCategory::Ufdtnia.has_ground_lane());
+    assert!(LogicCategory::QfUfnia.has_ground_lane());
+    assert!(LogicCategory::QfNira.has_ground_lane());
+    assert!(LogicCategory::QfUfnira.has_ground_lane());
+    assert!(LogicCategory::Ufnira.has_ground_lane());
+}
+
+/// The fail-closed residue keeps NO lane: there is no `solve_uf_nra` sibling for
+/// `solve_with_dt_axioms` to compose with, and `Other` is the recognized-but-
+/// uncombinable set.
+#[test]
+fn laneless_categories_stay_laneless() {
+    assert!(!LogicCategory::Ufdtnra.has_ground_lane());
+    assert!(!LogicCategory::Ufdtnira.has_ground_lane());
+    assert!(!LogicCategory::Nira.has_ground_lane());
+    assert!(!LogicCategory::Other.has_ground_lane());
 }

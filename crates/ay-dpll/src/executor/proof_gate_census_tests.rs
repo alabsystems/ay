@@ -151,18 +151,13 @@ const VETTED: &[(&str, usize, usize, usize, &str)] = &[
     (
         "executor/theories/lia/mod.rs",
         0,
-        1,
-        1,
-        "1x explicit-demand incremental-eager arm; 1x eager-assume UNSAT \
-         probe dormant lane (B2: kept dead)",
-    ),
-    (
-        "executor/theories/lra/mod.rs",
         0,
-        3,
-        0,
-        "explicit-demand gates: LRA incremental/eager engine routing (2 \
-         routing gates + 1 routing-guard debug_assert)",
+        1,
+        "1x eager-assume UNSAT probe dormant lane (B2: kept dead). The \
+         incremental-eager routing arm moved off !is_producing_proofs() to \
+         !checked_certificate_demanded() (routing decoupled from the \
+         best-effort sidecar); it is inventoried by \
+         `routing_gate_census_matches_vetted_list` below",
     ),
     (
         "executor/theories/solve_harness/mod.rs",
@@ -343,6 +338,206 @@ fn negated_proof_gate_census_matches_vetted_list() {
 
 /// The dormant-lane predicate semantics (B2 item 1): the two lanes stay
 /// exactly as dead as before in every configuration —
+/// Vetted call sites of `checked_certificate_demanded()` — the routing
+/// predicate that keeps a theory engine on its proof-capable arm ONLY when a
+/// checked certificate is demanded (path relative to `src/`, call sites,
+/// rationale). Every site here is an engine-ROUTING gate, never an
+/// UNSAT-originating shortcut: each arm it selects is independently sound
+/// (the eager LRA/LIA arms re-validate SAT against the original assertions
+/// and refute by monotone strengthening; the CEGAR loop injects only theory
+/// tautologies), so the predicate may only change WHICH sound engine runs.
+/// Adding a site means auditing that the newly reachable arm is sound
+/// without a checked certificate, then recording it here.
+const ROUTING_VETTED: &[(&str, usize, &str)] = &[
+    (
+        "executor/check_sat.rs",
+        1,
+        "CEGAR pending-lemma refinement loop (theory-tautology lemmas only; \
+         refines Unknown into a definite verdict, never flips one)",
+    ),
+    (
+        "executor/proof/lane_policy.rs",
+        0,
+        "the definition; `fn ...(&self)` is not a call token, so it counts 0 \
+         — the row pins the file so a call added beside it is still caught",
+    ),
+    (
+        "executor/theories/lia/mod.rs",
+        1,
+        "incremental-eager split-loop arm (0-wrong: SAT re-validated, UNSAT \
+         by scope-selector monotone strengthening)",
+    ),
+    (
+        "executor/theories/lra/mod.rs",
+        3,
+        "incremental-engine arm + eager standalone arm (2 routing gates) + \
+         the inc-engine lane's routing-guard debug_assert",
+    ),
+];
+
+/// Routing-gate census: every `checked_certificate_demanded()` call site in
+/// the crate's production sources must be inventoried in `ROUTING_VETTED`.
+#[test]
+fn routing_gate_census_matches_vetted_list() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    production_sources(&src, &mut files);
+    files.sort();
+
+    let mut observed: Vec<(String, usize)> = Vec::new();
+    for path in &files {
+        let text =
+            fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let sites = count_sites(&text, "checked_certificate_demanded()", false);
+        let rel = path
+            .strip_prefix(&src)
+            .expect("under src/")
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if sites > 0 || rel == "executor/proof/lane_policy.rs" {
+            observed.push((rel, sites));
+        }
+    }
+    observed.sort();
+
+    let vetted: Vec<(String, usize)> = ROUTING_VETTED
+        .iter()
+        .map(|&(path, n, _)| (path.to_string(), n))
+        .collect();
+    {
+        let mut sorted = vetted.clone();
+        sorted.sort();
+        assert_eq!(
+            vetted, sorted,
+            "keep the ROUTING_VETTED list sorted by path"
+        );
+    }
+    assert_eq!(
+        observed, vetted,
+        "routing-gate census mismatch: a `checked_certificate_demanded()` site \
+         was added, removed, or moved. Audit that every arm the new site can \
+         select is sound WITHOUT a checked certificate, then update \
+         ROUTING_VETTED with a rationale.\n\nobserved:\n{observed:?}\n\nvetted:\n{vetted:?}"
+    );
+}
+
+/// `checked_certificate_demanded()` is FALSE for the synthesized best-effort
+/// artifact and for a shedding solve (both route to the eager arms, exactly
+/// alike), and TRUE for every explicit checked-certificate demand.
+#[test]
+fn routing_predicate_tracks_checked_certificate_demand_not_the_tracker() {
+    use super::Executor;
+
+    // Bare executor: no demand.
+    let mut exec = Executor::new();
+    assert!(!exec.checked_certificate_demanded());
+    // The certified public path arms the tracker (mandatory certificate)
+    // WITHOUT any user demand: routing must not be demoted by that.
+    exec.begin_public_solve(false);
+    assert!(exec.produce_proofs_enabled());
+    assert!(!exec.checked_certificate_demanded());
+
+    // Synthesized best-effort sidecar: `is_producing_proofs()` is true, but
+    // no checked certificate is demanded — routing stays eager.
+    let mut exec = Executor::new();
+    exec.set_best_effort_produce_proofs(1_000);
+    exec.begin_public_solve(false);
+    assert!(exec.is_producing_proofs());
+    assert!(!exec.checked_certificate_demanded());
+
+    // Competition shedding: identical routing answer to the best-effort case.
+    let mut exec = Executor::new();
+    exec.set_competition_mode(true);
+    exec.begin_public_solve(false);
+    assert!(exec.competition_shedding_active());
+    assert!(!exec.checked_certificate_demanded());
+
+    // Explicit artifact demand (`--proof`, API set_produce_proofs).
+    let mut exec = Executor::new();
+    exec.set_produce_proofs(true);
+    assert!(exec.checked_certificate_demanded());
+
+    // `--self-check` (mandatory collection without an artifact demand).
+    let mut exec = Executor::new();
+    exec.set_self_check(true);
+    exec.set_mandatory_proof_collection();
+    assert!(exec.checked_certificate_demanded());
+
+    // In-script `(set-option :produce-proofs true)` is an explicit demand,
+    // and so is `(set-option :check-proofs-strict true)`.
+    for script in [
+        "(set-option :produce-proofs true)",
+        "(set-option :check-proofs-strict true)",
+    ] {
+        let commands = ay_frontend::parse(script).expect("valid SMT-LIB option script");
+        let mut exec = Executor::new();
+        exec.execute_all(&commands)
+            .expect("set-option must execute");
+        assert!(
+            exec.checked_certificate_demanded(),
+            "{script} must demand a checked certificate"
+        );
+    }
+
+    // Shedding + explicit demand: the demand wins, exactly as for the tracker.
+    let mut exec = Executor::new();
+    exec.set_competition_mode(true);
+    exec.set_produce_proofs(true);
+    exec.begin_public_solve(false);
+    assert!(!exec.competition_shedding_active());
+    assert!(exec.checked_certificate_demanded());
+}
+
+/// The trust-leaf rebuild's theory-refutation meter is bounded ONLY for the
+/// synthesized best-effort artifact; every explicit proof demand keeps it
+/// unbounded, so certification behaviour there is byte-identical.
+#[test]
+fn best_effort_rebuild_refutation_meter_is_bounded_only_for_the_best_effort_artifact() {
+    use super::Executor;
+
+    // No proof policy at all (library default / mandatory certificate):
+    // budget None, so the meter admits everything.
+    let mut exec = Executor::new();
+    assert_eq!(exec.best_effort_rebuild_refutation_budget(), None);
+    assert!(exec.charge_best_effort_rebuild_refutation(u64::MAX));
+
+    // Best-effort artifact: budget = step budget / 64, then the meter refuses
+    // the first refutation that would overrun it and stays refused.
+    let mut exec = Executor::new();
+    exec.set_best_effort_produce_proofs(6_400);
+    assert_eq!(exec.best_effort_rebuild_refutation_budget(), Some(100));
+    assert!(exec.charge_best_effort_rebuild_refutation(60));
+    assert!(!exec.charge_best_effort_rebuild_refutation(41));
+    assert!(exec.charge_best_effort_rebuild_refutation(40));
+    assert!(!exec.charge_best_effort_rebuild_refutation(1));
+    // A refused charge must not have been debited.
+    assert_eq!(exec.best_effort_rebuild_refutation_spent, 100);
+
+    // Explicit API/CLI artifact demand: unbounded, whatever budget was set.
+    let mut exec = Executor::new();
+    exec.set_produce_proofs(true);
+    exec.set_proof_reconstruction_step_budget(Some(6_400));
+    assert_eq!(exec.best_effort_rebuild_refutation_budget(), None);
+    assert!(exec.charge_best_effort_rebuild_refutation(u64::MAX));
+
+    // In-script `(set-option :produce-proofs true)` is an explicit demand even
+    // on an executor that was configured best-effort by the CLI.
+    let commands =
+        ay_frontend::parse("(set-option :produce-proofs true)").expect("valid option script");
+    let mut exec = Executor::new();
+    exec.set_best_effort_produce_proofs(6_400);
+    exec.execute_all(&commands)
+        .expect("set-option must execute");
+    assert_eq!(exec.best_effort_rebuild_refutation_budget(), None);
+
+    // Self-check's mandatory collection clears the budget: unbounded.
+    let mut exec = Executor::new();
+    exec.set_best_effort_produce_proofs(6_400);
+    exec.set_self_check(true);
+    exec.set_mandatory_proof_collection();
+    assert_eq!(exec.best_effort_rebuild_refutation_budget(), None);
+}
+
 /// `unvetted_no_proof_lane_allowed()` equals the old `!produce_proofs_enabled()`
 /// whenever competition shedding is inactive, and is additionally FALSE
 /// under active shedding.

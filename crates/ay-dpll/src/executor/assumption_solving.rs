@@ -382,7 +382,18 @@ impl Executor {
                 } else {
                     DpllT::from_tseitin(&self.ctx.terms, &result, $theory)
                 };
-                $dpll.set_proof_bookkeeping_budget(self.search_proof_bookkeeping_budget());
+                // Only a proof-tracking DpllT owns a clause trace, and the
+                // ay-sat lifecycle refuses a bookkeeping budget without one
+                // (`LiveTraceForBudget`). The budget must therefore follow the
+                // SAME condition that chose the constructor above — every
+                // other setter site in the tree is already guarded this way.
+                // Unguarded, a run whose executor still carried a best-effort
+                // reconstruction budget while `begin_public_solve` had shed
+                // the tracker (the z3 default posture on the LRA optimization
+                // lane) aborted the process instead of solving.
+                if proof_enabled {
+                    $dpll.set_proof_bookkeeping_budget(self.search_proof_bookkeeping_budget());
+                }
                 self.apply_random_seed_to_dpll(&mut $dpll);
                 self.apply_progress_to_dpll(&mut $dpll);
                 // #8123: hand the datatype tautology literals to the conflict

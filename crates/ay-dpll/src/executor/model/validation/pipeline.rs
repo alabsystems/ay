@@ -1226,6 +1226,7 @@ impl Executor {
                         let cls = find(&mut uf, aid);
                         cell_vals.push((a.clone(), format!("@ay!wit!dval!{cls}")));
                     }
+                    self.stash_unrepaired_candidate_once();
                     if let Some(model) = self.last_model.as_mut() {
                         if let Some(euf) = model.euf_model.as_mut() {
                             for (&iv, a) in idx_atom.iter() {
@@ -1722,6 +1723,7 @@ impl Executor {
                     interp_r.push((a.clone(), format!("@ay!wit!xval!{cr}")));
                 }
                 // Install: index valuations + both base interps.
+                self.stash_unrepaired_candidate_once();
                 if let Some(model) = self.last_model.as_mut() {
                     for (&iv, a) in idx_atom.iter() {
                         if is_int_idx {
@@ -1810,6 +1812,7 @@ impl Executor {
                             alias_values.push((v, val.clone()));
                         }
                     }
+                    self.stash_unrepaired_candidate_once();
                     if let Some(model) = self.last_model.as_mut() {
                         if let Some(euf) = model.euf_model.as_mut() {
                             for (v, val) in alias_values {
@@ -2427,6 +2430,7 @@ impl Executor {
             &self.ctx.assertions,
         );
         protected.extend(extra_protected.iter().copied());
+        self.stash_unrepaired_candidate_once();
         let mut n_changed = self.repair_root_read_cells(&vs, &protected);
         n_changed += self.resync_lia_derived_values(&vs, &protected);
         n_changed
@@ -2892,6 +2896,72 @@ impl Executor {
         }
     }
 
+    /// #repair-fallback-unrepaired: keep the candidate exactly as it stood
+    /// before the model-repair pass's FIRST semantic mutation. Idempotent per
+    /// gate window (the first call clones, later calls are no-ops), so a pass
+    /// that repairs nothing costs nothing and a retry pass keeps the snapshot
+    /// its first pass took.
+    fn stash_unrepaired_candidate_once(&mut self) {
+        if self.unrepaired_model_candidate.is_none() {
+            self.unrepaired_model_candidate = self.last_model.clone();
+        }
+    }
+
+    /// #repair-fallback-unrepaired: a repair pass may only ever ADD
+    /// satisfaction — it must never turn a candidate the strict oracle would
+    /// have accepted into a rejection. When the REPAIRED witness is refuted
+    /// and the pass stashed the candidate it started from, re-run the
+    /// identical strict oracle on that unrepaired candidate.
+    ///
+    /// Fail-closed: accepting the unrepaired candidate publishes nothing. It
+    /// only clears the strict verdict; `last_model_validated` is reset, and
+    /// every caller then runs the full validation pipeline (independent gate
+    /// included) over exactly the model that passed here. If the unrepaired
+    /// candidate is refuted too, the repaired witness and its rejection are
+    /// restored so the diagnostics describe what the gate actually refused.
+    ///
+    /// Measured motivation: on the skolemized-extensionality
+    /// `storecomm_invalid_*_pp_sf_*` family the search's model was correct
+    /// and a repair falsified a read pin it already satisfied (see the
+    /// `#qf-auflia-diseq-shift` collision test), publishing `unknown` for a
+    /// genuine `sat`.
+    fn strict_verdict_after_unrepaired_fallback(
+        &mut self,
+        rejection: (usize, &'static str, TermId),
+    ) -> Option<(usize, &'static str, TermId)> {
+        let Some(unrepaired) = self.unrepaired_model_candidate.take() else {
+            return Some(rejection);
+        };
+        let repaired = self.last_model.replace(unrepaired);
+        crate::executor::model::eval_memo_clear();
+        self.last_model_validated = false;
+        match self.verify_model_strict_with_scoped_authority() {
+            None => {
+                self.last_rejected_array_assertion = None;
+                let n = self
+                    .last_statistics
+                    .get_int("model_validation.unrepaired_fallback_accepted")
+                    .unwrap_or(0);
+                self.last_statistics
+                    .set_int("model_validation.unrepaired_fallback_accepted", n + 1);
+                // CENSUS DIAGNOSTIC ONLY (`--model-reject-dump`). WRITE-ONLY.
+                if ay_core::misc_cli_flags().model_reject_dump {
+                    eprintln!(
+                        "[repair-fallback] strict oracle {} refuted the REPAIRED witness on \
+                         assertion {}; the unrepaired candidate passes — validating it instead",
+                        rejection.1, rejection.0
+                    );
+                }
+                None
+            }
+            Some(_) => {
+                self.last_model = repaired;
+                crate::executor::model::eval_memo_clear();
+                Some(rejection)
+            }
+        }
+    }
+
     fn repair_asserted_array_read_pins(&mut self) {
         use ay_core::term::TermData;
         if !matches!(self.last_result, Some(SolveResult::Sat)) || self.last_model.is_none() {
@@ -3018,19 +3088,29 @@ impl Executor {
             // fail-closed afterwards.
             {
                 let mut diseq_shifts: Vec<(TermId, i64)> = Vec::new();
-                let int_val = |exec: &Self, t: TermId| -> Option<num_bigint::BigInt> {
-                    let model = exec.last_model.as_ref()?;
-                    if let Some(lia) = model.lia_model.as_ref() {
-                        if let Some(v) = lia.values.get(&t) {
-                            return Some(v.clone());
+                // The collision test MUST use the value semantics the strict
+                // oracle itself uses (`evaluate_term`: LIA/LRA slot, merged
+                // EUF string/int value, completion slot). The former two-slot
+                // lookup (LIA `values` / EUF `int_values`, absent read as 0)
+                // was BLIND to a peer valued only in the merged EUF string
+                // view: on the skolemized storecomm/swap `pp_sf` families
+                // `(not (= e e'))` with `e' = 31` there and `e = 0` read as a
+                // collision, the shift moved `e` to the sentinel, and the
+                // strict arrays oracle then refuted the read pin
+                // `(= e (select A i))` the candidate ALREADY satisfied — a
+                // correct `sat` published as `unknown` (measured: 0/108
+                // storecomm_invalid_*_pp_sf_* solved; the ladder's model was
+                // right).
+                let int_val = |exec: &Self,
+                               model: &crate::executor::model::Model,
+                               t: TermId|
+                 -> Option<num_bigint::BigInt> {
+                    match exec.evaluate_term(model, t) {
+                        crate::executor::model::EvalValue::Rational(r) if r.is_integer() => {
+                            Some(r.numer().clone())
                         }
+                        _ => None,
                     }
-                    if let Some(euf) = model.euf_model.as_ref() {
-                        if let Some(v) = euf.int_values.get(&t) {
-                            return Some(v.clone());
-                        }
-                    }
-                    None
                 };
                 for assertion in self.ctx.assertions.clone() {
                     let TermData::Not(inner) = self.ctx.terms.get(assertion) else {
@@ -3053,22 +3133,38 @@ impl Executor {
                     if !x_var && !y_var {
                         continue;
                     }
-                    // Absent values complete to the default (0) downstream:
-                    // None counts as 0 (measured: store-chain indices appear
-                    // only in stores, LIA never rows them, both default 0).
-                    let zero = num_bigint::BigInt::from(0);
-                    let vx = int_val(self, x).unwrap_or_else(|| zero.clone());
-                    let vy = int_val(self, y).unwrap_or_else(|| zero.clone());
-                    if vx != vy {
-                        continue; // already satisfied
-                    }
-                    // Violated: shift a free var side.
-                    let target = if x_var && !shifted_vars.contains(&x) {
-                        x
-                    } else if y_var && !shifted_vars.contains(&y) {
-                        y
-                    } else {
-                        continue;
+                    let model = self.last_model.as_ref().expect("checked above");
+                    let vx = int_val(self, model, x);
+                    let vy = int_val(self, model, y);
+                    // Which side may move:
+                    //  * both concrete and distinct — satisfied: never touch;
+                    //  * both concrete and equal — a genuine collision, the
+                    //    candidate is doomed on this assertion, so either free
+                    //    var side may take a fresh value;
+                    //  * exactly one concrete — not definitively violated. The
+                    //    concrete side may be pinned by an assertion the
+                    //    candidate already satisfies, so ONLY the unvalued
+                    //    side may move (every assertion definitively true with
+                    //    that leaf unvalued stays true under any value for it);
+                    //  * both unvalued — both complete to the default (0)
+                    //    downstream and collide (measured: store-chain indices
+                    //    appear only in stores, LIA never rows them), so
+                    //    separate them now.
+                    let free = |t: TermId, is_var: bool| is_var && !shifted_vars.contains(&t);
+                    let target = match (&vx, &vy) {
+                        (Some(a), Some(b)) if a != b => continue,
+                        (Some(_), Some(_)) | (None, None) => {
+                            if free(x, x_var) {
+                                x
+                            } else if free(y, y_var) {
+                                y
+                            } else {
+                                continue;
+                            }
+                        }
+                        (Some(_), None) if free(y, y_var) => y,
+                        (None, Some(_)) if free(x, x_var) => x,
+                        _ => continue,
                     };
                     // CENSUS DIAGNOSTIC ONLY (`--model-reject-dump`; default
                     // off is byte-identical — one `var_os` probe, no I/O and no
@@ -3083,7 +3179,10 @@ impl Executor {
                             "[diseq-shift] {} := {} (was {}, collided with {} on assertion {})",
                             self.format_term(target),
                             next_fresh,
-                            vx,
+                            match (target == x, &vx, &vy) {
+                                (true, Some(v), _) | (false, _, Some(v)) => v.to_string(),
+                                _ => "unvalued".to_string(),
+                            },
                             self.format_term(if target == x { y } else { x }),
                             self.format_term(assertion)
                                 .chars()
@@ -3133,6 +3232,7 @@ impl Executor {
                     shifted_vars.insert(target);
                 }
                 if !diseq_shifts.is_empty() {
+                    self.stash_unrepaired_candidate_once();
                     let model = self.last_model.as_mut().expect("checked above");
                     for (iv, fresh) in &diseq_shifts {
                         let fresh_big = num_bigint::BigInt::from(*fresh);
@@ -3248,6 +3348,7 @@ impl Executor {
                 }
             }
             if !index_shifts.is_empty() {
+                self.stash_unrepaired_candidate_once();
                 let model = self.last_model.as_mut().expect("checked above");
                 for (iv, fresh) in &index_shifts {
                     let fresh_big = num_bigint::BigInt::from(*fresh);
@@ -3384,6 +3485,7 @@ impl Executor {
                 }
                 term_demands.retain(|(t, _)| !bad.contains(t));
             }
+            self.stash_unrepaired_candidate_once();
             let model = self.last_model.as_mut().expect("checked above");
             // Harmonize pinned vars AND write-term demands everywhere.
             let mut writes: Vec<(TermId, String)> = term_demands;
@@ -3608,6 +3710,7 @@ impl Executor {
                 // The bounded search mutates a trial assignment in place. If
                 // no separating cell exists, the attempt establishes nothing
                 // and must leave the predecessor model byte-for-byte intact.
+                self.stash_unrepaired_candidate_once();
                 let trial_predecessor = self.last_model.clone();
                 let mut witness: Option<String> = None;
                 for attempt in 0..max_attempts {
@@ -4149,6 +4252,9 @@ impl Executor {
         // collision, so the range-blind diseq shift is never even reached for
         // them. Env-gated; default off is a no-op returning 0.
         self.uflia_fill_bounded_int_leaves();
+        // #repair-fallback-unrepaired: open the stash window (see
+        // `strict_verdict_after_unrepaired_fallback`).
+        self.unrepaired_model_candidate = None;
         self.repair_asserted_array_read_pins();
         // #uflia-witness-complete (1b), mirroring the finalize site: an
         // IN-LOOP-validated model reaches the funnel through THIS entry, so
@@ -4198,6 +4304,12 @@ impl Executor {
                 }
             }
         }
+        // #repair-fallback-unrepaired: last resort before degrading — the
+        // candidate as the search produced it, strict-checked the same way.
+        if let Some(rejection) = strict {
+            strict = self.strict_verdict_after_unrepaired_fallback(rejection);
+        }
+        self.unrepaired_model_candidate = None;
         if let Some((idx, oracle, assertion)) = strict {
             self.note_exact_ite_uf_definition_model_rejection(oracle);
             self.last_statistics.model_validation_failures += 1;
@@ -4230,6 +4342,15 @@ impl Executor {
             // class as the in-loop BV validator / independent-gate hooks).
             if self.bv_subst_lane {
                 self.bv_subst_model_rejected = true;
+            }
+            // #qfax-isolated-lane-retry: a gate refutation of a model the
+            // LIA-less isolated QF_AUFLIA ladder published arms the single
+            // combiner re-solve (`check_sat_guarded`), the same reactive
+            // pattern as the BV arm. Scoped to `qfax_isolated_lane` so no
+            // other route's rejection buys a second solve; the fail-closed
+            // downgrade here is unaffected.
+            if self.qfax_isolated_lane {
+                self.qfax_isolated_model_rejected = true;
             }
             self.last_model = None;
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
@@ -4760,6 +4881,9 @@ impl Executor {
         // downstream fallbacks.
         // #uflia-witness-complete (1a-i): see `apply_strict_model_gate`.
         self.uflia_fill_bounded_int_leaves();
+        // #repair-fallback-unrepaired: open the stash window (see
+        // `strict_verdict_after_unrepaired_fallback`).
+        self.unrepaired_model_candidate = None;
         self.repair_asserted_array_read_pins();
         // #uflia-witness-complete (1b): UNDER-COMPLETED UF TABLE. A falsified
         // UF-chain equality whose chain argument lands on a function point the
@@ -4815,6 +4939,7 @@ impl Executor {
                         self.confirm_sat_with_independent_gate(),
                         ay_model_check::GateVerdict::ConfirmedSat
                     ) {
+                        self.unrepaired_model_candidate = None;
                         self.last_model_validated = true;
                         return Ok(SolveResult::Sat);
                     }
@@ -4823,6 +4948,13 @@ impl Executor {
             }
             other => other,
         };
+        // #repair-fallback-unrepaired: last resort before degrading (see
+        // `strict_verdict_after_unrepaired_fallback`).
+        let strict_verdict = match strict_verdict {
+            Some(rejection) => self.strict_verdict_after_unrepaired_fallback(rejection),
+            None => None,
+        };
+        self.unrepaired_model_candidate = None;
         if let Some((idx, oracle, assertion)) = strict_verdict {
             self.note_exact_ite_uf_definition_model_rejection(oracle);
             if oracle.starts_with("arrays") {
@@ -4928,6 +5060,15 @@ impl Executor {
             // #abv-subst-model-retry: see `apply_strict_model_gate`.
             if self.bv_subst_lane {
                 self.bv_subst_model_rejected = true;
+            }
+            // #qfax-isolated-lane-retry: a gate refutation of a model the
+            // LIA-less isolated QF_AUFLIA ladder published arms the single
+            // combiner re-solve (`check_sat_guarded`), the same reactive
+            // pattern as the BV arm. Scoped to `qfax_isolated_lane` so no
+            // other route's rejection buys a second solve; the fail-closed
+            // downgrade here is unaffected.
+            if self.qfax_isolated_lane {
+                self.qfax_isolated_model_rejected = true;
             }
             // #uflia-cong-repair-arm: a strict-oracle refutation of a
             // UFLIA-lane model is the same evidence class as the independent
@@ -5207,6 +5348,9 @@ impl Executor {
         // circuits because those flags only suppress the full
         // observation pipeline — they must NOT allow a known-wrong
         // model to escape as SAT. Soundness over completeness.
+        // #repair-fallback-unrepaired: open the stash window (see
+        // `strict_verdict_after_unrepaired_fallback`).
+        self.unrepaired_model_candidate = None;
         self.repair_asserted_array_read_pins();
         // Third strict-gate site in finalize: use the same centralized,
         // fail-closed coverage policy as both earlier funnels and their retries.
@@ -5238,6 +5382,7 @@ impl Executor {
                         self.confirm_sat_with_independent_gate(),
                         ay_model_check::GateVerdict::ConfirmedSat
                     ) {
+                        self.unrepaired_model_candidate = None;
                         self.last_model_validated = true;
                         return Ok(SolveResult::Sat);
                     }
@@ -5246,6 +5391,13 @@ impl Executor {
             }
             other => other,
         };
+        // #repair-fallback-unrepaired: last resort before degrading (see
+        // `strict_verdict_after_unrepaired_fallback`).
+        let strict3 = match strict3 {
+            Some(rejection) => self.strict_verdict_after_unrepaired_fallback(rejection),
+            None => None,
+        };
+        self.unrepaired_model_candidate = None;
         if let Some((idx, oracle, assertion)) = strict3 {
             self.note_exact_ite_uf_definition_model_rejection(oracle);
             if oracle.starts_with("arrays") {
@@ -5267,6 +5419,15 @@ impl Executor {
             // #abv-subst-model-retry: see `apply_strict_model_gate`.
             if self.bv_subst_lane {
                 self.bv_subst_model_rejected = true;
+            }
+            // #qfax-isolated-lane-retry: a gate refutation of a model the
+            // LIA-less isolated QF_AUFLIA ladder published arms the single
+            // combiner re-solve (`check_sat_guarded`), the same reactive
+            // pattern as the BV arm. Scoped to `qfax_isolated_lane` so no
+            // other route's rejection buys a second solve; the fail-closed
+            // downgrade here is unaffected.
+            if self.qfax_isolated_lane {
+                self.qfax_isolated_model_rejected = true;
             }
             self.last_model = None;
             self.last_unknown_reason = Some(UnknownReason::Incomplete);

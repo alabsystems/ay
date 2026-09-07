@@ -3230,6 +3230,15 @@ impl Executor {
                 if self.bv_subst_lane {
                     self.bv_subst_model_rejected = true;
                 }
+                // #qfax-isolated-lane-retry: a gate refutation of a model the
+                // LIA-less isolated QF_AUFLIA ladder published arms the single
+                // combiner re-solve (`check_sat_guarded`), the same reactive
+                // pattern as the BV arm. Scoped to `qfax_isolated_lane` so no
+                // other route's rejection buys a second solve; the fail-closed
+                // downgrade here is unaffected.
+                if self.qfax_isolated_lane {
+                    self.qfax_isolated_model_rejected = true;
+                }
                 // ENFORCED, UNCONDITIONALLY. A `ModelViolates` means the gate's
                 // own evaluator ground-falsified an assertion under the EMITTED
                 // `last_model` — a concrete refutation of the witness. Shipping
@@ -3263,6 +3272,17 @@ impl Executor {
                     .set_string("model_check_gate.result", "cannot-confirm");
                 self.last_statistics
                     .set_string("model_check_gate.cannot_confirm_reason", reason.clone());
+                // #qfax-isolated-lane-retry: an UNCONFIRMABLE model from the
+                // LIA-less isolated QF_AUFLIA ladder is the same recoverable
+                // evidence class as a strict refutation of one — the ladder
+                // leaves Int-sorted witnesses (`i = (sk A B)`) without an
+                // arithmetic slot, which is precisely a coverage gap — so it
+                // arms the same single combiner re-solve. Scoped to the lane
+                // and retry-once; the fail-closed downgrade below is
+                // unaffected, and a still-unconfirmed re-solve stays Unknown.
+                if self.qfax_isolated_lane {
+                    self.qfax_isolated_model_rejected = true;
+                }
                 // `CannotConfirm` is distinct from `ModelViolates`: it is a
                 // coverage gap, not evidence that the candidate is false. It is
                 // nevertheless insufficient evidence for an authoritative SAT

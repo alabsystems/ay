@@ -35,5 +35,7 @@ mod uflra_incremental_push_pop;
 mod ufn_assumption_soundness_6289;
 #[path = "group_euf/ufnia_soundness_5984.rs"]
 mod ufnia_soundness_5984;
+#[path = "group_euf/ufnra_post_split_unsat_verify.rs"]
+mod ufnra_post_split_unsat_verify;
 #[path = "group_euf/ufnra_speculative_eq_7449.rs"]
 mod ufnra_speculative_eq_7449;

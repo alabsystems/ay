@@ -11,7 +11,7 @@ use crate::command::{MatchPattern, ParsedConstant, QualifiedIdentifier, Term as 
 use crate::sexp::{PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE};
 use ay_core::{Constant, Sort, Symbol, TermData, TermId};
 
-use super::{Context, ElaborateError, Result};
+use super::{Context, ElaborateError, MacroCallSite, MacroExpansionWatermark, Result};
 
 struct ElaboratedQuantifierAttributes {
     triggers: Vec<Vec<TermId>>,
@@ -66,7 +66,7 @@ fn elab_let_chain_enabled() -> bool {
 /// binder shadowing and includes operator/qualified heads — which is sound for
 /// the caller: it only ever causes a truly-dead binding to be kept, never a live
 /// one to be dropped. Iterative (explicit stack) for deep-term stack safety.
-fn collect_term_names(root: &ParsedTerm, out: &mut HashSet<String>) {
+pub(super) fn collect_term_names(root: &ParsedTerm, out: &mut HashSet<String>) {
     let mut stack: Vec<&ParsedTerm> = vec![root];
     while let Some(t) = stack.pop() {
         match t {
@@ -144,26 +144,47 @@ impl Context {
                         // quantifier variable, `let` binding, `match` pattern
                         // variable — capture a global the body names; see the
                         // capture-avoidance note in `elaborate_app`.
-                        let term = self.elaborate_term(&body, &HashMap::default())?;
-                        // SMT-LIB implicit Int->Real coercion for define-fun:
-                        // (define-fun x () Real 0) — the numeral `0` elaborates
-                        // as Int but the declared sort is Real. Coerce to match.
-                        // Without this, downstream mk_eq panics on sort mismatch
-                        // and release builds produce false-UNSAT (#6812).
-                        let actual = self.terms.sort(term).clone();
-                        if actual == result_sort {
-                            return Ok(term);
-                        }
-                        if self.int_real_coercions()
-                            && actual == Sort::Int
-                            && result_sort == Sort::Real
+                        //
+                        // The body therefore depends on nothing but the
+                        // definition, so the same use-site memo the applied
+                        // case uses (`elaborate/macro_memo.rs`) elaborates a
+                        // chain of nullary definitions once instead of once per
+                        // path through it.
+                        let entry_depth = self.fun_expansion_depth;
+                        let memo_key = (MacroCallSite::BareSymbol, name.clone(), Vec::new());
+                        if let Some(memoized) =
+                            self.memoized_macro_expansion(&memo_key, entry_depth)
                         {
-                            return Ok(self.coerce_int_to_real(term));
+                            return Ok(memoized);
                         }
-                        return Err(ElaborateError::SortMismatch {
-                            expected: result_sort.to_string(),
-                            actual: actual.to_string(),
-                        });
+                        let watermark = MacroExpansionWatermark::open(self, entry_depth, &body);
+                        let expanded =
+                            self.elaborate_term(&body, &HashMap::default())
+                                .and_then(|term| {
+                                    // SMT-LIB implicit Int->Real coercion for
+                                    // define-fun: (define-fun x () Real 0) —
+                                    // the numeral `0` elaborates as Int but the
+                                    // declared sort is Real. Coerce to match.
+                                    // Without this, downstream mk_eq panics on
+                                    // sort mismatch and release builds produce
+                                    // false-UNSAT (#6812).
+                                    let actual = self.terms.sort(term).clone();
+                                    if actual == result_sort {
+                                        Ok(term)
+                                    } else if self.int_real_coercions()
+                                        && actual == Sort::Int
+                                        && result_sort == Sort::Real
+                                    {
+                                        Ok(self.coerce_int_to_real(term))
+                                    } else {
+                                        Err(ElaborateError::SortMismatch {
+                                            expected: result_sort.to_string(),
+                                            actual: actual.to_string(),
+                                        })
+                                    }
+                                });
+                        watermark.close(self, memo_key, expanded.as_ref().ok().copied());
+                        return expanded;
                     }
                 }
                 // Check global symbols. Bare identifiers can denote only a

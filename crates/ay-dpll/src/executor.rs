@@ -213,6 +213,43 @@ pub struct Executor {
     pub(crate) last_rejected_array_assertion: Option<TermId>,
     /// Re-entrancy guard for the rejected-target repair retry.
     pub(crate) qfax_retry_done: bool,
+    /// #repair-fallback-unrepaired: the SAT candidate exactly as the search
+    /// produced it, stashed by the model-repair pass right before its FIRST
+    /// semantic mutation (lazily — a pass that repairs nothing never clones).
+    /// The strict gates consume it: when the REPAIRED witness is refuted, the
+    /// identical strict oracle re-runs on this unrepaired candidate, because
+    /// a repair may only ever add satisfaction and must never turn a
+    /// candidate the gate would have accepted into a rejection. Transient:
+    /// cleared at every gate window's entry and consumed at its exit.
+    pub(in crate::executor) unrepaired_model_candidate: Option<Model>,
+    /// #qfax-isolated-lane-retry: marks a verdict PUBLISHED by the isolated
+    /// QF_AUFLIA array+EUF escalation ladder (`check_sat.rs`, the
+    /// `constants_only` arm). That ladder is LIA-less, so an Int-sorted
+    /// skolem witness like `i = (sk A B)` gets no arithmetic model slot and
+    /// its `Sat` can be refuted by the strict/independent model gates even
+    /// though the formula is genuinely satisfiable. Scoping the retry signal
+    /// to this lane keeps every other route's rejection behaviour unchanged.
+    /// Set immediately before the ladder returns; cleared at
+    /// `check_sat_internal` entry (so the fall-through `solve_auf_lia` never
+    /// inherits it).
+    pub(crate) qfax_isolated_lane: bool,
+    /// #qfax-isolated-lane-retry: set when a model produced by that isolated
+    /// lane was REFUTED by the strict model gate or by the independent model
+    /// checker. Read once by `check_sat_guarded` to arm the combiner
+    /// re-solve. Reset at `check_sat_guarded` entry.
+    pub(crate) qfax_isolated_model_rejected: bool,
+    /// #qfax-isolated-lane-retry: retry-once latch (loop guard). The combiner
+    /// re-solve fires AT MOST ONCE per public check-sat; a still-rejected
+    /// re-solve stays the fail-closed Unknown.
+    pub(crate) qfax_isolated_retry_done: bool,
+    /// #qfax-isolated-lane-retry: route-facing flag for that re-solve — it
+    /// suppresses the isolated ladder so the QfAuflia arm goes straight to
+    /// `solve_auf_lia`, whose `has_substantive_int_constraints` clause
+    /// `is_int_uf_app_with_array_arg` already classifies the skolem-witness
+    /// shape as needing LIA. Deliberately NOT cleared at
+    /// `check_sat_internal` entry: the re-solve re-enters that fn and must
+    /// preserve it.
+    pub(crate) qfax_force_combiner: bool,
     /// #uflia-cong-repair-arm: enable-flag threaded into the UFLIA
     /// `TheoryCombiner` for the accept-point UF function-graph consistency
     /// scan. Set `true` ONLY inside `check_sat_guarded` for the single armed
@@ -464,6 +501,12 @@ pub struct Executor {
     /// their first pass while bounded ones stop being vetoed for work no pass
     /// ever performs.
     proof_source_work: proof_trust_surgery_surface_audit::ProofSourceWorkEnvelope,
+    /// Units already debited this query from the best-effort trust-leaf
+    /// rebuild refutation budget (`best_effort_rebuild_refutation_budget`).
+    /// Reset with `proof_source_work` at every public query start; unused
+    /// (never consulted) under an explicit proof demand, whose budget is
+    /// `None`.
+    best_effort_rebuild_refutation_spent: u64,
     /// This solve asserted at least one quantified consequence whose exact
     /// authored-scope `forall_inst` derivation was not registered.  A raw UNSAT
     /// may still be mathematically sound, but its trace is not publication

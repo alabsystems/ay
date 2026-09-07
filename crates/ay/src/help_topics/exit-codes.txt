@@ -67,10 +67,14 @@ Choosing the DIMACS convention yourself
   where it is `z3`. An explicit --sat-exit-codes overrides either default.
 
   `--competition` is a different switch and does not touch 10/20. What it
-  changes is the memory budget: a memout prints a `c memout` marker and
-  exits 0 rather than 124. A timeout under `--competition` still exits
-  124 -- the competition convention for timeouts is applied by the
-  submission wrapper, not by this flag.
+  changes is the memory budget on DIMACS input: a memout still prints the
+  `c memout` / `s UNKNOWN` lines every DIMACS run prints, but exits 0
+  rather than 124. The verdict grammar follows the input, never the
+  posture: an SMT-LIB memout prints `unknown` and (:reason-unknown
+  "memout") and exits 124 at every rigor level, exactly like an SMT-LIB
+  timeout. A timeout under `--competition` still exits 124 -- the
+  competition convention for timeouts is applied by the submission
+  wrapper, not by this flag.
 
 Signals
 

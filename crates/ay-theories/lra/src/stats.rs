@@ -49,6 +49,12 @@ pub(crate) struct LraStats {
     /// Number of conflicts found by the full `check_impl()` at complete
     /// assignment (#8008).
     pub(crate) full_check_conflict_count: u64,
+    /// Number of times a simplex `Sat` was downgraded to `Unknown` because an
+    /// atom carrying an LRA-uninterpretable sub-term was asserted (#6165/#9224
+    /// fail-closed guard in `check_impl`). Pure telemetry: it records how often
+    /// the abstraction gap costs a verdict, so the population can be measured
+    /// without a debug build.
+    pub(crate) unsupported_sat_downgrades: u64,
 
     // ----- Reason materialization telemetry -----
     /// Number of propagated reasons that were already materialized when queued.

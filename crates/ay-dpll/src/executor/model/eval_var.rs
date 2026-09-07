@@ -107,6 +107,26 @@ impl Executor {
                 // keep the result Unknown instead of inventing a value.
                 return EvalValue::Unknown;
             }
+            // #subst-key-no-default: a missing entry is not evidence that this
+            // variable is FREE — it may have been eliminated by preprocessing
+            // and be DEFINED by a recorded substitution, exactly the contract
+            // the BitVec branch below already states. Fabricating 0 here is
+            // not merely a guess: it is read back by model completion, whose
+            // substitution fixpoint is fill-only (it derives `from` from its
+            // RHS only while `from` still evaluates to Unknown), so the
+            // phantom 0 PERMANENTLY shadows the definition and the strict
+            // gate then refutes the very equality that defined it. Measured
+            // on the LIA-less array+EUF lane: `(= x (select A i))` records
+            // `x -> (select A i)`, `x` fabricated 0, and the arrays oracle
+            // rejected assertion `(= x (select A i))` on a candidate whose
+            // array content was correct. Keeping it Unknown hands the key to
+            // completion, which either replays the definition or — when the
+            // RHS is genuinely unconstrained — installs the same default in
+            // phase 2.5, so a key completion cannot derive ends up exactly
+            // where it was before.
+            if self.recorded_var_substitutions.contains_key(&term_id) {
+                return EvalValue::Unknown;
+            }
             // Default to 0 for unassigned integer variables
             EvalValue::Rational(BigRational::zero())
         } else if matches!(sort, Sort::Real) {

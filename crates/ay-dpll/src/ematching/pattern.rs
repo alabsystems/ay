@@ -45,6 +45,82 @@ pub(super) struct TermIndex {
     pub(super) by_symbol: HashMap<String, Vec<TermId>>,
 }
 
+/// Dense id of an interned binder scope (see [`BoundVarScopeMemo`]). `0` is
+/// always the empty scope.
+type ScopeId = u32;
+
+/// Memo for [`TermIndex::collect_bound_var_ids`].
+///
+/// # Why
+///
+/// `collect_bound_var_ids` is a recursive DAG walk with no visited set, and its
+/// callers run it once per ROOT: `collect_ground_terms_by_sort` and
+/// `collect_bool_uf_arg_terms` walk `0..terms.len()`, `TermIndex::new` walks
+/// every reachable id, and `PersistentMatchState::refresh_index` walks every
+/// newly reachable id. The cost is therefore the SUM OF SUBTREE SIZES over the
+/// whole store, which on the hash-consed 45k-346k-term SPARK/GNATprove stores is
+/// quadratic and measured as ~99% of the solver's wall clock. With the memo it
+/// is one pass per distinct `(term, scope)` pair.
+///
+/// # Why it is behaviour-preserving
+///
+/// Let `R(t, S)` be the set of ids the un-memoized walk inserts when entered at
+/// term `t` with binder-name scope `S`. Reading the walk:
+///
+/// * the only state it READS is `terms`, `term_id` and `bound_names`;
+/// * the only state it WRITES is `bound_var_ids` (insert-only, so idempotent)
+///   and `bound_names`, which every arm restores exactly (`added` records the
+///   names a quantifier actually inserted and pops precisely those).
+///
+/// So `R` is a pure function of `(t, S)`, and running the walk twice on the same
+/// pair against the same accumulator adds nothing the second time. The memo
+/// records exactly the pairs already folded into one accumulator and skips them;
+/// the final `bound_var_ids` is therefore identical, element for element.
+///
+/// Scopes are interned on their EXACT sorted, deduplicated name vector, not on a
+/// hash or fingerprint, so two different scopes can never share a `ScopeId` and
+/// no contribution can be skipped by aliasing. (`bound_names` is a set, so the
+/// sorted vector is a canonical key.)
+///
+/// # Pairing rule
+///
+/// A memo is valid only while used with the SAME `bound_var_ids` accumulator and
+/// the same immutable `TermStore`. Both callers create it as a local of the loop
+/// that owns the accumulator, so the store cannot grow or roll back underneath
+/// it and stale `TermId`s cannot arise.
+#[derive(Default)]
+pub(super) struct BoundVarScopeMemo {
+    /// Sorted, deduplicated binder-name set -> dense id. The empty scope is `0`
+    /// and is never stored here.
+    scope_ids: HashMap<Vec<String>, ScopeId>,
+    /// `(TermId.0, scope id)` pairs already walked with this accumulator.
+    walked: HashSet<(u32, ScopeId)>,
+}
+
+impl BoundVarScopeMemo {
+    /// The id of `bound_names` as a scope, interning it on first sight.
+    fn scope_id(&mut self, bound_names: &HashSet<String>) -> ScopeId {
+        if bound_names.is_empty() {
+            return 0;
+        }
+        let mut key: Vec<String> = bound_names.iter().cloned().collect();
+        key.sort_unstable();
+        if let Some(&id) = self.scope_ids.get(&key) {
+            return id;
+        }
+        // +1: id 0 is reserved for the empty scope, which is never interned.
+        let id = self.scope_ids.len() as ScopeId + 1;
+        self.scope_ids.insert(key, id);
+        id
+    }
+
+    /// Claim `(term, scope)` for this walk. `true` on the first claim (walk it),
+    /// `false` if it was already folded into the accumulator (skip it).
+    fn mark_walked(&mut self, term_id: TermId, scope: ScopeId) -> bool {
+        self.walked.insert((term_id.0, scope))
+    }
+}
+
 impl TermIndex {
     /// Build an index of ground App terms reachable from the current assertions.
     /// This indexes all reachable App terms (not just top-level) that are ground.
@@ -68,8 +144,16 @@ impl TermIndex {
         // We need to track which binding names are currently in scope as we traverse.
         let mut bound_var_ids: HashSet<u32> = HashSet::default();
         let mut bound_names: HashSet<String> = HashSet::default();
+        // One memo for the whole root loop (it is paired with `bound_var_ids`).
+        let mut bound_var_memo = BoundVarScopeMemo::default();
         for &term_id in &reachable {
-            Self::collect_bound_var_ids(terms, term_id, &mut bound_var_ids, &mut bound_names);
+            Self::collect_bound_var_ids(
+                terms,
+                term_id,
+                &mut bound_var_ids,
+                &mut bound_names,
+                &mut bound_var_memo,
+            );
         }
 
         // Second pass: index all terms, using the collected bound var IDs.
@@ -135,13 +219,41 @@ impl TermIndex {
     /// `bound_names` contains the names of variables bound by enclosing quantifiers.
     /// A Var is bound only if its name matches one of these binding names.
     /// Uses push/pop on `bound_names` to avoid cloning at each quantifier level.
+    ///
+    /// `memo` records the `(term, scope)` pairs already folded into THIS
+    /// `bound_var_ids` accumulator — see [`BoundVarScopeMemo`] for why sharing it
+    /// across a whole root loop is behaviour-preserving, and for the pairing rule
+    /// it must be used under.
     pub(super) fn collect_bound_var_ids(
         terms: &TermStore,
         term_id: TermId,
         bound_var_ids: &mut HashSet<u32>,
         bound_names: &mut HashSet<String>,
+        memo: &mut BoundVarScopeMemo,
+    ) {
+        let scope = memo.scope_id(bound_names);
+        Self::collect_bound_var_ids_scoped(terms, term_id, bound_var_ids, bound_names, memo, scope);
+    }
+
+    /// [`Self::collect_bound_var_ids`] with the interned id of the CURRENT
+    /// `bound_names` scope threaded down, so the memo key needs no per-node
+    /// re-interning. `scope` must always equal `memo.scope_id(bound_names)`;
+    /// the only place the scope changes is the quantifier arm, which re-interns.
+    fn collect_bound_var_ids_scoped(
+        terms: &TermStore,
+        term_id: TermId,
+        bound_var_ids: &mut HashSet<u32>,
+        bound_names: &mut HashSet<String>,
+        memo: &mut BoundVarScopeMemo,
+        scope: ScopeId,
     ) {
         stacker::maybe_grow(EMATCH_STACK_RED_ZONE, EMATCH_STACK_SIZE, || {
+            if !memo.mark_walked(term_id, scope) {
+                // Already walked at exactly this scope with this accumulator:
+                // re-walking would re-insert ids `bound_var_ids` already holds
+                // and would restore `bound_names` unchanged. Skipping is a no-op.
+                return;
+            }
             match terms.get(term_id) {
                 TermData::Forall(vars, body, _) | TermData::Exists(vars, body, _) => {
                     // Push quantifier binding names, track which were new for pop
@@ -151,7 +263,15 @@ impl TermIndex {
                             added.push(name.clone());
                         }
                     }
-                    Self::collect_bound_var_ids(terms, *body, bound_var_ids, bound_names);
+                    let inner_scope = memo.scope_id(bound_names);
+                    Self::collect_bound_var_ids_scoped(
+                        terms,
+                        *body,
+                        bound_var_ids,
+                        bound_names,
+                        memo,
+                        inner_scope,
+                    );
                     // Pop: remove only names we added
                     for name in &added {
                         bound_names.remove(name);
@@ -167,25 +287,154 @@ impl TermIndex {
                 }
                 TermData::App(_, args) => {
                     for &arg in args {
-                        Self::collect_bound_var_ids(terms, arg, bound_var_ids, bound_names);
+                        Self::collect_bound_var_ids_scoped(
+                            terms,
+                            arg,
+                            bound_var_ids,
+                            bound_names,
+                            memo,
+                            scope,
+                        );
                     }
                 }
                 TermData::Not(inner) => {
-                    Self::collect_bound_var_ids(terms, *inner, bound_var_ids, bound_names);
+                    Self::collect_bound_var_ids_scoped(
+                        terms,
+                        *inner,
+                        bound_var_ids,
+                        bound_names,
+                        memo,
+                        scope,
+                    );
                 }
                 TermData::Ite(c, t, e) => {
-                    Self::collect_bound_var_ids(terms, *c, bound_var_ids, bound_names);
-                    Self::collect_bound_var_ids(terms, *t, bound_var_ids, bound_names);
-                    Self::collect_bound_var_ids(terms, *e, bound_var_ids, bound_names);
+                    Self::collect_bound_var_ids_scoped(
+                        terms,
+                        *c,
+                        bound_var_ids,
+                        bound_names,
+                        memo,
+                        scope,
+                    );
+                    Self::collect_bound_var_ids_scoped(
+                        terms,
+                        *t,
+                        bound_var_ids,
+                        bound_names,
+                        memo,
+                        scope,
+                    );
+                    Self::collect_bound_var_ids_scoped(
+                        terms,
+                        *e,
+                        bound_var_ids,
+                        bound_names,
+                        memo,
+                        scope,
+                    );
                 }
                 TermData::Let(bindings, body) => {
                     for (_, val) in bindings {
-                        Self::collect_bound_var_ids(terms, *val, bound_var_ids, bound_names);
+                        Self::collect_bound_var_ids_scoped(
+                            terms,
+                            *val,
+                            bound_var_ids,
+                            bound_names,
+                            memo,
+                            scope,
+                        );
                     }
-                    Self::collect_bound_var_ids(terms, *body, bound_var_ids, bound_names);
+                    Self::collect_bound_var_ids_scoped(
+                        terms,
+                        *body,
+                        bound_var_ids,
+                        bound_names,
+                        memo,
+                        scope,
+                    );
                 }
                 TermData::Const(_) => {}
                 // Future TermData variants: skip (no bound vars to collect).
+                _ => {}
+            }
+        })
+    }
+
+    /// The un-memoized reference walk: the body [`Self::collect_bound_var_ids`]
+    /// had before `BoundVarScopeMemo` was introduced, kept verbatim so the
+    /// differential test can assert the memo changes nothing. Test-only.
+    #[cfg(test)]
+    pub(super) fn collect_bound_var_ids_unmemoized(
+        terms: &TermStore,
+        term_id: TermId,
+        bound_var_ids: &mut HashSet<u32>,
+        bound_names: &mut HashSet<String>,
+    ) {
+        stacker::maybe_grow(EMATCH_STACK_RED_ZONE, EMATCH_STACK_SIZE, || {
+            match terms.get(term_id) {
+                TermData::Forall(vars, body, _) | TermData::Exists(vars, body, _) => {
+                    let mut added: Vec<String> = Vec::new();
+                    for (name, _) in vars {
+                        if bound_names.insert(name.clone()) {
+                            added.push(name.clone());
+                        }
+                    }
+                    Self::collect_bound_var_ids_unmemoized(
+                        terms,
+                        *body,
+                        bound_var_ids,
+                        bound_names,
+                    );
+                    for name in &added {
+                        bound_names.remove(name);
+                    }
+                }
+                TermData::Var(name, _) => {
+                    let base_name = name.trim_end_matches(|c: char| c == '_' || c.is_ascii_digit());
+                    if bound_names.contains(name) || bound_names.contains(base_name) {
+                        bound_var_ids.insert(term_id.0);
+                    }
+                }
+                TermData::App(_, args) => {
+                    for &arg in args {
+                        Self::collect_bound_var_ids_unmemoized(
+                            terms,
+                            arg,
+                            bound_var_ids,
+                            bound_names,
+                        );
+                    }
+                }
+                TermData::Not(inner) => {
+                    Self::collect_bound_var_ids_unmemoized(
+                        terms,
+                        *inner,
+                        bound_var_ids,
+                        bound_names,
+                    );
+                }
+                TermData::Ite(c, t, e) => {
+                    Self::collect_bound_var_ids_unmemoized(terms, *c, bound_var_ids, bound_names);
+                    Self::collect_bound_var_ids_unmemoized(terms, *t, bound_var_ids, bound_names);
+                    Self::collect_bound_var_ids_unmemoized(terms, *e, bound_var_ids, bound_names);
+                }
+                TermData::Let(bindings, body) => {
+                    for (_, val) in bindings {
+                        Self::collect_bound_var_ids_unmemoized(
+                            terms,
+                            *val,
+                            bound_var_ids,
+                            bound_names,
+                        );
+                    }
+                    Self::collect_bound_var_ids_unmemoized(
+                        terms,
+                        *body,
+                        bound_var_ids,
+                        bound_names,
+                    );
+                }
+                TermData::Const(_) => {}
                 _ => {}
             }
         })

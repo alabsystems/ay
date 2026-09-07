@@ -87,9 +87,16 @@ pub enum ExecutorError {
     /// DPLL(T) solver error (theory-SAT mapping failure or unexpected result)
     #[error("DPLL solver error: {0}")]
     Dpll(#[from] DpllError),
-    /// Unsupported logic
+    /// No decision procedure for the problem's theory combination.
+    ///
+    /// The payload is the DECLARED logic, which is not necessarily what is
+    /// unsupported: content routing can reach this from an `ALL` or unmapped
+    /// declaration whose theory MIX has no combined lane. Saying "Supported
+    /// logics: ALL, ..." while rejecting an `ALL` file was self-contradictory,
+    /// so the list is named for what it is — the logics with a dedicated route.
     #[error(
-        "unsupported logic: {0}. Supported logics: \
+        "unsupported logic: {0} (no combined decision procedure for this \
+        problem's theory mix). Logics with a dedicated route: \
         ALL, AUFDT, AUFDTLIA, AUFDTLIRA, AUFLIA, AUFLIRA, AUFLRA, \
         LIA, LIRA, LRA, NIA, NIRA, NRA, \
         QF_ABV, QF_AUFBV, QF_AUFBVLIA, QF_AUFLIA, QF_AUFLIRA, QF_AUFLRA, QF_AX, \
@@ -555,6 +562,49 @@ pub struct Statistics {
     pub ematching_instances_created: u64,
 
     // =========================================================================
+    // Guarded quantifier instantiation statistics (z3-parity stage 0)
+    // =========================================================================
+    // These seven counters are OBSERVATION ONLY. They are surfaced under the
+    // `quantifier.*` key namespace already used by `quantifier.relevance.*` and
+    // `quantifier.demand.*`, but they live as named fields rather than in
+    // `extra` so that `Display` can print them UNCONDITIONALLY. That is
+    // deliberate: an absent key and a zero are different claims (see the
+    // `extra`-backed certificate rows, which stay omitted precisely so a reader
+    // can tell "minted none" from "never asked"), and the staged guarded
+    // instantiation work is measured as MOVEMENT away from zero. A counter that
+    // only appears once its producer lands cannot distinguish "the stage
+    // produced nothing" from "the stage forgot to wire its counter".
+    //
+    // Producers, as of this commit:
+    //   - `quantifier_mbqi_*` and `quantifier_cegqi_*` are wired to the live
+    //     MBQI and CEGQI loops.
+    //   - `quantifier_proxies_minted` and the two `guarded_instances_*`
+    //     counters have NO producer yet; the proxy-literal abstraction that
+    //     moves them is a later stage. They read zero everywhere today, which
+    //     is the frozen baseline the later stages are measured against.
+    //
+    // Each field is the single source for its key: a producer must bump the
+    // field, never `set_int` the dotted name, or the block prints the row twice.
+    /// Quantifier proxy literals minted by the guarded-instantiation
+    /// abstraction. No producer yet — reads zero.
+    pub quantifier_proxies_minted: u64,
+    /// Guarded instance clauses `(or (not q) body[t])` constructed. No producer
+    /// yet — reads zero.
+    pub quantifier_guarded_instances_created: u64,
+    /// Guarded instance clauses actually pushed into the assertion set. No
+    /// producer yet — reads zero.
+    pub quantifier_guarded_instances_asserted: u64,
+    /// Model-based quantifier instantiation rounds entered in the last
+    /// check-sat, summed over the generic, finite-model and bit-vector lanes.
+    pub quantifier_mbqi_rounds: u64,
+    /// Candidate ground terms MBQI probed against the current model.
+    pub quantifier_mbqi_candidates_probed: u64,
+    /// CEGQI refinement rounds entered in the last check-sat.
+    pub quantifier_cegqi_rounds: u64,
+    /// Counterexample lemmas CEGQI produced in the last check-sat.
+    pub quantifier_cegqi_ce_lemmas: u64,
+
+    // =========================================================================
     // Resource consumption
     // =========================================================================
     /// Bytes consumed by the per-instance term store (hash-consed terms).
@@ -647,6 +697,30 @@ impl Statistics {
             "annotated_core_theories" => Some(self.annotated_core_theories),
             "ematching_rounds_completed" => Some(self.ematching_rounds_completed),
             "ematching_instances_created" => Some(self.ematching_instances_created),
+            // Both spellings resolve: the snake_case field name, and the dotted
+            // key the `(:statistics ...)` block prints, so a harness can read
+            // back exactly what it grepped.
+            "quantifier_proxies_minted" | "quantifier.proxies_minted" => {
+                Some(self.quantifier_proxies_minted)
+            }
+            "quantifier_guarded_instances_created" | "quantifier.guarded_instances_created" => {
+                Some(self.quantifier_guarded_instances_created)
+            }
+            "quantifier_guarded_instances_asserted" | "quantifier.guarded_instances_asserted" => {
+                Some(self.quantifier_guarded_instances_asserted)
+            }
+            "quantifier_mbqi_rounds" | "quantifier.mbqi.rounds" => {
+                Some(self.quantifier_mbqi_rounds)
+            }
+            "quantifier_mbqi_candidates_probed" | "quantifier.mbqi.candidates_probed" => {
+                Some(self.quantifier_mbqi_candidates_probed)
+            }
+            "quantifier_cegqi_rounds" | "quantifier.cegqi.rounds" => {
+                Some(self.quantifier_cegqi_rounds)
+            }
+            "quantifier_cegqi_ce_lemmas" | "quantifier.cegqi.ce_lemmas" => {
+                Some(self.quantifier_cegqi_ce_lemmas)
+            }
             "term_bytes" => Some(self.term_bytes),
             "term_count" => Some(self.term_count),
             "refinement_count" => Some(self.refinement_count),
@@ -662,6 +736,49 @@ impl Statistics {
                 }
             }),
         }
+    }
+
+    /// The seven guarded-instantiation counters, in printing order, under the
+    /// dotted keys the `(:statistics …)` block uses. One array so that the full
+    /// block, the curated block and any later consumer cannot drift apart on
+    /// spelling or order.
+    pub fn guarded_quantifier_counters(&self) -> [(&'static str, u64); 7] {
+        [
+            (":quantifier.proxies_minted", self.quantifier_proxies_minted),
+            (
+                ":quantifier.guarded_instances_created",
+                self.quantifier_guarded_instances_created,
+            ),
+            (
+                ":quantifier.guarded_instances_asserted",
+                self.quantifier_guarded_instances_asserted,
+            ),
+            (":quantifier.mbqi.rounds", self.quantifier_mbqi_rounds),
+            (
+                ":quantifier.mbqi.candidates_probed",
+                self.quantifier_mbqi_candidates_probed,
+            ),
+            (":quantifier.cegqi.rounds", self.quantifier_cegqi_rounds),
+            (
+                ":quantifier.cegqi.ce_lemmas",
+                self.quantifier_cegqi_ce_lemmas,
+            ),
+        ]
+    }
+
+    /// True when this run engaged the quantifier machinery at all.
+    ///
+    /// Gates the curated block's `quantifiers` group as a whole, so a QF run
+    /// gains no rows about quantifier instantiation while a run that did engage
+    /// shows the instantiation count on default `--stats` rather than only
+    /// under `--stats-full`.
+    pub fn quantifier_lane_engaged(&self) -> bool {
+        self.ematching_rounds_completed > 0
+            || self.ematching_instances_created > 0
+            || self
+                .guarded_quantifier_counters()
+                .iter()
+                .any(|&(_, value)| value > 0)
     }
 
     /// Set an extra integer statistic
@@ -797,6 +914,14 @@ impl std::fmt::Display for Statistics {
                 "  :ematching-instances-created {}",
                 self.ematching_instances_created
             )?;
+        }
+        // Unconditional, unlike the E-matching pair above. These are the keys
+        // the staged guarded-instantiation work is measured on, and a stage that
+        // moves one from zero must be distinguishable from a stage whose counter
+        // was never wired — which an omitted row is not. Three of the seven have
+        // no producer today and are expected to read zero.
+        for (key, value) in self.guarded_quantifier_counters() {
+            writeln!(f, "  {key} {value}")?;
         }
         if self.term_bytes > 0 {
             writeln!(f, "  :term-bytes {}", self.term_bytes)?;

@@ -26,9 +26,9 @@ use super::{
     proof_artifact::{
         write_sealed_proof_artifact, DigestBytes, ProofArtifactProblem, ProofArtifactTheoryMetadata,
     },
-    stats_output, ProofConfig, ProofFormat, COMPETITION_MODE_ENABLED, EXPLAIN_ENABLED,
-    EXPLAIN_FORMAT_JSON, EXPLICIT_VERIFY_PROOF_ENABLED, GLOBAL_TIMEOUT_MS, INTERRUPT_HANDLE,
-    MINIMIZE_MODEL_ENABLED, PROGRESS_ENABLED, PROGRESS_JSON_PATH, SELF_CHECK_ENABLED, START_TIME,
+    stats_output, ProofConfig, ProofFormat, EXPLAIN_ENABLED, EXPLAIN_FORMAT_JSON,
+    EXPLICIT_VERIFY_PROOF_ENABLED, GLOBAL_TIMEOUT_MS, INTERRUPT_HANDLE, MINIMIZE_MODEL_ENABLED,
+    PROGRESS_ENABLED, PROGRESS_JSON_PATH, PROOF_CYCLE_SHED_ENABLED, SELF_CHECK_ENABLED, START_TIME,
     STRICT_PROOFS_ENABLED, VERIFY_FIREWALL_ENABLED, VERIFY_PROOF_ENABLED, Z3_MODEL_ENABLED,
     Z3_MODE_ENABLED,
 };
@@ -103,13 +103,18 @@ fn new_executor() -> Executor {
     if MINIMIZE_MODEL_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         executor.set_aggressive_model_minimize(true);
     }
-    // Competition mode (#proof-capability B1): the executor sheds the internal
-    // proof cycle on public solves with no proof demand. Setting the mode here
-    // is safe alongside the proof wiring below — precedence is evaluated
+    // Proof-cycle shedding (#proof-capability B1, generalised): the executor
+    // sheds the internal proof cycle on public solves with no proof demand.
+    // Keyed on `PROOF_CYCLE_SHED_ENABLED` — competition mode, `--no-proof`,
+    // `--z3-mode`, and every plain solve that requested no certification (the
+    // z3 default posture) — not on the competition latch alone, so the shed
+    // posture never drags the SAT-competition verdict grammar, the CHC
+    // validation battery, or the DIMACS proof re-check along with it. Setting the mode
+    // here is safe alongside the proof wiring below — precedence is evaluated
     // executor-side at every `begin_public_solve`, so a `set_produce_proofs`
     // from `--proof`/`--strict-proofs`/`--self-check` (in any order) or a
     // later in-script `:produce-proofs true` always wins over shedding.
-    if COMPETITION_MODE_ENABLED.load(std::sync::atomic::Ordering::SeqCst) {
+    if PROOF_CYCLE_SHED_ENABLED.load(std::sync::atomic::Ordering::SeqCst) {
         executor.set_competition_mode(true);
     }
     // Strict-proof mode forces internal Alethe proof generation regardless of
@@ -1294,6 +1299,39 @@ fn print_diagnostic_line(state: &SmtTranscriptState, line: &str) {
         &state.diagnostic_output_file,
         line,
     );
+}
+
+/// Render an internal error message as an SMT-LIB string literal safe to embed
+/// in a `(:reason-unknown ...)` s-expression.
+///
+/// SMT-LIB 2.6 string literals escape a double quote by DOUBLING it and have no
+/// other escape, so quoting is: collapse every control character to a space,
+/// double the quotes, and bound the length (an elaboration error can carry a
+/// whole term). The result always parses as one atom, so a reader that only
+/// matches the leading class token is unaffected.
+fn smt_quoted_reason_detail(message: &str) -> String {
+    /// Longest detail carried into `(:reason-unknown ...)`, in characters.
+    const MAX_DETAIL_CHARS: usize = 200;
+
+    let mut body = String::with_capacity(message.len() + 2);
+    let mut chars = 0usize;
+    let mut truncated = false;
+    for ch in message.chars() {
+        if chars >= MAX_DETAIL_CHARS {
+            truncated = true;
+            break;
+        }
+        chars += 1;
+        match ch {
+            '"' => body.push_str("\"\""),
+            c if c.is_control() => body.push(' '),
+            c => body.push(c),
+        }
+    }
+    if truncated {
+        body.push_str("...");
+    }
+    format!("\"{body}\"")
 }
 
 fn z3_unsupported_query_position(state: &SmtTranscriptState) -> Option<SourcePosition> {
@@ -4164,7 +4202,16 @@ fn execute_and_print(
             if is_decision_query {
                 executor.replace_last_result_with_unknown(UnknownReason::InternalError);
                 update_transcript_state_after_command(transcript, cmd);
-                transcript.record_synthesized_unknown("(incomplete decision-execution-error)");
+                // Carry the underlying error text as the reason DETAIL. A bare
+                // `(incomplete decision-execution-error)` cannot be told apart
+                // from a crash, so "I have no decision procedure for this
+                // fragment" and "I hit an internal defect" looked identical to
+                // anyone driving AY as a z3 replacement. The class token stays
+                // first so existing reason-classification keeps working.
+                transcript.record_synthesized_unknown(format!(
+                    "(incomplete decision-execution-error {})",
+                    smt_quoted_reason_detail(&message)
+                ));
                 invalidate_artifacts_for_rejected_result();
                 if let Err(error) = invalidate_decision_trace_for_public_mismatch(transcript) {
                     eprintln_smt_error(error);
@@ -4719,6 +4766,32 @@ mod tests {
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The reason detail must stay one parseable SMT-LIB atom whatever the
+    /// underlying error text looks like — a user of a Z3 replacement has to be
+    /// able to tell "I do not support this" from "I crashed", and the class
+    /// token in front of it keeps existing reason-classification working.
+    #[test]
+    fn reason_detail_quotes_and_bounds_the_underlying_error_text() {
+        assert_eq!(
+            smt_quoted_reason_detail("unsupported logic: AUFBVDTNIA"),
+            "\"unsupported logic: AUFBVDTNIA\""
+        );
+        assert_eq!(
+            smt_quoted_reason_detail("said \"no\"\nand stopped"),
+            "\"said \"\"no\"\" and stopped\""
+        );
+        let long = smt_quoted_reason_detail(&"x".repeat(500));
+        assert!(
+            long.ends_with("...\""),
+            "over-long detail is truncated: {long}"
+        );
+        assert!(
+            long.chars().count() <= 210,
+            "detail must stay bounded: {}",
+            long.chars().count()
+        );
     }
 
     #[test]
@@ -7944,6 +8017,12 @@ pub(super) fn run_interactive(
             let prefix_str = String::from_utf8_lossy(&prefix);
             is_horn_logic(&prefix_str) || is_fixedpoint_format(&prefix_str)
         };
+        // The memory-budget verdict grammar follows the input format.
+        crate::note_verdict_grammar_route(if is_dimacs {
+            crate::VerdictGrammarRoute::Dimacs
+        } else {
+            crate::VerdictGrammarRoute::SmtLib
+        });
 
         if !is_dimacs && !is_chc_family {
             // SMT-LIB: stream. Chain the sniffed prefix back in front of the live
@@ -8035,6 +8114,7 @@ pub(super) fn run_interactive(
     }
 
     // Line-by-line mode: TTY interactive OR piped incremental (#5360).
+    crate::note_verdict_grammar_route(crate::VerdictGrammarRoute::SmtLib);
     run_interactive_smt_stream(
         stdin.lock(),
         repl_surface(is_tty, incremental),
@@ -8116,12 +8196,23 @@ fn run_interactive_smt_stream(
         configure_proof_policy(&mut executor, proof);
     } else if !ResultGateRequests::current().any() {
         // No proof can be emitted this session (`--no-proof` / `--z3-mode` /
-        // competition mode), and no mandatory result/artifact gate needs the
-        // internal proof surface: skip retaining a deep parsed-AST clone of
-        // every assertion (~190 MB of a 318 MB peak on a 6 MB QF_UF input,
-        // #rss-vs-z3). An in-script `(set-option :produce-proofs true)`
-        // re-enables retention.
+        // competition mode, or stdin with nothing to name a sidecar after),
+        // and no mandatory result/artifact gate needs the internal proof
+        // surface: skip retaining a deep parsed-AST clone of every assertion
+        // (~190 MB of a 318 MB peak on a 6 MB QF_UF input, #rss-vs-z3). An
+        // in-script `(set-option :produce-proofs true)` re-enables retention.
         executor.set_retain_parsed_assertions(false);
+        // Whatever proof work a NON-shedding executor still does here (the
+        // mandatory certificate of a `--rigor standard` stdin session) is
+        // best-effort with no artifact behind it, so its bookkeeping meter
+        // must be the same budgeted one the synthesized-default file route
+        // uses — never `None`. An unbudgeted meter was the `--no-proof` trap:
+        // gensys_icl161 materialised a 122k-step proof and strict-checked
+        // 3.9M steps for an artifact nobody asked for. A shedding executor
+        // never consults it, and an explicit demand (`set_produce_proofs`,
+        // in-script `:produce-proofs`) keeps its unbudgeted slot by contract.
+        executor
+            .set_proof_reconstruction_step_budget(Some(DEFAULT_PROOF_RECONSTRUCTION_STEP_BUDGET));
     }
 
     loop {
@@ -8453,6 +8544,7 @@ pub(super) fn run_file(
                 && cube_and_conquer_depth.is_none()
                 && dimacs::has_dimacs_file_extension(path)
             {
+                crate::note_verdict_grammar_route(crate::VerdictGrammarRoute::Dimacs);
                 reject_bv_cnf_export_for_non_smt_route("DIMACS file");
                 reject_firewall_emission_for_route("DIMACS file");
                 reject_firewall_verification_for_route("DIMACS file");
@@ -8503,8 +8595,16 @@ pub(super) fn run_file(
     };
     match read_result {
         Ok(()) => {
-            // Check for DIMACS CNF format first (by extension or content)
-            if dimacs::has_cnf_extension(path) || dimacs::is_dimacs_format(&content) {
+            // Check for DIMACS CNF format first (by extension or content). The
+            // memory-budget verdict grammar follows the input format.
+            let dimacs_input =
+                dimacs::has_cnf_extension(path) || dimacs::is_dimacs_format(&content);
+            crate::note_verdict_grammar_route(if dimacs_input {
+                crate::VerdictGrammarRoute::Dimacs
+            } else {
+                crate::VerdictGrammarRoute::SmtLib
+            });
+            if dimacs_input {
                 reject_bv_cnf_export_for_non_smt_route("DIMACS file");
                 reject_firewall_emission_for_route("DIMACS file");
                 reject_firewall_verification_for_route("DIMACS file");
@@ -8735,12 +8835,23 @@ fn run_smt_file_content(
         configure_proof_policy(&mut executor, proof);
     } else if !ResultGateRequests::current().any() {
         // No proof can be emitted this session (`--no-proof` / `--z3-mode` /
-        // competition mode), and no mandatory result/artifact gate needs the
-        // internal proof surface: skip retaining a deep parsed-AST clone of
-        // every assertion (~190 MB of a 318 MB peak on a 6 MB QF_UF input,
-        // #rss-vs-z3). An in-script `(set-option :produce-proofs true)`
-        // re-enables retention.
+        // competition mode, or stdin with nothing to name a sidecar after),
+        // and no mandatory result/artifact gate needs the internal proof
+        // surface: skip retaining a deep parsed-AST clone of every assertion
+        // (~190 MB of a 318 MB peak on a 6 MB QF_UF input, #rss-vs-z3). An
+        // in-script `(set-option :produce-proofs true)` re-enables retention.
         executor.set_retain_parsed_assertions(false);
+        // Whatever proof work a NON-shedding executor still does here (the
+        // mandatory certificate of a `--rigor standard` stdin session) is
+        // best-effort with no artifact behind it, so its bookkeeping meter
+        // must be the same budgeted one the synthesized-default file route
+        // uses — never `None`. An unbudgeted meter was the `--no-proof` trap:
+        // gensys_icl161 materialised a 122k-step proof and strict-checked
+        // 3.9M steps for an artifact nobody asked for. A shedding executor
+        // never consults it, and an explicit demand (`set_produce_proofs`,
+        // in-script `:produce-proofs`) keeps its unbudgeted slot by contract.
+        executor
+            .set_proof_reconstruction_step_budget(Some(DEFAULT_PROOF_RECONSTRUCTION_STEP_BUDGET));
     }
 
     let mut cmd_index = 0usize;

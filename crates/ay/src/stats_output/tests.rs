@@ -237,7 +237,21 @@ fn every_curated_key_also_appears_in_the_full_block() {
     populated.term_bytes = 939;
     populated.term_count = 6;
 
-    for stats in [&empty, &populated] {
+    // A third branch: the curated `quantifiers` group is whole-group
+    // conditional and re-selects the E-matching pair, which the full block
+    // gates separately. Both gate combinations have to stay subsets.
+    let mut quantified = ay_dpll::Statistics::default();
+    quantified.ematching_rounds_completed = 2;
+    quantified.ematching_instances_created = 4;
+    quantified.quantifier_cegqi_rounds = 3;
+
+    // …and the case where the lane engaged with NO completed E-matching round,
+    // which is exactly where a careless curated row would name a key the full
+    // block omitted.
+    let mut cegqi_only = ay_dpll::Statistics::default();
+    cegqi_only.quantifier_cegqi_ce_lemmas = 9;
+
+    for stats in [&empty, &populated, &quantified, &cegqi_only] {
         let full = stats.to_string();
         let curated = curated_smt_statistics(stats, "sat", Duration::from_millis(58), false);
 
@@ -303,4 +317,43 @@ fn absent_certificate_counters_are_omitted_not_zeroed() {
     let stats = ay_dpll::Statistics::default();
     let curated = curated_smt_statistics(&stats, "sat", Duration::ZERO, false);
     assert!(!curated.contains(":cert.decisions"), "{curated}");
+}
+
+/// The quantifier group is whole-group conditional. A QF run that never touched
+/// a binder must not gain nine rows about quantifier instantiation; a run that
+/// did must see the instantiation count on default `-st` rather than only under
+/// `--stats-full`, which is what made the parity census read the full block.
+#[test]
+fn quantifier_group_is_conditional_but_complete_once_it_fires() {
+    let idle = ay_dpll::Statistics::default();
+    let curated = curated_smt_statistics(&idle, "sat", Duration::ZERO, false);
+    assert!(!curated.contains(":quantifier."), "{curated}");
+    assert!(!curated.contains(":ematching-"), "{curated}");
+
+    let mut engaged = ay_dpll::Statistics::default();
+    engaged.ematching_rounds_completed = 2;
+    engaged.ematching_instances_created = 4;
+    let curated = curated_smt_statistics(&engaged, "unknown", Duration::ZERO, false);
+    for key in [
+        ":ematching-rounds-completed",
+        ":ematching-instances-created",
+        ":quantifier.proxies_minted",
+        ":quantifier.guarded_instances_created",
+        ":quantifier.guarded_instances_asserted",
+        ":quantifier.mbqi.rounds",
+        ":quantifier.mbqi.candidates_probed",
+        ":quantifier.cegqi.rounds",
+        ":quantifier.cegqi.ce_lemmas",
+    ] {
+        assert!(curated.contains(key), "missing {key} in:\n{curated}");
+    }
+    // Zeros are printed once the group fires: "wired and idle" is a different
+    // claim from "not wired", and the staged work is measured on the difference.
+    assert!(curated.contains(":quantifier.proxies_minted"), "{curated}");
+    assert!(
+        curated
+            .lines()
+            .any(|l| l.contains(":quantifier.proxies_minted") && l.trim_end().ends_with(" 0")),
+        "{curated}"
+    );
 }

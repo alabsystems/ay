@@ -620,11 +620,13 @@ impl Executor {
         // and the session state (scope_depth, shared EUF/LRA fields, derived
         // assertion metadata) is restored untouched.
         //
-        // Proof-producing sessions stay on the lazy arm: eager-incremental
-        // proof artifacts are not yet validated (plan §3.6); CHC BMC/PDR/
-        // Houdini traffic does not consume proofs.
-        let eager_routing =
-            self.lia_incremental_eager_override.unwrap_or(true) && !self.is_producing_proofs();
+        // Sessions that DEMAND a checked certificate stay on the lazy arm:
+        // eager-incremental proof artifacts are not yet validated (plan
+        // §3.6); CHC BMC/PDR/Houdini traffic does not consume proofs. The
+        // gate is `checked_certificate_demanded`, not `is_producing_proofs`:
+        // a synthesized best-effort sidecar never demotes the engine.
+        let eager_routing = self.lia_incremental_eager_override.unwrap_or(true)
+            && !self.checked_certificate_demanded();
         if eager_routing {
             let saved_state = self.incr_theory_state.take();
             self.incr_theory_state = Some(crate::incremental_state::IncrementalTheoryState::new());

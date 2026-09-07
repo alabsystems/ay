@@ -67,6 +67,12 @@ impl Context {
     #[doc(hidden)]
     #[must_use]
     pub fn compact_terms_for_derived_query(&mut self) -> bool {
+        // `mark_and_compact` relabels every surviving id, and the macro
+        // expansion memo holds ids in its keys as well as its values. It is a
+        // pure cache with no roots of its own, so drop it instead of walking
+        // it: an un-relabelled entry would answer a later expansion with a
+        // stale id.
+        self.invalidate_macro_expansion_memo();
         let mut roots: Vec<TermId> = Vec::new();
         let collected = self.walk_term_ids(&mut |id| {
             roots.push(*id);
@@ -166,6 +172,15 @@ impl Context {
             // Retained as authored SPELLINGS precisely so no `TermId` is stored.
             z3_debug_exprs: _,
             fun_expansion_depth: _,
+            fun_expansion_depth_watermark: _,
+            // A pure cache of macro expansions, dropped outright by
+            // `compact_terms_for_derived_query` before the arena is relabelled
+            // (see the note there) rather than remapped: its ids appear in the
+            // KEYS as well as the values, so a partial remap could collide two
+            // distinct call sites onto one entry.
+            macro_expansion_memo: _,
+            // Names, not terms.
+            macro_expansion_memo_names: _,
             multivar_lambda_curry_allowed: _,
             uses_multiset: _,
             uses_set: _,

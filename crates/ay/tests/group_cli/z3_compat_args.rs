@@ -2122,10 +2122,21 @@ fn smt_undefined_symbol_errors_are_recoverable_stdout_results() {
     // AY answers the failed decision query with a synthesized fail-closed
     // `unknown` (every check-sat emits a verdict) and explains it with a
     // single reason diagnostic on stderr; the error text itself matches z3.
-    assert_eq!(
-        assuming_stderr,
-        "(:reason-unknown (incomplete decision-execution-error))\n",
-        "undefined check-sat-assuming literal should emit exactly the reason diagnostic: {assuming_stderr}"
+    // The reason carries the UNDERLYING error text as its detail: a driver has
+    // to be able to tell "I have no decision procedure for this" from "I hit an
+    // internal defect", and the bare class token could not (#dt-nia-content-route).
+    assert!(
+        assuming_stderr.starts_with("(:reason-unknown (incomplete decision-execution-error \""),
+        "undefined check-sat-assuming literal should emit the reason diagnostic \
+         with a quoted detail: {assuming_stderr}"
+    );
+    assert!(
+        assuming_stderr.ends_with("\"))\n"),
+        "the reason detail must be a closed SMT-LIB string atom: {assuming_stderr}"
+    );
+    assert!(
+        assuming_stderr.contains("undefined symbol: p"),
+        "the reason detail must name the underlying error: {assuming_stderr}"
     );
     assert_eq!(
         assuming_stdout,

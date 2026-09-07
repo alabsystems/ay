@@ -9,6 +9,7 @@ use ay_core::{Sort, TermId, TermStore};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 
+use super::pattern::BoundVarScopeMemo;
 use super::{instantiate_body, TermIndex};
 
 /// Enumerative instantiation fallback for triggerless quantifiers.
@@ -215,9 +216,23 @@ pub(crate) fn collect_ground_terms_by_sort(
     // Collect bound var IDs (same as TermIndex) to skip non-ground terms
     let mut bound_var_ids: HashSet<u32> = HashSet::default();
     let mut bound_names: HashSet<String> = HashSet::default();
+    // One memo for the whole `0..terms.len()` loop, paired with `bound_var_ids`
+    // (see `BoundVarScopeMemo`). Without it this loop costs the SUM OF SUBTREE
+    // SIZES of the whole store and is ~99% of the wall clock on SPARK VCs.
+    // The root SET is deliberately unchanged: restricting it to the ids
+    // reachable from `assertions` would drop bound-var classifications coming
+    // from store-resident-but-unasserted quantifiers, and so would change which
+    // terms count as ground.
+    let mut bound_var_memo = BoundVarScopeMemo::default();
     for idx in 0..terms.len() {
         let term_id = TermId(idx as u32);
-        TermIndex::collect_bound_var_ids(terms, term_id, &mut bound_var_ids, &mut bound_names);
+        TermIndex::collect_bound_var_ids(
+            terms,
+            term_id,
+            &mut bound_var_ids,
+            &mut bound_names,
+            &mut bound_var_memo,
+        );
     }
 
     for &assertion in assertions {
@@ -355,9 +370,17 @@ fn term_contains_bound_var(terms: &TermStore, term: TermId, bound_var_ids: &Hash
 pub(crate) fn collect_bool_uf_arg_terms(terms: &TermStore, assertions: &[TermId]) -> Vec<TermId> {
     let mut bound_var_ids: HashSet<u32> = HashSet::default();
     let mut bound_names: HashSet<String> = HashSet::default();
+    // One memo for the whole root loop (paired with `bound_var_ids`).
+    let mut bound_var_memo = BoundVarScopeMemo::default();
     for idx in 0..terms.len() {
         let term_id = TermId(idx as u32);
-        TermIndex::collect_bound_var_ids(terms, term_id, &mut bound_var_ids, &mut bound_names);
+        TermIndex::collect_bound_var_ids(
+            terms,
+            term_id,
+            &mut bound_var_ids,
+            &mut bound_names,
+            &mut bound_var_memo,
+        );
     }
     let mut visited: HashSet<TermId> = HashSet::default();
     let mut out: Vec<TermId> = Vec::new();

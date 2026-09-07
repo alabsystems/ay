@@ -322,6 +322,68 @@ impl Executor {
                 .with_nonlinear(&features);
         }
 
+        // SOUNDNESS/ROUTING (#qf-aufnia-array-drop): a DECLARED `QF_AUFNIA`
+        // collapses to the array-LESS `QfUfnia` category
+        // (`logic_detection/parse.rs`, the `"QF_UFNIA" | "QF_AUFNIA"` arm), and
+        // that category dispatches to `solve_uf_nia`, whose own doc-comment
+        // records that the EUF+NIA combination has NO dedicated array theory.
+        // `select`/`store` therefore reach the search as bare uninterpreted
+        // functions under congruence — a RELAXATION of the array axioms. That
+        // is sound for `unsat` and never for `sat`, so every candidate model
+        // needing read-over-write is refused by the strict model-validation
+        // oracle ("arrays rejected assertion N") and the file answers `unknown`
+        // with `:conflicts 0 :decisions 0`. Measured over the whole 17-file
+        // SMT-LIB QF_AUFNIA division: 0 decided, the array theory doing nothing
+        // while `:theory.arrays` counts 731-1349 array terms.
+        //
+        // The declared logic is an upper bound, not a licence to drop a theory
+        // — the same rule the BV/array block directly above and the
+        // pure-arithmetic narrowing further up encode. When the live window
+        // carries arrays but NO genuine nonlinear arithmetic (all 17 division
+        // files multiply only by literals, so `has_nonlinear_int` is false),
+        // the NIA lane buys nothing and costs the array theory, so re-derive
+        // the category from content: `infer_logic` answers `QF_AUFLIA` and the
+        // array-aware AUFLIA route — arrays + UF + linear integer arithmetic
+        // via `TheoryCombiner::auf_lia` (EUF + `ArraySolver` + `LiaSolver`) —
+        // is a superset of this window and decides it with the array axioms
+        // enforced inside the search rather than by the gate afterwards.
+        //
+        // FIRES ONLY ON A DECLARED array-less nonlinear token. A
+        // content-INFERRED `QfUfnia` always carries `has_nonlinear_int`
+        // (`features/logic_inference.rs` returns `QF_AUFNIA`/`QF_UFNIA` only
+        // under a nonlinear flag), and so does every `with_nonlinear`
+        // promotion, both of which this guard excludes — so the `ALL`/unset
+        // content-detection path is untouched. Editing the shared
+        // `from_logic` table instead would have re-routed those inferred
+        // windows too.
+        //
+        // NOT WIDENED to windows whose arithmetic really IS nonlinear: AY has
+        // no arrays+UF+NIA lane (`TheoryCombiner` carries `lia`/`lra` only and
+        // `UfNiaSolver` owns no `ArraySolver`), so those keep the fail-closed
+        // EUF relaxation rather than being handed to a linear lane that would
+        // abstract their products — the wrong-SAT mechanism `with_nonlinear`
+        // (#6086) exists to prevent.
+        //
+        // NOT WIDENED to a symbolic `div`/`mod` divisor either: `solve_uf_nia`
+        // runs `eliminate_int_mod_div` with the guarded Euclidean axioms, while
+        // `solve_auf_lia` refuses an array window with an unsupported divisor
+        // outright, so re-routing that shape would trade a search for an
+        // instant `unknown (unsupported arithmetic)`.
+        if !assertions.is_empty()
+            && !assertion_has_datatypes
+            && assertion_features.has_arrays
+            && !assertion_features.has_nonlinear_int
+            && !assertion_features.has_nonlinear_real
+            && matches!(category, LogicCategory::QfUfnia)
+            && !(assertion_features.has_int_div_mod
+                && !self.int_div_mod_terms_have_known_zero_or_constant_divisors(assertions))
+        {
+            category = LogicCategory::from_logic(assertion_features.infer_logic())
+                .align_linear_arithmetic_sorts(&assertion_features)
+                .widen_with_uf(&features)
+                .with_nonlinear(&features);
+        }
+
         if !features.has_int
             && !features.has_real
             && !features.has_bv

@@ -44,6 +44,7 @@ mod mv_printer;
 mod no_fabricated_values;
 mod optimization;
 mod partition_rescue;
+mod qf_aufnia_array_routing;
 mod qf_ufbvlia;
 mod qf_ufbvlia_admission;
 mod qf_ufbvlia_bounded_source;

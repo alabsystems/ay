@@ -49,6 +49,109 @@ impl LogicCategory {
         )
     }
 
+    /// Whether SOME ground theory lane exists for this category.
+    ///
+    /// Two dispatch tables route a category to a theory solver:
+    /// `Executor::route_to_solver` (check-sat) and
+    /// `Executor::solve_for_category` (the quantifier loop's ground re-solve).
+    /// They drifted apart once already — `Ufdtnia` reached `solve_dt_uf_nia` in
+    /// the first and a blanket `Unknown` in the second, so every SPARK/Barrett
+    /// file whose quantifiers were stripped lost its ground solve (#5989).
+    ///
+    /// This predicate is the shared statement of intent both tables are checked
+    /// against by `debug_assert`:
+    /// - `route_to_solver` must not return a definitive verdict for a category
+    ///   marked `false` (it would mean a lane was added without updating this);
+    /// - `solve_for_category` must not answer its "no lane" arm for a category
+    ///   marked `true` (it would mean the tables diverged again).
+    ///
+    /// "Some" is deliberate: a few categories reach their lane only for part of
+    /// the feature space (`QfNira`/`QfUfnira`/`Ufnira` decline when a Real sort
+    /// is present, because `solve_nia`/`solve_uf_nia` have no LRA), and those
+    /// count as having a lane.
+    pub(crate) const fn has_ground_lane(self) -> bool {
+        match self {
+            // No DT composition over a nonlinear REAL base exists: there is no
+            // `solve_uf_nra` sibling for `solve_with_dt_axioms` to compose with,
+            // so both tables answer a sound `unknown`.
+            Self::Ufdtnra | Self::Ufdtnira => false,
+            // Quantified NIRA: `solve_nia` has no LRA and the mixed category
+            // carries Reals by construction.
+            Self::Nira => false,
+            // The fail-closed residue: recognized-but-uncombinable theory sets
+            // (BV+LRA, AUF+BV+LIA, DT+FP) and unmapped logics.
+            Self::Other => false,
+            Self::Propositional
+            | Self::QfUf
+            | Self::QfAx
+            | Self::QfLra
+            | Self::QfLia
+            | Self::QfNia
+            | Self::QfEia
+            | Self::QfNra
+            | Self::QfNira
+            | Self::QfUfnia
+            | Self::QfUfnra
+            | Self::QfUfnira
+            | Self::QfUflia
+            | Self::QfUflra
+            | Self::QfAuflia
+            | Self::QfAuflra
+            | Self::QfLira
+            | Self::QfAuflira
+            | Self::QfBv
+            | Self::QfAbv
+            | Self::QfUfbv
+            | Self::QfAufbv
+            | Self::QfBvLia
+            | Self::QfBvLiaIndep
+            | Self::QfS
+            | Self::QfSlia
+            | Self::QfSnia
+            | Self::QfSeq
+            | Self::QfSeqBv
+            | Self::QfSeqlia
+            | Self::QfSet
+            | Self::QfSetlia
+            | Self::QfMultiset
+            | Self::QfMslia
+            | Self::QfMap
+            | Self::QfMaplia
+            | Self::QfFp
+            | Self::QfBvfp
+            | Self::QfAbvfp
+            | Self::QfDt
+            | Self::DtAuflia
+            | Self::DtAuflra
+            | Self::DtUfbv
+            | Self::DtAufbv
+            | Self::DtAuflira
+            | Self::DtAx
+            | Self::Lia
+            | Self::Lra
+            | Self::Nia
+            | Self::Nra
+            | Self::Ufnia
+            | Self::Ufnra
+            | Self::Ufnira
+            | Self::Uf
+            | Self::Uflia
+            | Self::Auflia
+            | Self::Auflra
+            | Self::Uflra
+            | Self::Lira
+            | Self::Auflira
+            | Self::Ufdt
+            | Self::Ufdtlia
+            | Self::Ufdtlra
+            | Self::Ufdtlira
+            | Self::Ufdtnia
+            | Self::Aufdt
+            | Self::Aufdtlia
+            | Self::Aufdtlira => true,
+        }
+    }
+
     /// Upgrade a logic category to its DT-combined variant when datatypes
     /// are declared but the user specified a non-DT logic (#3223).
     pub(crate) fn with_datatypes(self) -> Self {
@@ -417,10 +520,35 @@ impl LogicCategory {
             Self::QfAuflra if nl_real => Self::QfUfnra,
             Self::QfAuflira if nl_int || nl_real => Self::QfUfnira,
 
-            // DT + nonlinear -> Other (no combined DT+NIA/NRA solver; #6088).
-            // with_datatypes() runs first. If we still see a DT variant with
-            // nonlinear terms, routing to QfNia/QfNra would drop DT axioms.
+            // DT + nonlinear Int -> the quantified DT+NIA route (#dt-nia-content-route).
+            //
+            // This mirrors the DECLARED-logic arms immediately below
+            // (`Ufdtlia`/`Aufdtlia` + nl_int => `Ufdtnia`), which route to
+            // `solve_dt_uf_nia`: the lazy DT axiom lane first, then the eager DT
+            // selector axioms composed over `solve_uf_nia` (EUF + NIA via
+            // Nelson-Oppen). Both component theories are present and DT axioms
+            // are NOT dropped, so #6088's objection ("routing to QfNia/QfNra
+            // would drop DT axioms") does not apply to this target.
+            //
+            // Content detection reaches `DtAuflia` for any datatype+Int problem,
+            // including one whose declared logic is unmapped (`AUFBVDTNIA`) or
+            // `ALL`. Before this arm every such file hit `Other` and check-sat
+            // returned `Err(UnsupportedLogic)` — a hard refusal with no verdict,
+            // even though the SAME file with a declared `AUFDTNIA` solved through
+            // `Ufdtnia` in hundredths of a second.
+            //
+            // ARRAY GUARD (soundness): `solve_uf_nia` has no array theory, so a
+            // formula with live array terms would have `select`/`store` treated
+            // as uninterpreted — sound for UNSAT but able to fabricate a `sat`
+            // that violates the read-over-write axiom. Array-bearing DT+NIA
+            // content therefore keeps the fail-closed `Other`. (The declared
+            // `Aufdtlia` arm below is deliberately left as-is: changing an
+            // existing declared-logic route is not this change's business.)
+            Self::DtAuflia if nl_int && !features.has_arrays => Self::Ufdtnia,
             Self::DtAuflia if nl_int => Self::Other,
+            // DT + nonlinear Real / mixed -> Other. There is no `solve_uf_nra`
+            // DT composition to route to (`Ufdtnra`/`Ufdtnira` themselves answer
+            // a bare Unknown), so the fail-closed refusal stands.
             Self::DtAuflra if nl_real => Self::Other,
             Self::DtAuflira if nl_int || nl_real => Self::Other,
 

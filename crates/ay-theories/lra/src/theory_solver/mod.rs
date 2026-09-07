@@ -175,6 +175,10 @@ impl TheorySolver for LraSolver {
                 "lra_full_check_conflicts",
                 self.stats.full_check_conflict_count,
             ),
+            (
+                "lra_unsupported_sat_downgrades",
+                self.stats.unsupported_sat_downgrades,
+            ),
             ("lra_reasons_eager", self.stats.eager_reason_count),
             ("lra_reasons_deferred", self.stats.deferred_reason_count),
             (

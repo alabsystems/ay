@@ -1099,6 +1099,11 @@ impl Executor {
         certified: &mut bool,
     ) -> Option<Result<SolveResult>> {
         for round in 0..MAX_FINITE_MODEL_ROUNDS {
+            // Observation only (z3-parity stage 0). This lane probes one witness
+            // per authored universal through a sub-solve rather than enumerating
+            // a candidate grid, so it contributes rounds but never contributes
+            // to `quantifier_mbqi_candidates_probed`.
+            self.last_statistics.quantifier_mbqi_rounds += 1;
             if self.should_abort_theory_loop() {
                 trace(|| format!("round {round}: abort requested"));
                 return None;

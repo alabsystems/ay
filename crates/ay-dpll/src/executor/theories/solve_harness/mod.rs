@@ -1368,10 +1368,47 @@ impl Executor {
         let axiom_start = self.ctx.assertions.len();
         // #7890 diagnostic: instrument AUFLIA preprocess blow-up (ios/qlock/pointer-safe)
         let _diag_terms_before_fixpoint = self.ctx.terms.len();
-        self.run_array_axiom_fixpoint_at(
-            axiom_start,
-            super::euf::ArrayAxiomMode::LazyRow2FinalCheck,
-        );
+        // #arraylazy-eager-row: the lemmas-on-demand A/B arm for the AUFLIA
+        // route (z3-parity r3 rank 11 / r1 rank 9). `AY_AUFLIA_EAGER_ROW=0`
+        // withholds the pre-search ROW/structural axiom fixpoint entirely,
+        // leaving the live `ArraySolver` inside the AUFLIA combiner — which
+        // already instantiates ROW2 on demand from its own parent lists
+        // (`generate_lazy_row2_axioms`, 64 per `check()`, drained WITHOUT a
+        // budget in `final_check` before any `Sat` can be returned) — as the
+        // sole producer of read-over-write instances.
+        //
+        // Withholding a VALID generated fact can only cost completeness, never
+        // soundness. An `unsat` still rests on lemmas that were actually
+        // instantiated: the SAT core never sees a clause that was not added.
+        // A `sat` is still gated by the unchanged strict model validator and
+        // the independent model gate, both of which evaluate the ORIGINAL
+        // assertions, so an under-instantiated candidate that violates
+        // read-over-write degrades to `unknown` rather than publishing. The
+        // shapes that fail closed under the arm are the ones the preprocessing
+        // fixpoint covers and the runtime solver does not: extensionality
+        // witnesses, array-default congruence/store axioms, store-value and
+        // other-side congruence, shadowed-store equalities, disjunctive
+        // store-index axioms, and store-store base decomposition.
+        //
+        // Default is EAGER (unchanged). Measured at `-T:20` over seeded
+        // 20-file samples of ALIA / QF_ALIA / QF_AUFLIA / QF_AX against
+        // z3 5.1.0, the arm is net +1 on QF_AUFLIA (16 -> 17) and flat
+        // everywhere else, with zero sat/unsat disagreements: it converts
+        // `storecomm_invalid_t1_pp_sf_ni_00030_003` (unknown -> sat, 7.1 s)
+        // and `swap_invalid_t3_pp_sf_ai_00010_004` (unknown -> sat, 4.8 s) —
+        // two of the files r1 rank 9 names — and loses
+        // `storecomm_invalid_t3_pp_sf_ni_00060_009` (sat -> unknown, the
+        // fail-closed direction). +2/-1 on twenty files is not enough to
+        // move a default on a no-regression control division, so the arm
+        // ships as the A/B lever the wider sample needs.
+        let eager_row_axioms =
+            std::env::var_os("AY_AUFLIA_EAGER_ROW").is_none_or(|value| value != "0");
+        if eager_row_axioms {
+            self.run_array_axiom_fixpoint_at(
+                axiom_start,
+                super::euf::ArrayAxiomMode::LazyRow2FinalCheck,
+            );
+        }
         let _diag_terms_after_fixpoint = self.ctx.terms.len();
         let generated_axioms: Vec<_> = self.ctx.assertions.drain(axiom_start..).collect();
         let _diag_axioms_post_fixpoint = generated_axioms.len();
@@ -1503,6 +1540,11 @@ impl Executor {
         );
         let _diag_lift_start_terms = self.ctx.terms.len();
         let pre_lift_assertions = preprocessed_assertions.clone();
+        // #arraylazy-lift-garbage: the abandoned Shannon lift is a SPECULATIVE
+        // pass. Capture the suffix boundary so the exhausted branch below can
+        // hand the arena back the ~200k dead terms it minted; see the rollback
+        // call for the retention argument.
+        let lift_checkpoint = self.ctx.terms.rollback_checkpoint();
         let (lifted, lift_budget_exhausted) = self
             .ctx
             .terms
@@ -1518,6 +1560,30 @@ impl Executor {
             // cs_lazy.i_*: Shannon lifted 2.4k terms into the full 200k budget
             // (15k theory atoms, solve diverges); the definitional path stays
             // at ~3k terms.
+            //
+            // #arraylazy-lift-garbage: RECLAIM the abandoned expansion. On this
+            // branch `lifted` is overwritten wholesale by `named` (computed
+            // from `pre_lift_assertions`, captured BEFORE the lift), so every
+            // term the exhausted pass interned past `lift_checkpoint` is
+            // unreachable the moment `preprocessed_assertions` is reassigned:
+            // the lift is a pure `&mut TermStore` traversal that publishes
+            // nothing else, its memo tables die with the call, and
+            // `source_sets` holds only ORIGINAL-assertion ids from before the
+            // checkpoint. That satisfies `rollback_to`'s contract (no retained
+            // `TermId >= checkpoint.len`) by construction.
+            //
+            // Verdict-neutral: the discarded expansion never reaches the
+            // solver, so the only observable difference is memory and the
+            // whole-store scan width of every later pass. Measured at -T:20 on
+            // QF_ALIA cs_sync.i_4 — this pass 205,168 -> 3,745 terms,
+            // whole-solve `:term-count` 206,912 -> 55,451, peak RSS
+            // 2,469 MB -> 158 MB — and on the sibling cs_sync.i_3, which
+            // stopped memouting (3,015 MB abort at 6.6 s -> 100 MB, full
+            // budget searched). The 2.4 GB was never the arena itself
+            // (`:term-bytes` was 32 MB); it was the split loop rebuilding
+            // O(terms.len()) state once per refinement round.
+            drop(std::mem::take(&mut preprocessed_assertions));
+            self.ctx.terms.rollback_to(lift_checkpoint);
             let mut ite_defs: Vec<TermId> = Vec::new();
             let named = self
                 .ctx

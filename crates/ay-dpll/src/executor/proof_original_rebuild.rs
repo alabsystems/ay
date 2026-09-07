@@ -2311,6 +2311,12 @@ impl Executor {
             .copied()
             .filter(|&bound| is_linear_literal(&self.ctx.terms, bound))
             .collect();
+        // Best-effort artifacts meter this fresh whole-bound-set LRA solve
+        // (see `best_effort_rebuild_refutation_budget`); declining keeps the
+        // trust leaf and never touches the verdict.
+        if !self.charge_best_effort_rebuild_refutation(linear_bounds.len() as u64 + 1) {
+            return None;
+        }
         let mut lra = ay_lra::LraSolver::new(&self.ctx.terms);
         lra.set_combined_theory_mode(true);
         TheorySolver::register_atom(&mut lra, di_atom);
@@ -2621,6 +2627,10 @@ impl Executor {
             .filter(|&i| bound_specs[i].distinct.is_none())
             .collect();
         if usable.is_empty() {
+            return false;
+        }
+        // Same best-effort meter as `refute_disjunct_against_bounds`.
+        if !self.charge_best_effort_rebuild_refutation(usable.len() as u64 + 1) {
             return false;
         }
 
