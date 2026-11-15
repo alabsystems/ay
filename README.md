@@ -14,7 +14,8 @@ Install it with aterm's package manager, which verifies every signed binary:
 aterm pkg install ay
 ```
 
-Every release is listed under [Releases](https://github.com/alabsystems/ay/releases).
+Every release is listed under [Releases](https://github.com/alabsystems/ay/releases),
+and its notes are in `release-notes/`.
 
 ## Security
 
