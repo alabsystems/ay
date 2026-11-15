@@ -95,6 +95,31 @@ fn a_poll_armed_without_a_deadline_sees_one_installed() {
     assert!(poll.expired());
 }
 
+/// A work ceiling reached after a poll armed, with no deadline and with a
+/// far one, stops the poll at the same count of polls: the
+/// [`ARMED_CLOCK_POLLS`]th after the one that armed it, which read the
+/// ceiling as not reached.
+#[test]
+fn an_armed_poll_stops_at_the_work_ceiling_on_its_clock_stride() {
+    for deadline in [None, Some(far())] {
+        let cell = SolveDeadlineCell::new();
+        cell.set(deadline);
+        let poll = DeadlinePoll::new(cell.clone());
+        let ceiling = ay_core::resource::enter_work_ceiling(Some(1));
+        arm(&poll);
+        ay_core::resource::work().add_sat_work(1, 0);
+        assert!(ceiling.spent());
+        let stopped_at = (1..=2 * ARMED_CLOCK_POLLS).find(|_| poll.expired());
+        assert_eq!(stopped_at, Some(ARMED_CLOCK_POLLS), "deadline {deadline:?}");
+        assert!(poll.is_armed(), "the stop came from the armed poll");
+        drop(ceiling);
+        assert!(
+            (0..2 * ARMED_CLOCK_POLLS).all(|_| !poll.expired()),
+            "the ceiling ends with its scope"
+        );
+    }
+}
+
 /// The alarm, not the walk's callback rate, bounds when an armed poll sees
 /// the deadline pass. The poll arms first against a far deadline, so no
 /// assertion races the clock; the deadline then moves near, and the poll

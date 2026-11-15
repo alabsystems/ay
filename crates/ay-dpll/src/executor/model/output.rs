@@ -27,21 +27,89 @@ use aggregate_constants::{AggregateConstantValue, AggregateConstantValues};
 /// Nesting bound of [`Executor::gv_printed_bool`].
 const PRINTED_BOOL_DEPTH: u32 = 256;
 
+#[cfg(test)]
+thread_local! {
+    /// The `c ay.model.partial` lines this thread wrote to stderr, in order.
+    static PARTIAL_MODEL_REPORTS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test hook: the `c ay.model.partial` lines this thread wrote to stderr
+/// since the last call, in order.
+#[cfg(test)]
+pub(super) fn take_partial_model_reports() -> Vec<String> {
+    PARTIAL_MODEL_REPORTS.with(|reports| std::mem::take(&mut *reports.borrow_mut()))
+}
+
+/// A `(get-model)` response rendered in one spelling, and the symbols it
+/// leaves out. [`Executor::surface_response`] can render a response in both
+/// spellings and return either, so the omissions are reported by
+/// [`Self::publish`], for the rendering returned, not by each rendering.
+struct ModelResponse {
+    text: String,
+    /// Sorted, without duplicates.
+    omitted: Vec<String>,
+}
+
+impl AsRef<str> for ModelResponse {
+    fn as_ref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl ModelResponse {
+    /// The response text, once its omissions are reported on stderr as
+    /// `c ay.model.partial omitted=<n> symbols=[<names>]`.
+    ///
+    /// Every fail-closed omission drops a symbol from an otherwise
+    /// well-formed model. The result still prints `sat`, so the run scores
+    /// ZERO in Model-Validation while the scoreboard reads `errors: 0`. The
+    /// report is on stderr ONLY: stdout is piped verbatim into Dolmen and
+    /// must stay a pure get-model response. The harness already captures
+    /// `stderr_tail`, so this makes a partial model greppable in the run
+    /// record instead of silently scoring zero.
+    fn publish(self) -> String {
+        // Not under `--z3-mode`, whose stderr stays empty as z3's does; the
+        // response itself shows the omission.
+        if !self.omitted.is_empty() && !ay_core::misc_cli_flags().z3_transcript {
+            let line = format!(
+                "c ay.model.partial omitted={} symbols=[{}]",
+                self.omitted.len(),
+                self.omitted.join(" ")
+            );
+            eprintln!("{line}");
+            #[cfg(test)]
+            PARTIAL_MODEL_REPORTS.with(|reports| reports.borrow_mut().push(line));
+        }
+        self.text
+    }
+}
+
 impl Executor {
     /// Generate model output for get-model command.
     pub(crate) fn model(&self) -> String {
         self.checked_evaluation_output(|| {
-            self.surface_response(|spelling| self.model_unstopped(spelling))
+            self.surface_response(|spelling| self.model_response(spelling))
+                .publish()
         })
     }
 
     /// [`Self::model`] in [`ValueSpelling::Sorted`], for a reader inside this
     /// process that holds the solver.
     pub(crate) fn model_for_decoder(&self) -> String {
-        self.checked_evaluation_output(|| self.model_unstopped(ValueSpelling::Sorted))
+        self.checked_evaluation_output(|| self.model_response(ValueSpelling::Sorted).publish())
     }
 
-    fn model_unstopped(&self, spelling: ValueSpelling) -> String {
+    /// The model rendered in `spelling`, with the symbols it leaves out.
+    fn model_response(&self, spelling: ValueSpelling) -> ModelResponse {
+        let mut omitted = Vec::new();
+        let text = self.model_unstopped(spelling, &mut omitted);
+        ModelResponse { text, omitted }
+    }
+
+    /// The model text in `spelling`; the symbols it leaves out go to
+    /// `omissions`.
+    fn model_unstopped(&self, spelling: ValueSpelling, omissions: &mut Vec<String>) -> String {
         if !self.produce_models_enabled() {
             return "(error \"model generation is not enabled\")".to_string();
         }
@@ -70,10 +138,12 @@ impl Executor {
             },
         };
         if unvalidated_candidate {
-            self.with_model_data_read(model, |read| self.model_from_selected(read, true, spelling))
+            self.with_model_data_read(model, |read| {
+                self.model_from_selected(read, true, spelling, omissions)
+            })
         } else {
             self.with_model_construction_read(model, |read| {
-                self.model_from_selected(read, false, spelling)
+                self.model_from_selected(read, false, spelling, omissions)
             })
         }
     }
@@ -83,6 +153,7 @@ impl Executor {
         read: &dyn ModelRead,
         unvalidated_candidate: bool,
         spelling: ValueSpelling,
+        omissions: &mut Vec<String>,
     ) -> String {
         let model = read.model();
         if !self.materialized_scalar_functions_current(model) {
@@ -105,11 +176,9 @@ impl Executor {
         let overloaded = self.overloaded_ctors_for(spelling);
         let mut definitions = self.total_selector_definitions(model, &overloaded);
         // Every fail-closed omission below drops a symbol from an otherwise
-        // well-formed model. The result still prints `sat`, so the run scores
-        // ZERO in Model-Validation while the scoreboard reads `errors: 0` — the
-        // omission is invisible to every downstream consumer. Record what was
-        // dropped so it can be surfaced on stderr; stdout is piped verbatim
-        // into Dolmen and must stay a pure get-model response.
+        // well-formed model, invisibly to every downstream consumer of the
+        // response. Record what was dropped: it goes to `omissions`, which
+        // `ModelResponse::publish` reports on stderr.
         let mut omitted: Vec<String> = Vec::new();
 
         // Entailed reconstruction of datatype/array-sorted constants, shared with
@@ -1096,20 +1165,11 @@ impl Executor {
         if unvalidated_candidate {
             self.finish_candidate_definitions(&mut definitions, &mut omitted);
         }
-        // Not under `--z3-mode`, whose stderr stays empty as z3's does; the
-        // response itself shows the omission.
-        if !omitted.is_empty() && !ay_core::misc_cli_flags().z3_transcript {
-            // stderr ONLY — stdout is the get-model response. The harness
-            // already captures `stderr_tail`, so this makes a partial model
-            // greppable in the run record instead of silently scoring zero.
-            omitted.sort();
-            omitted.dedup();
-            eprintln!(
-                "c ay.model.partial omitted={} symbols=[{}]",
-                omitted.len(),
-                omitted.join(" ")
-            );
-        }
+        // Reported by the caller, once for the rendering it returns:
+        // `Self::surface_response` can render the model in both spellings.
+        omitted.sort();
+        omitted.dedup();
+        *omissions = omitted;
         self.ascribe_overloaded_constant_definitions(&mut definitions, &overloaded);
         if let Some(admission) = model.constant_array_read_admission(self) {
             let mut text = ay_core::render_admission::Buffer::new(Some(&admission));

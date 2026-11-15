@@ -33,6 +33,12 @@
 //! at load 24-28); the clock read bounds it by 4,096 callbacks of a dense
 //! walk. Where no thread can watch the clock (wasm32, or a failed spawn) the
 //! poll keeps reading the cell.
+//!
+//! The cell's `expired` also answers a reached work ceiling
+//! (`ay_core::resource::work_ceiling_reached`), and so does an armed poll, at
+//! each of its clock reads, with or without a deadline. The stride is a count
+//! of polls, so a counted ceiling still stops a long walk at a poll the input
+//! fixes, at most [`ARMED_CLOCK_POLLS`] polls after the ceiling is reached.
 
 use super::SolveDeadlineCell;
 use ay_core::time::{ClockStride, Instant};
@@ -177,11 +183,18 @@ struct Armed {
 }
 
 impl Armed {
+    /// Whether the deadline has passed, or a work ceiling over this thread
+    /// is reached. Both are read once per [`ARMED_CLOCK_POLLS`] polls, the
+    /// ceiling with or without a deadline; the alarm's flag at every poll.
     fn expired(&self) -> bool {
+        let due = self.clock.due();
+        if due && ay_core::resource::work_ceiling_reached() {
+            return true;
+        }
         let Some((deadline, alarm)) = &self.deadline else {
             return false;
         };
-        alarm.raised() || (self.clock.due() && Instant::now() >= *deadline)
+        alarm.raised() || (due && Instant::now() >= *deadline)
     }
 }
 
@@ -195,7 +208,8 @@ impl DeadlinePoll {
     }
 
     /// [`SolveDeadlineCell::expired`], answered from an alarm once this
-    /// poll has read the cell [`EXACT_POLLS`] times.
+    /// poll has read the cell [`EXACT_POLLS`] times; the work ceiling the
+    /// cell's poll also reads is then read on the alarm's clock stride.
     pub(crate) fn expired(&self) -> bool {
         let generation = self.cell.generation();
         if let Some(armed) = self.armed.borrow().as_ref() {

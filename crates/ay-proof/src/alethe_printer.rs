@@ -3705,6 +3705,26 @@ impl<'a> AlethePrinter<'a> {
                 reason: "integer bounds tautology changed under surface rewriting".to_string(),
             });
         }
+        if matches!(kind, ay_core::TheoryLemmaKind::ArithClauseTautology) && farkas.is_none() {
+            let endpoints = {
+                let overrides = self.judgement_overrides();
+                crate::arith_order_split_lowering(self.terms, clause, overrides.as_ref())
+            };
+            if let Some((a, b, lt, eq, bound)) = endpoints {
+                let (a, b) = (self.format_term(a), self.format_term(b));
+                let equality = self.format_term(clause[eq]);
+                let less = self.format_term(clause[lt]);
+                let not_bound = self.format_term(clause[bound]);
+                let conclusion = self.format_clause(clause);
+                return Ok(format!(
+                    "(step {id}.split (cl (or {equality} {not_bound} (not (<= {b} {a})))) :rule la_disequality)\n\
+                     (step {id}.flat (cl {equality} {not_bound} (not (<= {b} {a}))) :rule or :premises ({id}.split))\n\
+                     (step {id}.order (cl (<= {b} {a}) {less}) :rule la_generic :args (1 1))\n\
+                     (step {id}.joined (cl {equality} {not_bound} {less}) :rule resolution :premises ({id}.flat {id}.order))\n\
+                     (step {id} {conclusion} :rule reordering :premises ({id}.joined))"
+                ));
+            }
+        }
         // `ArithClauseTautology` is a broad native rule, while
         // `LiaGeneric`/`LinearIdentity` is a unit positive equality that
         // Carcara cannot check as `la_generic`. Their one-equality polynomial

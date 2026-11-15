@@ -700,9 +700,13 @@ fn typed_term_values_are_charged_for_the_bare_spelling() {
 /// reader returns `f`.
 #[test]
 fn scalar_function_models_are_charged_for_the_bare_spelling() {
+    use std::fmt::Write as _;
     let sort = format!("L{}", "a".repeat(39));
-    let fields: String = (0..200).map(|at| format!(" (f{at} {sort})")).collect();
-    let nils: String = (0..200).map(|_| format!(" (as nil {sort})")).collect();
+    let mut fields = String::new();
+    for at in 0..200 {
+        write!(fields, " (f{at} {sort})").expect("write to a String");
+    }
+    let nils = format!(" (as nil {sort})").repeat(200);
     let mut script = format!(
         "(declare-datatypes (({sort} 0)) (((cons (hd Bool) (tl {sort})) (nil))))\n\
          (declare-datatypes ((L2 0)) (((cons (hd Int) (tl L2)) (nil))))\n\

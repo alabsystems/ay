@@ -49,38 +49,24 @@ fn incremental_unknown_retains_theory_incompleteness_reason() {
     assert!(outcome.unsat_proof.is_none());
 }
 
-/// Trust's unsigned var*var multiply-overflow obligation, reduced (Trust
-/// `crates/deductive-checksgen/src/generate/overflow_vc.rs`, the UMUL record): the
-/// 64-bit bitvector overflow predicate over FRESH operand images `l`/`r`,
-/// beside the Int out-of-range reading of the same product over the real
-/// operands `a`/`b`. The halves share no symbol, the product makes the Int half
-/// nonlinear, and ay has no combined BV + NIA lane (`QfBvLiaIndep if nl_int =>
-/// Other`), so the check-sat ends undecided. Trust's native lane names the mix
-/// `QF_AUFBVNIA` and enables proofs, as here.
-fn bv_nia_theory_mix() -> AYProgram {
+/// Trust's bitwise operator bridged into a nonlinear Int product, reduced:
+/// the low four bits of the 32-bit `l` (`bvand`), read as an Int (`bv2int`),
+/// times the Int `a`, above 10. That one assertion holds the symbols of both
+/// theories, so the query is one component, which the partition rescue cannot
+/// split, and ay has no combined lane for bitvectors with nonlinear integer
+/// arithmetic (the router's `LogicCategory::Other`). Trust's native lane names
+/// the mix `QF_AUFBVNIA` and enables proofs, as here.
+fn bridged_bv_nia_theory_mix() -> AYProgram {
     let mut program = AYProgram::new();
     program.add_constraint(crate::constraint::Constraint::set_option(
         ":produce-proofs",
         "true",
     ));
     program.set_logic("QF_AUFBVNIA");
-    let l = program.declare_const("l", Sort::bv32()).zero_extend(32);
-    let r = program.declare_const("r", Sort::bv32()).zero_extend(32);
+    let l = program.declare_const("l", Sort::bv32());
     let a = program.declare_const("a", Sort::int());
-    let b = program.declare_const("b", Sort::int());
-    program.assert(l.clone().eq(Expr::bitvec_const(0u64, 64)).not());
-    program.assert(l.clone().bvmul(r.clone()).bvudiv(l).eq(r).not());
-    for operand in [&a, &b] {
-        program.assert(operand.clone().int_ge(Expr::int(0)));
-        program.assert(operand.clone().int_le(Expr::int(u32::MAX)));
-    }
-    let product = a.int_mul(b);
-    program.assert(
-        product
-            .clone()
-            .int_lt(Expr::int(0))
-            .or(product.int_gt(Expr::int(u64::MAX))),
-    );
+    let low = l.bvand(Expr::bitvec_const(15u64, 32)).bv2int();
+    program.assert(low.int_mul(a).int_gt(Expr::int(10)));
     program.check_sat();
     program
 }
@@ -93,10 +79,20 @@ fn bv_nia_theory_mix() -> AYProgram {
 /// counted it as a non-reproducible `solver-fault` where its multiply-overflow
 /// record or a bitwise operator bridged into a nonlinear product met this
 /// refusal. The refusal's text is the diagnostic's detail, under phase
-/// `theory-combination`: the query never searched.
+/// `theory-combination`.
+///
+/// The fixture is the bridged shape, one component, so the refusal is the
+/// answer. The multiply-overflow record was the fixture before: its two halves
+/// share no symbol, so since 550b6b40e (DR-119) the partition rescue splits it
+/// into two components and searches them. Each half is unsatisfiable, so
+/// `unsat` is that record's answer, and this test on it ended
+/// `unknown`/`timeout` after about 300 s instead of with the refusal.
+/// f990caf2cd moved ay-dpll's twin,
+/// `test_theory_mix_without_a_lane_is_incomplete_not_internal_error`, to the
+/// bridged shape for the same reason.
 #[test]
 fn incremental_theory_mix_without_a_lane_is_incomplete_not_internal_error() {
-    let outcomes = execute_incremental(&bv_nia_theory_mix()).unwrap();
+    let outcomes = execute_incremental(&bridged_bv_nia_theory_mix()).unwrap();
     assert_eq!(outcomes.len(), 1);
     let outcome = &outcomes[0];
     let solve = outcome.solve_details.as_ref().unwrap();

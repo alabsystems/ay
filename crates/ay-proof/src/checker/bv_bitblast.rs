@@ -1395,7 +1395,7 @@ struct ProofProducingLowerer<'a, 'p> {
     /// `(= v K)` or the case of a split (`hypotheses.rs`, `case_split.rs`) —
     /// so closed evaluation (`bounded_eval::closed_bv_in`) reads them too.
     constants: Vec<(TermId, EvalValue)>,
-    /// Scalar definitions for a DAG retry or exact signed-power lowering.
+    /// Scalar definitions for a DAG retry or exact signed-literal lowering.
     definitions: Option<proof_producing_control::Definitions>,
 }
 
@@ -2046,7 +2046,7 @@ impl<'a, 'p> ProofProducingLowerer<'a, 'p> {
         let [lhs_term, rhs_term] = args else {
             return Err(format!("`{name}` requires two arguments"));
         };
-        self.prepare_signed_power(name, *rhs_term);
+        self.prepare_signed_literal(name, *rhs_term);
         if let Some((product, width)) = self.lower_padded_product(name, *lhs_term, *rhs_term)? {
             return Ok(BvApplicationLowering::Exact(product, width));
         }

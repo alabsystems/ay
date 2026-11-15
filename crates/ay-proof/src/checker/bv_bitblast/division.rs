@@ -15,7 +15,9 @@
 //! Literal zero divisors also lower exactly: rem/mod preserve the dividend;
 //! quotient is one for negative dividends and all ones otherwise.
 //! Nonzero signed power-of-two magnitudes use biased arithmetic shifts and
-//! masks. Large scalar operands are named before lowering under the existing
+//! masks. Other raw literal magnitudes use the SMT-LIB sign/magnitude
+//! reduction to unsigned division/remainder. Large scalar operands are named
+//! before lowering under the existing
 //! functional-definition rules, so internal copies stay bounded without a new
 //! retry, source census, or budget. Array retry eligibility is unchanged.
 //!
@@ -26,7 +28,7 @@
 
 use super::*;
 
-struct SignedPower {
+struct SignedLiteralMagnitude {
     width: u32,
     magnitude: u128,
     negative: bool,
@@ -34,15 +36,15 @@ struct SignedPower {
 
 impl<'a, 'p> ProofProducingLowerer<'a, 'p> {
     /// Start bounded scalar naming before operands can be copied internally.
-    pub(super) fn prepare_signed_power(&mut self, name: &str, divisor: TermId) {
+    pub(super) fn prepare_signed_literal(&mut self, name: &str, divisor: TermId) {
         if matches!(name, "bvsdiv" | "bvsrem" | "bvsmod")
-            && self.signed_power_divisor(divisor).is_some()
+            && self.nonunit_signed_literal(divisor).is_some()
         {
             self.record_scalar_definitions();
         }
     }
 
-    fn signed_power_divisor(&self, divisor: TermId) -> Option<SignedPower> {
+    fn nonunit_signed_literal(&self, divisor: TermId) -> Option<SignedLiteralMagnitude> {
         if !self.abstract_reserved_bv_operators {
             return None;
         }
@@ -68,14 +70,14 @@ impl<'a, 'p> ProofProducingLowerer<'a, 'p> {
         } else {
             value
         };
-        magnitude.is_power_of_two().then_some(SignedPower {
+        Some(SignedLiteralMagnitude {
             width,
             magnitude,
             negative,
         })
     }
 
-    /// Exact signed zero/unit literal semantics for lemma validation only.
+    /// Exact signed literal semantics for lemma validation only.
     /// Negation wraps at the signed minimum; width1's unit bit pattern also
     /// works because modular negation is the identity at that width.
     pub(super) fn signed_literal_divisor(
@@ -122,8 +124,11 @@ impl<'a, 'p> ProofProducingLowerer<'a, 'p> {
             });
         }
         if value != 1 && value != all_ones {
-            return match self.signed_power_divisor(divisor) {
-                Some(power) => Ok(signed_power_expression(name, lhs, power)),
+            return match self.nonunit_signed_literal(divisor) {
+                Some(literal) if literal.magnitude.is_power_of_two() => {
+                    Ok(signed_power_expression(name, lhs, literal))
+                }
+                Some(literal) => Ok(signed_nonpower_expression(name, lhs, literal)),
                 None => Err(lhs),
             };
         }
@@ -193,8 +198,8 @@ impl<'a, 'p> ProofProducingLowerer<'a, 'p> {
 
 /// For m=2^k, bias=(x<0 ? m-1 : 0) makes arithmetic shift round toward zero.
 /// The same bias gives signed remainder as ((x+bias)&(m-1))-bias.
-fn signed_power_expression(name: &str, lhs: BvExpr, power: SignedPower) -> BvExpr {
-    let SignedPower {
+fn signed_power_expression(name: &str, lhs: BvExpr, power: SignedLiteralMagnitude) -> BvExpr {
+    let SignedLiteralMagnitude {
         width,
         magnitude,
         negative,
@@ -233,6 +238,55 @@ fn signed_power_expression(name: &str, lhs: BvExpr, power: SignedPower) -> BvExp
             quotient
         }
     }
+}
+
+// SMT-LIB QF_BV arithmetic extensions: https://smt-lib.org/logics-all.shtml#QF_BV
+// Literal magnitude is nonzero and nonunit; operands and widths already checked.
+fn signed_nonpower_expression(name: &str, lhs: BvExpr, literal: SignedLiteralMagnitude) -> BvExpr {
+    let SignedLiteralMagnitude {
+        width,
+        magnitude,
+        negative,
+    } = literal;
+    let zero = || BvExpr::const_val(0, width);
+    // Reuse the core comparison form so equivalent abs/divider expressions
+    // can share encoder nodes without a second circuit for the sign test.
+    let sign = BvExpr::sign_ext(
+        ProofProducingLowerer::signed_lt(lhs.clone(), zero(), width),
+        width - 1,
+    );
+    let absolute = select_signed_branch(sign.clone(), BvExpr::sub(zero(), lhs.clone()), lhs);
+    if name == "bvsdiv" {
+        let q = BvExpr::udiv(absolute, BvExpr::const_val(magnitude, width));
+        let q = select_signed_branch(sign, BvExpr::sub(zero(), q.clone()), q);
+        return if negative { BvExpr::sub(zero(), q) } else { q };
+    }
+    let r = BvExpr::urem(absolute, BvExpr::const_val(magnitude, width));
+    if name == "bvsrem" {
+        return select_signed_branch(sign, BvExpr::sub(zero(), r.clone()), r);
+    }
+    let nonzero = BvExpr::not(BvExpr::sign_ext(BvExpr::eq(r.clone(), zero()), width - 1));
+    let adjusted = if negative {
+        select_signed_branch(
+            sign,
+            BvExpr::sub(zero(), r.clone()),
+            BvExpr::sub(r, BvExpr::const_val(magnitude, width)),
+        )
+    } else {
+        select_signed_branch(
+            sign,
+            BvExpr::sub(BvExpr::const_val(magnitude, width), r.clone()),
+            r,
+        )
+    };
+    BvExpr::and(nonzero, adjusted)
+}
+
+fn select_signed_branch(mask: BvExpr, then_expr: BvExpr, else_expr: BvExpr) -> BvExpr {
+    BvExpr::or(
+        BvExpr::and(mask.clone(), then_expr),
+        BvExpr::and(BvExpr::not(mask), else_expr),
+    )
 }
 
 /// Whether `clause` mentions `bvudiv` or `bvurem` (a bounded walk; a clause

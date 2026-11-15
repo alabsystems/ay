@@ -826,6 +826,14 @@ impl Executor {
                 {
                     return false;
                 }
+                if matches!(kind, ay_core::TheoryLemmaKind::ArithClauseTautology)
+                    && farkas.is_none()
+                    && ay_proof::arith_order_split_lowering(
+                        &self.ctx.terms, clause, term_overrides.as_ref(),
+                    ).is_some()
+                {
+                    return false;
+                }
                 if matches!(kind, ay_core::TheoryLemmaKind::ArithEqTriangle)
                     && ay_proof::arith_eq_triangle_lowering_supported(
                         &self.ctx.terms,

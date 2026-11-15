@@ -30,7 +30,7 @@
 //!
 //! which is `def_1 ∧ … ∧ def_n → C[defs]`. Its expression is linear in the DAG.
 //!
-//! Exact signed-power lowering can also start scalar naming in its first
+//! Exact signed-literal lowering can also start scalar naming in its first
 //! lowering, before reading operands. It names only scalar results above
 //! `DEFINE_ABOVE_NODES`, without a source census. Array values are not named;
 //! the same functional-extension argument applies to already lowered scalar
@@ -57,7 +57,7 @@
 //! The `proof_def_` namespace is disjoint from every other leaf this lowering
 //! names (`proof_bool_`, `proof_bv_`, `proof_array_…`, the frame offsets), and
 //! the retry runs only after the ordinary lowering was refused. First-pass
-//! scalar naming for signed powers can change expression shape and copy costs;
+//! scalar naming for signed literals can change expression shape and copy costs;
 //! preserving prior admissions therefore requires semantic regression checks.
 //! A definitional lowering is under the same caps as an ordinary one, and
 //! continues its walk count (`lower_clause`).
@@ -117,7 +117,7 @@ fn shared_terms(terms: &TermStore, clause: &[TermId]) -> Option<HashSet<TermId>>
 }
 
 impl ProofProducingLowerer<'_, '_> {
-    /// Bound internal operand copies before exact signed-power lowering.
+    /// Bound internal operand copies before exact signed-literal lowering.
     /// Naming only large scalar results needs no source-DAG census. The same
     /// functional definitions and counted walks/materializations below apply;
     /// this is one lowering, including when its source contains arrays.

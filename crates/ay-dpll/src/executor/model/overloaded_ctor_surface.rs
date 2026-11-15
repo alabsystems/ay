@@ -298,9 +298,14 @@ impl Executor {
     /// take the `Surface` one as the `Sorted` one. The check is of the whole
     /// response because an unquoted name (`y|`) can pair with the bars of an
     /// ascribed sort (`(as nil |My List|)`) lines away.
-    pub(super) fn surface_response(&self, print: impl Fn(ValueSpelling) -> String) -> String {
+    ///
+    /// Only one of the renderings `print` makes is returned, so what a
+    /// rendering reports about the response, such as the symbols a
+    /// `(get-model)` leaves out, travels in it (`R`), for the caller to
+    /// report once for the rendering returned.
+    pub(super) fn surface_response<R: AsRef<str>>(&self, print: impl Fn(ValueSpelling) -> R) -> R {
         let surface = print(ValueSpelling::Surface);
-        if !surface.contains("(as ") {
+        if !surface.as_ref().contains("(as ") {
             return surface;
         }
         let overloaded = self.overloaded_nullary_ctors();
@@ -308,7 +313,10 @@ impl Executor {
             return surface;
         }
         let bare = print(ValueSpelling::Sorted);
-        if bare == surface || crate::constructor_ascription::reads_as_bare(&bare, &surface) {
+        let (bare_text, surface_text) = (bare.as_ref(), surface.as_ref());
+        if bare_text == surface_text
+            || crate::constructor_ascription::reads_as_bare(bare_text, surface_text)
+        {
             surface
         } else {
             bare
@@ -769,6 +777,44 @@ mod tests {
             assert!(!out[2].contains("__ay_overload"), "{}", out[2]);
             assert!(out[2].starts_with("(((hd (as nil L2)) "), "{}", out[2]);
             assert!(!bare_nil_remains(&out[2]), "{}", out[2]);
+        }
+    }
+
+    /// `(get-model)` here omits `f`, and its `Surface` rendering holds
+    /// `(as const (Array Int L2))`. With `red` declared by two datatypes,
+    /// `surface_response` renders the model in both spellings, and the
+    /// response still writes one `c ay.model.partial` line, as it does with
+    /// the second `red` renamed.
+    #[test]
+    #[timeout(60000)]
+    fn a_partial_model_is_reported_once_per_response() {
+        for second_red in ["red", "red2"] {
+            let src = format!(
+                "(declare-datatypes ((E1 0) (E2 0)) (((red) (green)) (({second_red}) (blue))))\n\
+                (set-option :produce-models true)\n\
+                (declare-datatypes ((L1 0) (L2 0))\n\
+                  (((nil) (c1 (h1 Int) (t1 L1))) ((nil2) (c2 (h2 Bool) (t2 L2)))))\n\
+                (declare-const x L1) (declare-const y L2)\n\
+                (declare-const a (Array Int L2))\n\
+                (declare-fun f (L1) L2)\n\
+                (assert (= x (c1 3 (as nil L1)))) (assert (= y (c2 true nil2)))\n\
+                (assert (= (select a 0) nil2)) (assert (= (select a 1) y))\n\
+                (assert (= (f (as nil L1)) nil2)) (assert (= (f x) y))\n\
+                (check-sat)\n\
+                (get-model)\n"
+            );
+            let commands = parse(&src).expect("parse");
+            let mut exec = Executor::new();
+            let _ = super::super::output::take_partial_model_reports();
+            let out = exec.execute_all(&commands).expect("execute");
+            assert_eq!(out[0], "sat");
+            assert!(out[1].contains("(as const (Array Int L2))"), "{}", out[1]);
+            assert!(!out[1].contains("(define-fun f "), "{}", out[1]);
+            assert_eq!(
+                super::super::output::take_partial_model_reports(),
+                ["c ay.model.partial omitted=1 symbols=[f]"],
+                "{second_red}"
+            );
         }
     }
 

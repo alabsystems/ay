@@ -609,6 +609,44 @@ pub fn arith_eq_triangle_lowering_supported(
         && crate::recognize_arith_eq_triangle(terms, clause)
 }
 
+/// Exact order split `a < b || a = b || !(a <= b)`, with no
+/// source-surface changes. Returns the oriented endpoints and literal slots.
+#[must_use]
+pub fn arith_order_split_lowering(
+    terms: &TermStore,
+    clause: &[TermId],
+    overrides: Option<&DetHashMap<TermId, String>>,
+) -> Option<(TermId, TermId, usize, usize, usize)> {
+    if clause.len() != 3 || !exact_clause_surface_preserved(terms, clause, overrides) {
+        return None;
+    }
+    for (lt_index, &literal) in clause.iter().enumerate() {
+        let TermData::App(Symbol::Named(op), args) = terms.get(literal) else {
+            continue;
+        };
+        if op != "<" || args.len() != 2 {
+            continue;
+        }
+        let (a, b) = (args[0], args[1]);
+        if terms.sort(a) != terms.sort(b)
+            || !matches!(terms.sort(a), ay_core::Sort::Int | ay_core::Sort::Real)
+        {
+            continue;
+        }
+        let eq_index = clause.iter().position(|&term| {
+            matches!(terms.get(term),
+            TermData::App(Symbol::Named(op), pair) if op == "=" && pair.as_slice() == [a, b])
+        })?;
+        let bound_index = clause.iter().position(|&term| {
+            matches!(terms.get(term),
+            TermData::Not(inner) if matches!(terms.get(*inner),
+                TermData::App(Symbol::Named(op), pair) if op == "<=" && pair.as_slice() == [a, b]))
+        })?;
+        return Some((a, b, lt_index, eq_index, bound_index));
+    }
+    None
+}
+
 /// Whether the equality-to-bound adapter has the exact checked `la_generic`
 /// lowering emitted by the Alethe printer.
 ///
@@ -1664,5 +1702,55 @@ mod tests {
             ClauseSurfaceAgreement::Divergent,
             "the ninth shape's simplified operand is a changed clause"
         );
+    }
+}
+
+#[cfg(test)]
+mod order_split_tests {
+    use super::*;
+
+    #[test]
+    fn order_split_renders_a_checked_document_and_refuses_changed_operands() {
+        for sort in [ay_core::Sort::Int, ay_core::Sort::Real] {
+            let mut terms = TermStore::new();
+            let a = terms.mk_var("a", sort.clone());
+            let b = terms.mk_var("b", sort.clone());
+            let lt = terms.mk_app(Symbol::named("<"), [a, b], ay_core::Sort::Bool);
+            let eq = terms.mk_app(Symbol::named("="), [a, b], ay_core::Sort::Bool);
+            let le = terms.mk_app(Symbol::named("<="), [a, b], ay_core::Sort::Bool);
+            let not_le = terms.mk_not_raw(le);
+            let clause = [lt, eq, not_le];
+            assert!(arith_order_split_lowering(&terms, &clause, None).is_some());
+            let step = ProofStep::TheoryLemma {
+                theory: "arith".into(),
+                clause: clause.to_vec(),
+                farkas: None,
+                kind: TheoryLemmaKind::ArithClauseTautology,
+                lia: None,
+            };
+            let rendered = crate::alethe_printer::AlethePrinter::new(&terms)
+                .format_step(&step, ProofId(3))
+                .unwrap();
+            assert!(!rendered.contains(":rule hole"), "{rendered}");
+            let (logic, sort_name) = if sort == ay_core::Sort::Int {
+                ("QF_LIA", "Int")
+            } else {
+                ("QF_LRA", "Real")
+            };
+            let problem = format!("(set-logic {logic})\n(declare-fun a () {sort_name})\n(declare-fun b () {sort_name})\n(assert (not (< a b)))\n(assert (not (= a b)))\n(assert (<= a b))\n(check-sat)\n");
+            let document = format!("(assume h0 (not (< a b)))\n(assume h1 (not (= a b)))\n(assume h2 (<= a b))\n{rendered}\n(step done (cl) :rule resolution :premises (t3 h0 h1 h2))\n");
+            let scope = crate::ProblemScope::from_smtlib_source(&problem);
+            crate::check_alethe_document(&document, &scope).unwrap();
+            let reversed_bound = terms.mk_app(Symbol::named("<="), [b, a], ay_core::Sort::Bool);
+            let not_reversed_bound = terms.mk_not_raw(reversed_bound);
+            assert!(
+                arith_order_split_lowering(&terms, &[lt, eq, not_reversed_bound], None).is_none()
+            );
+            let reverse = terms.mk_app(Symbol::named("<"), [b, a], ay_core::Sort::Bool);
+            assert!(arith_order_split_lowering(&terms, &[reverse, eq, not_le], None).is_none());
+            let mut overrides = DetHashMap::default();
+            overrides.insert(a, "7".into());
+            assert!(arith_order_split_lowering(&terms, &clause, Some(&overrides)).is_none());
+        }
     }
 }

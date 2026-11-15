@@ -259,11 +259,11 @@ pub use terminal_trust::{
 };
 pub use wire_rule::{
     arith_eq_implies_bound_lowering_supported, arith_eq_triangle_lowering_supported,
-    arith_poly_simp_lowering_supported, bv_eq_simplify_step_lowering_supported,
-    bv_offset_spines_step_lowering_supported, bv_reconstruct_step_lowering_supported,
-    evaluate_step_lowering_supported, exact_clause_surface_preserved,
-    int_bounds_tautology_lowering_supported, la_generic_farkas_lowering_supported,
-    lia_divisibility_lowering_supported, promoted_wire_rule,
+    arith_order_split_lowering, arith_poly_simp_lowering_supported,
+    bv_eq_simplify_step_lowering_supported, bv_offset_spines_step_lowering_supported,
+    bv_reconstruct_step_lowering_supported, evaluate_step_lowering_supported,
+    exact_clause_surface_preserved, int_bounds_tautology_lowering_supported,
+    la_generic_farkas_lowering_supported, lia_divisibility_lowering_supported, promoted_wire_rule,
     theory_lemma_bv_arithmetic_lowering_supported,
     theory_lemma_bv_arithmetic_lowering_supported_asking,
     theory_lemma_poly_simp_lowering_supported, ArithPolySimpPromotionBudget,

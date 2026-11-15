@@ -472,8 +472,8 @@ fn test_bv_bitblast_proof_producer_interprets_or_abstracts_division_but_never_fo
     );
     validate_theory_lemma_strict(&terms, vec![same], TheoryLemmaKind::BvBitBlast)
         .expect("an identity of one opaque term holds for every interpretation");
-    // ... while a clause that needs the operator's MEANING fails closed: the
-    // abstraction has a model, and a model of the abstraction is not a proof.
+    // Literal unit division lowers exactly, unlike the symbolic divisor.
+    // Keep both a valid unit identity and an invalid quotient claim.
     let one = terms.mk_bitvec(BigInt::from(1), 32);
     let by_one = terms.mk_app(
         ay_core::Symbol::named("bvsdiv"),
@@ -482,7 +482,14 @@ fn test_bv_bitblast_proof_producer_interprets_or_abstracts_division_but_never_fo
     );
     let meaning = terms.mk_app(ay_core::Symbol::named("="), vec![by_one, bv], Sort::Bool);
     validate_theory_lemma_strict(&terms, vec![meaning], TheoryLemmaKind::BvBitBlast)
-        .expect_err("x sdiv 1 = x needs bvsdiv's semantics, which the abstraction forgets");
+        .expect("signed division by literal one preserves the dividend");
+    let zero = terms.mk_bitvec(BigInt::from(0), 32);
+    let wrong_unit = terms.mk_app(ay_core::Symbol::named("="), vec![by_one, zero], Sort::Bool);
+    validate_theory_lemma_strict(&terms, vec![wrong_unit], TheoryLemmaKind::BvBitBlast)
+        .expect_err("signed division by one is not always zero");
+    let symbolic_meaning = terms.mk_app(ay_core::Symbol::named("="), vec![signed, bv], Sort::Bool);
+    validate_theory_lemma_strict(&terms, vec![symbolic_meaning], TheoryLemmaKind::BvBitBlast)
+        .expect_err("a symbolic divisor does not always preserve the dividend");
 }
 
 #[test]
