@@ -10,6 +10,52 @@ use ay_core::Sort;
 
 use super::{is_canonical_theory_operator_identity, Context, ElaborateError, Result, SymbolInfo};
 
+/// The class `carrier_surface_class` gives a carrier: the carriers of one
+/// source sort description (`Context::nominal_carriers_share_surface`), such
+/// as a datatype and its declaration again after `pop`, or the carrier alone
+/// when it has no description.
+#[derive(PartialEq, Eq, Hash)]
+enum CarrierSurfaceClass<'a> {
+    Described(&'a super::NominalSortSurface),
+    Exact(&'a str),
+}
+
+/// The external spellings of datatype members, from one census of them
+/// ([`Context::datatype_output_names`]).
+pub struct DatatypeOutputNames<'a> {
+    context: &'a Context,
+    /// Selector identity to the carrier, if any, of a constructor that
+    /// declares it.
+    selector_carriers: HashMap<&'a str, Option<&'a str>>,
+    /// Per surface name and carrier class: how many members carry it, and one
+    /// of them.
+    sharers: HashMap<(&'a str, CarrierSurfaceClass<'a>), (usize, &'a str)>,
+}
+
+impl<'a> DatatypeOutputNames<'a> {
+    /// The output name of `identity`, as [`Context::output_symbol_name`]
+    /// gives it: its surface name (`identity` when none is recorded), unless
+    /// `identity` has a carrier and another datatype member (a constructor,
+    /// tester or selector) whose carrier is in the same `CarrierSurfaceClass`
+    /// as that carrier has that surface name too; then `identity` itself.
+    pub fn name(&self, identity: &'a str) -> &'a str {
+        let context = self.context;
+        let surface = context.dt_surface_name(identity).unwrap_or(identity);
+        let Some(carrier) = context.member_carrier_among(identity, &self.selector_carriers) else {
+            return surface;
+        };
+        let collides = self
+            .sharers
+            .get(&(surface, context.carrier_surface_class(carrier)))
+            .is_some_and(|(count, one)| *count > 1 || *one != identity);
+        if collides {
+            identity
+        } else {
+            surface
+        }
+    }
+}
+
 /// Mangle a parametric-datatype instantiation `(Name A1 .. An)` into a unique,
 /// deterministic sort name used as `Sort::Uninterpreted(<mangled>)`.
 ///
@@ -413,6 +459,70 @@ impl Context {
             identity
         } else {
             surface
+        }
+    }
+
+    /// [`Self::output_symbol_name`] for many identities, from one census of
+    /// the datatype members instead of one per identity.
+    pub fn datatype_output_names(&self) -> DatatypeOutputNames<'_> {
+        // Selector identity -> its carrier, as `datatype_member_carrier` finds
+        // it, without that function's scan per selector.
+        let mut selector_carriers: HashMap<&str, Option<&str>> = HashMap::default();
+        for (constructor, selectors) in &self.ctor_selector_info {
+            let carrier = self
+                .constructors
+                .get(constructor)
+                .map(|(carrier, _)| carrier.as_str());
+            for (selector, _) in selectors {
+                selector_carriers
+                    .entry(selector.as_str())
+                    .or_insert(carrier);
+            }
+        }
+        let mut sharers: HashMap<(&str, CarrierSurfaceClass<'_>), (usize, &str)> =
+            HashMap::default();
+        for identity in self.datatype_member_symbols.keys() {
+            let Some(carrier) = self.member_carrier_among(identity, &selector_carriers) else {
+                continue;
+            };
+            let surface = self.dt_surface_name(identity).unwrap_or(identity);
+            sharers
+                .entry((surface, self.carrier_surface_class(carrier)))
+                .or_insert((0, identity.as_str()))
+                .0 += 1;
+        }
+        DatatypeOutputNames {
+            context: self,
+            selector_carriers,
+            sharers,
+        }
+    }
+
+    /// [`Self::datatype_member_carrier`] with the selectors already indexed.
+    fn member_carrier_among<'a>(
+        &'a self,
+        identity: &str,
+        selector_carriers: &HashMap<&'a str, Option<&'a str>>,
+    ) -> Option<&'a str> {
+        if let Some((carrier, _)) = self.constructors.get(identity) {
+            return Some(carrier);
+        }
+        if let Some((carrier, _)) = identity
+            .strip_prefix("is-")
+            .and_then(|constructor| self.constructors.get(constructor))
+        {
+            return Some(carrier);
+        }
+        selector_carriers.get(identity).copied().flatten()
+    }
+
+    /// The class of carriers `nominal_carriers_share_surface` relates to
+    /// `carrier`: those of the same source description, or `carrier` alone
+    /// when it has none.
+    fn carrier_surface_class<'a>(&'a self, carrier: &'a str) -> CarrierSurfaceClass<'a> {
+        match self.nominal_sort_surfaces.get(carrier) {
+            Some(surface) => CarrierSurfaceClass::Described(surface),
+            None => CarrierSurfaceClass::Exact(carrier),
         }
     }
 

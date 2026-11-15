@@ -17,6 +17,7 @@ use crate::executor_format::{
 use crate::executor_types::SolveResult;
 
 use super::construction_owner::{ModelConstructionRead, ModelRead};
+use super::overloaded_ctor_surface::ValueSpelling;
 use super::Executor;
 use super::{debug_model, CertifiedConstInterpBody, EvalValue, LinearIntBody, Model};
 
@@ -29,10 +30,18 @@ const PRINTED_BOOL_DEPTH: u32 = 256;
 impl Executor {
     /// Generate model output for get-model command.
     pub(crate) fn model(&self) -> String {
-        self.checked_evaluation_output(|| self.model_unstopped())
+        self.checked_evaluation_output(|| {
+            self.surface_response(|spelling| self.model_unstopped(spelling))
+        })
     }
 
-    fn model_unstopped(&self) -> String {
+    /// [`Self::model`] in [`ValueSpelling::Sorted`], for a reader inside this
+    /// process that holds the solver.
+    pub(crate) fn model_for_decoder(&self) -> String {
+        self.checked_evaluation_output(|| self.model_unstopped(ValueSpelling::Sorted))
+    }
+
+    fn model_unstopped(&self, spelling: ValueSpelling) -> String {
         if !self.produce_models_enabled() {
             return "(error \"model generation is not enabled\")".to_string();
         }
@@ -61,13 +70,20 @@ impl Executor {
             },
         };
         if unvalidated_candidate {
-            self.with_model_data_read(model, |read| self.model_from_selected(read, true))
+            self.with_model_data_read(model, |read| self.model_from_selected(read, true, spelling))
         } else {
-            self.with_model_construction_read(model, |read| self.model_from_selected(read, false))
+            self.with_model_construction_read(model, |read| {
+                self.model_from_selected(read, false, spelling)
+            })
         }
     }
 
-    fn model_from_selected(&self, read: &dyn ModelRead, unvalidated_candidate: bool) -> String {
+    fn model_from_selected(
+        &self,
+        read: &dyn ModelRead,
+        unvalidated_candidate: bool,
+        spelling: ValueSpelling,
+    ) -> String {
         let model = read.model();
         if !self.materialized_scalar_functions_current(model) {
             return "(error \"materialized scalar function model is stale\")".to_string();
@@ -84,7 +100,10 @@ impl Executor {
         // definition defers to the builtin selector on the owning constructor
         // and reproduces the internal model's committed value on every
         // constrained wrong-constructor case.
-        let mut definitions = self.total_selector_definitions(model);
+        // The constructors `overloaded_ctor_surface` may ascribe in
+        // `spelling` (#overloaded-nil-surface).
+        let overloaded = self.overloaded_ctors_for(spelling);
+        let mut definitions = self.total_selector_definitions(model, &overloaded);
         // Every fail-closed omission below drops a symbol from an otherwise
         // well-formed model. The result still prints `sat`, so the run scores
         // ZERO in Model-Validation while the scoreboard reads `errors: 0` — the
@@ -544,6 +563,7 @@ impl Executor {
                             &info.sort,
                             &resolved,
                             model,
+                            &overloaded,
                         ) {
                             Ok(def) => {
                                 definitions.push(def);
@@ -640,6 +660,7 @@ impl Executor {
                                     &info.sort,
                                     &table,
                                     model,
+                                    &overloaded,
                                 ) {
                                     Ok(def) => definitions.push(def),
                                     // The reconstructed table is not a function
@@ -1089,6 +1110,7 @@ impl Executor {
                 omitted.join(" ")
             );
         }
+        self.ascribe_overloaded_constant_definitions(&mut definitions, &overloaded);
         if let Some(admission) = model.constant_array_read_admission(self) {
             let mut text = ay_core::render_admission::Buffer::new(Some(&admission));
             if !text.push("(model\n") {
@@ -1620,10 +1642,18 @@ impl Executor {
 
     /// Generate output for get-value command.
     pub(crate) fn values(&self, requested: &[(String, TermId)]) -> String {
-        self.checked_evaluation_output(|| self.values_unstopped(requested))
+        self.checked_evaluation_output(|| {
+            self.surface_response(|spelling| self.values_unstopped(requested, spelling))
+        })
     }
 
-    fn values_unstopped(&self, requested: &[(String, TermId)]) -> String {
+    /// [`Self::values`] in [`ValueSpelling::Sorted`], for a decoder inside
+    /// this process that holds the solver.
+    pub(crate) fn values_for_decoder(&self, requested: &[(String, TermId)]) -> String {
+        self.checked_evaluation_output(|| self.values_unstopped(requested, ValueSpelling::Sorted))
+    }
+
+    fn values_unstopped(&self, requested: &[(String, TermId)], spelling: ValueSpelling) -> String {
         // Check if we have a model.
         //
         // For trivially-SAT cases where `last_model` is `None` (e.g., all
@@ -1638,10 +1668,17 @@ impl Executor {
             Err(e) => return e,
         };
 
-        self.with_model_construction_read(model, |read| self.values_from_selected(read, requested))
+        self.with_model_construction_read(model, |read| {
+            self.values_from_selected(read, requested, spelling)
+        })
     }
 
-    fn values_from_selected(&self, read: &dyn ModelRead, requested: &[(String, TermId)]) -> String {
+    fn values_from_selected(
+        &self,
+        read: &dyn ModelRead,
+        requested: &[(String, TermId)],
+        spelling: ValueSpelling,
+    ) -> String {
         let model = read.model();
         // Memoize evaluation across ALL requested terms (#eval-memo). `get-value`
         // over N terms that share large subterms — e.g. a Kani query's ~190
@@ -1662,9 +1699,16 @@ impl Executor {
         // single-constructor datatype constant `w` is eagerly eliminated to
         // `(wrap <field>)`, whose fresh field var must not leak into the key.
         let mut pairs: Vec<String> = Vec::with_capacity(requested.len());
+        let overloaded = self.overloaded_ctors_for(spelling);
         for (term_str, term_id) in requested {
             match self.get_value_string(read, &aggregate_values, *term_id) {
-                Ok(value_str) => pairs.push(format!("({term_str} {value_str})")),
+                Ok(value_str) => {
+                    // In `ValueSpelling::Surface` this may ascribe an
+                    // overloaded nullary constructor (#overloaded-nil-surface).
+                    let sort = self.ctx.terms.sort(*term_id);
+                    let value_str = self.ascribe_overloaded_ctors(&value_str, sort, &overloaded);
+                    pairs.push(format!("({term_str} {value_str})"));
+                }
                 // A term with no value under the model errors honestly —
                 // never a fabricated default (#no-fabricated-model-values).
                 Err(e) => return format!("(error \"value of {term_str} is not available: {e}\")"),

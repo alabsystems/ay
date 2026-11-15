@@ -1252,8 +1252,10 @@ unsafe fn check_solver_handle(
     handle.last_model = ctx.solver.model().map(|m| m.into_inner());
     // Raw model text captured alongside: it carries the arity > 0 function
     // tables the parsed constants-only `Model` drops, so `Z3_model` handles
-    // can resolve UF applications from the snapshot.
-    handle.last_model_text = ctx.solver.model_str();
+    // can resolve UF applications from the snapshot. It is the decoder text
+    // (`Solver::model_str_for_decoder`, #overloaded-nil-surface), which a
+    // converted decision below may replace.
+    handle.last_model_text = ctx.solver.model_str_for_decoder();
     if let Some(decision) = converted_decision.as_mut() {
         if let Some(model) = decision.model.take() {
             // Converted models contain supported scalar interpretations only;
@@ -1709,7 +1711,7 @@ fn scope_published_model(
     if handle.last_model.is_none() || handle.last_model_text.is_none() {
         let detail = ctx
             .solver
-            .try_get_model_str()
+            .try_get_model_str_for_decoder()
             .err()
             .map_or_else(|| "no model".to_string(), |e| e.to_string());
         return Err(format!(

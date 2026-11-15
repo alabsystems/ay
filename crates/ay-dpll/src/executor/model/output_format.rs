@@ -329,6 +329,7 @@ impl Executor {
         result_sort: &Sort,
         table: &[(Vec<String>, String)],
         model: &Model,
+        overloaded: &super::overloaded_ctor_surface::OverloadedCtors,
     ) -> Result<String, String> {
         // Generate parameter names: x0, x1, ...
         let params: Vec<String> = arg_sorts
@@ -340,9 +341,26 @@ impl Executor {
         let params_str = params.join(" ");
         let result_sort_str = format_sort_surface(&self.ctx, result_sort);
 
-        let resolved_table = self
+        let mut resolved_table = self
             .printed_uf_table_rows(name, arg_sorts, result_sort, table, model)
             .map_err(|error| error.to_string())?;
+        // Each cell takes the name `Self::table_cell_surface` gives it, if
+        // any, and then goes through `Self::ascribe_overloaded_ctors` with its
+        // column's sort (#overloaded-nil-surface), as z3 ascribes a table cell.
+        for (args, value) in &mut resolved_table {
+            let cells = args
+                .iter_mut()
+                .zip(arg_sorts)
+                .chain(std::iter::once((value, result_sort)));
+            for (cell, sort) in cells {
+                if let Some(named) = self.table_cell_surface(cell, sort, overloaded) {
+                    *cell = named;
+                }
+                if !overloaded.is_empty() {
+                    *cell = self.ascribe_overloaded_ctors(cell, sort, overloaded);
+                }
+            }
+        }
 
         // Build nested ite expression from resolved table.
         let body = if resolved_table.is_empty() {
@@ -351,7 +369,11 @@ impl Executor {
             // it with the canonical constant body (legitimate model
             // completion of an unconstrained function, not a fabricated value
             // for a missing one).
-            self.default_value_surface(result_sort)
+            self.ascribe_overloaded_ctors(
+                &self.default_value_surface(result_sort),
+                result_sort,
+                overloaded,
+            )
         } else {
             self.format_function_body(arg_sorts, result_sort, &resolved_table)
         };

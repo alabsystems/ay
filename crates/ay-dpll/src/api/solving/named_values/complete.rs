@@ -104,7 +104,7 @@ impl Solver {
         self.executor
             .check_evaluation_read()
             .map_err(SolverError::ModelGenerationFailed)?;
-        let output = self.executor.values(requests);
+        let output = self.executor.values_for_decoder(requests);
         let result = model_parse::parse_get_value_output(
             &output,
             requests,

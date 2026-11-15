@@ -1013,7 +1013,8 @@ fn optimize_solve(
             match ctx.solver.model_for_consumer() {
                 Some(model) => {
                     opt.last_model = Some(model.into_inner());
-                    opt.last_model_text = ctx.solver.model_str();
+                    // The decoder text (#overloaded-nil-surface).
+                    opt.last_model_text = ctx.solver.model_str_for_decoder();
                     ctx.last_error = Z3_OK;
                     Z3_L_TRUE
                 }
@@ -1154,7 +1155,8 @@ fn optimize_check_objectives(ctx: &mut Z3Context, opt: &mut OptimizeHandle) -> c
         match ctx.solver.model_for_consumer() {
             Some(model) => {
                 opt.last_model = Some(model.into_inner());
-                opt.last_model_text = ctx.solver.model_str();
+                // As above (#overloaded-nil-surface).
+                opt.last_model_text = ctx.solver.model_str_for_decoder();
                 ctx.last_error = Z3_OK;
                 Z3_L_TRUE
             }

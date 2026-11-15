@@ -78,6 +78,17 @@ impl Expr {
                 write!(f, "(- {}.0)", v.magnitude())
             }
             ExprValue::RealConst(v) => write!(f, "{v}.0"),
+            // A `Var` of sort String whose name is in double quotes, as
+            // `Expr::string_const` builds one (#5969), renders as the string
+            // literal of the text between them, not as the symbol `|"a"|`.
+            ExprValue::Var { name }
+                if self.sort.is_string()
+                    && name.len() >= 2
+                    && name.starts_with('"')
+                    && name.ends_with('"') =>
+            {
+                write!(f, "{}", ay_core::string_literal(&name[1..name.len() - 1]))
+            }
             ExprValue::Var { name } => write!(f, "{}", format_symbol(name)),
             ExprValue::Not(e) => write!(f, "(not {e})"),
             ExprValue::And(es) => {

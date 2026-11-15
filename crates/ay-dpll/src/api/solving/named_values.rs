@@ -48,7 +48,7 @@ impl Solver {
             return Ok(Vec::new());
         }
         let requests = self.named_value_requests(names)?;
-        let output = self.executor.values(&requests);
+        let output = self.executor.values_for_decoder(&requests);
         model_parse::parse_get_value_output(
             &output,
             &requests,

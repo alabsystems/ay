@@ -126,7 +126,7 @@ fn fresh_conversion_sequences_have_identical_versioned_receipts() {
     drop(sequence(&first).unwrap());
     let second = ample();
     drop(sequence(&second).unwrap());
-    assert_eq!(COUNTED_TERM_WORK_VERSION, 1);
+    assert_eq!(COUNTED_TERM_WORK_VERSION, 2);
     assert_eq!(first.usage().unwrap(), second.usage().unwrap());
 }
 
@@ -202,4 +202,25 @@ fn geometric_native_growth_avoids_quadratic_admission_on_shared_chains() {
         large < small * 8,
         "geometric growth plus ordered lookup, not one whole-map scan per node"
     );
+}
+
+/// Opening a counted builder over an existing producer store must not
+/// re-inspect and re-index every existing term: the store's native
+/// hash-cons already indexes them, and counted construction only pays
+/// for the buckets it actually touches. Re-indexing the whole store
+/// charged ~35 work per existing node before any tactic ran, which
+/// refused counted tactics on real-scale stores under the shared
+/// functional-work budget.
+#[test]
+fn builder_construction_does_not_rescan_existing_store() {
+    let mut store = TermStore::new();
+    let existing_true = store.mk_bool(true);
+    for i in 0..20_000i64 {
+        store.mk_int(i.into());
+    }
+    let original = owner(50_000, 1 << 26);
+    let mut builder = CountedTermBuilder::new(&mut store, &original).unwrap();
+    // Dedup against a pre-existing term still finds the original id.
+    assert_eq!(builder.boolean(true).unwrap(), existing_true);
+    builder.finish().unwrap();
 }

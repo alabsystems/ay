@@ -339,22 +339,39 @@ pub(super) fn eliminate(
         if layer.is_empty() {
             break;
         }
-        // Remove the layer's roots (descending positions keep later
-        // indices valid) and record its definitions in scan order.
+        // Record the layer's definitions in scan order, then drop its
+        // roots by one in-place compaction pass: removing them one by
+        // one charges the suffix memmove per removal, quadratic on
+        // interleaved definition/residual roots. Layer positions are
+        // ascending (scan order) and duplicate-free, so a two-pointer
+        // merge moves each kept root at most once.
         let mut subst: DetHashMap<TermId, TermId> = DetHashMap::default();
-        for &(position, definition) in layer.iter().rev() {
-            tick(owner, roots.len() - position)?;
-            let _removed = roots.remove(position);
+        for &(_, definition) in &layer {
             if let Some((variable, value)) = definition {
                 tick(owner, 1)?;
                 subst.insert(variable, value);
+                push(&mut definitions, (variable, value), owner)?;
             }
         }
-        for &(_, definition) in &layer {
-            if let Some(definition) = definition {
-                push(&mut definitions, definition, owner)?;
+        let mut removed = layer.iter().map(|&(position, _)| position).peekable();
+        let mut write = 0usize;
+        for read in 0..roots.len() {
+            tick(owner, 1)?;
+            if removed.peek() == Some(&read) {
+                removed.next();
+                continue;
             }
+            if write != read {
+                tick(owner, 1)?;
+                roots[write] = roots[read];
+            }
+            write += 1;
         }
+        if removed.next().is_some() {
+            return Err(failed());
+        }
+        tick(owner, roots.len() - write)?;
+        roots.truncate(write);
         if subst.is_empty() {
             continue;
         }
@@ -498,12 +515,15 @@ mod tests {
     /// many independent definitions must not re-scan the whole store per
     /// candidate / per elimination: that quadratic charging refused
     /// `(apply solve-eqs)` at ~90 variable pairs (and on real benchmark
-    /// files) while z3 applies it at any of these scales.
+    /// files) while z3 applies it at any of these scales. Removing the
+    /// eliminated roots one by one from the interleaved root vector is
+    /// likewise quadratic in charged memmoves, so this scale uses
+    /// interleaved definition/residual roots throughout.
     #[test]
     fn eliminate_scales_within_functional_work_budget() {
         let mut store = TermStore::new();
         let mut roots = Vec::new();
-        for i in 0..120 {
+        for i in 0..1200 {
             let x = store.mk_var(format!("x{i}"), Sort::Int);
             let y = store.mk_var(format!("y{i}"), Sort::Int);
             let one = store.mk_int(1.into());
@@ -519,8 +539,8 @@ mod tests {
         )
         .unwrap();
         let result = eliminate(&mut store, roots, &admitted).unwrap();
-        assert_eq!(result.definitions.len(), 120);
-        assert_eq!(result.roots.len(), 120);
+        assert_eq!(result.definitions.len(), 1200);
+        assert_eq!(result.roots.len(), 1200);
         // Every remaining root is a comparison over the substituted term:
         // no root still mentions an eliminated variable as a bare operand.
         for &root in &result.roots {

@@ -478,7 +478,7 @@ fn hash_bucket_selection_is_not_term_or_sort_authority() {
     let no = builder.boolean(false).unwrap();
     let candidate = TermData::App(Symbol::named("and"), vec![yes, no]);
     let hash = TermStore::compute_hash(&candidate);
-    builder.terms.insert(hash, yes, &original).unwrap();
+    builder.store.hash_cons.entry(hash).or_default().push(yes);
     let actual = builder.apply(CountedBuiltin::And, &[yes, no]).unwrap();
     assert_ne!(actual, yes);
     assert_eq!(builder.store.get(actual), &candidate);

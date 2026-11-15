@@ -454,6 +454,7 @@ fn popped_datatype_member_core_identities_are_never_reused() {
     assert_eq!(ctx.dt_surface_name(&new_tester), Some("is-ScopedC"));
     assert_eq!(ctx.output_symbol_name(&old_ctor), old_ctor);
     assert_eq!(ctx.output_symbol_name(&new_ctor), new_ctor);
+    assert_output_name_census_matches(&ctx);
     assert_eq!(
         ctx.format_sort_surface(&old_carrier),
         Some(ay_core::quote_symbol(match &old_carrier {
@@ -1603,4 +1604,38 @@ fn test_dt_field_surface_qualifies_polymorphic_overload_root() {
             .map(String::as_str),
         Some("(|left field| (as |c root| |Rec sort|))")
     );
+}
+
+/// Asserts that, for each datatype member of `ctx`, the one-census name is
+/// the name `output_symbol_name` gives it.
+fn assert_output_name_census_matches(ctx: &Context) {
+    let names = ctx.datatype_output_names();
+    assert!(!ctx.datatype_member_symbols.is_empty());
+    for identity in ctx.datatype_member_symbols.keys() {
+        assert_eq!(
+            names.name(identity),
+            ctx.output_symbol_name(identity),
+            "census spelling of {identity}"
+        );
+    }
+    assert_eq!(names.name("no-such-member"), "no-such-member");
+}
+
+#[test]
+fn output_name_census_matches_per_identity_spelling() {
+    let script = "(declare-datatypes ((L1 0) (L2 0)) (((nil) (c1 (h1 Int) (t1 L1))) ((nil) (c2 (h2 L1) (t2 L2)))))
+        (declare-datatypes ((List 1)) ((par (T) ((nil) (cons (hd T) (tl (List T)))))))
+        (declare-datatype E ((nil (v Int)) (leaf)))
+        (declare-const a (List Int))
+        (declare-const b (List (List Int)))
+        (push 1)
+        (declare-datatype S ((nil) (mk (f S))))
+        (declare-const s S)
+        (pop 1)
+        (declare-datatype S ((nil) (mk (f S))))";
+    let mut ctx = Context::new();
+    for command in parse(script).expect("parse") {
+        ctx.process_command(&command).expect("declare");
+    }
+    assert_output_name_census_matches(&ctx);
 }

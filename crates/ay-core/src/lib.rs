@@ -40,6 +40,7 @@
 #![warn(clippy::all)]
 
 pub(crate) mod alethe;
+mod constructor_ascription;
 pub mod debug_channel;
 pub mod forgone;
 pub mod kani_compat;
@@ -63,6 +64,11 @@ pub mod time;
 pub(crate) mod tseitin;
 pub mod verification;
 
+pub use constructor_ascription::{
+    ascribed_constructor_spelling, ascription_may_name_constructor, bare_constructor_spelling,
+    model_constant_definition, smtlib_term_len, ASCRIPTION_THEORY_SORT_HEADS,
+    ASCRIPTION_THEORY_VALUE_HEADS,
+};
 pub use debug_channel::{
     captured_misc_cli_flags, chc_debug_env_flags, claim_trace_file, debug_channel_active,
     declared_proof_checker, misc_cli_flags, misc_test_override, release_trace_file,

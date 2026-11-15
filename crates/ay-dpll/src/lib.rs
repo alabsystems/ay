@@ -120,6 +120,13 @@ pub(crate) mod cegqi;
 mod clause_application;
 mod combined_solvers;
 mod construction;
+mod constructor_ascription;
+#[doc(hidden)]
+pub use constructor_ascription::{
+    as_application_pair, constructor_ascription_matrix, overload_pairs, AscriptionCase,
+    OverloadPair, AS_APPLICATION_OWN_SORT, AS_APPLICATION_UNIT, MATRIX_CONSTRUCTORS, MATRIX_SORTS,
+    OVERLOAD_ASCRIBED_CONSTRUCTORS, OVERLOAD_BARE_CONSTRUCTORS, OVERLOAD_PAIR_VARIANTS,
+};
 mod diagnostic_trace;
 mod dpll_error;
 mod dpll_proof_lifecycle;

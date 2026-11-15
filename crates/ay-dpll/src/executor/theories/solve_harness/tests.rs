@@ -10,6 +10,7 @@ use num_traits::FromPrimitive;
 
 mod int_const_subst_zero_divisor;
 mod split_atoms;
+mod ufnia_varsubst;
 
 fn rat(n: i64) -> BigRational {
     BigRational::from_i64(n).unwrap()

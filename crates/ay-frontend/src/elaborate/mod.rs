@@ -1246,7 +1246,7 @@ pub enum AuthoredAssertionRef<'a> {
 ///
 /// This metadata follows the term-store lifetime, not source scope: a retained
 /// term may still need to print its old sort after the declaration was popped.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum NominalSortSurface {
     /// A zero-arity sort declaration or monomorphic datatype.
     Simple(String),
@@ -3373,6 +3373,7 @@ pub enum CommandResult {
 mod app;
 mod commands;
 mod datatypes;
+pub use datatypes::DatatypeOutputNames;
 mod declarations;
 mod definitional_check_sat;
 pub use definitional_check_sat::{

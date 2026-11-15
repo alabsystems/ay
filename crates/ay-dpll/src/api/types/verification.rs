@@ -328,11 +328,11 @@ pub struct ResourceUsage {
     pub learned_clause_count: usize,
     /// Wall-clock time spent in this solve call.
     pub wall_time: Duration,
-    /// Which caller-set limit (if any) caused an Unknown result.
+    /// Which effective limit (if any) caused an Unknown result.
     pub limit_hit: Option<LimitKind>,
 }
 
-/// Which caller-set limit caused an Unknown result.
+/// Which effective limit caused an Unknown result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum LimitKind {
@@ -348,6 +348,8 @@ pub enum LimitKind {
     ClauseDbBytesLimit,
     /// Solver was interrupted by another thread.
     Interrupted,
+    /// Deterministic solver work budget was exhausted.
+    ResourceLimit,
 }
 
 impl LimitKind {
@@ -356,6 +358,7 @@ impl LimitKind {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Timeout => "timeout",
+            Self::ResourceLimit => "resource_limit",
             Self::MemoryLimit => "memory_limit",
             Self::TermMemoryLimit => "term_memory_limit",
             Self::LearnedClauseLimit => "learned_clause_limit",
@@ -369,6 +372,7 @@ impl LimitKind {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Timeout => "Timeout",
+            Self::ResourceLimit => "Resource limit",
             Self::MemoryLimit => "Memory limit",
             Self::TermMemoryLimit => "Term memory limit",
             Self::LearnedClauseLimit => "Learned clause limit",
@@ -408,7 +412,7 @@ pub struct SolveUnknownSummary {
     pub cost_center: Option<String>,
     /// Human-readable detail suitable for downstream messages.
     pub detail: Option<String>,
-    /// Caller-set limit that caused Unknown, when known.
+    /// Effective limit that caused Unknown, when known.
     pub limit_hit: Option<LimitKind>,
     /// Stable limit code from [`LimitKind::code`], when a limit was hit.
     pub limit_code: Option<&'static str>,

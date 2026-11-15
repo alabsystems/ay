@@ -57,7 +57,7 @@ impl TermConstructionAdmission for CountedAdmission {
 /// payload bytes/edges, actual collision-candidate comparisons and geometric
 /// allocation/rehash copies. Opaque allocator and hashbrown probe instructions
 /// are not individually counted. Original cancellation/memory remain separate.
-pub const COUNTED_TERM_WORK_VERSION: u32 = 1;
+pub const COUNTED_TERM_WORK_VERSION: u32 = 2;
 
 /// Closed prime-field operators, separate from the existing BV vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,7 +187,6 @@ impl PayloadUse {
 pub struct CountedTermBuilder<'store, 'owner, O: TermConstructionAdmission = CountedAdmission> {
     store: &'store mut TermStore,
     owner: &'owner O,
-    terms: index::Index,
     variables: index::Index,
     registry_name_bytes: usize,
 }
@@ -280,7 +279,6 @@ impl<'store, 'owner, O: TermConstructionAdmission> CountedTermBuilder<'store, 'o
         let mut builder = Self {
             store,
             owner,
-            terms: index::Index::default(),
             variables: index::Index::default(),
             registry_name_bytes: 0,
         };
@@ -295,12 +293,12 @@ impl<'store, 'owner, O: TermConstructionAdmission> CountedTermBuilder<'store, 'o
     }
 
     fn initialize(&mut self) -> Result<()> {
-        for (position, entry) in self.store.terms.iter().enumerate() {
-            inspection::entry(&entry.term, &entry.sort, self.owner)?;
-            let hash = TermStore::compute_hash(&entry.term);
-            let id = checked_term_id(position).map_err(|_| storage::work(self.owner))?;
-            self.terms.insert(hash, id, self.owner)?;
-        }
+        // Term dedup reads the store's native hash-cons directly (see
+        // `indexed_ids`): every Producer growth path maintains it, so
+        // re-inspecting and re-indexing the whole store here only
+        // duplicated it at whole-store admission cost. The typed
+        // variable side-index has no native equivalent (the names
+        // table is last-binding), so it is still seeded per name.
         for (name, (id, _)) in &self.store.names {
             self.owner.admit(
                 name.len()
@@ -432,10 +430,22 @@ impl<'store, 'owner, O: TermConstructionAdmission> CountedTermBuilder<'store, 'o
         Ok(())
     }
 
+    /// Candidate ids for `hash` from the store's native hash-cons,
+    /// charged as one admitted bucket probe. Every Producer growth
+    /// path (native builders, counted commit, compaction rebuild)
+    /// maintains that map, and counted commits insert into it, so it
+    /// stays exact for the builder's whole session. Candidates are
+    /// still inspected and compared exactly by the callers; the map
+    /// only nominates them.
+    fn indexed_ids(&self, hash: u64) -> Result<Option<&[TermId]>> {
+        self.owner.admit(1, 0)?;
+        Ok(self.store.hash_cons.get(&hash).map(Vec::as_slice))
+    }
+
     fn intern(&mut self, term: &TermData, sort: &Sort) -> Result<TermId> {
         payload::visit(term, sort, self.owner, PayloadUse::Inspect)?;
         let hash = TermStore::compute_hash(term);
-        if let Some(ids) = self.terms.get(hash, self.owner)? {
+        if let Some(ids) = self.indexed_ids(hash)? {
             for id in ids {
                 self.owner.admit(1, 0)?;
                 let entry = self
@@ -469,9 +479,6 @@ impl<'store, 'owner, O: TermConstructionAdmission> CountedTermBuilder<'store, 'o
             .map_err(|_| storage::storage(self.owner))?;
         let stamp =
             next_entry_stamp(&NEXT_TERM_ENTRY_STAMP).map_err(|_| storage::work(self.owner))?;
-        // Side-index reservation/insertion happens first. If a later refusal
-        // occurs, this owner is terminal and cannot use the incomplete index.
-        self.terms.insert(hash, id, self.owner)?;
         let children = match &owned {
             TermData::App(_, args) => args.len(),
             TermData::Ite(..) => 3,

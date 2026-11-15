@@ -1,0 +1,5 @@
+(set-logic QF_BV)
+(set-option :produce-proofs true)
+(declare-const x (_ BitVec 5))
+(assert (not (= (bvsrem x (_ bv0 5)) x)))
+(check-sat)

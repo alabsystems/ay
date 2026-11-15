@@ -160,7 +160,7 @@ impl<O: TermConstructionAdmission> CountedTermBuilder<'_, '_, O> {
     ) -> Result<TermId> {
         inspection::entry(&term, &sort, self.owner)?;
         let hash = TermStore::compute_hash(&term);
-        if let Some(ids) = self.terms.get(hash, self.owner)? {
+        if let Some(ids) = self.indexed_ids(hash)? {
             for id in ids {
                 self.owner.admit(1, 0)?;
                 let entry = self
@@ -187,7 +187,6 @@ impl<O: TermConstructionAdmission> CountedTermBuilder<'_, '_, O> {
             .map_err(|_| storage::storage(self.owner))?;
         let stamp =
             next_entry_stamp(&NEXT_TERM_ENTRY_STAMP).map_err(|_| storage::work(self.owner))?;
-        self.terms.insert(hash, id, self.owner)?;
         let mut count = 1usize;
         children(&term, &mut |_| {
             count = count

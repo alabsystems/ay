@@ -351,6 +351,87 @@ mod tests {
     use super::*;
     use num_bigint::BigInt;
 
+    /// For each case of `ay_dpll::constructor_ascription_matrix`
+    /// (#overloaded-nil-surface), this reader reads the printed model as it
+    /// reads `AscriptionCase::bare` of it.
+    #[test]
+    fn a_printed_model_reads_as_its_bare_spelling() {
+        let mut tops = 0;
+        for case in ay_dpll::constructor_ascription_matrix() {
+            let (_solver, printed) = case.solve().unwrap_or_else(|error| panic!("{error}"));
+            let bare = case.bare(&printed);
+            assert_ne!(bare, printed, "{}", case.label);
+            let constructor = case.constructor().to_string();
+            let constructors: FxHashSet<String> = ["mk", "omk", "w", constructor.as_str()]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            let read = |text: &str| {
+                let mut model = FxHashMap::default();
+                parse_model_into(&mut model, text, &constructors);
+                model
+            };
+            let values = read(&printed);
+            assert_eq!(values, read(&bare), "{}:\n{printed}", case.label);
+            let nullary = SmtValue::Datatype(constructor, vec![]);
+            let Some(top) = values.get("top") else {
+                continue;
+            };
+            tops += 1;
+            assert_eq!(top, &nullary, "{}", case.label);
+            assert_eq!(
+                values.get("nested"),
+                Some(&SmtValue::Datatype(
+                    "w".to_string(),
+                    vec![nullary.clone(), nullary]
+                )),
+                "{}:\n{printed}",
+                case.label
+            );
+        }
+        // Not vacuous: `top` was read for each constructor and sort.
+        assert_eq!(
+            tops,
+            ay_dpll::MATRIX_CONSTRUCTORS.len() * ay_dpll::MATRIX_SORTS.len()
+        );
+    }
+
+    /// For each pair of `ay_dpll::overload_pairs`, this reader returns the
+    /// same values for the model of `pair.overloaded` as for that of
+    /// `pair.renamed`.
+    #[test]
+    fn a_model_reads_the_same_whether_or_not_a_constructor_is_overloaded() {
+        let mut read_values = 0;
+        for pair in ay_dpll::overload_pairs() {
+            let (_, overloaded) = pair
+                .solve(&pair.overloaded)
+                .unwrap_or_else(|error| panic!("{error}"));
+            let (_, renamed) = pair
+                .solve(&pair.renamed)
+                .unwrap_or_else(|error| panic!("{error}"));
+            let constructors: FxHashSet<String> =
+                ["cons", "halt", "w", "rec", "as", pair.constructor.as_str()]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+            let read = |text: &str| {
+                let mut model = FxHashMap::default();
+                parse_model_into(&mut model, text, &constructors);
+                model
+            };
+            let values = read(&overloaded);
+            assert_eq!(
+                values,
+                read(&renamed),
+                "{}:\n{overloaded}\n{renamed}",
+                pair.label
+            );
+            read_values += values.len();
+        }
+        // Not vacuous: at least 156 values were read.
+        assert!(read_values >= 156, "{read_values}");
+    }
+
     #[test]
     fn wide_literals_preserve_high_bits() {
         let constructors = FxHashSet::default();

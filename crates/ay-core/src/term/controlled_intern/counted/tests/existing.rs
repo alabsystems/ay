@@ -30,7 +30,12 @@ fn mixed_existing_arena_preserves_ids_and_deduplicates_supported_data() {
     // Force a general existing payload into a supported candidate's bucket.
     let candidate = TermData::App(Symbol::named("and"), vec![yes, body]);
     let hash = TermStore::compute_hash(&candidate);
-    builder.terms.insert(hash, quantified, &original).unwrap();
+    builder
+        .store
+        .hash_cons
+        .entry(hash)
+        .or_default()
+        .push(quantified);
     let actual = builder.apply(CountedBuiltin::And, &[yes, body]).unwrap();
     assert_eq!(builder.store.get(actual), &candidate);
     assert_eq!(
@@ -48,13 +53,17 @@ fn mixed_existing_arena_preserves_ids_and_deduplicates_supported_data() {
 }
 
 #[test]
-fn existing_payload_work_refusal_is_sticky_without_source_mutation() {
+fn existing_payload_work_refusal_on_touch_is_sticky_without_source_mutation() {
+    // Construction no longer re-inspects the whole store (the native
+    // hash-cons already indexes it), so the refusal lands when the
+    // oversized payload is first touched — and stays sticky.
     let mut store = TermStore::new();
     let id = store.mk_string("x".repeat(4096));
     let before = store.terms.len();
     let original = owner(200, 1024 * 1024);
+    let mut builder = CountedTermBuilder::new(&mut store, &original).unwrap();
     assert!(matches!(
-        CountedTermBuilder::new(&mut store, &original),
+        builder.string(&"x".repeat(4096)),
         Err(CountedTermError::Stopped(
             CountedAdmissionError::WorkExhausted
         ))
@@ -67,16 +76,20 @@ fn existing_payload_work_refusal_is_sticky_without_source_mutation() {
 }
 
 #[test]
-fn too_deep_existing_sort_refuses_before_hashing_and_stays_terminal() {
+fn too_deep_existing_sort_refuses_on_first_touch_and_stays_terminal() {
     let mut sort = Sort::Int;
     for _ in 0..258 {
         sort = Sort::Seq(Box::new(sort));
     }
     let mut store = TermStore::new();
-    store.mk_var("deep", sort);
+    let deep = store.mk_var("deep", sort);
+    let eq = store.mk_app(Symbol::named("="), [deep, deep], Sort::Bool);
     let original = ample();
+    // Opening the builder no longer meters every existing sort; the
+    // first counted touch that must meter this one refuses terminally.
+    let mut builder = CountedTermBuilder::new(&mut store, &original).unwrap();
     assert!(matches!(
-        CountedTermBuilder::new(&mut store, &original),
+        builder.rebuild_existing(eq, &[deep, deep]),
         Err(CountedTermError::Stopped(
             CountedAdmissionError::WorkExhausted
         ))

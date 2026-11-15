@@ -393,6 +393,16 @@ use super::model_parse_compound::parse_seq_value;
 pub(crate) use super::model_parse_compound::parse_value_sexp;
 pub(crate) use super::model_parse_compound::{parse_array_value, parse_dt_value, parse_fp_value};
 
+/// The typed get-value decoder on one value of `sort`, against `context`.
+#[cfg(test)]
+pub(crate) fn decode_typed_value(
+    value: &ay_frontend::SExpr,
+    sort: &Sort,
+    context: &ay_frontend::Context,
+) -> Option<ModelValue> {
+    typed::Decoder::with_context(context).decode(value, sort)
+}
+
 /// Reuse the bounded exact data-only decoder for this new model carrier.
 pub(crate) fn parse_field_literal(
     value: &ay_frontend::SExpr,

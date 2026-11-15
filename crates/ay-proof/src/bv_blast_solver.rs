@@ -645,10 +645,11 @@ pub enum BvExpr {
     /// operand-swap path's `BvOp::Xor` uses.
     Xor(Box<BvExpr>, Box<BvExpr>),
     /// A fixed bit-vector constant: `value` is the unsigned little-endian bit pattern
-    /// (bit `i` = `(value >> i) & 1`), `width` is the bit width. Bits at or above
+    /// (bit `i < 128` = `(value >> i) & 1`), `width` is the bit width. Wider
+    /// constants have zero bits above the stored value. Bits at or above
     /// `width` of `value` must be zero (else the expression is malformed).
     Const {
-        /// Unsigned constant value (bit `i` is `(value >> i) & 1`).
+        /// Low bits of the unsigned constant; higher bits are zero.
         value: u128,
         /// Bit width of the constant.
         width: u32,
@@ -1324,7 +1325,9 @@ impl<'a> ExprBlaster<'a> {
                     .map(|bit| {
                         self.check_deadline()?;
                         Ok({
-                            let set = (*value >> bit) & 1 == 1;
+                            // A wider literal zero-pads the stored u128 value.
+                            // Never evaluate a host shift by 128 or more.
+                            let set = bit < u128::BITS && (*value >> bit) & 1 == 1;
                             if set {
                                 self.one(vars, bit_lemmas, clauses)
                             } else {

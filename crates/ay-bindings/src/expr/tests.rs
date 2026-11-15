@@ -923,6 +923,23 @@ fn test_datatype_constructor_struct() {
     assert_eq!(point.to_string(), "(Point_mk #x00000001 #x00000002)");
 }
 
+/// Here each string constant renders as a string literal, and the Int
+/// constant `my x` as the symbol `|my x|`.
+#[test]
+fn test_string_constant_renders_as_a_literal() {
+    assert_eq!(Expr::string_const("a").to_string(), "\"a\"");
+    assert_eq!(
+        Expr::string_const("| (as nil L1) )").to_string(),
+        "\"| (as nil L1) )\""
+    );
+    assert_eq!(
+        Expr::string_const("say \"hi\"").to_string(),
+        "\"say \"\"hi\"\"\""
+    );
+    assert_eq!(Expr::string_const("").to_string(), "\"\"");
+    assert_eq!(Expr::var("my x", Sort::int()).to_string(), "|my x|");
+}
+
 #[test]
 fn test_datatype_constructor_no_args() {
     // Unit-like struct: qualified form even for nullary constructors (#3362)

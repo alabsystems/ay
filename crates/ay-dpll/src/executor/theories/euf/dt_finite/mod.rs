@@ -124,14 +124,9 @@
 //! some model of the script breaks this for EVERY lane, and is fixed at that
 //! pass. The LNH symmetry pass did so (#dt-fd-lnh-ctor and the E13 audit's
 //! l01..l06: it took nullary constructors and compound terms such as
-//! `(hd l_i)` for interchangeable constants); on main it is off in every
-//! posture (`lnh_symmetry::lnh_enabled()` is false). The pending domain
-//! repair (fix/lnh-symmetry-domain) re-enables it only over declared free
-//! constants (never a constructor or compound term) and only in a
-//! non-incremental check, where its clauses are a symmetry reduction of that
-//! one check's φ and so keep it equisatisfiable; this lane needs no LNH
-//! refusal of its own under either, and no pass this lane runs after
-//! injects such a root today.
+//! `(hd l_i)` for interchangeable constants). It now runs under the
+//! conditions `lnh_symmetry` states, and this lane has no LNH refusal of its
+//! own.
 //!
 //! # Lemma 4 (guarded selectors; justifies compaction O2)
 //!

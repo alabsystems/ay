@@ -1135,6 +1135,111 @@ fn parse_function_table_accepts_ascribed_uninterpreted_arguments() {
     assert_eq!(interps[0].else_value, ModelValue::Bool(false));
 }
 
+/// The fields of each function table, as `captured_function_tables` returns
+/// them, sorted by name.
+#[cfg(test)]
+type TableFields = Vec<(
+    String,
+    Vec<Sort>,
+    Sort,
+    Vec<(Vec<ModelValue>, ModelValue)>,
+    ModelValue,
+)>;
+
+/// The function tables `parse_func_interps` reads from `solver`'s
+/// `Solver::model_str_for_decoder`, sorted by name.
+#[cfg(test)]
+fn captured_function_tables(solver: &Solver) -> TableFields {
+    let text = solver
+        .model_str_for_decoder()
+        .expect("the text a handle captures");
+    let mut fields: TableFields = parse_func_interps(&text)
+        .into_iter()
+        .map(|interp| {
+            (
+                interp.name,
+                interp.param_sorts,
+                interp.result_sort,
+                interp.rows,
+                interp.else_value,
+            )
+        })
+        .collect();
+    fields.sort_by(|left, right| left.0.cmp(&right.0));
+    fields
+}
+
+/// For each pair of `ay_dpll::overload_pairs` (#overloaded-nil-surface),
+/// `captured_function_tables` gives the same tables for `pair.overloaded` as
+/// for `pair.renamed`.
+#[cfg(test)]
+#[test]
+fn function_tables_read_the_same_whether_or_not_a_constructor_is_overloaded() {
+    let mut tables = 0;
+    let mut ascribed = 0;
+    for pair in ay_dpll::overload_pairs() {
+        let (overloaded_solver, overloaded) = pair
+            .solve(&pair.overloaded)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let (renamed_solver, renamed) = pair
+            .solve(&pair.renamed)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let context = format!("{}:\n{overloaded}\n{renamed}", pair.label);
+        assert_eq!(
+            renamed_solver.model_str_for_decoder().as_deref(),
+            Some(renamed.as_str()),
+            "{context}"
+        );
+        let read = captured_function_tables(&overloaded_solver);
+        assert_eq!(read, captured_function_tables(&renamed_solver), "{context}");
+        tables += read.len();
+        ascribed += usize::from(overloaded.contains("(as ") && overloaded != renamed);
+    }
+    // Not vacuous: at least 20 tables were read, and at least 20 overloaded
+    // scripts print a model that holds `(as ` and differs from their renamed
+    // twin's.
+    assert!(tables >= 20, "{tables}");
+    assert!(ascribed >= 20, "{ascribed}");
+}
+
+/// In these scripts `f` returns the application of a constructor named `as`,
+/// and its table in the decoder text holds the cell paired below;
+/// `captured_function_tables` reads no table `f` from any of them.
+#[cfg(test)]
+#[test]
+fn a_function_table_of_applications_of_as_is_skipped_as_before() {
+    let solve = |script: &str| {
+        let mut solver = Solver::new(ay_dpll::api::Logic::All);
+        solver.parse_smtlib2(script).expect("script");
+        assert_eq!(solver.check_sat(), ay_dpll::api::SolveResult::Sat);
+        solver
+    };
+    let (overloaded, renamed) = ay_dpll::as_application_pair();
+    for (script, cell) in [
+        (ay_dpll::AS_APPLICATION_UNIT, "(as Unit Unit)"),
+        (ay_dpll::AS_APPLICATION_OWN_SORT, "(as nil L1)"),
+        (overloaded.as_str(), "(as nil Other)"),
+        (renamed.as_str(), "(as nil Other)"),
+    ] {
+        let solver = solve(script);
+        let text = solver.model_str_for_decoder().expect("captured text");
+        let table = text
+            .split("(define-fun f ((x0 Int)) P")
+            .nth(1)
+            .unwrap_or_else(|| panic!("f is printed: {text}"));
+        assert!(table.contains(cell), "{text}");
+        let read = captured_function_tables(&solver);
+        assert!(
+            read.iter().all(|(name, ..)| name != "f"),
+            "{cell}: {read:?}"
+        );
+    }
+    assert_eq!(
+        captured_function_tables(&solve(&overloaded)),
+        captured_function_tables(&solve(&renamed))
+    );
+}
+
 /// The free constants of `root` (outside every binder of the same name);
 /// `None` when the scopes cannot be separated (see `value_folds`).
 pub(crate) fn scoped_free_leaves(solver: &Solver, root: Term) -> Option<Vec<Term>> {

@@ -627,7 +627,19 @@ fn retain_refusal(accepted: bool) -> bool {
 }
 
 fn admit(value: &EvalValue) -> bool {
-    !active() || retain_refusal(super::recovery_admission::admit_eval_value_copy(value, pay))
+    !active()
+        || retain_refusal(super::recovery_admission::admit_eval_value_copy(
+            value,
+            pay_scalar_copy,
+        ))
+}
+
+/// A private recovery search must prepay borrowed scalar payloads in its
+/// aggregate ledger as well as the original evaluation arena, before cloning.
+fn pay_scalar_copy(work: usize, bytes: usize) -> bool {
+    pay(work, bytes)
+        && super::recovery_admission::RecoveryAdmission::current()
+            .is_none_or(|admission| admission.pay(work, bytes))
 }
 
 pub(super) fn copy(value: &EvalValue) -> EvalValue {
@@ -645,9 +657,9 @@ pub(super) fn integer(value: &num_bigint::BigInt) -> bool {
         .and_then(|limbs| limbs.checked_mul(8))
         .and_then(|bytes| bytes.checked_add(std::mem::size_of::<EvalValue>()))
     else {
-        return pay(usize::MAX, usize::MAX);
+        return pay_scalar_copy(usize::MAX, usize::MAX);
     };
-    pay(bytes, bytes)
+    pay_scalar_copy(bytes, bytes)
 }
 
 pub(super) fn rational(value: &num_rational::BigRational) -> bool {
@@ -655,7 +667,7 @@ pub(super) fn rational(value: &num_rational::BigRational) -> bool {
 }
 
 pub(super) fn string(value: &str) -> bool {
-    pay(value.len(), value.len())
+    pay_scalar_copy(value.len(), value.len())
 }
 
 pub(super) fn copy_string(value: &String) -> Option<String> {

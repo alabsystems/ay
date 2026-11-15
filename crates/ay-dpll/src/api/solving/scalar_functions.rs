@@ -59,7 +59,7 @@ impl Solver {
         // Only one printing pass, through the same immutable Executor/Context.
         // The strict decoder authenticates every requested signature and closed
         // body; this is not the best-effort whole-model parser.
-        let output = self.executor.model();
+        let output = self.executor.model_for_decoder();
         self.scalar_model_controls()?;
         let result = model_parse::parse_scalar_function_models(&output, &expected);
         drop(output);

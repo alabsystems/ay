@@ -30,6 +30,13 @@
 //!
 //! which is `def_1 ∧ … ∧ def_n → C[defs]`. Its expression is linear in the DAG.
 //!
+//! Exact signed-power lowering can also start scalar naming in its first
+//! lowering, before reading operands. It names only scalar results above
+//! `DEFINE_ABOVE_NODES`, without a source census. Array values are not named;
+//! the same functional-extension argument applies to already lowered scalar
+//! results in array-containing clauses. Walk and materialization charges stay
+//! in place. This does not enable the array-excluded retry described above.
+//!
 //! ## Why accepting `C'` accepts `C`
 //!
 //! Take any assignment to the ORIGINAL leaves (a free leaf the lowering
@@ -49,10 +56,11 @@
 //!
 //! The `proof_def_` namespace is disjoint from every other leaf this lowering
 //! names (`proof_bool_`, `proof_bv_`, `proof_array_…`, the frame offsets), and
-//! the retry runs only after the ordinary lowering was refused, so every
-//! clause the checker accepted before is lowered, blasted and accepted exactly
-//! as before. A definitional lowering is under the same caps as an ordinary
-//! one, and continues its walk count (`lower_clause`).
+//! the retry runs only after the ordinary lowering was refused. First-pass
+//! scalar naming for signed powers can change expression shape and copy costs;
+//! preserving prior admissions therefore requires semantic regression checks.
+//! A definitional lowering is under the same caps as an ordinary one, and
+//! continues its walk count (`lower_clause`).
 
 use super::super::{BvExpr, ProofProducingExpr, ProofProducingLowerer};
 use ay_core::{TermData, TermId, TermStore};
@@ -109,6 +117,19 @@ fn shared_terms(terms: &TermStore, clause: &[TermId]) -> Option<HashSet<TermId>>
 }
 
 impl ProofProducingLowerer<'_, '_> {
+    /// Bound internal operand copies before exact signed-power lowering.
+    /// Naming only large scalar results needs no source-DAG census. The same
+    /// functional definitions and counted walks/materializations below apply;
+    /// this is one lowering, including when its source contains arrays.
+    pub(in crate::checker::bv_bitblast) fn record_scalar_definitions(&mut self) {
+        if self.definitions.is_none() {
+            self.definitions = Some(Definitions {
+                recorded: Vec::new(),
+                shared: Some(HashSet::new()),
+            });
+        }
+    }
+
     /// Replace a freshly lowered compound term by its definition leaf when
     /// this lowering is definitional; otherwise return it unchanged.
     pub(in crate::checker::bv_bitblast) fn define(

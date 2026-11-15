@@ -570,7 +570,7 @@ impl Solver {
         let limit_hit = self.last_unknown_reason.and_then(|r| match r {
             UnknownReason::Timeout => Some(LimitKind::Timeout),
             UnknownReason::MemoryLimit => Some(LimitKind::MemoryLimit),
-            UnknownReason::ResourceLimit => Some(LimitKind::MemoryLimit),
+            UnknownReason::ResourceLimit => Some(LimitKind::ResourceLimit),
             UnknownReason::Interrupted => Some(LimitKind::Interrupted),
             _ => None,
         });
@@ -629,7 +629,8 @@ fn default_unknown_phase(reason: UnknownReason, limit_hit: Option<LimitKind>) ->
     match limit_hit {
         Some(LimitKind::Timeout | LimitKind::Interrupted) => "search-control",
         Some(
-            LimitKind::MemoryLimit
+            LimitKind::ResourceLimit
+            | LimitKind::MemoryLimit
             | LimitKind::TermMemoryLimit
             | LimitKind::LearnedClauseLimit
             | LimitKind::ClauseDbBytesLimit,
@@ -654,6 +655,7 @@ fn default_unknown_cost_center(
     match limit_hit {
         Some(LimitKind::Timeout) => "deadline",
         Some(LimitKind::Interrupted) => "interrupt",
+        Some(LimitKind::ResourceLimit) => "deterministic-budget",
         Some(LimitKind::MemoryLimit) => "memory",
         Some(LimitKind::TermMemoryLimit) => "term-memory",
         Some(LimitKind::LearnedClauseLimit) => "learned-clause-limit",
@@ -671,7 +673,8 @@ fn default_unknown_cost_center(
             UnknownReason::ExpressionSplit => "expression-split",
             UnknownReason::Timeout => "deadline",
             UnknownReason::Interrupted => "interrupt",
-            UnknownReason::MemoryLimit | UnknownReason::ResourceLimit => "memory",
+            UnknownReason::ResourceLimit => "deterministic-budget",
+            UnknownReason::MemoryLimit => "memory",
             UnknownReason::InternalError => "internal-error",
             UnknownReason::SelfCheckRejected => "self-check-rejected",
             UnknownReason::ProofTrusted => "proof-trusted",

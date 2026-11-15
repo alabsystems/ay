@@ -2845,7 +2845,11 @@ impl Executor {
     /// committed point with a fabricated value reads as a wrong model
     /// (voiding, M4 F1/F2). Same principle when the e-graph assignment's
     /// structural self-check fails: ALL totalizations are withheld.
-    pub(super) fn total_selector_definitions(&self, model: &Model) -> Vec<String> {
+    pub(super) fn total_selector_definitions(
+        &self,
+        model: &Model,
+        overloaded: &super::overloaded_ctor_surface::OverloadedCtors,
+    ) -> Vec<String> {
         let Some(SelectorTables {
             infos: sel_infos,
             cases: wrong_cases,
@@ -2854,9 +2858,20 @@ impl Executor {
         else {
             return Vec::new();
         };
+        // No definition here for a selector `n` for which
+        // `Context::overloaded_surface_name` gives a surface name other than
+        // `n` (#overloaded-nil-surface), for example, with two monomorphic
+        // declarations, the second's `hd`, held as `__ay_overload_N`, which
+        // is no symbol of the script; a definition under the surface name
+        // could conflict with another selector's.
         let mut names: Vec<&String> = sel_infos
             .iter()
             .filter(|(n, i)| !i.skip && !dropped.contains(n.as_str()))
+            .filter(|(n, _)| {
+                self.ctx
+                    .overloaded_surface_name(n)
+                    .is_none_or(|surface| surface == n.as_str())
+            })
             .map(|(n, _)| n)
             .collect();
         names.sort();
@@ -2887,9 +2902,17 @@ impl Executor {
             }
             // else-chain: committed wrong-constructor cases first, canonical
             // default innermost.
-            let mut els = self.canonical_default_value(&info.ret_sort);
+            let arg_sort = Sort::Uninterpreted(info.dt_name.clone());
+            let ascribe =
+                |value: &str, sort: &Sort| self.ascribe_overloaded_ctors(value, sort, overloaded);
+            let mut els = ascribe(
+                &self.canonical_default_value(&info.ret_sort),
+                &info.ret_sort,
+            );
             if let Some(cases) = wrong_cases.get(name) {
                 for (arg, val) in cases.iter().rev() {
+                    let arg = ascribe(arg, &arg_sort);
+                    let val = ascribe(val, &info.ret_sort);
                     els = format!("(ite (= @p0 {arg}) {val} {els})");
                 }
             }

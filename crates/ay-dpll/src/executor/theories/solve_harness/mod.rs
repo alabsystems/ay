@@ -1157,6 +1157,50 @@ impl Executor {
             &mut source_sets,
         );
 
+        // Scalar SSA elimination (z3's solve-eqs collapse on blast
+        // encodings, the s3 family): inline top-level scalar
+        // definitions `(= var term)` so the combiner does not churn on
+        // hundreds of definitional atoms. This mirrors the AUFLIA
+        // enrollment (#7890), including no scalar-replacement node
+        // limit (the ABV budgeted variant's composed-DAG cap rejects
+        // SSA chains after ~16 links; hash-consed rebuilds bound
+        // store growth by distinct nodes here) and its UF gate: with
+        // declared uninterpreted functions present, full substitution
+        // degrades instant SATs to Unknown through model recovery
+        // (measured on QF_UFNIA CLEARSY/Zohar files; the #7884 hazard
+        // family), so only VAR := CONSTANT folds there. Array
+        // definitions stay (skip-array-sort in both modes): the
+        // deferred model validator needs their defining equalities.
+        // Every substitution is recorded for model completion,
+        // changed roots drop proof provenance, and the pass is
+        // skipped wholesale when proofs are requested.
+        if !self.skip_varsubst_for_proofs() {
+            let features =
+                crate::features::StaticFeatures::collect(&self.ctx.terms, &preprocessed_assertions);
+            let mut var_subst = if features.has_uf {
+                VariableSubstitution::new_constants_only()
+            } else {
+                VariableSubstitution::new_skip_arrays()
+            };
+            var_subst.set_preserve_nonlinear_vars(true);
+            let before = preprocessed_assertions.clone();
+            let changed = var_subst.apply(&mut self.ctx.terms, &mut preprocessed_assertions);
+            self.record_var_substitutions(&var_subst);
+            if changed {
+                for ((old, new), sources) in before
+                    .iter()
+                    .zip(preprocessed_assertions.iter())
+                    .zip(source_sets.iter_mut())
+                {
+                    if *old != *new {
+                        *sources = None;
+                    }
+                }
+                let new_len = preprocessed_assertions.len();
+                source_sets.resize_with(new_len, || None);
+            }
+        }
+
         let mut som_pass = NormalizeArithSom::new();
         som_pass.apply(&mut self.ctx.terms, &mut preprocessed_assertions);
         preprocessed_assertions = self

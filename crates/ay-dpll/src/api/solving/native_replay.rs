@@ -1983,7 +1983,8 @@ fn model_evidence_status(result: &str, model: &NativeReplayModelSummary) -> &'st
 fn limit_phase(limit: LimitKind) -> String {
     match limit {
         LimitKind::Timeout | LimitKind::Interrupted => "search-control",
-        LimitKind::MemoryLimit
+        LimitKind::ResourceLimit
+        | LimitKind::MemoryLimit
         | LimitKind::TermMemoryLimit
         | LimitKind::LearnedClauseLimit
         | LimitKind::ClauseDbBytesLimit => "resource-control",

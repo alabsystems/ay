@@ -177,16 +177,40 @@ impl Solver {
     /// - [`SolverError::ModelGenerationFailed`] — executor returned empty or error model
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_get_model_str(&self) -> Result<String, SolverError> {
-        self.with_model_evaluation_read(|| self.try_get_model_str_in_read())
+        self.with_model_evaluation_read(|| self.model_text_in_read(false))
     }
 
-    fn try_get_model_str_in_read(&self) -> Result<String, SolverError> {
+    /// The model text for a decoder inside this process that holds this
+    /// solver: `Executor::model_for_decoder`, the `ValueSpelling::Sorted`
+    /// rendering (#overloaded-nil-surface), where
+    /// [`try_get_model_str`](Self::try_get_model_str) may ascribe an
+    /// overloaded nullary constructor, for example `(as nil L1)`. It may name
+    /// a constructor by the frontend's identity, for example `__ay_overload_N`.
+    #[must_use = "this returns a Result that must be checked"]
+    pub fn try_get_model_str_for_decoder(&self) -> Result<String, SolverError> {
+        self.with_model_evaluation_read(|| self.model_text_in_read(true))
+    }
+
+    /// [`try_get_model_str_for_decoder`](Self::try_get_model_str_for_decoder),
+    /// `None` on any failure.
+    #[must_use]
+    pub fn model_str_for_decoder(&self) -> Option<String> {
+        self.try_get_model_str_for_decoder().ok()
+    }
+
+    /// The model text: `Executor::model_for_decoder` when `for_decoder`,
+    /// `Executor::model` otherwise.
+    fn model_text_in_read(&self, for_decoder: bool) -> Result<String, SolverError> {
         let last_result = self.executor.last_result().ok_or(SolverError::NoResult)?;
         if !last_result.is_sat() {
             return Err(SolverError::NotSat);
         }
 
-        let model_str = self.executor.model();
+        let model_str = if for_decoder {
+            self.executor.model_for_decoder()
+        } else {
+            self.executor.model()
+        };
         if model_str.is_empty() {
             return Err(SolverError::ModelGenerationFailed(
                 "empty model string".into(),
@@ -251,7 +275,8 @@ impl Solver {
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_get_model(&self) -> Result<VerifiedModel, SolverError> {
         self.with_model_evaluation_read(|| {
-            let model_str = self.try_get_model_str()?;
+            // The decoder text (`Self::try_get_model_str_for_decoder`).
+            let model_str = self.model_text_in_read(true)?;
             Ok(VerifiedModel::from_validated(model_parse::parse_model_str(
                 &model_str,
             )))
@@ -434,7 +459,7 @@ impl Solver {
             .iter()
             .map(|&id| (self.executor.format_term(id), id))
             .collect();
-        let output = self.executor.values(&pairs);
+        let output = self.executor.values_for_decoder(&pairs);
 
         if output.starts_with("(error ") || output.is_empty() {
             return Err(SolverError::ModelGenerationFailed(output));

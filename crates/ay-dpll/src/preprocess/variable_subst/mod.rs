@@ -70,6 +70,13 @@ pub(crate) struct VariableSubstitution {
     /// (#7884) cannot arise. Lets QF_UFLIA/QF_AUFLIA fold facts like
     /// `(= adr_lo 4)` through the formula the way z3's preprocessing does.
     constants_only: bool,
+    /// Keep variables that occur inside a nonlinear product named.
+    /// Inlining such a variable rewrites `(* v v)` into a product of
+    /// compound sums, and the NIA refutations that key on a single
+    /// named monomial (e.g. no integer squares to 2) no longer fire.
+    /// Used by the UFNIA lane, whose nonlinear solver is weaker than
+    /// z3's nlsat on expanded forms.
+    preserve_nonlinear_vars: bool,
 }
 
 impl VariableSubstitution {
@@ -82,6 +89,7 @@ impl VariableSubstitution {
             skip_array_sort: false,
             scalar_replacement_node_limit: None,
             constants_only: false,
+            preserve_nonlinear_vars: false,
         }
     }
 
@@ -96,6 +104,7 @@ impl VariableSubstitution {
             skip_array_sort: true,
             scalar_replacement_node_limit: None,
             constants_only: true,
+            preserve_nonlinear_vars: false,
         }
     }
 
@@ -111,6 +120,7 @@ impl VariableSubstitution {
             skip_array_sort: true,
             scalar_replacement_node_limit: None,
             constants_only: false,
+            preserve_nonlinear_vars: false,
         }
     }
 
@@ -128,11 +138,18 @@ impl VariableSubstitution {
             skip_array_sort: true,
             scalar_replacement_node_limit: None,
             constants_only: false,
+            preserve_nonlinear_vars: false,
         }
     }
 
     pub(crate) fn set_scalar_replacement_node_limit(&mut self, limit: usize) {
         self.scalar_replacement_node_limit = Some(limit);
+    }
+
+    /// Keep variables occurring inside nonlinear products named (see the
+    /// field doc); used by the UFNIA preprocessing route.
+    pub(crate) fn set_preserve_nonlinear_vars(&mut self, preserve: bool) {
+        self.preserve_nonlinear_vars = preserve;
     }
 
     /// Get the substitution map (from -> to).
@@ -152,6 +169,56 @@ impl VariableSubstitution {
     /// Check if a term is a variable (not a constant, not a compound term).
     fn is_variable(terms: &TermStore, term: TermId) -> bool {
         matches!(terms.get(term), TermData::Var(_, _))
+    }
+
+    /// Variables occurring inside a nonlinear product (a `*` node with at
+    /// least two non-constant factors) anywhere in `assertions`. A
+    /// same-named declared function is treated as a product too: that
+    /// only over-protects, never mis-substitutes.
+    fn nonlinear_protected_vars(terms: &TermStore, assertions: &[TermId]) -> HashSet<TermId> {
+        let mut protected = HashSet::default();
+        let mut seen: HashSet<(TermId, bool)> = HashSet::default();
+        let mut stack: Vec<(TermId, bool)> = assertions.iter().map(|&root| (root, false)).collect();
+        while let Some((term, inside)) = stack.pop() {
+            if !seen.insert((term, inside)) {
+                continue;
+            }
+            match terms.get(term) {
+                TermData::Var(_, _) => {
+                    if inside {
+                        protected.insert(term);
+                    }
+                }
+                TermData::Const(_) => {}
+                TermData::App(sym, args) => {
+                    let nonlinear = sym.name() == "*"
+                        && args
+                            .iter()
+                            .filter(|arg| !matches!(terms.get(**arg), TermData::Const(_)))
+                            .count()
+                            >= 2;
+                    let child_inside = inside || nonlinear;
+                    stack.extend(args.iter().map(|&arg| (arg, child_inside)));
+                }
+                TermData::Not(inner) => stack.push((*inner, inside)),
+                TermData::Ite(c, t, e) => {
+                    stack.extend([(*c, inside), (*t, inside), (*e, inside)]);
+                }
+                TermData::Let(bindings, body) => {
+                    stack.push((*body, inside));
+                    stack.extend(bindings.iter().map(|(_, binding)| (*binding, inside)));
+                }
+                TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
+                    stack.push((*body, inside));
+                    stack.extend(triggers.iter().flatten().map(|&trigger| (trigger, inside)));
+                }
+                // All current TermData variants are handled above.
+                other => unreachable!(
+                    "unhandled TermData variant in nonlinear_protected_vars(): {other:?}"
+                ),
+            }
+        }
+        protected
     }
 
     /// Check whether a candidate replacement is cheap enough to substitute.
@@ -896,6 +963,12 @@ impl PreprocessingPass for VariableSubstitution {
         // graph-based cycle checks that are less restrictive than TermId ordering (#2830).
         let mut combined_substs = self.substitutions.clone();
 
+        let nonlinear_protected = if self.preserve_nonlinear_vars {
+            Self::nonlinear_protected_vars(terms, assertions)
+        } else {
+            HashSet::default()
+        };
+
         for &assertion in assertions.iter() {
             if let Some((var, replacement)) = Self::find_substitution(
                 terms,
@@ -906,6 +979,12 @@ impl PreprocessingPass for VariableSubstitution {
                 self.scalar_replacement_node_limit,
                 self.constants_only,
             ) {
+                if nonlinear_protected.contains(&var) {
+                    if debug {
+                        safe_eprintln!("[var_subst] Skip: {var:?} occurs in a nonlinear product");
+                    }
+                    continue;
+                }
                 // Don't substitute a variable twice (within this pass, or across fixed-point rounds).
                 if self.substitutions.contains_key(&var) || substituted_vars.contains(&var) {
                     if debug {

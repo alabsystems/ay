@@ -5269,7 +5269,9 @@ impl Executor {
         // the outer publication gates still decide whether SAT can be emitted.
         let candidate = self.take_store_chain_class_candidate();
         let datatype_array_candidate = self.prepare_exact_datatype_array_rebuild();
-        let mut result = self.finalize_sat_model_validation_inner();
+        let mut scalar_integer_candidate = None;
+        let mut result =
+            self.finalize_sat_model_validation_inner(Some(&mut scalar_integer_candidate));
         if matches!(result, Ok(SolveResult::Sat)) {
             // The independent publication gate can still reject this first
             // witness. Preserve its alternative for that later boundary.
@@ -5300,7 +5302,7 @@ impl Executor {
                 super::super::eval_memo_clear();
                 self.last_statistics
                     .set_int("model_validation.store_chain_class_candidate", 1);
-                result = self.finalize_sat_model_validation_inner();
+                result = self.finalize_sat_model_validation_inner(None);
                 if matches!(result, Ok(SolveResult::Sat)) {
                     self.last_unknown_reason = None;
                     for key in [
@@ -5318,11 +5320,23 @@ impl Executor {
                 }
             }
         }
-        if matches!(result, Ok(SolveResult::Unknown))
-            && !self.publish_evaluation_stop()
-            && !self.solve_deadline.expired()
-        {
-            if let Some(candidate) = datatype_array_candidate {
+        for (statistic, candidate) in [
+            (
+                "model_validation.exact_datatype_array_rebuild",
+                datatype_array_candidate,
+            ),
+            (
+                "model_validation.scalar_integer_candidate",
+                scalar_integer_candidate,
+            ),
+        ] {
+            if !matches!(result, Ok(SolveResult::Unknown))
+                || self.publish_evaluation_stop()
+                || self.solve_deadline.expired()
+            {
+                break;
+            }
+            if let Some(candidate) = candidate {
                 self.record_rejected_model();
                 let rejected = self.last_model.take();
                 let first_reason = self.last_unknown_reason.take();
@@ -5331,9 +5345,8 @@ impl Executor {
                 self.last_result = Some(SolveResult::Sat);
                 super::super::eval_memo_clear();
                 super::super::independent_gate::invalidate_functional_model_caches();
-                self.last_statistics
-                    .set_int("model_validation.exact_datatype_array_rebuild", 1);
-                let retry = self.finalize_sat_model_validation_inner();
+                self.last_statistics.set_int(statistic, 1);
+                let retry = self.finalize_sat_model_validation_inner(None);
                 let independently_gated = if matches!(retry, Ok(SolveResult::Sat)) {
                     self.apply_independent_model_gate(SolveResult::Sat)
                 } else {
@@ -5357,8 +5370,7 @@ impl Executor {
                     ] {
                         self.last_statistics.extra.remove(key);
                     }
-                    self.last_statistics
-                        .set_int("model_validation.exact_datatype_array_rebuild", 2);
+                    self.last_statistics.set_int(statistic, 2);
                     result = retry;
                 } else {
                     self.record_rejected_model();
@@ -5385,7 +5397,10 @@ impl Executor {
         }
     }
 
-    fn finalize_sat_model_validation_inner(&mut self) -> Result<SolveResult> {
+    fn finalize_sat_model_validation_inner(
+        &mut self,
+        scalar_integer_candidate: Option<&mut Option<super::super::Model>>,
+    ) -> Result<SolveResult> {
         // Skips accrued BEFORE this finalization (nested/deferred probe solves,
         // or a previous check-sat in the same incremental session) say nothing
         // about the model being finalized here — see the mixed Seq+datatype
@@ -5762,6 +5777,13 @@ impl Executor {
                     }
                 }
             }
+            // Only a rejected completed seed may spend recovery resources.
+            // Valid ordinary models never enter the optional candidate search.
+            // Retain DATA before this existing withdrawal; the outer retry
+            // still checks every strict and independent publication gate.
+            if let Some(candidate) = scalar_integer_candidate {
+                *candidate = self.prepare_scalar_integer_candidate();
+            }
             self.withdraw_rejected_model();
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
             self.last_result = Some(SolveResult::Unknown);
@@ -6111,6 +6133,9 @@ impl Executor {
             // downgrade here is unaffected.
             if self.qfax_isolated_lane {
                 self.qfax_isolated_model_rejected = true;
+            }
+            if let Some(candidate) = scalar_integer_candidate {
+                *candidate = self.prepare_scalar_integer_candidate();
             }
             self.withdraw_rejected_model();
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
@@ -6691,6 +6716,9 @@ impl Executor {
                 // validation should produce Unknown, not an error.
                 self.last_statistics.model_validation_failures += 1;
                 tracing::warn!(error = %e, "model validation violated, degrading to Unknown (#8373)");
+                if let Some(candidate) = scalar_integer_candidate {
+                    *candidate = self.prepare_scalar_integer_candidate();
+                }
                 self.withdraw_rejected_model();
                 self.last_unknown_reason = Some(UnknownReason::Incomplete);
                 self.last_result = Some(SolveResult::Unknown);
